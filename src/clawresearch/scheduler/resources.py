@@ -41,3 +41,20 @@ class ResourceManager:
                 "UPDATE resource_locks SET lock_status = 'released', released_at = ? WHERE id = ?",
                 (utc_now(), lock_id),
             )
+
+    def release_owner_locks(self, project_id: str, owner_type: str, owner_id: str) -> int:
+        with self.store.transaction() as connection:
+            rows = connection.execute(
+                """
+                SELECT id
+                FROM resource_locks
+                WHERE project_id = ? AND owner_type = ? AND owner_id = ? AND lock_status = 'active'
+                """,
+                (project_id, owner_type, owner_id),
+            ).fetchall()
+            for row in rows:
+                connection.execute(
+                    "UPDATE resource_locks SET lock_status = 'released', released_at = ? WHERE id = ?",
+                    (utc_now(), row["id"]),
+                )
+        return len(rows)

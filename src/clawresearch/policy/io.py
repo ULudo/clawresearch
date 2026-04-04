@@ -7,8 +7,13 @@ import yaml
 from clawresearch.policy.model import Policy
 
 
-def default_policy_for_workspace(workspace: Path) -> Policy:
-    return Policy(allowed_writable_roots=[str(workspace.resolve())])
+def default_policy_for_workspace(workspace: Path, codebase_root: Path | None = None) -> Policy:
+    allowed = [str(workspace.resolve())]
+    if codebase_root is not None:
+        resolved = str(codebase_root.resolve())
+        if resolved not in allowed:
+            allowed.append(resolved)
+    return Policy(allowed_writable_roots=allowed)
 
 
 def write_policy(path: Path, policy: Policy) -> None:

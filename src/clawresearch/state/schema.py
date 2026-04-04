@@ -5,7 +5,8 @@ SCHEMA_STATEMENTS = [
     CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        root_path TEXT NOT NULL UNIQUE,
+        workspace_root TEXT NOT NULL UNIQUE,
+        codebase_root TEXT,
         status TEXT NOT NULL,
         paused INTEGER NOT NULL DEFAULT 0,
         summary TEXT,

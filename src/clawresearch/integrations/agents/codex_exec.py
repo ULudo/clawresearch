@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from clawresearch.integrations.agents.prompting import build_prompt, schema_payload
+
+_build_prompt = build_prompt
+_schema_payload = schema_payload
+
+
+def main() -> int:
+    prompt_file = Path(os.environ["CLAWRESEARCH_PROMPT_FILE"]).resolve()
+    output_file = Path(os.environ["CLAWRESEARCH_OUTPUT_FILE"]).resolve()
+    workspace_root = Path(os.environ["CLAWRESEARCH_WORKSPACE_ROOT"]).resolve()
+    codebase_root = Path(os.environ["CLAWRESEARCH_CODEBASE_ROOT"]).resolve()
+    mode = os.environ.get("CLAWRESEARCH_MODE", "planner")
+    codex_bin = Path(os.environ.get("CLAWRESEARCH_CODEX_BIN", "codex"))
+    codex_model = os.environ.get("CLAWRESEARCH_CODEX_MODEL", "").strip()
+    codex_reasoning_effort = os.environ.get("CLAWRESEARCH_CODEX_REASONING_EFFORT", "").strip()
+
+    bundle = json.loads(prompt_file.read_text(encoding="utf-8"))
+
+    run_dir = output_file.parent
+    schema_path = run_dir / "codex-output-schema.json"
+    schema_path.write_text(json.dumps(schema_payload(), indent=2), encoding="utf-8")
+
+    prompt = build_prompt(bundle, workspace_root=workspace_root, codebase_root=codebase_root, mode=mode)
+    codex_bin_dir = str(codex_bin.parent.resolve()) if codex_bin.parent != Path("") else ""
+    env = dict(os.environ)
+    if codex_bin_dir:
+        env["PATH"] = f"{codex_bin_dir}:{env.get('PATH', '')}"
+
+    command = [
+        str(codex_bin),
+        "exec",
+        "--sandbox",
+        "read-only",
+        "-C",
+        str(codebase_root),
+        "--output-schema",
+        str(schema_path),
+        "-o",
+        str(output_file),
+        "-",
+    ]
+    if codex_model:
+        command[2:2] = ["-m", codex_model]
+    if codex_reasoning_effort:
+        command[2:2] = ["-c", f'model_reasoning_effort="{codex_reasoning_effort}"']
+    result = subprocess.run(
+        command,
+        input=prompt,
+        text=True,
+        env=env,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr)
+        return int(result.returncode)
+    if not output_file.exists():
+        raise RuntimeError("codex exec completed without producing the expected output file")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

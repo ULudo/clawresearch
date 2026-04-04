@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -14,6 +15,23 @@ from clawresearch.state.schema import SCHEMA_STATEMENTS
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _normalize_task_text(value: str) -> str:
+    collapsed = re.sub(r"\s+", " ", (value or "").strip().lower())
+    return collapsed
+
+
+def _task_fingerprint(kind: str, title: str, owner_mode: str | None, payload: dict[str, Any] | None) -> str:
+    payload_text = json.dumps(payload or {}, sort_keys=True, separators=(",", ":"))
+    return "||".join(
+        [
+            _normalize_task_text(kind),
+            _normalize_task_text(title),
+            _normalize_task_text(owner_mode or ""),
+            payload_text,
+        ]
+    )
 
 
 class StateStore:
@@ -41,39 +59,71 @@ class StateStore:
             for statement in SCHEMA_STATEMENTS:
                 connection.execute(statement)
 
-    def create_project(self, name: str, root_path: Path, summary: str | None = None) -> ProjectRecord:
+    def create_project(
+        self,
+        name: str,
+        workspace_root: Path,
+        codebase_root: Path | None = None,
+        summary: str | None = None,
+    ) -> ProjectRecord:
+        resolved_workspace_root = workspace_root.resolve()
+        resolved_codebase_root = codebase_root.resolve() if codebase_root else None
         project_id = f"project_{uuid.uuid4().hex[:12]}"
         timestamp = utc_now()
         with self.transaction() as connection:
             connection.execute(
                 """
-                INSERT INTO projects (id, name, root_path, status, paused, summary, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 0, ?, ?, ?)
+                INSERT INTO projects (id, name, workspace_root, codebase_root, status, paused, summary, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
                 """,
-                (project_id, name, str(root_path), ProjectStatus.RESEARCHING.value, summary, timestamp, timestamp),
+                (
+                    project_id,
+                    name,
+                    str(resolved_workspace_root),
+                    str(resolved_codebase_root) if resolved_codebase_root else None,
+                    ProjectStatus.RESEARCHING.value,
+                    summary,
+                    timestamp,
+                    timestamp,
+                ),
             )
         self.append_event(
             project_id=project_id,
             entity_type="project",
             entity_id=project_id,
             event_type="project.created",
-            payload={"name": name, "root_path": str(root_path), "summary": summary},
+            payload={
+                "name": name,
+                "workspace_root": str(resolved_workspace_root),
+                "codebase_root": str(resolved_codebase_root) if resolved_codebase_root else None,
+                "summary": summary,
+            },
             dedupe_key=f"project-created:{project_id}",
         )
-        return ProjectRecord(project_id, name, str(root_path), ProjectStatus.RESEARCHING.value, False, summary)
+        return ProjectRecord(
+            project_id,
+            name,
+            str(resolved_workspace_root),
+            str(resolved_codebase_root) if resolved_codebase_root else None,
+            ProjectStatus.RESEARCHING.value,
+            False,
+            summary,
+        )
 
     def get_project(self, workspace: Path) -> ProjectRecord | None:
+        resolved_workspace = workspace.resolve()
         with self.transaction() as connection:
             row = connection.execute(
-                "SELECT id, name, root_path, status, paused, summary FROM projects WHERE root_path = ?",
-                (str(workspace),),
+                "SELECT id, name, workspace_root, codebase_root, status, paused, summary FROM projects WHERE workspace_root = ?",
+                (str(resolved_workspace),),
             ).fetchone()
         if row is None:
             return None
         return ProjectRecord(
             id=row["id"],
             name=row["name"],
-            root_path=row["root_path"],
+            workspace_root=row["workspace_root"],
+            codebase_root=row["codebase_root"],
             status=row["status"],
             paused=bool(row["paused"]),
             summary=row["summary"],
@@ -161,18 +211,60 @@ class StateStore:
             entity_type="task",
             entity_id=task_id,
             event_type="task.created",
-            payload={"kind": kind, "title": title, "owner_mode": owner_mode, "priority": priority},
+            payload={"kind": kind, "title": title, "owner_mode": owner_mode, "priority": priority, "payload": payload or {}},
         )
         return task_id
+
+    def ensure_task(
+        self,
+        *,
+        project_id: str,
+        kind: str,
+        title: str,
+        owner_mode: str | None = None,
+        priority: int = 100,
+        payload: dict[str, Any] | None = None,
+    ) -> tuple[str, bool]:
+        desired = _task_fingerprint(kind, title, owner_mode, payload)
+        for row in self.list_open_tasks(project_id):
+            existing = _task_fingerprint(
+                str(row["kind"] or ""),
+                str(row["title"] or ""),
+                str(row["owner_mode"] or ""),
+                json.loads(row["payload_json"]),
+            )
+            if existing == desired:
+                return str(row["id"]), False
+        return (
+            self.create_task(
+                project_id=project_id,
+                kind=kind,
+                title=title,
+                owner_mode=owner_mode,
+                priority=priority,
+                payload=payload,
+            ),
+            True,
+        )
 
     def list_open_tasks(self, project_id: str) -> list[sqlite3.Row]:
         with self.transaction() as connection:
             return list(
                 connection.execute(
-                    "SELECT * FROM tasks WHERE project_id = ? AND status = 'open' ORDER BY priority ASC, created_at ASC",
+                    "SELECT * FROM tasks WHERE project_id = ? AND status = 'open' ORDER BY priority DESC, created_at ASC",
                     (project_id,),
                 ).fetchall()
             )
+
+    def list_tasks(self, project_id: str, *, status: str | None = None) -> list[sqlite3.Row]:
+        query = "SELECT * FROM tasks WHERE project_id = ?"
+        params: list[Any] = [project_id]
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY priority DESC, created_at ASC"
+        with self.transaction() as connection:
+            return list(connection.execute(query, params).fetchall())
 
     def set_task_status(self, task_id: str, status: str, blocked_reason: str | None = None) -> None:
         timestamp = utc_now()
@@ -180,6 +272,14 @@ class StateStore:
             connection.execute(
                 "UPDATE tasks SET status = ?, blocked_reason = ?, updated_at = ? WHERE id = ?",
                 (status, blocked_reason, timestamp, task_id),
+            )
+
+    def set_task_owner_mode(self, task_id: str, owner_mode: str) -> None:
+        timestamp = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE tasks SET owner_mode = ?, updated_at = ? WHERE id = ?",
+                (owner_mode, timestamp, task_id),
             )
 
     def create_job(
@@ -220,20 +320,50 @@ class StateStore:
             connection.execute(
                 """
                 UPDATE jobs
-                SET status = ?, pid = COALESCE(?, pid), exit_code = ?, started_at = COALESCE(?, started_at), finished_at = COALESCE(?, finished_at)
+                SET status = ?, pid = COALESCE(?, pid), exit_code = COALESCE(?, exit_code), started_at = COALESCE(?, started_at), finished_at = COALESCE(?, finished_at)
                 WHERE id = ?
                 """,
                 (status, pid, exit_code, started_at, finished_at, job_id),
             )
 
-    def list_active_jobs(self, project_id: str) -> list[sqlite3.Row]:
+    def update_job_metadata(self, job_id: str, metadata: dict[str, Any]) -> None:
         with self.transaction() as connection:
-            return list(
-                connection.execute(
-                    "SELECT * FROM jobs WHERE project_id = ? AND status IN ('pending', 'running') ORDER BY rowid ASC",
-                    (project_id,),
-                ).fetchall()
+            row = connection.execute("SELECT metadata_json FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"unknown job id: {job_id}")
+            current = json.loads(row["metadata_json"])
+            current.update(metadata)
+            connection.execute(
+                "UPDATE jobs SET metadata_json = ? WHERE id = ?",
+                (json.dumps(current, sort_keys=True), job_id),
             )
+
+    def list_jobs(
+        self,
+        project_id: str,
+        *,
+        statuses: tuple[str, ...] | None = None,
+        limit: int | None = None,
+    ) -> list[sqlite3.Row]:
+        query = "SELECT * FROM jobs WHERE project_id = ?"
+        params: list[Any] = [project_id]
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            query += f" AND status IN ({placeholders})"
+            params.extend(statuses)
+        query += " ORDER BY rowid ASC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        with self.transaction() as connection:
+            return list(connection.execute(query, params).fetchall())
+
+    def get_job(self, job_id: str) -> sqlite3.Row | None:
+        with self.transaction() as connection:
+            return connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+
+    def list_active_jobs(self, project_id: str) -> list[sqlite3.Row]:
+        return self.list_jobs(project_id, statuses=("pending", "running"))
 
     def list_pending_approvals(self, project_id: str) -> list[sqlite3.Row]:
         with self.transaction() as connection:
@@ -243,6 +373,10 @@ class StateStore:
                     (project_id,),
                 ).fetchall()
             )
+
+    def get_approval(self, approval_id: str) -> sqlite3.Row | None:
+        with self.transaction() as connection:
+            return connection.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
 
     def create_approval(self, *, project_id: str, approval_type: str, reason: str, payload: dict[str, Any]) -> str:
         approval_id = f"approval_{uuid.uuid4().hex[:12]}"
@@ -263,6 +397,28 @@ class StateStore:
             payload={"approval_type": approval_type, "reason": reason},
         )
         return approval_id
+
+    def resolve_approval(self, approval_id: str, *, status: str, payload: dict[str, Any] | None = None) -> None:
+        timestamp = utc_now()
+        with self.transaction() as connection:
+            row = connection.execute("SELECT project_id FROM approvals WHERE id = ?", (approval_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"unknown approval id: {approval_id}")
+            connection.execute(
+                """
+                UPDATE approvals
+                SET status = ?, resolved_payload_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, json.dumps(payload or {}, sort_keys=True), timestamp, approval_id),
+            )
+        self.append_event(
+            project_id=str(row["project_id"]),
+            entity_type="approval",
+            entity_id=approval_id,
+            event_type="approval.resolved",
+            payload={"status": status, "payload": payload or {}},
+        )
 
     def record_agent_run(
         self,
@@ -286,3 +442,237 @@ class StateStore:
                 (run_id, project_id, mode, status, adapter_name, input_path, output_path, utc_now(), confidence, summary),
             )
         return run_id
+
+    def list_recent_agent_runs(self, project_id: str, *, limit: int = 5) -> list[sqlite3.Row]:
+        with self.transaction() as connection:
+            return list(
+                connection.execute(
+                    "SELECT * FROM agent_runs WHERE project_id = ? ORDER BY started_at DESC LIMIT ?",
+                    (project_id, limit),
+                ).fetchall()
+            )
+
+    def upsert_claim(
+        self,
+        *,
+        project_id: str,
+        claim_id: str,
+        text: str,
+        scope: str | None,
+        claim_type: str,
+        status: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        timestamp = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO claims (id, project_id, text, scope, claim_type, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    text = excluded.text,
+                    scope = excluded.scope,
+                    claim_type = excluded.claim_type,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at
+                """,
+                (claim_id, project_id, text, scope, claim_type, status, timestamp, timestamp),
+            )
+        self.append_event(
+            project_id=project_id,
+            entity_type="claim",
+            entity_id=claim_id,
+            event_type="claim.upserted",
+            payload={"text": text, "scope": scope, "claim_type": claim_type, "status": status, "metadata": metadata or {}},
+            dedupe_key=f"claim-upserted:{project_id}:{claim_id}:{status}:{text}",
+        )
+        return claim_id
+
+    def list_claims(self, project_id: str) -> list[sqlite3.Row]:
+        with self.transaction() as connection:
+            return list(connection.execute("SELECT * FROM claims WHERE project_id = ? ORDER BY created_at ASC", (project_id,)).fetchall())
+
+    def upsert_evidence_item(
+        self,
+        *,
+        project_id: str,
+        evidence_item_id: str,
+        source_type: str,
+        title: str,
+        strength: str,
+        reproducibility: dict[str, Any],
+        conclusion_impact: str | None,
+        summary: str | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        timestamp = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO evidence_items (
+                    id, project_id, source_type, title, strength, reproducibility_json, conclusion_impact, summary, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    source_type = excluded.source_type,
+                    title = excluded.title,
+                    strength = excluded.strength,
+                    reproducibility_json = excluded.reproducibility_json,
+                    conclusion_impact = excluded.conclusion_impact,
+                    summary = excluded.summary,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    evidence_item_id,
+                    project_id,
+                    source_type,
+                    title,
+                    strength,
+                    json.dumps(reproducibility, sort_keys=True),
+                    conclusion_impact,
+                    summary,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        self.append_event(
+            project_id=project_id,
+            entity_type="evidence_item",
+            entity_id=evidence_item_id,
+            event_type="evidence.upserted",
+            payload={
+                "source_type": source_type,
+                "title": title,
+                "strength": strength,
+                "reproducibility": reproducibility,
+                "conclusion_impact": conclusion_impact,
+                "summary": summary,
+                "metadata": metadata or {},
+            },
+            dedupe_key=f"evidence-upserted:{project_id}:{evidence_item_id}:{strength}:{title}",
+        )
+        return evidence_item_id
+
+    def list_evidence_items(self, project_id: str) -> list[sqlite3.Row]:
+        with self.transaction() as connection:
+            return list(
+                connection.execute("SELECT * FROM evidence_items WHERE project_id = ? ORDER BY created_at ASC", (project_id,)).fetchall()
+            )
+
+    def upsert_decision(
+        self,
+        *,
+        project_id: str,
+        decision_id: str,
+        decision_type: str,
+        status: str,
+        summary: str,
+        rationale: str,
+        blocking: bool,
+        evidence: dict[str, Any] | None = None,
+    ) -> str:
+        timestamp = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO decisions (id, project_id, decision_type, status, summary, rationale, blocking, evidence_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    decision_type = excluded.decision_type,
+                    status = excluded.status,
+                    summary = excluded.summary,
+                    rationale = excluded.rationale,
+                    blocking = excluded.blocking,
+                    evidence_json = excluded.evidence_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    decision_id,
+                    project_id,
+                    decision_type,
+                    status,
+                    summary,
+                    rationale,
+                    int(blocking),
+                    json.dumps(evidence or {}, sort_keys=True),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        self.append_event(
+            project_id=project_id,
+            entity_type="decision",
+            entity_id=decision_id,
+            event_type="decision.upserted",
+            payload={
+                "decision_type": decision_type,
+                "status": status,
+                "summary": summary,
+                "rationale": rationale,
+                "blocking": blocking,
+                "evidence": evidence or {},
+            },
+            dedupe_key=f"decision-upserted:{project_id}:{decision_id}:{status}:{summary}",
+        )
+        return decision_id
+
+    def list_decisions(self, project_id: str) -> list[sqlite3.Row]:
+        with self.transaction() as connection:
+            return list(connection.execute("SELECT * FROM decisions WHERE project_id = ? ORDER BY created_at ASC", (project_id,)).fetchall())
+
+    def upsert_artifact(
+        self,
+        *,
+        project_id: str,
+        artifact_id: str,
+        artifact_type: str,
+        path: str,
+        checksum: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        timestamp = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO artifacts (id, project_id, artifact_type, path, checksum, metadata_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    artifact_type = excluded.artifact_type,
+                    path = excluded.path,
+                    checksum = excluded.checksum,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    artifact_id,
+                    project_id,
+                    artifact_type,
+                    path,
+                    checksum,
+                    json.dumps(metadata or {}, sort_keys=True),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        self.append_event(
+            project_id=project_id,
+            entity_type="artifact",
+            entity_id=artifact_id,
+            event_type="artifact.upserted",
+            payload={"artifact_type": artifact_type, "path": path, "checksum": checksum, "metadata": metadata or {}},
+            dedupe_key=f"artifact-upserted:{project_id}:{artifact_id}:{path}",
+        )
+        return artifact_id
+
+    def list_artifacts(self, project_id: str) -> list[sqlite3.Row]:
+        with self.transaction() as connection:
+            return list(connection.execute("SELECT * FROM artifacts WHERE project_id = ? ORDER BY created_at ASC", (project_id,)).fetchall())
+
+    def list_recent_events(self, project_id: str, *, limit: int = 10) -> list[sqlite3.Row]:
+        with self.transaction() as connection:
+            return list(
+                connection.execute(
+                    "SELECT * FROM events WHERE project_id = ? ORDER BY timestamp DESC LIMIT ?",
+                    (project_id, limit),
+                ).fetchall()
+            )

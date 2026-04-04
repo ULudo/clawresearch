@@ -48,7 +48,8 @@ class AgentMode(StrEnum):
 class ProjectRecord:
     id: str
     name: str
-    root_path: str
+    workspace_root: str
+    codebase_root: str | None
     status: str
     paused: bool
     summary: str | None = None

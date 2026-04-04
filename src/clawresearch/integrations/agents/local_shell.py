@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import uuid
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Any
 from clawresearch.state.models import AgentOutputEnvelope
 
 from .base import AgentAdapter
+from .parsing import parse_envelope_from_text
 
 
 class LocalShellAgentAdapter(AgentAdapter):
@@ -19,26 +21,42 @@ class LocalShellAgentAdapter(AgentAdapter):
         self.env = env or {}
         self.timeout_seconds = timeout_seconds
 
-    def prepare_context(self, workspace: Path, mode: str, prompt_bundle: dict[str, Any]) -> Path:
+    def prepare_context(
+        self,
+        workspace: Path,
+        mode: str,
+        prompt_bundle: dict[str, Any],
+        codebase_root: Path | None = None,
+    ) -> Path:
         run_dir = workspace / ".clawresearch" / "checkpoints" / f"agent-{uuid.uuid4().hex[:10]}"
         run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "prompt.json").write_text(json.dumps(prompt_bundle, indent=2), encoding="utf-8")
         return run_dir
 
-    def run_agent(self, workspace: Path, mode: str, prompt_bundle: dict[str, Any]) -> AgentOutputEnvelope:
+    def run_agent(
+        self,
+        workspace: Path,
+        mode: str,
+        prompt_bundle: dict[str, Any],
+        codebase_root: Path | None = None,
+    ) -> AgentOutputEnvelope:
         if not self.command_template:
             raise RuntimeError("agent adapter command_template is empty")
-        run_dir = self.prepare_context(workspace, mode, prompt_bundle)
+        run_dir = self.prepare_context(workspace, mode, prompt_bundle, codebase_root=codebase_root)
         output_file = run_dir / "output.json"
+        resolved_codebase_root = codebase_root or workspace
         env = {
+            **os.environ,
             **self.env,
             "CLAWRESEARCH_MODE": mode,
             "CLAWRESEARCH_PROMPT_FILE": str(run_dir / "prompt.json"),
             "CLAWRESEARCH_OUTPUT_FILE": str(output_file),
+            "CLAWRESEARCH_WORKSPACE_ROOT": str(workspace),
+            "CLAWRESEARCH_CODEBASE_ROOT": str(resolved_codebase_root),
         }
         result = subprocess.run(
             self.command_template,
-            cwd=str(workspace),
+            cwd=str(resolved_codebase_root),
             env={**env},
             capture_output=True,
             text=True,
@@ -51,8 +69,7 @@ class LocalShellAgentAdapter(AgentAdapter):
         return self.parse_typed_output(raw_output)
 
     def parse_typed_output(self, raw_output: str) -> AgentOutputEnvelope:
-        payload = json.loads(raw_output)
-        return AgentOutputEnvelope(**payload)
+        return parse_envelope_from_text(raw_output)
 
     def collect_generated_artifacts(self, run_dir: Path) -> list[Path]:
         return sorted(path for path in run_dir.iterdir() if path.is_file())

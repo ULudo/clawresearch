@@ -11,11 +11,23 @@ class AgentAdapter(ABC):
     name: str
 
     @abstractmethod
-    def prepare_context(self, workspace: Path, mode: str, prompt_bundle: dict[str, Any]) -> Path:
+    def prepare_context(
+        self,
+        workspace: Path,
+        mode: str,
+        prompt_bundle: dict[str, Any],
+        codebase_root: Path | None = None,
+    ) -> Path:
         raise NotImplementedError
 
     @abstractmethod
-    def run_agent(self, workspace: Path, mode: str, prompt_bundle: dict[str, Any]) -> AgentOutputEnvelope:
+    def run_agent(
+        self,
+        workspace: Path,
+        mode: str,
+        prompt_bundle: dict[str, Any],
+        codebase_root: Path | None = None,
+    ) -> AgentOutputEnvelope:
         raise NotImplementedError
 
     @abstractmethod
