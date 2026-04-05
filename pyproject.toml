@@ -19,6 +19,7 @@ dependencies = [
 [project.scripts]
 clawresearch = "clawresearch.cli.main:main"
 clawresearchd = "clawresearch.daemon.main:main"
+clawresearch-api = "clawresearch.api.server:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

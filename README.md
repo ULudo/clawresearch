@@ -13,6 +13,7 @@ It separates:
 
 - `clawresearch`: CLI for workspace and project lifecycle
 - `clawresearchd`: background supervisor daemon
+- `clawresearch-api`: local API server for the product UI layer
 
 Key runtime features:
 
@@ -54,6 +55,53 @@ clawresearch jobs list --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc
 clawresearch inspect claims --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc
 clawresearch inspect evidence --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc
 clawresearch inspect decisions --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc
+```
+
+## Local API layer
+
+ClawResearch now includes a local API layer that translates runtime state into UI-friendly project data.
+
+You can run it against a single workspace:
+
+```bash
+clawresearch-api \
+  --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc \
+  --host 127.0.0.1 \
+  --port 8342
+```
+
+Or directly via the Python module if your editable install has not been refreshed yet:
+
+```bash
+python -m clawresearch.api.server \
+  --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc \
+  --host 127.0.0.1 \
+  --port 8342
+```
+
+Useful endpoints:
+
+```bash
+curl -s http://127.0.0.1:8342/api/health
+curl -s http://127.0.0.1:8342/api/projects/project_xxx/overview
+curl -s http://127.0.0.1:8342/api/projects/project_xxx/activity
+curl -s http://127.0.0.1:8342/api/projects/project_xxx/tasks
+curl -s http://127.0.0.1:8342/api/projects/project_xxx/approvals
+curl -s http://127.0.0.1:8342/api/projects/project_xxx/jobs
+curl -s http://127.0.0.1:8342/api/projects/project_xxx/claims
+curl -s http://127.0.0.1:8342/api/projects/project_xxx/evidence
+curl -s http://127.0.0.1:8342/api/projects/project_xxx/decisions
+curl -s http://127.0.0.1:8342/api/projects/project_xxx/artifacts
+```
+
+Control-style commands can be submitted as JSON:
+
+```bash
+curl -s \
+  -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Continue and prioritize the same-backbone baseline."}' \
+  http://127.0.0.1:8342/api/projects/project_xxx/commands
 ```
 
 ## Workspace layout

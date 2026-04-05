@@ -129,6 +129,42 @@ class StateStore:
             summary=row["summary"],
         )
 
+    def get_project_by_id(self, project_id: str) -> ProjectRecord | None:
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT id, name, workspace_root, codebase_root, status, paused, summary FROM projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ProjectRecord(
+            id=row["id"],
+            name=row["name"],
+            workspace_root=row["workspace_root"],
+            codebase_root=row["codebase_root"],
+            status=row["status"],
+            paused=bool(row["paused"]),
+            summary=row["summary"],
+        )
+
+    def list_projects(self) -> list[ProjectRecord]:
+        with self.transaction() as connection:
+            rows = connection.execute(
+                "SELECT id, name, workspace_root, codebase_root, status, paused, summary FROM projects ORDER BY created_at DESC"
+            ).fetchall()
+        return [
+            ProjectRecord(
+                id=row["id"],
+                name=row["name"],
+                workspace_root=row["workspace_root"],
+                codebase_root=row["codebase_root"],
+                status=row["status"],
+                paused=bool(row["paused"]),
+                summary=row["summary"],
+            )
+            for row in rows
+        ]
+
     def set_project_status(self, project_id: str, status: str, paused: bool | None = None) -> None:
         timestamp = utc_now()
         fields = ["status = ?", "updated_at = ?"]
@@ -667,6 +703,10 @@ class StateStore:
     def list_artifacts(self, project_id: str) -> list[sqlite3.Row]:
         with self.transaction() as connection:
             return list(connection.execute("SELECT * FROM artifacts WHERE project_id = ? ORDER BY created_at ASC", (project_id,)).fetchall())
+
+    def get_artifact(self, artifact_id: str) -> sqlite3.Row | None:
+        with self.transaction() as connection:
+            return connection.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
 
     def list_recent_events(self, project_id: str, *, limit: int = 10) -> list[sqlite3.Row]:
         with self.transaction() as connection:
