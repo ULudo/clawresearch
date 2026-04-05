@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from clawresearch.api.server import ApiRequestHandler
+from clawresearch.api.server import ApiRequestHandler, load_static_asset
 from clawresearch.api.service import ApiService
 from clawresearch.cli.main import ensure_initialized, init_workspace
 
@@ -104,6 +104,15 @@ class ApiLayerTests(unittest.TestCase):
 
         tasks = service.list_tasks(self.project_id)
         self.assertTrue(any(task["title"].startswith("Focus on the same-backbone baseline first") for task in tasks))
+
+    def test_static_assets_are_available_for_web_shell(self) -> None:
+        content_type, index_bytes = load_static_asset("/")
+        self.assertEqual(content_type, "text/html")
+        self.assertIn(b"ClawResearch", index_bytes)
+
+        css_type, css_bytes = load_static_asset("/assets/styles.css")
+        self.assertEqual(css_type, "text/css")
+        self.assertIn(b".shell", css_bytes)
 
 
 class _DummyRouteHarness:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import sys
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +11,22 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from clawresearch.api.service import ApiError, ApiService
+
+STATIC_ROOT = Path(__file__).with_name("static")
+
+
+def load_static_asset(request_path: str) -> tuple[str, bytes]:
+    normalized = request_path or "/"
+    if normalized in {"/", ""}:
+        target = STATIC_ROOT / "index.html"
+    else:
+        target = (STATIC_ROOT / normalized.lstrip("/")).resolve()
+        if STATIC_ROOT.resolve() not in target.parents and target != STATIC_ROOT.resolve():
+            raise ApiError(404, "Static asset not found.")
+    if not target.exists() or not target.is_file():
+        raise ApiError(404, "Static asset not found.")
+    content_type, _ = mimetypes.guess_type(target.name)
+    return (content_type or "application/octet-stream"), target.read_bytes()
 
 
 class ApiRequestHandler(BaseHTTPRequestHandler):
@@ -33,6 +50,10 @@ class ApiRequestHandler(BaseHTTPRequestHandler):
     def _dispatch(self, method: str) -> None:
         try:
             parsed = urlparse(self.path)
+            if method == "GET" and not parsed.path.startswith("/api"):
+                content_type, data = load_static_asset(parsed.path)
+                self._write_bytes(HTTPStatus.OK, content_type, data)
+                return
             segments = [segment for segment in parsed.path.split("/") if segment]
             query = parse_qs(parsed.query)
             body = self._read_json_body() if method == "POST" else {}
@@ -162,8 +183,11 @@ class ApiRequestHandler(BaseHTTPRequestHandler):
 
     def _write_json(self, status_code: int, payload: Any) -> None:
         data = json.dumps(payload, indent=2).encode("utf-8")
+        self._write_bytes(status_code, "application/json", data)
+
+    def _write_bytes(self, status_code: int, content_type: str, data: bytes) -> None:
         self.send_response(status_code)
-        self._send_common_headers(content_type="application/json")
+        self._send_common_headers(content_type=content_type)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)

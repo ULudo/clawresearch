@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ClawResearch</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">CR</div>
+          <div>
+            <h1>ClawResearch</h1>
+            <p>Autonomous research control room</p>
+          </div>
+        </div>
+
+        <section class="panel create-project-panel">
+          <div class="panel-head">
+            <h2>Start Research</h2>
+            <span class="eyebrow">New mission</span>
+          </div>
+          <form id="create-project-form" class="stack-form">
+            <label>
+              <span>Project name</span>
+              <input id="create-name" name="name" placeholder="rellflow-e2e-mpc" required />
+            </label>
+            <label>
+              <span>Codebase path</span>
+              <input id="create-codebase" name="codebase_root" placeholder="/home/uli/Development/Python/ReLLFloW" />
+            </label>
+            <label>
+              <span>Workspace parent path</span>
+              <input id="create-path" name="path" placeholder="/home/uli/Development/Python/research-workspaces" />
+            </label>
+            <label>
+              <span>Research goal</span>
+              <textarea id="create-prompt" name="initial_prompt" rows="4" placeholder="Investigate whether end-to-end MPC improves a separately trained predictor + MPC pipeline under matched conditions."></textarea>
+            </label>
+            <button type="submit" class="primary-button">Start research</button>
+          </form>
+        </section>
+
+        <section class="panel project-list-panel">
+          <div class="panel-head">
+            <h2>Projects</h2>
+            <button id="refresh-projects" class="ghost-button small-button" type="button">Refresh</button>
+          </div>
+          <div id="projects-list" class="project-list empty-state">No projects loaded yet.</div>
+        </section>
+      </aside>
+
+      <main class="main-content">
+        <header class="hero panel">
+          <div>
+            <p class="eyebrow">Mission summary</p>
+            <h2 id="hero-title">Select a project</h2>
+            <p id="hero-summary" class="hero-summary">The dashboard will show what the agent is doing, what is blocked, and what it needs from you.</p>
+          </div>
+          <div class="hero-actions">
+            <button id="refresh-project" class="ghost-button" type="button">Refresh project</button>
+            <button id="pause-project" class="ghost-button" type="button">Pause</button>
+            <button id="resume-project" class="primary-button" type="button">Resume</button>
+          </div>
+        </header>
+
+        <section class="overview-grid">
+          <article class="panel metric-card">
+            <p class="eyebrow">Status</p>
+            <h3 id="status-chip" class="status-chip neutral">Idle</h3>
+            <dl class="metric-list">
+              <div><dt>Open tasks</dt><dd id="count-open-tasks">0</dd></div>
+              <div><dt>Active jobs</dt><dd id="count-active-jobs">0</dd></div>
+              <div><dt>Pending approvals</dt><dd id="count-approvals">0</dd></div>
+            </dl>
+          </article>
+
+          <article class="panel focus-card">
+            <p class="eyebrow">Current blocker</p>
+            <h3 id="blocker-title">No blocker</h3>
+            <p id="blocker-summary" class="muted-text">The active project will show its main blocker here.</p>
+          </article>
+
+          <article class="panel focus-card">
+            <p class="eyebrow">Next action</p>
+            <h3 id="next-action-title">Stand by</h3>
+            <p id="next-action-summary" class="muted-text">No next action yet.</p>
+          </article>
+
+          <article class="panel focus-card">
+            <p class="eyebrow">Publication readiness</p>
+            <h3 id="publication-title">Continue research</h3>
+            <p id="publication-summary" class="muted-text">Publication guidance will appear here.</p>
+          </article>
+        </section>
+
+        <section class="content-grid">
+          <section class="panel section-panel command-panel">
+            <div class="panel-head">
+              <h2>Steer the agent</h2>
+              <span class="eyebrow">Plain language control</span>
+            </div>
+            <form id="command-form" class="command-form">
+              <textarea id="command-input" rows="3" placeholder="Continue and prioritize the same-backbone baseline."></textarea>
+              <button type="submit" class="primary-button">Send instruction</button>
+            </form>
+            <div id="command-result" class="inline-feedback muted-text"></div>
+          </section>
+
+          <section class="panel section-panel approvals-panel">
+            <div class="panel-head">
+              <h2>Approvals</h2>
+              <span class="eyebrow">High-impact decisions</span>
+            </div>
+            <div id="approvals-list" class="stack-list empty-state">No pending approvals.</div>
+          </section>
+
+          <section class="panel section-panel jobs-panel">
+            <div class="panel-head">
+              <h2>Jobs</h2>
+              <span class="eyebrow">Long-running execution</span>
+            </div>
+            <div id="jobs-list" class="stack-list empty-state">No jobs yet.</div>
+          </section>
+
+          <section class="panel section-panel findings-panel">
+            <div class="panel-head">
+              <h2>Latest findings</h2>
+              <span class="eyebrow">Claims, evidence, decisions</span>
+            </div>
+            <div class="findings-grid">
+              <div>
+                <h3>Claims</h3>
+                <div id="claims-list" class="stack-list empty-state">No claims recorded yet.</div>
+              </div>
+              <div>
+                <h3>Evidence</h3>
+                <div id="evidence-list" class="stack-list empty-state">No evidence recorded yet.</div>
+              </div>
+              <div>
+                <h3>Decisions</h3>
+                <div id="decisions-list" class="stack-list empty-state">No decisions recorded yet.</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel section-panel artifacts-panel">
+            <div class="panel-head">
+              <h2>Research artifacts</h2>
+              <span class="eyebrow">Scientific substance</span>
+            </div>
+            <div class="artifacts-layout">
+              <div id="artifacts-list" class="artifact-list empty-state">No artifacts available.</div>
+              <article class="artifact-viewer">
+                <header>
+                  <h3 id="artifact-title">Select an artifact</h3>
+                  <p id="artifact-path" class="muted-text"></p>
+                </header>
+                <div id="artifact-content" class="markdown-viewer muted-text">Artifact content will appear here.</div>
+              </article>
+            </div>
+          </section>
+
+          <section class="panel section-panel activity-panel">
+            <div class="panel-head">
+              <h2>Activity</h2>
+              <span class="eyebrow">Recent runtime events</span>
+            </div>
+            <div id="activity-list" class="stack-list empty-state">No activity yet.</div>
+          </section>
+        </section>
+      </main>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="/assets/app.js" defer></script>
+  </body>
+</html>

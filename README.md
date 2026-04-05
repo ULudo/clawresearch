@@ -60,6 +60,7 @@ clawresearch inspect decisions --workspace /tmp/clawresearch-workspaces/rellflow
 ## Local API layer
 
 ClawResearch now includes a local API layer that translates runtime state into UI-friendly project data.
+The same server also serves the first local web shell at `/`.
 
 You can run it against a single workspace:
 
@@ -93,6 +94,22 @@ curl -s http://127.0.0.1:8342/api/projects/project_xxx/evidence
 curl -s http://127.0.0.1:8342/api/projects/project_xxx/decisions
 curl -s http://127.0.0.1:8342/api/projects/project_xxx/artifacts
 ```
+
+Open the web shell in a browser:
+
+```bash
+open http://127.0.0.1:8342/
+```
+
+The shell currently includes:
+
+- project creation
+- project overview cards
+- approvals and actions
+- jobs visibility
+- claims, evidence, and decisions
+- research artifact browsing
+- plain-language command submission
 
 Control-style commands can be submitted as JSON:
 
