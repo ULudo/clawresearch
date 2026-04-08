@@ -801,15 +801,19 @@ def _chat_session(
                     _render_system_panel("Starting the autonomous loop without a new chat brief.", title="Run", style="green")
                 return "go"
             continue
-        response = _run_conversation_round(
-            store,
-            project,
-            workspace,
-            phase=phase,
-            session_id=session_id,
-            new_direction=new_direction,
-            user_message=text,
-        )
+        try:
+            response = _run_conversation_round(
+                store,
+                project,
+                workspace,
+                phase=phase,
+                session_id=session_id,
+                new_direction=new_direction,
+                user_message=text,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _render_system_panel(str(exc), title="Agent unavailable", style="red")
+            continue
         _render_agent_reply(response.reply, summary=response.summary, ready_to_start=response.ready_to_start)
         approvals = store.list_pending_approvals(project.id)
         if approvals:

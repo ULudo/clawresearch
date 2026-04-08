@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -711,13 +712,59 @@ def _enqueue_job_followups(store, project_id: str) -> list[str]:
 
 
 def _build_agent_adapter(policy):
-    if policy.agent_adapter.name == "openai_compatible":
-        return openai_adapter_from_env(policy.agent_adapter.env, timeout_seconds=policy.agent_adapter.timeout_seconds)
-    return LocalShellAgentAdapter(
-        command_template=policy.agent_adapter.command_template,
-        env=policy.agent_adapter.env,
-        timeout_seconds=policy.agent_adapter.timeout_seconds,
+    adapter_name = str(policy.agent_adapter.name or "local_shell").strip() or "local_shell"
+    adapter_env = dict(policy.agent_adapter.env or {})
+
+    if adapter_name == "openai_compatible":
+        return openai_adapter_from_env(adapter_env, timeout_seconds=policy.agent_adapter.timeout_seconds)
+
+    if policy.agent_adapter.command_template:
+        return LocalShellAgentAdapter(
+            command_template=policy.agent_adapter.command_template,
+            env=adapter_env,
+            timeout_seconds=policy.agent_adapter.timeout_seconds,
+        )
+
+    openai_base_url = (adapter_env.get("CLAWRESEARCH_OPENAI_BASE_URL") or os.environ.get("CLAWRESEARCH_OPENAI_BASE_URL") or "").strip()
+    openai_model = (adapter_env.get("CLAWRESEARCH_OPENAI_MODEL") or os.environ.get("CLAWRESEARCH_OPENAI_MODEL") or "").strip()
+    if openai_base_url and openai_model:
+        return openai_adapter_from_env(adapter_env, timeout_seconds=policy.agent_adapter.timeout_seconds)
+
+    codex_bin = _detect_codex_bin(adapter_env)
+    if codex_bin is not None:
+        detected_env = {**adapter_env, "CLAWRESEARCH_CODEX_BIN": str(codex_bin)}
+        return LocalShellAgentAdapter(
+            command_template=[sys.executable, "-m", "clawresearch.integrations.agents.codex_exec"],
+            env=detected_env,
+            timeout_seconds=policy.agent_adapter.timeout_seconds,
+        )
+
+    raise RuntimeError(
+        "No agent backend is configured. ClawResearch looked for an OpenAI-compatible endpoint "
+        "(CLAWRESEARCH_OPENAI_BASE_URL + CLAWRESEARCH_OPENAI_MODEL) and for Codex on PATH or under ~/.nvm, "
+        "but found neither."
     )
+
+
+def _detect_codex_bin(adapter_env: dict[str, str]) -> Path | None:
+    explicit = (adapter_env.get("CLAWRESEARCH_CODEX_BIN") or os.environ.get("CLAWRESEARCH_CODEX_BIN") or "").strip()
+    if explicit:
+        explicit_path = Path(explicit).expanduser()
+        if explicit_path.exists():
+            return explicit_path.resolve()
+
+    discovered = shutil.which("codex")
+    if discovered:
+        return Path(discovered).resolve()
+
+    home = Path.home()
+    nvm_root = home / ".nvm" / "versions" / "node"
+    if nvm_root.exists():
+        matches = sorted(nvm_root.glob("*/bin/codex"), reverse=True)
+        for candidate in matches:
+            if candidate.exists():
+                return candidate.resolve()
+    return None
 
 
 def run_supervisor_tick(workspace: Path) -> dict[str, object]:
@@ -775,10 +822,6 @@ def run_supervisor_tick(workspace: Path) -> dict[str, object]:
         summary["actions"].append("no_open_tasks_archive_local")
         return summary
 
-    if policy.agent_adapter.name == "local_shell" and not policy.agent_adapter.command_template:
-        summary["actions"].append("agent_adapter_not_configured")
-        return summary
-
     task = open_tasks[0]
     task_payload = json.loads(task["payload_json"])
     execution_mode = _normalize_owner_mode(
@@ -806,9 +849,9 @@ def run_supervisor_tick(workspace: Path) -> dict[str, object]:
         "runtime_capabilities": _runtime_capabilities(policy),
         "state_snapshot": _state_snapshot(store, project, workspace, str(task["id"])),
     }
-    adapter = _build_agent_adapter(policy)
     store.set_task_status(str(task["id"]), "running")
     try:
+        adapter = _build_agent_adapter(policy)
         result = adapter.run_agent(
             workspace,
             execution_mode,
