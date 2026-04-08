@@ -4,12 +4,21 @@ import argparse
 import json
 import sys
 import time
+import uuid
 from pathlib import Path
 
 from clawresearch.artifacts.manager import ArtifactManager
 from clawresearch.policy.io import default_policy_for_workspace, read_policy, write_policy
-from clawresearch.state.models import ProjectStatus
+from clawresearch.state.models import ConversationPhase, ProjectStatus
 from clawresearch.state.store import StateStore
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Prompt
+from rich.rule import Rule
+from rich.table import Table
+
+
+RICH_CONSOLE = Console()
 
 
 def runtime_dir(workspace: Path) -> Path:
@@ -183,25 +192,27 @@ def _queue_job_from_approval(store: StateStore, workspace: Path, project_id: str
     )
 
 
-def _resolve_approval(args: argparse.Namespace, *, status: str) -> int:
-    workspace = Path(args.workspace).resolve()
-    store = ensure_initialized(workspace)
+def _resolve_approval_for_workspace(
+    store: StateStore,
+    workspace: Path,
+    *,
+    approval_id: str,
+    status: str,
+    note: str | None = None,
+) -> dict[str, object]:
     project = store.get_project(workspace)
     if project is None:
-        print(f"No project found at {workspace}", file=sys.stderr)
-        return 1
+        raise RuntimeError(f"No project found at {workspace}")
 
-    approval = store.get_approval(args.approval_id)
+    approval = store.get_approval(approval_id)
     if approval is None or approval["project_id"] != project.id:
-        print(f"No approval found: {args.approval_id}", file=sys.stderr)
-        return 1
+        raise RuntimeError(f"No approval found: {approval_id}")
     if approval["status"] != "pending":
-        print(f"Approval is not pending: {args.approval_id}", file=sys.stderr)
-        return 1
+        raise RuntimeError(f"Approval is not pending: {approval_id}")
 
     resolved_payload: dict[str, object] = {}
-    if args.note:
-        resolved_payload["note"] = args.note
+    if note:
+        resolved_payload["note"] = note
 
     created_job_id = None
     if status == "approved" and approval["approval_type"] in {"gpu_budget_threshold", "job_path_outside_policy"}:
@@ -210,16 +221,28 @@ def _resolve_approval(args: argparse.Namespace, *, status: str) -> int:
 
     store.resolve_approval(approval["id"], status=status, payload=resolved_payload)
     store.set_project_status(project.id, ProjectStatus.RESEARCHING.value, paused=False)
-    print(
-        json.dumps(
-            {
-                "approval_id": approval["id"],
-                "status": status,
-                "created_job_id": created_job_id,
-            },
-            indent=2,
+    return {
+        "approval_id": approval["id"],
+        "status": status,
+        "created_job_id": created_job_id,
+    }
+
+
+def _resolve_approval(args: argparse.Namespace, *, status: str) -> int:
+    workspace = Path(args.workspace).resolve()
+    store = ensure_initialized(workspace)
+    try:
+        payload = _resolve_approval_for_workspace(
+            store,
+            workspace,
+            approval_id=args.approval_id,
+            status=status,
+            note=args.note,
         )
-    )
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps(payload, indent=2))
     return 0
 
 
@@ -246,48 +269,6 @@ def cmd_logs(args: argparse.Namespace) -> int:
     return 0
 
 
-def _validate_codebase_root(raw_value: str | None) -> Path | None:
-    if not raw_value:
-        return None
-    codebase_root = Path(raw_value).resolve()
-    if not codebase_root.exists():
-        raise ValueError(f"Codebase root does not exist: {codebase_root}")
-    if not codebase_root.is_dir():
-        raise ValueError(f"Codebase root is not a directory: {codebase_root}")
-    return codebase_root
-
-
-def _prompt_line(prompt: str, *, default: str | None = None, required: bool = False) -> str:
-    while True:
-        suffix = f" [{default}]" if default else ""
-        value = input(f"{prompt}{suffix}: ").strip()
-        if value:
-            return value
-        if default is not None:
-            return default
-        if not required:
-            return ""
-        print("Please enter a value.")
-
-
-def _prompt_multiline(prompt: str) -> str:
-    print(prompt)
-    print("Finish with an empty line.")
-    lines: list[str] = []
-    while True:
-        prefix = "research> " if not lines else "... "
-        try:
-            line = input(prefix)
-        except EOFError:
-            break
-        if not line.strip():
-            if lines:
-                break
-            continue
-        lines.append(line)
-    return "\n".join(lines).strip()
-
-
 def _normalize_summary_text(value: str, *, limit: int = 140) -> str:
     collapsed = " ".join((value or "").strip().split())
     if len(collapsed) <= limit:
@@ -302,7 +283,7 @@ def _task_title_from_text(text: str, *, prefix: str) -> str:
     return normalized
 
 
-def _enqueue_console_task(
+def _append_console_task(
     store: StateStore,
     *,
     project_id: str,
@@ -310,14 +291,18 @@ def _enqueue_console_task(
     kind: str,
     owner_mode: str = "planner",
     priority: int = 150,
+    metadata: dict[str, object] | None = None,
 ) -> str:
+    payload = {"brief": text, "source": "console"}
+    if metadata:
+        payload.update(metadata)
     return store.create_task(
         project_id=project_id,
         kind=kind,
         title=_task_title_from_text(text, prefix="Research task"),
         owner_mode=owner_mode,
         priority=priority,
-        payload={"brief": text, "source": "console"},
+        payload=payload,
     )
 
 
@@ -383,9 +368,50 @@ def _project_snapshot_text(store: StateStore, workspace: Path) -> str:
     return "\n".join(lines)
 
 
+def _render_system_panel(message: str, *, title: str = "System", style: str = "blue") -> None:
+    RICH_CONSOLE.print(Panel(message, title=title, border_style=style))
+
+
 def _print_project_snapshot(store: StateStore, workspace: Path) -> None:
-    print()
-    print(_project_snapshot_text(store, workspace))
+    RICH_CONSOLE.print(Panel(_project_snapshot_text(store, workspace), title="Project Status", border_style="cyan"))
+
+
+def _render_agent_reply(reply: str, *, summary: str | None = None, ready_to_start: bool = False) -> None:
+    title = "Agent"
+    if ready_to_start:
+        title += " · ready to start"
+    body = reply.strip()
+    if summary:
+        body = f"{body}\n\n[dim]Summary: {_normalize_summary_text(summary, limit=180)}[/dim]"
+    RICH_CONSOLE.print(Panel(body, title=title, border_style="green"))
+
+
+def _render_help() -> None:
+    table = Table(title="Console Commands", box=None)
+    table.add_column("Command", style="bold cyan")
+    table.add_column("What it does")
+    table.add_row("/go", "Start or resume the autonomous research loop.")
+    table.add_row("/status", "Show the current project status.")
+    table.add_row("/approvals", "List pending approvals.")
+    table.add_row("/approve <id>", "Approve one pending approval.")
+    table.add_row("/approve-all", "Approve every pending approval.")
+    table.add_row("/pause", "Pause the project and stay in chat mode.")
+    table.add_row("/resume", "Mark the project as resumed without starting the loop.")
+    table.add_row("/quit", "Exit the console.")
+    table.add_row("/help", "Show this help.")
+    RICH_CONSOLE.print(table)
+
+
+def _print_approvals(store: StateStore, project_id: str) -> None:
+    approvals = store.list_pending_approvals(project_id)
+    if not approvals:
+        _render_system_panel("No pending approvals.", title="Approvals", style="green")
+        return
+    body = "\n".join(
+        f"- {row['id']} [{row['approval_type']}] {_normalize_summary_text(str(row['reason']), limit=180)}"
+        for row in approvals
+    )
+    _render_system_panel(body, title="Approvals", style="yellow")
 
 
 def _print_new_job_logs(store: StateStore, project_id: str, job_offsets: dict[str, int]) -> None:
@@ -401,8 +427,8 @@ def _print_new_job_logs(store: StateStore, project_id: str, job_offsets: dict[st
             job_offsets[str(row["id"])] = handle.tell()
         if not chunk.strip():
             continue
-        for line in chunk.splitlines():
-            print(f"  job {row['id']}: {line}")
+        rendered = "\n".join(chunk.splitlines()[-20:])
+        RICH_CONSOLE.print(Panel(rendered, title=f"Job output · {row['id']}", border_style="magenta"))
 
 
 def _print_tick_report(
@@ -415,15 +441,14 @@ def _print_tick_report(
 ) -> None:
     project = store.get_project(workspace)
     if project is None:
-        print(f"[tick] No project found at {workspace}")
+        _render_system_panel(f"No project found at {workspace}", title="Tick", style="red")
         return
     status = str(tick_result.get("project_status") or project.status)
     actions = [str(action) for action in tick_result.get("actions", [])]
-    print()
-    print(f"[tick] {project.name} | status={status}")
+    lines = [f"project: {project.name}", f"status: {status}"]
     if actions:
-        for action in actions:
-            print(f"  - {_humanize_action(action)}")
+        lines.extend(f"- {_humanize_action(action)}" for action in actions)
+    RICH_CONSOLE.print(Panel("\n".join(lines), title="State update", border_style="blue"))
     recent_runs = store.list_recent_agent_runs(project.id, limit=3)
     for row in reversed(recent_runs):
         run_id = str(row["id"])
@@ -431,31 +456,30 @@ def _print_tick_report(
             continue
         seen_run_ids.add(run_id)
         summary = _normalize_summary_text(str(row["summary"] or "completed an agent step"), limit=220)
-        print(f"  agent [{row['mode']}] {summary}")
+        RICH_CONSOLE.print(Panel(summary, title=f"Agent reply · {row['mode']}", border_style="green"))
     approvals = store.list_pending_approvals(project.id)
     if approvals:
-        print("  approvals:")
-        for row in approvals:
-            print(f"    - {row['id']}: {_normalize_summary_text(str(row['reason']), limit=160)}")
+        _print_approvals(store, project.id)
     active_jobs = store.list_active_jobs(project.id)
     if active_jobs:
-        print("  jobs:")
+        rows: list[str] = []
         for row in active_jobs:
             metadata = json.loads(row["metadata_json"])
             summary = _normalize_summary_text(str(metadata.get("summary") or row["command"]), limit=140)
-            print(f"    - {row['id']} [{row['status']}] {summary}")
+            rows.append(f"- {row['id']} [{row['status']}] {summary}")
+        RICH_CONSOLE.print(Panel("\n".join(rows), title="Jobs", border_style="magenta"))
     _print_new_job_logs(store, project.id, job_offsets)
 
 
-def _ensure_console_project(workspace: Path, *, project_name: str | None, codebase_root: Path | None) -> tuple[StateStore, object, bool]:
+def _ensure_console_project(workspace: Path) -> tuple[StateStore, object, bool]:
     workspace.mkdir(parents=True, exist_ok=True)
-    init_workspace(workspace, codebase_root)
+    init_workspace(workspace, workspace)
     store = ensure_initialized(workspace)
     project = store.get_project(workspace)
     created = False
     if project is None:
-        name = project_name or workspace.name or "research-project"
-        project = store.create_project(name, workspace, codebase_root=codebase_root)
+        name = workspace.name or "research-project"
+        project = store.create_project(name, workspace, codebase_root=workspace)
         created = True
     return store, project, created
 
@@ -467,12 +491,9 @@ def _handle_pending_approvals_interactively(store: StateStore, workspace: Path) 
     approvals = store.list_pending_approvals(project.id)
     if not approvals:
         return False
-    print()
-    print("Approval required before the agent can continue.")
-    for row in approvals:
-        print(f"- {row['id']} [{row['approval_type']}] {_normalize_summary_text(str(row['reason']), limit=180)}")
+    _print_approvals(store, project.id)
     while True:
-        choice = input("approval> [a]pprove all / [r]eject <id> / [w]ait / [q]uit: ").strip()
+        choice = Prompt.ask("approval", default="wait").strip()
         if not choice:
             continue
         lowered = choice.lower()
@@ -495,113 +516,404 @@ def _handle_pending_approvals_interactively(store: StateStore, workspace: Path) 
             namespace = argparse.Namespace(workspace=str(workspace), note="Rejected from console", approval_id=approval_id)
             cmd_approval_reject(namespace)
             return True
-        print("Unknown choice.")
+        _render_system_panel("Unknown approval command.", title="Approvals", style="red")
 
 
-def cmd_console(args: argparse.Namespace) -> int:
-    workspace = Path(args.workspace).resolve()
-    try:
-        codebase_root = _validate_codebase_root(args.codebase_root)
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+def _build_conversation_bundle(store: StateStore, project, workspace: Path, *, phase: str, session_id: str, new_direction: bool, user_message: str) -> dict[str, object]:
+    from clawresearch.daemon.main import _runtime_capabilities, _state_snapshot
 
-    try:
-        store, project, created = _ensure_console_project(
-            workspace,
-            project_name=args.project_name,
-            codebase_root=codebase_root,
+    policy = read_policy(runtime_dir(workspace) / "policy.yaml")
+    history: list[dict[str, object]] = []
+    for row in store.list_conversation_turns(project.id):
+        metadata = json.loads(row["metadata_json"])
+        if metadata.get("session_id") != session_id:
+            continue
+        history.append(
+            {
+                "role": row["role"],
+                "content": row["content"],
+                "metadata": metadata,
+            }
         )
-    except ValueError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
+    history = history[-12:]
+    return {
+        "project": {
+            "id": project.id,
+            "name": project.name,
+            "workspace_root": project.workspace_root,
+            "codebase_root": project.codebase_root,
+        },
+        "conversation": {
+            "phase": phase,
+            "new_direction": new_direction,
+            "history": history,
+            "latest_user_message": user_message,
+        },
+        "runtime_capabilities": _runtime_capabilities(policy),
+        "state_snapshot": _state_snapshot(store, project, workspace, ""),
+    }
 
-    if created:
-        print(f"Created research project '{project.name}' at {workspace}")
+
+def _run_conversation_round(store: StateStore, project, workspace: Path, *, phase: str, session_id: str, new_direction: bool, user_message: str):
+    from clawresearch.daemon.main import _build_agent_adapter
+
+    policy = read_policy(runtime_dir(workspace) / "policy.yaml")
+    adapter = _build_agent_adapter(policy)
+    store.append_conversation_turn(
+        project_id=project.id,
+        phase=phase,
+        role="user",
+        content=user_message,
+        metadata={"session_id": session_id, "new_direction": new_direction},
+    )
+    bundle = _build_conversation_bundle(
+        store,
+        project,
+        workspace,
+        phase=phase,
+        session_id=session_id,
+        new_direction=new_direction,
+        user_message=user_message,
+    )
+    response = adapter.run_conversation(
+        workspace,
+        bundle,
+        codebase_root=Path(project.codebase_root) if project.codebase_root else workspace,
+    )
+    store.append_conversation_turn(
+        project_id=project.id,
+        phase=phase,
+        role="agent",
+        content=response.reply,
+        metadata={
+            "session_id": session_id,
+            "summary": response.summary,
+            "research_brief": response.research_brief,
+            "proposed_question": response.proposed_question,
+            "recommended_next_step": response.recommended_next_step,
+            "ready_to_start": response.ready_to_start,
+            "new_direction": new_direction,
+        },
+    )
+    return response
+
+
+def _session_turns(store: StateStore, project_id: str, session_id: str) -> list[dict[str, object]]:
+    selected: list[dict[str, object]] = []
+    for row in store.list_conversation_turns(project_id):
+        metadata = json.loads(row["metadata_json"])
+        if metadata.get("session_id") != session_id:
+            continue
+        selected.append(
+            {
+                "role": row["role"],
+                "content": row["content"],
+                "metadata": metadata,
+            }
+        )
+    return selected
+
+
+def _materialize_session_to_runtime(
+    store: StateStore,
+    project,
+    workspace: Path,
+    *,
+    session_id: str,
+    new_direction: bool,
+) -> bool:
+    turns = _session_turns(store, project.id, session_id)
+    if not turns:
+        return False
+    last_user = next((turn["content"] for turn in reversed(turns) if turn["role"] == "user"), "")
+    last_agent = next((turn for turn in reversed(turns) if turn["role"] == "agent"), None)
+    last_metadata = dict(last_agent["metadata"]) if last_agent is not None else {}
+    research_brief = str(last_metadata.get("research_brief") or last_user or project.summary or "").strip()
+    proposed_question = str(last_metadata.get("proposed_question") or "").strip() or None
+    next_step = str(last_metadata.get("recommended_next_step") or "").strip() or None
+    if not research_brief:
+        return False
+
+    ArtifactManager(workspace).write_research_question_summary(
+        research_brief=research_brief,
+        proposed_question=proposed_question,
+        next_step=next_step,
+    )
+    store.update_project_summary(project.id, research_brief)
+
+    if new_direction:
+        kind = "research.reframe"
+        owner_mode = "planner"
+        priority = 240
+    elif not store.list_recent_agent_runs(project.id, limit=1) and not store.list_open_tasks(project.id):
+        kind = "research.bootstrap"
+        owner_mode = "planner"
+        priority = 220
     else:
-        print(f"Attached to research project '{project.name}' at {workspace}")
-    if project.codebase_root:
-        print(f"Operating on codebase: {project.codebase_root}")
+        kind = "user.command"
+        owner_mode = "planner"
+        priority = 180
 
-    initial_prompt = (args.prompt or "").strip()
-    if not initial_prompt:
-        if created:
-            initial_prompt = _prompt_multiline("Describe the research question or problem you want the agent to work on.")
-        else:
-            print()
-            print("You can refine the research direction now, then hand off to the autonomous loop.")
-            initial_prompt = input("briefing> ").strip()
+    _, created = store.ensure_task(
+        project_id=project.id,
+        kind=kind,
+        title=_task_title_from_text(research_brief, prefix="Research direction"),
+        owner_mode=owner_mode,
+        priority=priority,
+        payload={
+            "brief": research_brief,
+            "proposed_question": proposed_question,
+            "recommended_next_step": next_step,
+            "source": "conversation",
+            "session_id": session_id,
+            "new_direction": new_direction,
+        },
+    )
+    return created
 
-    if initial_prompt:
-        kind = "research.question" if created else "user.command"
-        priority = 220 if created else 180
-        _enqueue_console_task(store, project_id=project.id, text=initial_prompt, kind=kind, priority=priority)
 
+def _project_has_history(store: StateStore, project_id: str) -> bool:
+    if store.list_recent_agent_runs(project_id, limit=1):
+        return True
+    if store.list_conversation_turns(project_id, limit=1):
+        return True
+    if store.list_claims(project_id) or store.list_evidence_items(project_id) or store.list_decisions(project_id):
+        return True
+    if store.list_jobs(project_id, limit=1):
+        return True
+    tasks = store.list_tasks(project_id, status=None)
+    if any(str(row["kind"]) != "research.bootstrap" for row in tasks):
+        return True
+    if len(tasks) > 1:
+        return True
+    return False
+
+
+def _resume_prompt(store: StateStore, workspace: Path) -> str:
+    _print_project_snapshot(store, workspace)
+    _render_system_panel(
+        "Existing research was found in this directory.\nChoose [bold]c[/bold] to continue or [bold]n[/bold] to start a new direction in the same project.",
+        title="Resume",
+        style="cyan",
+    )
+    while True:
+        choice = Prompt.ask("resume", choices=["c", "n", "q"], default="c")
+        if choice in {"c", "n", "q"}:
+            return choice
+
+
+def _handle_chat_command(store: StateStore, workspace: Path, command: str) -> str | None:
+    project = store.get_project(workspace)
+    if project is None:
+        return "quit"
+    lowered = command.strip().lower()
+    if lowered == "/help":
+        _render_help()
+        return None
+    if lowered == "/status":
+        _print_project_snapshot(store, workspace)
+        return None
+    if lowered == "/approvals":
+        _print_approvals(store, project.id)
+        return None
+    if lowered == "/approve-all":
+        approvals = store.list_pending_approvals(project.id)
+        if not approvals:
+            _render_system_panel("No pending approvals.", title="Approvals", style="green")
+            return None
+        try:
+            for row in approvals:
+                _resolve_approval_for_workspace(
+                    store,
+                    workspace,
+                    approval_id=str(row["id"]),
+                    status="approved",
+                    note="Approved from console",
+                )
+        except RuntimeError as exc:
+            _render_system_panel(str(exc), title="Approvals", style="red")
+            return None
+        _render_system_panel(f"Approved {len(approvals)} approval(s).", title="Approvals", style="green")
+        return None
+    if lowered.startswith("/approve "):
+        approval_id = command.split(" ", 1)[1].strip()
+        if approval_id:
+            try:
+                _resolve_approval_for_workspace(
+                    store,
+                    workspace,
+                    approval_id=approval_id,
+                    status="approved",
+                    note="Approved from console",
+                )
+            except RuntimeError as exc:
+                _render_system_panel(str(exc), title="Approvals", style="red")
+                return None
+            _render_system_panel(f"Approved {approval_id}.", title="Approvals", style="green")
+        return None
+    if lowered == "/pause":
+        store.set_project_status(project.id, ProjectStatus.PAUSED.value, paused=True)
+        _render_system_panel("Project paused.", title="Project", style="yellow")
+        return None
+    if lowered == "/resume":
+        store.set_project_status(project.id, ProjectStatus.RESEARCHING.value, paused=False)
+        _render_system_panel("Project resumed.", title="Project", style="green")
+        return None
+    if lowered == "/go":
+        return "go"
+    if lowered == "/quit":
+        return "quit"
+    _render_system_panel("Unknown command. Use /help for available commands.", title="Chat", style="red")
+    return None
+
+
+def _chat_session(
+    store: StateStore,
+    project,
+    workspace: Path,
+    *,
+    phase: str,
+    new_direction: bool,
+) -> str:
+    session_id = uuid.uuid4().hex[:12]
+    if new_direction:
+        store.append_conversation_turn(
+            project_id=project.id,
+            phase=phase,
+            role="system",
+            content="A new research direction is being established in this project.",
+            metadata={"session_id": session_id, "new_direction": True},
+        )
+    while True:
+        raw = Prompt.ask("[bold cyan]you[/bold cyan]")
+        text = raw.strip()
+        if not text:
+            continue
+        if text.startswith("/"):
+            action = _handle_chat_command(store, workspace, text)
+            if action == "quit":
+                return "quit"
+            if action == "go":
+                materialized = _materialize_session_to_runtime(store, project, workspace, session_id=session_id, new_direction=new_direction)
+                if materialized:
+                    _render_system_panel("Research brief locked in. Starting the autonomous loop.", title="Run", style="green")
+                else:
+                    _render_system_panel("Starting the autonomous loop without a new chat brief.", title="Run", style="green")
+                return "go"
+            continue
+        response = _run_conversation_round(
+            store,
+            project,
+            workspace,
+            phase=phase,
+            session_id=session_id,
+            new_direction=new_direction,
+            user_message=text,
+        )
+        _render_agent_reply(response.reply, summary=response.summary, ready_to_start=response.ready_to_start)
+        approvals = store.list_pending_approvals(project.id)
+        if approvals:
+            _render_system_panel(
+                f"Current blocker: {_normalize_summary_text(str(approvals[0]['reason']), limit=180)}",
+                title="Blocker",
+                style="yellow",
+            )
+
+
+def _run_loop(store: StateStore, project, workspace: Path, *, interval_seconds: int) -> str:
     from clawresearch.daemon.main import run_supervisor_tick
 
     job_offsets: dict[str, int] = {}
-    seen_run_ids: set[str] = set()
-
-    if initial_prompt:
-        tick_result = run_supervisor_tick(workspace)
-        store = ensure_initialized(workspace)
-        _print_tick_report(store, workspace, tick_result, job_offsets=job_offsets, seen_run_ids=seen_run_ids)
-
-    while True:
-        print()
-        print("Type another briefing message, /go to start autonomous mode, /status to inspect, or /quit.")
-        command = input("briefing> ").strip()
-        if not command:
-            continue
-        if command == "/quit":
-            return 0
-        if command == "/status":
-            store = ensure_initialized(workspace)
-            _print_project_snapshot(store, workspace)
-            continue
-        if command == "/go":
-            break
-        _enqueue_console_task(store, project_id=project.id, text=command, kind="user.command", priority=180)
-        tick_result = run_supervisor_tick(workspace)
-        store = ensure_initialized(workspace)
-        _print_tick_report(store, workspace, tick_result, job_offsets=job_offsets, seen_run_ids=seen_run_ids)
-
-    print()
-    print("Autonomous research mode started. Press Ctrl+C for a control prompt.")
+    seen_run_ids: set[str] = set(str(row["id"]) for row in store.list_recent_agent_runs(project.id, limit=50))
+    RICH_CONSOLE.print(Rule("Autonomous research mode"))
     while True:
         try:
             tick_result = run_supervisor_tick(workspace)
             store = ensure_initialized(workspace)
             _print_tick_report(store, workspace, tick_result, job_offsets=job_offsets, seen_run_ids=seen_run_ids)
-
             project = store.get_project(workspace)
             if project is None:
-                print("Project disappeared. Exiting.")
-                return 1
+                _render_system_panel("Project disappeared. Exiting.", title="Run", style="red")
+                return "quit"
             if project.status == ProjectStatus.ARCHIVED_LOCAL.value:
-                print()
-                print("The agent reached a local archive state. Review the research artifacts and claims.")
-                return 0
-            if _handle_pending_approvals_interactively(store, workspace):
-                continue
-            time.sleep(args.interval_seconds)
+                _render_system_panel(
+                    "The agent reached a local archive state. Review the research artifacts and claims.",
+                    title="Run complete",
+                    style="green",
+                )
+                return "quit"
+            if project.status == ProjectStatus.AWAITING_APPROVAL.value:
+                _render_system_panel(
+                    "Autonomous progress is paused because an approval is required. You can ask questions, approve work, or quit.",
+                    title="Approval needed",
+                    style="yellow",
+                )
+                return "chat"
+            time.sleep(interval_seconds)
         except KeyboardInterrupt:
-            print()
-            print("Console interrupted. The project state is preserved on disk.")
-            choice = input("control> [c]ontinue / [s]tatus / [p]ause project / [q]uit: ").strip().lower()
-            if choice in {"", "c", "continue"}:
-                continue
-            if choice in {"s", "status"}:
-                store = ensure_initialized(workspace)
-                _print_project_snapshot(store, workspace)
-                continue
-            if choice in {"p", "pause"}:
-                namespace = argparse.Namespace(workspace=str(workspace))
-                cmd_project_pause(namespace)
+            _render_system_panel(
+                "Autonomous mode paused. You can ask follow-up questions, inspect status, or resume with /go.",
+                title="Paused",
+                style="cyan",
+            )
+            return "chat"
+
+
+def cmd_console(args: argparse.Namespace) -> int:
+    workspace = Path.cwd().resolve()
+    store, project, created = _ensure_console_project(workspace)
+
+    if created:
+        _render_system_panel(
+            f"Started a new ClawResearch session in {workspace.name}.\nEverything in this directory is now the working research context.",
+            title="ClawResearch",
+            style="green",
+        )
+        new_direction = False
+        phase = ConversationPhase.STARTUP_CHAT.value
+    else:
+        if _project_has_history(store, project.id):
+            choice = _resume_prompt(store, workspace)
+            if choice == "q":
                 return 0
-            if choice in {"q", "quit"}:
+            new_direction = choice == "n"
+            phase = ConversationPhase.STARTUP_CHAT.value if new_direction else ConversationPhase.PAUSED_CHAT.value
+            if new_direction:
+                _render_system_panel(
+                    "Starting a new research direction in the current project. Existing evidence stays available as context.",
+                    title="New direction",
+                    style="green",
+                )
+        else:
+            new_direction = False
+            phase = ConversationPhase.STARTUP_CHAT.value
+            _render_system_panel(
+                f"Attached to {project.name} in {workspace.name}.",
+                title="ClawResearch",
+                style="green",
+            )
+
+    _render_system_panel(
+        "Use plain language to discuss the research direction. When you are ready, type /go.\nUse /help for commands.",
+        title="Chat",
+        style="cyan",
+    )
+
+    while True:
+        chat_result = _chat_session(store, project, workspace, phase=phase, new_direction=new_direction)
+        if chat_result == "quit":
+            return 0
+        store = ensure_initialized(workspace)
+        project = store.get_project(workspace)
+        if project is None:
+            return 1
+        if chat_result == "go":
+            store.set_project_status(project.id, ProjectStatus.RESEARCHING.value, paused=False)
+            run_result = _run_loop(store, project, workspace, interval_seconds=args.interval_seconds)
+            if run_result == "quit":
                 return 0
-            print("Unknown choice; continuing.")
+            phase = ConversationPhase.PAUSED_CHAT.value
+            new_direction = False
 
 
 def cmd_task_create(args: argparse.Namespace) -> int:
@@ -766,7 +1078,7 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="clawresearch", description="Autonomous local research runtime")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command")
 
     init_parser = subparsers.add_parser("init", help="Initialize a workspace in place")
     init_parser.add_argument("path", nargs="?", default=".")
@@ -854,20 +1166,21 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("--workspace", default=".")
     inspect_parser.set_defaults(func=cmd_inspect)
 
-    console_parser = subparsers.add_parser("console", help="Interactive research console with autonomous execution loop")
-    console_parser.add_argument("--workspace", default=".")
-    console_parser.add_argument("--project-name", default=None, help="Project name to use when creating a workspace")
-    console_parser.add_argument("--codebase-root", default=None, help="External codebase root the research workspace should operate on")
-    console_parser.add_argument("--prompt", default=None, help="Initial research brief to seed the console session")
+    console_parser = subparsers.add_parser("console", help="Interactive research console in the current directory")
     console_parser.add_argument("--interval-seconds", type=int, default=30, help="Supervisor tick interval during autonomous mode")
     console_parser.set_defaults(func=cmd_console)
 
     return parser
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    args_list = list(sys.argv[1:] if argv is None else argv)
+    if not args_list:
+        return int(cmd_console(argparse.Namespace(interval_seconds=30)))
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(args_list)
+    if not hasattr(args, "func"):
+        return int(cmd_console(argparse.Namespace(interval_seconds=30)))
     return int(args.func(args))
 
 

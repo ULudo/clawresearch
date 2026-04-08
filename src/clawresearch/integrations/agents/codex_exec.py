@@ -6,7 +6,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-from clawresearch.integrations.agents.prompting import build_prompt, schema_payload
+from clawresearch.integrations.agents.prompting import (
+    build_conversation_prompt,
+    build_prompt,
+    conversation_schema_payload,
+    schema_payload,
+)
 
 _build_prompt = build_prompt
 _schema_payload = schema_payload
@@ -18,6 +23,7 @@ def main() -> int:
     workspace_root = Path(os.environ["CLAWRESEARCH_WORKSPACE_ROOT"]).resolve()
     codebase_root = Path(os.environ["CLAWRESEARCH_CODEBASE_ROOT"]).resolve()
     mode = os.environ.get("CLAWRESEARCH_MODE", "planner")
+    interaction_kind = os.environ.get("CLAWRESEARCH_INTERACTION_KIND", "runtime").strip() or "runtime"
     codex_bin = Path(os.environ.get("CLAWRESEARCH_CODEX_BIN", "codex"))
     codex_model = os.environ.get("CLAWRESEARCH_CODEX_MODEL", "").strip()
     codex_reasoning_effort = os.environ.get("CLAWRESEARCH_CODEX_REASONING_EFFORT", "").strip()
@@ -26,9 +32,13 @@ def main() -> int:
 
     run_dir = output_file.parent
     schema_path = run_dir / "codex-output-schema.json"
-    schema_path.write_text(json.dumps(schema_payload(), indent=2), encoding="utf-8")
-
-    prompt = build_prompt(bundle, workspace_root=workspace_root, codebase_root=codebase_root, mode=mode)
+    if interaction_kind == "conversation":
+        schema = conversation_schema_payload()
+        prompt = build_conversation_prompt(bundle, workspace_root=workspace_root, codebase_root=codebase_root)
+    else:
+        schema = schema_payload()
+        prompt = build_prompt(bundle, workspace_root=workspace_root, codebase_root=codebase_root, mode=mode)
+    schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
     codex_bin_dir = str(codex_bin.parent.resolve()) if codex_bin.parent != Path("") else ""
     env = dict(os.environ)
     if codex_bin_dir:

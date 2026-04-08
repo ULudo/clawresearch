@@ -133,3 +133,54 @@ class OpenAICompatibleAdapterTests(unittest.TestCase):
         self.assertGreaterEqual(len(seen_response_formats), 2)
         self.assertEqual(seen_response_formats[0]["type"], "json_schema")
         self.assertEqual(seen_response_formats[1]["type"], "json_object")
+
+    def test_adapter_can_run_conversation(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            self.assertEqual(body["response_format"]["type"], "json_schema")
+            response_payload = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "reply": "The current research direction is too broad. We should first test the same-backbone baseline.",
+                                    "summary": "Narrow to a matched same-backbone baseline question.",
+                                    "research_brief": "Test whether end-to-end MPC outperforms a separately trained same-backbone baseline.",
+                                    "proposed_question": "Does end-to-end MPC improve a same-backbone baseline under matched contracts?",
+                                    "recommended_next_step": "Plan and run the same-backbone baseline.",
+                                    "ready_to_start": True,
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=response_payload)
+
+        adapter = OpenAICompatibleAgentAdapter(
+            base_url="http://localhost:11434/v1",
+            model="qwen3-14b",
+            timeout_seconds=10,
+            transport=httpx.MockTransport(handler),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            codebase = workspace / "codebase"
+            codebase.mkdir()
+            result = adapter.run_conversation(
+                workspace,
+                {
+                    "project": {"id": "project_demo", "name": "demo"},
+                    "conversation": {
+                        "phase": "startup_chat",
+                        "history": [{"role": "user", "content": "What is the current research direction?"}],
+                        "latest_user_message": "What is the current research direction?",
+                    },
+                },
+                codebase_root=codebase,
+            )
+
+        self.assertIn("same-backbone baseline", result.reply)
+        self.assertTrue(result.ready_to_start)

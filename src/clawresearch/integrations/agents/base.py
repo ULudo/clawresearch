@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
-from clawresearch.state.models import AgentOutputEnvelope
+from clawresearch.state.models import AgentOutputEnvelope, ConversationResponse
 
 
 class AgentAdapter(ABC):
@@ -32,6 +32,19 @@ class AgentAdapter(ABC):
 
     @abstractmethod
     def parse_typed_output(self, raw_output: str) -> AgentOutputEnvelope:
+        raise NotImplementedError
+
+    @abstractmethod
+    def run_conversation(
+        self,
+        workspace: Path,
+        prompt_bundle: dict[str, Any],
+        codebase_root: Path | None = None,
+    ) -> ConversationResponse:
+        raise NotImplementedError
+
+    @abstractmethod
+    def parse_conversation_output(self, raw_output: str) -> ConversationResponse:
         raise NotImplementedError
 
     @abstractmethod

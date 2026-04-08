@@ -11,7 +11,7 @@ It separates:
 
 ## Main entrypoints
 
-- `clawresearch`: CLI for interactive research sessions and workspace lifecycle
+- `clawresearch`: primary interactive research console
 - `clawresearchd`: background supervisor daemon
 - `clawresearch-api`: local API server for the experimental UI layer
 
@@ -24,36 +24,34 @@ Key runtime features:
 - approval gates for expensive or policy-sensitive work
 - direct local-model support through an OpenAI-compatible API (for example Ollama)
 
-## Console-first quickstart
+## Quickstart
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 
-# Optional: switch a workspace to a local OpenAI-compatible model server.
-# Example policy env:
-# CLAWRESEARCH_OPENAI_BASE_URL=http://127.0.0.1:11434/v1
-# CLAWRESEARCH_OPENAI_MODEL=qwen3:14b
-# CLAWRESEARCH_OPENAI_API_KEY=ollama
-
-clawresearch console \
-  --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc \
-  --project-name rellflow-e2e-mpc \
-  --codebase-root /home/uli/Development/Python/ReLLFloW
+cd /path/to/your/research/codebase
+clawresearch
 ```
+
+The current directory is the project context:
+
+- `workspace_root = cwd`
+- `codebase_root = cwd`
 
 The console does three things in one place:
 
-- lets you discuss the research question briefly with the agent
-- hands off into an autonomous supervisor loop
-- shows readable terminal output for agent summaries, jobs, approvals, and runtime progress
+- lets you discuss the research question with the agent first
+- hands off into an autonomous supervisor loop with `/go`
+- shows readable terminal output for agent replies, jobs, approvals, and runtime progress
 
 Once you are inside the console:
 
 - type normal text to refine the research question
 - type `/go` to let the agent continue autonomously
-- press `Ctrl+C` for the control prompt
+- type `/help` to see commands
+- press `Ctrl+C` while the run is active to return to chat mode
 
 Useful lower-level inspection commands:
 
@@ -130,6 +128,8 @@ curl -s \
   -d '{"text":"Continue and prioritize the same-backbone baseline."}' \
   http://127.0.0.1:8342/api/projects/project_xxx/commands
 ```
+
+The console is the primary product path. The API and web shell are secondary, experimental surfaces.
 
 ## Workspace layout
 

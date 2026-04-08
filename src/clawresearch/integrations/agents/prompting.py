@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 
-def schema_payload() -> dict[str, Any]:
+def runtime_schema_payload() -> dict[str, Any]:
     next_action_item = {
         "type": "object",
         "additionalProperties": False,
@@ -88,6 +88,27 @@ def schema_payload() -> dict[str, Any]:
     }
 
 
+def conversation_schema_payload() -> dict[str, Any]:
+    properties: dict[str, Any] = {
+        "reply": {"type": "string"},
+        "summary": {"type": "string"},
+        "research_brief": {"type": ["string", "null"]},
+        "proposed_question": {"type": ["string", "null"]},
+        "recommended_next_step": {"type": ["string", "null"]},
+        "ready_to_start": {"type": "boolean"},
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": list(properties.keys()),
+    }
+
+
+def schema_payload() -> dict[str, Any]:
+    return runtime_schema_payload()
+
+
 def build_prompt(bundle: dict[str, Any], workspace_root: Path, codebase_root: Path, mode: str) -> str:
     task = bundle.get("task", {})
     project = bundle.get("project", {})
@@ -100,7 +121,7 @@ def build_prompt(bundle: dict[str, Any], workspace_root: Path, codebase_root: Pa
     capabilities = bundle.get("runtime_capabilities") or {}
     capabilities_text = json.dumps(capabilities, indent=2)
 
-    schema_text = json.dumps(schema_payload(), indent=2)
+    schema_text = json.dumps(runtime_schema_payload(), indent=2)
     return f"""You are operating as a ClawResearch {mode} agent.
 
 You are working inside a local autonomous research runtime.
@@ -173,4 +194,49 @@ Guidance for jobs_to_start:
   - `env`
   - `reason`
 - do not request a job if the prerequisite code or config is still unclear
+"""
+
+
+def build_conversation_prompt(bundle: dict[str, Any], workspace_root: Path, codebase_root: Path) -> str:
+    project = bundle.get("project", {})
+    conversation = bundle.get("conversation", {})
+    state_snapshot = json.dumps(bundle.get("state_snapshot", {}), indent=2)
+    capabilities_text = json.dumps(bundle.get("runtime_capabilities") or {}, indent=2)
+    schema_text = json.dumps(conversation_schema_payload(), indent=2)
+    return f"""You are the ClawResearch research assistant for an active local research project.
+
+Project:
+- id: {project.get("id", "")}
+- name: {project.get("name", "")}
+- workspace_root: {workspace_root}
+- codebase_root: {codebase_root}
+
+Current conversation phase:
+- phase: {conversation.get("phase", "startup_chat")}
+- new_direction: {conversation.get("new_direction", False)}
+
+Conversation history:
+{json.dumps(conversation.get("history", []), indent=2)}
+
+Latest user message:
+{conversation.get("latest_user_message", "")}
+
+Runtime capabilities:
+{capabilities_text}
+
+Current research state snapshot:
+{state_snapshot}
+
+Rules for this run:
+- Answer the user's latest message directly and clearly.
+- This is a conversation response, not an autonomous execution step.
+- Do not start jobs, request approvals, or pretend to have run experiments in this response.
+- If there is a blocker such as an approval or running job, mention it briefly but still answer the user's question.
+- If the project already has evidence, claims, or decisions, use them explicitly in your answer.
+- If the user is redirecting the work, help sharpen the direction rather than defending the old path.
+- Be concrete, grounded, and easy to read in a terminal.
+- Do not invent web findings or new experimental results.
+
+Return only a JSON object matching this schema:
+{schema_text}
 """

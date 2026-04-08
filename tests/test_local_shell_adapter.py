@@ -88,3 +88,46 @@ Path(os.environ["CLAWRESEARCH_OUTPUT_FILE"]).write_text(
             result = adapter.run_agent(workspace, "analyst", {"hello": "world"}, codebase_root=codebase)
             self.assertEqual(result.mode, "analyst")
             self.assertEqual(result.summary, "fenced")
+
+    def test_adapter_can_run_conversation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            script = workspace / "agent.py"
+            script.write_text(
+                """
+import json
+import os
+from pathlib import Path
+
+assert os.environ["CLAWRESEARCH_INTERACTION_KIND"] == "conversation"
+prompt = Path(os.environ["CLAWRESEARCH_PROMPT_TEXT_FILE"]).read_text(encoding="utf-8")
+assert "Latest user message" in prompt
+output = {
+    "reply": "The current direction is to validate the same-backbone baseline first.",
+    "summary": "Narrow the question before running more GPU jobs.",
+    "research_brief": "Validate a same-backbone baseline before broadening the claim.",
+    "proposed_question": "Does end-to-end MPC beat a same-backbone baseline?",
+    "recommended_next_step": "Inspect and run the same-backbone baseline.",
+    "ready_to_start": True,
+}
+Path(os.environ["CLAWRESEARCH_OUTPUT_FILE"]).write_text(json.dumps(output), encoding="utf-8")
+""",
+                encoding="utf-8",
+            )
+            codebase = workspace / "codebase"
+            codebase.mkdir()
+            adapter = LocalShellAgentAdapter(["python3", str(script)])
+            result = adapter.run_conversation(
+                workspace,
+                {
+                    "project": {"id": "project_demo", "name": "demo"},
+                    "conversation": {
+                        "phase": "startup_chat",
+                        "history": [{"role": "user", "content": "Where are we in the research?"}],
+                        "latest_user_message": "Where are we in the research?",
+                    },
+                },
+                codebase_root=codebase,
+            )
+            self.assertTrue(result.ready_to_start)
+            self.assertIn("same-backbone baseline", result.reply)

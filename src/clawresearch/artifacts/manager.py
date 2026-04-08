@@ -48,3 +48,30 @@ class ArtifactManager:
         if name not in OPTIONAL_ARTIFACTS:
             raise KeyError(f"unknown optional artifact: {name}")
         return self.research_dir / name
+
+    def write_research_question_summary(
+        self,
+        *,
+        research_brief: str,
+        proposed_question: str | None = None,
+        next_step: str | None = None,
+    ) -> Path:
+        target = self.research_dir / "research-question.md"
+        lines = [
+            "# Research Question",
+            "",
+            "## Current Direction",
+            "",
+            research_brief.strip() or "(not set yet)",
+            "",
+            "## Working Question",
+            "",
+            proposed_question.strip() if proposed_question else "(to be refined during research)",
+            "",
+            "## Immediate Next Step",
+            "",
+            next_step.strip() if next_step else "(start the research loop)",
+            "",
+        ]
+        target.write_text("\n".join(lines), encoding="utf-8")
+        return target

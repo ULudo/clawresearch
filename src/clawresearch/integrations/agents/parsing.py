@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 
-from clawresearch.state.models import AgentOutputEnvelope
+from clawresearch.state.models import AgentOutputEnvelope, ConversationResponse
 
 
 def parse_envelope_from_text(raw_output: str) -> AgentOutputEnvelope:
     payload = _extract_json_payload(raw_output)
     return AgentOutputEnvelope(**payload)
+
+
+def parse_conversation_from_text(raw_output: str) -> ConversationResponse:
+    payload = _extract_json_payload(raw_output)
+    return ConversationResponse(**payload)
 
 
 def _extract_json_payload(raw_output: str) -> dict:

@@ -8,11 +8,11 @@ from typing import Any
 
 import httpx
 
-from clawresearch.state.models import AgentOutputEnvelope
+from clawresearch.state.models import AgentOutputEnvelope, ConversationResponse
 
 from .base import AgentAdapter
-from .parsing import parse_envelope_from_text
-from .prompting import build_prompt, schema_payload
+from .parsing import parse_conversation_from_text, parse_envelope_from_text
+from .prompting import build_conversation_prompt, build_prompt, conversation_schema_payload, schema_payload
 
 
 class OpenAICompatibleAgentAdapter(AgentAdapter):
@@ -49,6 +49,12 @@ class OpenAICompatibleAgentAdapter(AgentAdapter):
         (run_dir / "prompt.json").write_text(json.dumps(prompt_bundle, indent=2), encoding="utf-8")
         return run_dir
 
+    def _prepare_interaction_context(self, workspace: Path, prompt_bundle: dict[str, Any], *, prefix: str) -> Path:
+        run_dir = workspace / ".clawresearch" / "checkpoints" / f"{prefix}-{uuid.uuid4().hex[:10]}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "prompt.json").write_text(json.dumps(prompt_bundle, indent=2), encoding="utf-8")
+        return run_dir
+
     def run_agent(
         self,
         workspace: Path,
@@ -56,7 +62,7 @@ class OpenAICompatibleAgentAdapter(AgentAdapter):
         prompt_bundle: dict[str, Any],
         codebase_root: Path | None = None,
     ) -> AgentOutputEnvelope:
-        run_dir = self.prepare_context(workspace, mode, prompt_bundle, codebase_root=codebase_root)
+        run_dir = self._prepare_interaction_context(workspace, prompt_bundle, prefix="agent")
         output_file = run_dir / "output.json"
         schema_file = run_dir / "response-schema.json"
         schema = schema_payload()
@@ -68,6 +74,25 @@ class OpenAICompatibleAgentAdapter(AgentAdapter):
         content = self._send_with_fallbacks(payload)
         output_file.write_text(content, encoding="utf-8")
         return self.parse_typed_output(content)
+
+    def run_conversation(
+        self,
+        workspace: Path,
+        prompt_bundle: dict[str, Any],
+        codebase_root: Path | None = None,
+    ) -> ConversationResponse:
+        run_dir = self._prepare_interaction_context(workspace, prompt_bundle, prefix="chat")
+        output_file = run_dir / "output.json"
+        schema_file = run_dir / "response-schema.json"
+        schema = conversation_schema_payload()
+        schema_file.write_text(json.dumps(schema, indent=2), encoding="utf-8")
+
+        resolved_codebase_root = codebase_root or workspace
+        prompt = build_conversation_prompt(prompt_bundle, workspace_root=workspace, codebase_root=resolved_codebase_root)
+        payload = self._request_payload(prompt, schema)
+        content = self._send_with_fallbacks(payload)
+        output_file.write_text(content, encoding="utf-8")
+        return self.parse_conversation_output(content)
 
     def _request_payload(self, prompt: str, schema: dict[str, Any]) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -130,6 +155,9 @@ class OpenAICompatibleAgentAdapter(AgentAdapter):
 
     def parse_typed_output(self, raw_output: str) -> AgentOutputEnvelope:
         return parse_envelope_from_text(raw_output)
+
+    def parse_conversation_output(self, raw_output: str) -> ConversationResponse:
+        return parse_conversation_from_text(raw_output)
 
     def collect_generated_artifacts(self, run_dir: Path) -> list[Path]:
         return sorted(path for path in run_dir.iterdir() if path.is_file())

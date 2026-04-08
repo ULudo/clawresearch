@@ -222,6 +222,18 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS conversation_turns (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(project_id) REFERENCES projects(id)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS resource_locks (
         id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL,

@@ -44,6 +44,11 @@ class AgentMode(StrEnum):
     REVIEWER = "reviewer"
 
 
+class ConversationPhase(StrEnum):
+    STARTUP_CHAT = "startup_chat"
+    PAUSED_CHAT = "paused_chat"
+
+
 @dataclass(slots=True)
 class ProjectRecord:
     id: str
@@ -71,3 +76,13 @@ class AgentOutputEnvelope:
     needs_human_approval: bool = False
     approval_reason: str | None = None
     budget_impact: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ConversationResponse:
+    reply: str
+    summary: str
+    research_brief: str | None = None
+    proposed_question: str | None = None
+    recommended_next_step: str | None = None
+    ready_to_start: bool = False

@@ -183,6 +183,21 @@ class StateStore:
             payload={"status": status, "paused": paused},
         )
 
+    def update_project_summary(self, project_id: str, summary: str | None) -> None:
+        timestamp = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                "UPDATE projects SET summary = ?, updated_at = ? WHERE id = ?",
+                (summary, timestamp, project_id),
+            )
+        self.append_event(
+            project_id=project_id,
+            entity_type="project",
+            entity_id=project_id,
+            event_type="project.summary_updated",
+            payload={"summary": summary},
+        )
+
     def append_event(
         self,
         *,
@@ -487,6 +502,54 @@ class StateStore:
                     (project_id, limit),
                 ).fetchall()
             )
+
+    def append_conversation_turn(
+        self,
+        *,
+        project_id: str,
+        phase: str,
+        role: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        turn_id = f"turn_{uuid.uuid4().hex[:12]}"
+        timestamp = utc_now()
+        with self.transaction() as connection:
+            connection.execute(
+                """
+                INSERT INTO conversation_turns (id, project_id, phase, role, content, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (turn_id, project_id, phase, role, content, json.dumps(metadata or {}, sort_keys=True), timestamp),
+            )
+        self.append_event(
+            project_id=project_id,
+            entity_type="conversation_turn",
+            entity_id=turn_id,
+            event_type="conversation.turn_added",
+            payload={"phase": phase, "role": role, "metadata": metadata or {}},
+        )
+        return turn_id
+
+    def list_conversation_turns(
+        self,
+        project_id: str,
+        *,
+        phases: tuple[str, ...] | None = None,
+        limit: int | None = None,
+    ) -> list[sqlite3.Row]:
+        query = "SELECT * FROM conversation_turns WHERE project_id = ?"
+        params: list[Any] = [project_id]
+        if phases:
+            placeholders = ",".join("?" for _ in phases)
+            query += f" AND phase IN ({placeholders})"
+            params.extend(phases)
+        query += " ORDER BY created_at ASC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        with self.transaction() as connection:
+            return list(connection.execute(query, params).fetchall())
 
     def upsert_claim(
         self,
