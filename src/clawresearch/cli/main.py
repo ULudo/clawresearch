@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 from clawresearch.artifacts.manager import ArtifactManager
@@ -243,6 +244,364 @@ def cmd_logs(args: argparse.Namespace) -> int:
     for line in lines[-args.lines :]:
         print(line)
     return 0
+
+
+def _validate_codebase_root(raw_value: str | None) -> Path | None:
+    if not raw_value:
+        return None
+    codebase_root = Path(raw_value).resolve()
+    if not codebase_root.exists():
+        raise ValueError(f"Codebase root does not exist: {codebase_root}")
+    if not codebase_root.is_dir():
+        raise ValueError(f"Codebase root is not a directory: {codebase_root}")
+    return codebase_root
+
+
+def _prompt_line(prompt: str, *, default: str | None = None, required: bool = False) -> str:
+    while True:
+        suffix = f" [{default}]" if default else ""
+        value = input(f"{prompt}{suffix}: ").strip()
+        if value:
+            return value
+        if default is not None:
+            return default
+        if not required:
+            return ""
+        print("Please enter a value.")
+
+
+def _prompt_multiline(prompt: str) -> str:
+    print(prompt)
+    print("Finish with an empty line.")
+    lines: list[str] = []
+    while True:
+        prefix = "research> " if not lines else "... "
+        try:
+            line = input(prefix)
+        except EOFError:
+            break
+        if not line.strip():
+            if lines:
+                break
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _normalize_summary_text(value: str, *, limit: int = 140) -> str:
+    collapsed = " ".join((value or "").strip().split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 1].rstrip() + "…"
+
+
+def _task_title_from_text(text: str, *, prefix: str) -> str:
+    normalized = _normalize_summary_text(text, limit=88)
+    if not normalized:
+        return prefix
+    return normalized
+
+
+def _enqueue_console_task(
+    store: StateStore,
+    *,
+    project_id: str,
+    text: str,
+    kind: str,
+    owner_mode: str = "planner",
+    priority: int = 150,
+) -> str:
+    return store.create_task(
+        project_id=project_id,
+        kind=kind,
+        title=_task_title_from_text(text, prefix="Research task"),
+        owner_mode=owner_mode,
+        priority=priority,
+        payload={"brief": text, "source": "console"},
+    )
+
+
+def _humanize_action(action: str) -> str:
+    if ":" not in action:
+        return action.replace("_", " ")
+    label, detail = action.split(":", 1)
+    if label == "awaiting_approval":
+        return f"waiting for approval ({detail})"
+    if label == "created_job_followups":
+        return f"created {detail} job follow-up task(s)"
+    if label == "running_jobs":
+        return f"{detail} job(s) still running"
+    if label == "normalized_owner_mode":
+        _, mode = detail.rsplit(":", 1)
+        return f"routed task to {mode}"
+    if label == "created_followup_tasks":
+        return f"queued {detail} follow-up task(s)"
+    if label == "persisted_artifacts":
+        return f"updated {detail} artifact record(s)"
+    if label == "persisted_claims":
+        return f"updated {detail} claim(s)"
+    if label == "persisted_evidence":
+        return f"updated {detail} evidence item(s)"
+    if label == "persisted_decisions":
+        return f"updated {detail} decision(s)"
+    if label == "persisted_job_requests":
+        return f"recorded {detail} job request(s)"
+    if label == "jobs_queued":
+        return f"queued {detail} managed job(s)"
+    if label == "job_approvals":
+        return f"opened {detail} approval(s) for requested job(s)"
+    if label == "started_job":
+        return f"started job {detail}"
+    if label == "agent_failed":
+        return f"agent run failed for task {detail}"
+    return action.replace("_", " ")
+
+
+def _project_snapshot_text(store: StateStore, workspace: Path) -> str:
+    project = store.get_project(workspace)
+    if project is None:
+        return f"No project found at {workspace}"
+    open_tasks = store.list_open_tasks(project.id)
+    approvals = store.list_pending_approvals(project.id)
+    active_jobs = store.list_active_jobs(project.id)
+    recent_runs = store.list_recent_agent_runs(project.id, limit=1)
+    lines = [
+        f"Project: {project.name}",
+        f"Status: {project.status}{' (paused)' if project.paused else ''}",
+        f"Workspace: {project.workspace_root}",
+    ]
+    if project.codebase_root:
+        lines.append(f"Codebase: {project.codebase_root}")
+    lines.append(f"Open tasks: {len(open_tasks)} | Pending approvals: {len(approvals)} | Active jobs: {len(active_jobs)}")
+    if open_tasks:
+        next_task = open_tasks[0]
+        lines.append(f"Next task: [{next_task['owner_mode']}] {next_task['title']}")
+    if recent_runs:
+        run = recent_runs[0]
+        if run["summary"]:
+            lines.append(f"Last agent summary: {_normalize_summary_text(str(run['summary']), limit=180)}")
+    return "\n".join(lines)
+
+
+def _print_project_snapshot(store: StateStore, workspace: Path) -> None:
+    print()
+    print(_project_snapshot_text(store, workspace))
+
+
+def _print_new_job_logs(store: StateStore, project_id: str, job_offsets: dict[str, int]) -> None:
+    jobs = store.list_jobs(project_id, statuses=("running", "succeeded", "failed", "unknown"))
+    for row in jobs:
+        log_path = Path(row["log_path"])
+        if not log_path.exists():
+            continue
+        previous_offset = job_offsets.get(str(row["id"]), 0)
+        with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(previous_offset)
+            chunk = handle.read()
+            job_offsets[str(row["id"])] = handle.tell()
+        if not chunk.strip():
+            continue
+        for line in chunk.splitlines():
+            print(f"  job {row['id']}: {line}")
+
+
+def _print_tick_report(
+    store: StateStore,
+    workspace: Path,
+    tick_result: dict[str, object],
+    *,
+    job_offsets: dict[str, int],
+    seen_run_ids: set[str],
+) -> None:
+    project = store.get_project(workspace)
+    if project is None:
+        print(f"[tick] No project found at {workspace}")
+        return
+    status = str(tick_result.get("project_status") or project.status)
+    actions = [str(action) for action in tick_result.get("actions", [])]
+    print()
+    print(f"[tick] {project.name} | status={status}")
+    if actions:
+        for action in actions:
+            print(f"  - {_humanize_action(action)}")
+    recent_runs = store.list_recent_agent_runs(project.id, limit=3)
+    for row in reversed(recent_runs):
+        run_id = str(row["id"])
+        if run_id in seen_run_ids:
+            continue
+        seen_run_ids.add(run_id)
+        summary = _normalize_summary_text(str(row["summary"] or "completed an agent step"), limit=220)
+        print(f"  agent [{row['mode']}] {summary}")
+    approvals = store.list_pending_approvals(project.id)
+    if approvals:
+        print("  approvals:")
+        for row in approvals:
+            print(f"    - {row['id']}: {_normalize_summary_text(str(row['reason']), limit=160)}")
+    active_jobs = store.list_active_jobs(project.id)
+    if active_jobs:
+        print("  jobs:")
+        for row in active_jobs:
+            metadata = json.loads(row["metadata_json"])
+            summary = _normalize_summary_text(str(metadata.get("summary") or row["command"]), limit=140)
+            print(f"    - {row['id']} [{row['status']}] {summary}")
+    _print_new_job_logs(store, project.id, job_offsets)
+
+
+def _ensure_console_project(workspace: Path, *, project_name: str | None, codebase_root: Path | None) -> tuple[StateStore, object, bool]:
+    workspace.mkdir(parents=True, exist_ok=True)
+    init_workspace(workspace, codebase_root)
+    store = ensure_initialized(workspace)
+    project = store.get_project(workspace)
+    created = False
+    if project is None:
+        name = project_name or workspace.name or "research-project"
+        project = store.create_project(name, workspace, codebase_root=codebase_root)
+        created = True
+    return store, project, created
+
+
+def _handle_pending_approvals_interactively(store: StateStore, workspace: Path) -> bool:
+    project = store.get_project(workspace)
+    if project is None:
+        return False
+    approvals = store.list_pending_approvals(project.id)
+    if not approvals:
+        return False
+    print()
+    print("Approval required before the agent can continue.")
+    for row in approvals:
+        print(f"- {row['id']} [{row['approval_type']}] {_normalize_summary_text(str(row['reason']), limit=180)}")
+    while True:
+        choice = input("approval> [a]pprove all / [r]eject <id> / [w]ait / [q]uit: ").strip()
+        if not choice:
+            continue
+        lowered = choice.lower()
+        if lowered in {"w", "wait"}:
+            return False
+        if lowered in {"q", "quit"}:
+            raise KeyboardInterrupt
+        if lowered in {"a", "approve", "approve all"}:
+            namespace = argparse.Namespace(workspace=str(workspace), note="Approved from console")
+            for row in approvals:
+                namespace.approval_id = row["id"]
+                cmd_approval_approve(namespace)
+            return True
+        if lowered.startswith("r ") or lowered.startswith("reject "):
+            _, _, approval_id = choice.partition(" ")
+            approval_id = approval_id.strip()
+            if not approval_id:
+                print("Please include an approval id to reject.")
+                continue
+            namespace = argparse.Namespace(workspace=str(workspace), note="Rejected from console", approval_id=approval_id)
+            cmd_approval_reject(namespace)
+            return True
+        print("Unknown choice.")
+
+
+def cmd_console(args: argparse.Namespace) -> int:
+    workspace = Path(args.workspace).resolve()
+    try:
+        codebase_root = _validate_codebase_root(args.codebase_root)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    try:
+        store, project, created = _ensure_console_project(
+            workspace,
+            project_name=args.project_name,
+            codebase_root=codebase_root,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if created:
+        print(f"Created research project '{project.name}' at {workspace}")
+    else:
+        print(f"Attached to research project '{project.name}' at {workspace}")
+    if project.codebase_root:
+        print(f"Operating on codebase: {project.codebase_root}")
+
+    initial_prompt = (args.prompt or "").strip()
+    if not initial_prompt:
+        if created:
+            initial_prompt = _prompt_multiline("Describe the research question or problem you want the agent to work on.")
+        else:
+            print()
+            print("You can refine the research direction now, then hand off to the autonomous loop.")
+            initial_prompt = input("briefing> ").strip()
+
+    if initial_prompt:
+        kind = "research.question" if created else "user.command"
+        priority = 220 if created else 180
+        _enqueue_console_task(store, project_id=project.id, text=initial_prompt, kind=kind, priority=priority)
+
+    from clawresearch.daemon.main import run_supervisor_tick
+
+    job_offsets: dict[str, int] = {}
+    seen_run_ids: set[str] = set()
+
+    if initial_prompt:
+        tick_result = run_supervisor_tick(workspace)
+        store = ensure_initialized(workspace)
+        _print_tick_report(store, workspace, tick_result, job_offsets=job_offsets, seen_run_ids=seen_run_ids)
+
+    while True:
+        print()
+        print("Type another briefing message, /go to start autonomous mode, /status to inspect, or /quit.")
+        command = input("briefing> ").strip()
+        if not command:
+            continue
+        if command == "/quit":
+            return 0
+        if command == "/status":
+            store = ensure_initialized(workspace)
+            _print_project_snapshot(store, workspace)
+            continue
+        if command == "/go":
+            break
+        _enqueue_console_task(store, project_id=project.id, text=command, kind="user.command", priority=180)
+        tick_result = run_supervisor_tick(workspace)
+        store = ensure_initialized(workspace)
+        _print_tick_report(store, workspace, tick_result, job_offsets=job_offsets, seen_run_ids=seen_run_ids)
+
+    print()
+    print("Autonomous research mode started. Press Ctrl+C for a control prompt.")
+    while True:
+        try:
+            tick_result = run_supervisor_tick(workspace)
+            store = ensure_initialized(workspace)
+            _print_tick_report(store, workspace, tick_result, job_offsets=job_offsets, seen_run_ids=seen_run_ids)
+
+            project = store.get_project(workspace)
+            if project is None:
+                print("Project disappeared. Exiting.")
+                return 1
+            if project.status == ProjectStatus.ARCHIVED_LOCAL.value:
+                print()
+                print("The agent reached a local archive state. Review the research artifacts and claims.")
+                return 0
+            if _handle_pending_approvals_interactively(store, workspace):
+                continue
+            time.sleep(args.interval_seconds)
+        except KeyboardInterrupt:
+            print()
+            print("Console interrupted. The project state is preserved on disk.")
+            choice = input("control> [c]ontinue / [s]tatus / [p]ause project / [q]uit: ").strip().lower()
+            if choice in {"", "c", "continue"}:
+                continue
+            if choice in {"s", "status"}:
+                store = ensure_initialized(workspace)
+                _print_project_snapshot(store, workspace)
+                continue
+            if choice in {"p", "pause"}:
+                namespace = argparse.Namespace(workspace=str(workspace))
+                cmd_project_pause(namespace)
+                return 0
+            if choice in {"q", "quit"}:
+                return 0
+            print("Unknown choice; continuing.")
 
 
 def cmd_task_create(args: argparse.Namespace) -> int:
@@ -494,6 +853,14 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("entity", choices=["claims", "evidence", "decisions"])
     inspect_parser.add_argument("--workspace", default=".")
     inspect_parser.set_defaults(func=cmd_inspect)
+
+    console_parser = subparsers.add_parser("console", help="Interactive research console with autonomous execution loop")
+    console_parser.add_argument("--workspace", default=".")
+    console_parser.add_argument("--project-name", default=None, help="Project name to use when creating a workspace")
+    console_parser.add_argument("--codebase-root", default=None, help="External codebase root the research workspace should operate on")
+    console_parser.add_argument("--prompt", default=None, help="Initial research brief to seed the console session")
+    console_parser.add_argument("--interval-seconds", type=int, default=30, help="Supervisor tick interval during autonomous mode")
+    console_parser.set_defaults(func=cmd_console)
 
     return parser
 

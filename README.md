@@ -11,9 +11,9 @@ It separates:
 
 ## Main entrypoints
 
-- `clawresearch`: CLI for workspace and project lifecycle
+- `clawresearch`: CLI for interactive research sessions and workspace lifecycle
 - `clawresearchd`: background supervisor daemon
-- `clawresearch-api`: local API server for the product UI layer
+- `clawresearch-api`: local API server for the experimental UI layer
 
 Key runtime features:
 
@@ -24,16 +24,12 @@ Key runtime features:
 - approval gates for expensive or policy-sensitive work
 - direct local-model support through an OpenAI-compatible API (for example Ollama)
 
-## Quickstart
+## Console-first quickstart
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-
-clawresearch project create rellflow-e2e-mpc \
-  --path /tmp/clawresearch-workspaces \
-  --codebase-root /home/uli/Development/Python/ReLLFloW
 
 # Optional: switch a workspace to a local OpenAI-compatible model server.
 # Example policy env:
@@ -41,11 +37,25 @@ clawresearch project create rellflow-e2e-mpc \
 # CLAWRESEARCH_OPENAI_MODEL=qwen3:14b
 # CLAWRESEARCH_OPENAI_API_KEY=ollama
 
-clawresearch project status --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc
-clawresearchd serve --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc --interval-seconds 30
+clawresearch console \
+  --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc \
+  --project-name rellflow-e2e-mpc \
+  --codebase-root /home/uli/Development/Python/ReLLFloW
 ```
 
-Useful inspection commands:
+The console does three things in one place:
+
+- lets you discuss the research question briefly with the agent
+- hands off into an autonomous supervisor loop
+- shows readable terminal output for agent summaries, jobs, approvals, and runtime progress
+
+Once you are inside the console:
+
+- type normal text to refine the research question
+- type `/go` to let the agent continue autonomously
+- press `Ctrl+C` for the control prompt
+
+Useful lower-level inspection commands:
 
 ```bash
 clawresearch task list --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc
@@ -57,7 +67,7 @@ clawresearch inspect evidence --workspace /tmp/clawresearch-workspaces/rellflow-
 clawresearch inspect decisions --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc
 ```
 
-## Local API layer
+## Experimental local API layer
 
 ClawResearch now includes a local API layer that translates runtime state into UI-friendly project data.
 The same server also serves the first local web shell at `/`.
