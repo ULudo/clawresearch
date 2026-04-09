@@ -785,7 +785,11 @@ def _chat_session(
             metadata={"session_id": session_id, "new_direction": True},
         )
     while True:
-        raw = Prompt.ask("[bold cyan]you[/bold cyan]")
+        try:
+            raw = Prompt.ask("[bold cyan]you[/bold cyan]")
+        except KeyboardInterrupt:
+            _render_system_panel("Chat interrupted. Exiting cleanly.", title="Chat", style="yellow")
+            return "quit"
         text = raw.strip()
         if not text:
             continue

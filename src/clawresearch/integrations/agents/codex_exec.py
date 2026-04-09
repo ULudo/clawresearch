@@ -17,6 +17,36 @@ _build_prompt = build_prompt
 _schema_payload = schema_payload
 
 
+def build_codex_command(
+    *,
+    codex_bin: Path,
+    codebase_root: Path,
+    schema_path: Path,
+    output_file: Path,
+    codex_model: str = "",
+    codex_reasoning_effort: str = "",
+) -> list[str]:
+    command = [
+        str(codex_bin),
+        "exec",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "-C",
+        str(codebase_root),
+        "--output-schema",
+        str(schema_path),
+        "-o",
+        str(output_file),
+        "-",
+    ]
+    if codex_model:
+        command[2:2] = ["-m", codex_model]
+    if codex_reasoning_effort:
+        command[2:2] = ["-c", f'model_reasoning_effort="{codex_reasoning_effort}"']
+    return command
+
+
 def main() -> int:
     prompt_file = Path(os.environ["CLAWRESEARCH_PROMPT_FILE"]).resolve()
     output_file = Path(os.environ["CLAWRESEARCH_OUTPUT_FILE"]).resolve()
@@ -44,23 +74,14 @@ def main() -> int:
     if codex_bin_dir:
         env["PATH"] = f"{codex_bin_dir}:{env.get('PATH', '')}"
 
-    command = [
-        str(codex_bin),
-        "exec",
-        "--sandbox",
-        "read-only",
-        "-C",
-        str(codebase_root),
-        "--output-schema",
-        str(schema_path),
-        "-o",
-        str(output_file),
-        "-",
-    ]
-    if codex_model:
-        command[2:2] = ["-m", codex_model]
-    if codex_reasoning_effort:
-        command[2:2] = ["-c", f'model_reasoning_effort="{codex_reasoning_effort}"']
+    command = build_codex_command(
+        codex_bin=codex_bin,
+        codebase_root=codebase_root,
+        schema_path=schema_path,
+        output_file=output_file,
+        codex_model=codex_model,
+        codex_reasoning_effort=codex_reasoning_effort,
+    )
     result = subprocess.run(
         command,
         input=prompt,

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from clawresearch.integrations.agents.codex_exec import _build_prompt, _schema_payload
+from clawresearch.integrations.agents.codex_exec import _build_prompt, _schema_payload, build_codex_command
 
 
 class CodexExecWrapperTests(unittest.TestCase):
@@ -38,3 +38,12 @@ class CodexExecWrapperTests(unittest.TestCase):
             self.assertIn(str(codebase), prompt)
             self.assertIn("Investigate end-to-end MPC for predictor training", prompt)
             self.assertIn("end-to-end objective training", prompt)
+
+    def test_build_codex_command_skips_git_repo_check(self) -> None:
+        command = build_codex_command(
+            codex_bin=Path("/tmp/codex"),
+            codebase_root=Path("/tmp/codebase"),
+            schema_path=Path("/tmp/schema.json"),
+            output_file=Path("/tmp/output.json"),
+        )
+        self.assertIn("--skip-git-repo-check", command)

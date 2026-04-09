@@ -8,6 +8,7 @@ from unittest import mock
 
 from clawresearch.cli.main import (
     _humanize_action,
+    _chat_session,
     _materialize_session_to_runtime,
     _project_has_history,
     _project_snapshot_text,
@@ -138,6 +139,17 @@ class ConsoleCliTests(unittest.TestCase):
     def test_humanize_action_maps_internal_labels(self) -> None:
         self.assertEqual(_humanize_action("created_followup_tasks:3"), "queued 3 follow-up task(s)")
         self.assertEqual(_humanize_action("started_job:job_123"), "started job job_123")
+
+    def test_chat_session_handles_keyboard_interrupt_cleanly(self) -> None:
+        with mock.patch("clawresearch.cli.main.Prompt.ask", side_effect=KeyboardInterrupt):
+            result = _chat_session(
+                self.store,
+                self.project,
+                self.workspace,
+                phase="startup_chat",
+                new_direction=False,
+            )
+        self.assertEqual(result, "quit")
 
 
 if __name__ == "__main__":
