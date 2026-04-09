@@ -806,15 +806,16 @@ def _chat_session(
                 return "go"
             continue
         try:
-            response = _run_conversation_round(
-                store,
-                project,
-                workspace,
-                phase=phase,
-                session_id=session_id,
-                new_direction=new_direction,
-                user_message=text,
-            )
+            with RICH_CONSOLE.status("[bold cyan]agent is thinking...[/bold cyan]"):
+                response = _run_conversation_round(
+                    store,
+                    project,
+                    workspace,
+                    phase=phase,
+                    session_id=session_id,
+                    new_direction=new_direction,
+                    user_message=text,
+                )
         except Exception as exc:  # noqa: BLE001
             _render_system_panel(str(exc), title="Agent unavailable", style="red")
             continue

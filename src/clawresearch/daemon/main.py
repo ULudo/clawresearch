@@ -10,6 +10,8 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from clawresearch.artifacts.manager import ArtifactManager
@@ -730,6 +732,12 @@ def _build_agent_adapter(policy):
     if openai_base_url and openai_model:
         return openai_adapter_from_env(adapter_env, timeout_seconds=policy.agent_adapter.timeout_seconds)
 
+    explicit_codex = (adapter_env.get("CLAWRESEARCH_CODEX_BIN") or os.environ.get("CLAWRESEARCH_CODEX_BIN") or "").strip()
+    if not explicit_codex:
+        detected_openai_env = _detect_local_openai_backend(adapter_env)
+        if detected_openai_env is not None:
+            return openai_adapter_from_env(detected_openai_env, timeout_seconds=policy.agent_adapter.timeout_seconds)
+
     codex_bin = _detect_codex_bin(adapter_env)
     if codex_bin is not None:
         detected_env = {**adapter_env, "CLAWRESEARCH_CODEX_BIN": str(codex_bin)}
@@ -741,9 +749,50 @@ def _build_agent_adapter(policy):
 
     raise RuntimeError(
         "No agent backend is configured. ClawResearch looked for an OpenAI-compatible endpoint "
-        "(CLAWRESEARCH_OPENAI_BASE_URL + CLAWRESEARCH_OPENAI_MODEL) and for Codex on PATH or under ~/.nvm, "
+        "(CLAWRESEARCH_OPENAI_BASE_URL + CLAWRESEARCH_OPENAI_MODEL), for a local Ollama model such as qwen3:14b, "
+        "and for Codex on PATH or under ~/.nvm, "
         "but found neither."
     )
+
+
+def _detect_local_openai_backend(adapter_env: dict[str, str]) -> dict[str, str] | None:
+    preferred_model = (
+        adapter_env.get("CLAWRESEARCH_LOCAL_OPENAI_MODEL")
+        or os.environ.get("CLAWRESEARCH_LOCAL_OPENAI_MODEL")
+        or "qwen3:14b"
+    ).strip()
+    base_url = (
+        adapter_env.get("CLAWRESEARCH_LOCAL_OPENAI_BASE_URL")
+        or os.environ.get("CLAWRESEARCH_LOCAL_OPENAI_BASE_URL")
+        or "http://127.0.0.1:11434/v1"
+    ).strip()
+    if not base_url:
+        return None
+
+    normalized_base = base_url.rstrip("/")
+    tags_url = normalized_base[:-3] + "/api/tags" if normalized_base.endswith("/v1") else normalized_base + "/api/tags"
+    try:
+        with urllib.request.urlopen(tags_url, timeout=1.5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError, ValueError):
+        return None
+
+    models = payload.get("models")
+    if not isinstance(models, list):
+        return None
+    model_names = [str(item.get("name") or "").strip() for item in models if isinstance(item, dict)]
+    if not model_names:
+        return None
+
+    for candidate in [preferred_model, "qwen3:14b", "qwen3:8b"]:
+        if candidate and candidate in model_names:
+            return {
+                **adapter_env,
+                "CLAWRESEARCH_OPENAI_BASE_URL": normalized_base,
+                "CLAWRESEARCH_OPENAI_MODEL": candidate,
+                "CLAWRESEARCH_OPENAI_API_KEY": adapter_env.get("CLAWRESEARCH_OPENAI_API_KEY", "ollama"),
+            }
+    return None
 
 
 def _detect_codex_bin(adapter_env: dict[str, str]) -> Path | None:

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import tempfile
+import urllib.error
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from clawresearch.cli.main import init_workspace, runtime_dir, state_store_for
-from clawresearch.daemon.main import _build_agent_adapter, _detect_codex_bin, run_supervisor_tick
+from clawresearch.daemon.main import _build_agent_adapter, _detect_codex_bin, _detect_local_openai_backend, run_supervisor_tick
 from clawresearch.state.models import AgentOutputEnvelope
 from clawresearch.policy.io import read_policy, write_policy
 
@@ -38,6 +39,45 @@ class DaemonFollowupTests(unittest.TestCase):
             self.assertEqual(adapter.name, "local_shell")
             self.assertEqual(adapter.command_template[:3], [adapter.command_template[0], "-m", "clawresearch.integrations.agents.codex_exec"])
             self.assertEqual(adapter.env["CLAWRESEARCH_CODEX_BIN"], str(codex_bin))
+
+    def test_build_agent_adapter_prefers_local_openai_backend_when_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "workspace"
+            codebase = Path(tmp) / "codebase"
+            codebase.mkdir(parents=True, exist_ok=True)
+            init_workspace(workspace, codebase)
+
+            policy_path = runtime_dir(workspace) / "policy.yaml"
+            policy = read_policy(policy_path)
+            policy.agent_adapter.command_template = []
+            policy.agent_adapter.env = {}
+            write_policy(policy_path, policy)
+
+            fake_adapter = mock.Mock()
+            fake_adapter.name = "openai_compatible"
+
+            with (
+                mock.patch(
+                    "clawresearch.daemon.main._detect_local_openai_backend",
+                    return_value={
+                        "CLAWRESEARCH_OPENAI_BASE_URL": "http://127.0.0.1:11434/v1",
+                        "CLAWRESEARCH_OPENAI_MODEL": "qwen3:14b",
+                        "CLAWRESEARCH_OPENAI_API_KEY": "ollama",
+                    },
+                ),
+                mock.patch("clawresearch.daemon.main.openai_adapter_from_env", return_value=fake_adapter) as patched_openai,
+                mock.patch("clawresearch.daemon.main._detect_codex_bin", return_value=Path("/tmp/codex")) as patched_codex,
+            ):
+                adapter = _build_agent_adapter(policy)
+
+            self.assertIs(adapter, fake_adapter)
+            patched_openai.assert_called_once()
+            patched_codex.assert_not_called()
+
+    def test_detect_local_openai_backend_returns_none_when_unavailable(self) -> None:
+        with mock.patch("clawresearch.daemon.main.urllib.request.urlopen", side_effect=urllib.error.URLError("offline")):
+            detected = _detect_local_openai_backend({})
+        self.assertIsNone(detected)
 
     def test_run_supervisor_tick_accepts_openai_compatible_without_command_template(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
