@@ -5,7 +5,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from clawresearch.integrations.agents.codex_exec import _build_prompt, _schema_payload, build_codex_command
+from clawresearch.integrations.agents.codex_exec import (
+    _build_prompt,
+    _codex_path_entries,
+    _schema_payload,
+    build_codex_command,
+)
 
 
 class CodexExecWrapperTests(unittest.TestCase):
@@ -47,3 +52,16 @@ class CodexExecWrapperTests(unittest.TestCase):
             output_file=Path("/tmp/output.json"),
         )
         self.assertIn("--skip-git-repo-check", command)
+
+    def test_codex_path_entries_include_node_bin_for_js_entrypoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            node_root = Path(tmp) / ".nvm" / "versions" / "node" / "v24.13.1"
+            js_entry = node_root / "lib" / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+            js_entry.parent.mkdir(parents=True, exist_ok=True)
+            js_entry.write_text("console.log('codex')\n", encoding="utf-8")
+            (node_root / "bin").mkdir(parents=True, exist_ok=True)
+
+            entries = _codex_path_entries(js_entry)
+
+        self.assertIn(str(js_entry.parent), entries)
+        self.assertIn(str(node_root / "bin"), entries)

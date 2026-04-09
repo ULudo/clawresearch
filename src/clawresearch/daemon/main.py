@@ -751,11 +751,11 @@ def _detect_codex_bin(adapter_env: dict[str, str]) -> Path | None:
     if explicit:
         explicit_path = Path(explicit).expanduser()
         if explicit_path.exists():
-            return explicit_path.resolve()
+            return explicit_path
 
     discovered = shutil.which("codex")
     if discovered:
-        return Path(discovered).resolve()
+        return Path(discovered).expanduser()
 
     home = Path.home()
     nvm_root = home / ".nvm" / "versions" / "node"
@@ -763,7 +763,7 @@ def _detect_codex_bin(adapter_env: dict[str, str]) -> Path | None:
         matches = sorted(nvm_root.glob("*/bin/codex"), reverse=True)
         for candidate in matches:
             if candidate.exists():
-                return candidate.resolve()
+                return candidate
     return None
 
 

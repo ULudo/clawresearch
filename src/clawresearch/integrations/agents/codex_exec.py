@@ -17,6 +17,26 @@ _build_prompt = build_prompt
 _schema_payload = schema_payload
 
 
+def _codex_path_entries(codex_bin: Path) -> list[str]:
+    entries: list[str] = []
+    parent = codex_bin.parent
+    if str(parent):
+        entries.append(str(parent))
+    for ancestor in codex_bin.parents:
+        if ancestor.name == "lib":
+            node_bin = ancestor.parent / "bin"
+            if node_bin.exists():
+                entries.append(str(node_bin))
+            break
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if entry and entry not in seen:
+            deduped.append(entry)
+            seen.add(entry)
+    return deduped
+
+
 def build_codex_command(
     *,
     codex_bin: Path,
@@ -69,10 +89,10 @@ def main() -> int:
         schema = schema_payload()
         prompt = build_prompt(bundle, workspace_root=workspace_root, codebase_root=codebase_root, mode=mode)
     schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
-    codex_bin_dir = str(codex_bin.parent.resolve()) if codex_bin.parent != Path("") else ""
     env = dict(os.environ)
-    if codex_bin_dir:
-        env["PATH"] = f"{codex_bin_dir}:{env.get('PATH', '')}"
+    path_entries = _codex_path_entries(codex_bin)
+    if path_entries:
+        env["PATH"] = f"{':'.join(path_entries)}:{env.get('PATH', '')}"
 
     command = build_codex_command(
         codex_bin=codex_bin,

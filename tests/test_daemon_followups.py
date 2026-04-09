@@ -17,7 +17,7 @@ class DaemonFollowupTests(unittest.TestCase):
             codex_bin = Path(tmp) / "codex"
             codex_bin.write_text("#!/bin/sh\n", encoding="utf-8")
             resolved = _detect_codex_bin({"CLAWRESEARCH_CODEX_BIN": str(codex_bin)})
-            self.assertEqual(resolved, codex_bin.resolve())
+            self.assertEqual(resolved, codex_bin)
 
     def test_build_agent_adapter_auto_detects_codex_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -37,7 +37,7 @@ class DaemonFollowupTests(unittest.TestCase):
             adapter = _build_agent_adapter(policy)
             self.assertEqual(adapter.name, "local_shell")
             self.assertEqual(adapter.command_template[:3], [adapter.command_template[0], "-m", "clawresearch.integrations.agents.codex_exec"])
-            self.assertEqual(adapter.env["CLAWRESEARCH_CODEX_BIN"], str(codex_bin.resolve()))
+            self.assertEqual(adapter.env["CLAWRESEARCH_CODEX_BIN"], str(codex_bin))
 
     def test_run_supervisor_tick_accepts_openai_compatible_without_command_template(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
