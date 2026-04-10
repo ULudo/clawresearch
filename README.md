@@ -1,174 +1,84 @@
 # ClawResearch
 
-ClawResearch is a local autonomous research runtime for empirical coding and ML research.
-It separates:
+ClawResearch is being reset around a smaller and more practical goal:
 
-- supervisor reliability and recovery
-- agent reasoning modes
-- experiment/job execution
-- claim/evidence tracking
-- ClawReview publication and review integration
+> a console-first autonomous research runtime for empirical computational research
 
-## Main entrypoints
+The previous implementation taught us a lot, but it also grew too quickly into a platform- and governance-heavy architecture. This repo now treats that first version as prototype history and uses the new concept as the source of truth for the next implementation.
 
-- `clawresearch`: primary interactive research console
-- `clawresearchd`: background supervisor daemon
-- `clawresearch-api`: local API server for the experimental UI layer
+## Start Here
 
-Key runtime features:
+If you are pulling this repo to begin the rewrite, read these in order:
 
-- persistent SQLite-backed research state and event log
-- separate `workspace_root` and `codebase_root`
-- typed agent outputs with claims, evidence, decisions, tasks, and job requests
-- managed detached job execution with recovery and job-followup analysis
-- approval gates for expensive or policy-sensitive work
-- direct local-model support through an OpenAI-compatible API (for example Ollama)
+1. `/Users/uludo/Documents/New project/clawresearch/docs/reset-development-concept.md`
+2. `/Users/uludo/Documents/New project/clawresearch/docs/autonomous-research-agent-literature-synthesis.md`
+3. `/Users/uludo/Documents/New project/clawresearch/docs/archive/product-design-v1.md` only if you want to inspect the older direction
 
-## Quickstart
+## Current Direction
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+The reset version of ClawResearch should be:
 
-cd /path/to/your/research/codebase
-clawresearch
-```
+- console-first
+- current-directory-as-project
+- persistent across restarts
+- capable of detached long-running jobs
+- findings-memory-driven
+- backend-agnostic across local and hosted models
 
-The current directory is the project context:
+What it should **not** start as:
 
-- `workspace_root = cwd`
-- `codebase_root = cwd`
+- a web platform
+- a research management control plane
+- a governance-heavy system
+- a generalized autonomous scientist for every domain
 
-The console does three things in one place:
+## Reset Priorities
 
-- lets you discuss the research question with the agent first
-- hands off into an autonomous supervisor loop with `/go`
-- shows readable terminal output for agent replies, jobs, approvals, and runtime progress
+The next implementation should begin with:
 
-Once you are inside the console:
+1. `clawresearch` as a single-command console entry
+2. minimal persistent run/session state
+3. detached job execution and reconciliation
+4. readable live trace plus persisted run trace
+5. findings memory with simple maturity states
+6. one solid local-model backend path
 
-- type normal text to refine the research question
-- type `/go` to let the agent continue autonomously
-- type `/help` to see commands
-- press `Ctrl+C` while the run is active to return to chat mode
+## Why the Repo Looks the Way It Does
 
-Useful lower-level inspection commands:
+The current source tree still contains the first prototype implementation. It should be treated as:
 
-```bash
-clawresearch task list --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc
-clawresearch approvals --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc
-clawresearch approval approve <approval-id> --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc
-clawresearch jobs list --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc
-clawresearch inspect claims --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc
-clawresearch inspect evidence --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc
-clawresearch inspect decisions --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc
-```
+- a source of lessons
+- a source of a few potentially reusable utilities
+- **not** the architectural foundation that must be preserved
 
-## Experimental local API layer
+The reset concept intentionally favors:
 
-ClawResearch now includes a local API layer that translates runtime state into UI-friendly project data.
-The same server also serves the first local web shell at `/`.
+- directness
+- debuggability
+- real long-running research loops
 
-You can run it against a single workspace:
+over:
 
-```bash
-clawresearch-api \
-  --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc \
-  --host 127.0.0.1 \
-  --port 8342
-```
+- early approval systems
+- policy-first safety layers
+- UI/platform breadth
 
-Or directly via the Python module if your editable install has not been refreshed yet:
+## Development Environment
 
-```bash
-python -m clawresearch.api.server \
-  --workspace /tmp/clawresearch-workspaces/rellflow-e2e-mpc \
-  --host 127.0.0.1 \
-  --port 8342
-```
+For this project, the recommended primary development machine is the one that already hosts:
 
-Useful endpoints:
+- the offline/open model
+- the larger storage budget
+- the heavier experiment runtime
 
-```bash
-curl -s http://127.0.0.1:8342/api/health
-curl -s http://127.0.0.1:8342/api/projects/project_xxx/overview
-curl -s http://127.0.0.1:8342/api/projects/project_xxx/activity
-curl -s http://127.0.0.1:8342/api/projects/project_xxx/tasks
-curl -s http://127.0.0.1:8342/api/projects/project_xxx/approvals
-curl -s http://127.0.0.1:8342/api/projects/project_xxx/jobs
-curl -s http://127.0.0.1:8342/api/projects/project_xxx/claims
-curl -s http://127.0.0.1:8342/api/projects/project_xxx/evidence
-curl -s http://127.0.0.1:8342/api/projects/project_xxx/decisions
-curl -s http://127.0.0.1:8342/api/projects/project_xxx/artifacts
-```
+That keeps development and real execution in the same environment.
 
-Open the web shell in a browser:
+## Packaging
 
-```bash
-open http://127.0.0.1:8342/
-```
+The current package entrypoints remain in the repo because they are useful reference points during the reset:
 
-The shell currently includes:
+- `clawresearch`
+- `clawresearchd`
+- `clawresearch-api`
 
-- project creation
-- project overview cards
-- approvals and actions
-- jobs visibility
-- claims, evidence, and decisions
-- research artifact browsing
-- plain-language command submission
-
-Control-style commands can be submitted as JSON:
-
-```bash
-curl -s \
-  -X POST \
-  -H 'Content-Type: application/json' \
-  -d '{"text":"Continue and prioritize the same-backbone baseline."}' \
-  http://127.0.0.1:8342/api/projects/project_xxx/commands
-```
-
-The console is the primary product path. The API and web shell are secondary, experimental surfaces.
-
-## Workspace layout
-
-Each project workspace contains:
-
-- `.clawresearch/state.db`
-- `.clawresearch/policy.yaml`
-- `.clawresearch/logs/`
-- `.clawresearch/jobs/`
-- `.clawresearch/checkpoints/`
-- `.clawresearch/artifacts/`
-- `research/`
-
-Projects can target an external codebase. The workspace stores runtime state, logs, and research artifacts, while `codebase_root` is the directory where agents inspect code, run commands, and execute experiments.
-
-## Architecture
-
-Core subsystems:
-
-- `clawresearch.state`: SQLite schema and repositories
-- `clawresearch.events`: append-only event log helpers
-- `clawresearch.policy`: policy model and YAML I/O
-- `clawresearch.jobs`: detached subprocess lifecycle
-- `clawresearch.scheduler`: resource locking and scheduling
-- `clawresearch.evidence`: claim/evidence management
-- `clawresearch.integrations.agents`: agent adapter boundary
-- `clawresearch.integrations.clawreview`: ClawReview protocol client
-- `clawresearch.recovery`: restart reconciliation
-- `clawresearch.daemon`: supervisor loop
-
-## Runtime loop
-
-The supervisor follows a bounded autonomous loop:
-
-1. reconcile running jobs and recover state after restarts
-2. surface pending approvals
-3. start pending managed jobs when policy allows
-4. call the configured agent backend with a typed prompt and current research snapshot
-5. persist claims, evidence, decisions, artifacts, and follow-up tasks
-6. gate expensive work through approvals instead of silently running it
-
-This keeps reliability, long-running execution, and scientific state management outside the model itself.
+But the reset development concept should drive what gets kept, replaced, or deleted next.

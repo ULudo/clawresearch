@@ -1,4 +1,15 @@
-# ClawResearch Product Design
+# Archived: ClawResearch Product Design v1
+
+This document reflects an earlier product direction centered around a web/app control plane.
+
+It is kept for reference only.
+
+It is **not** the current source of truth for the ClawResearch reset.
+
+For the current direction, use:
+
+- `/Users/uludo/Documents/New project/clawresearch/docs/reset-development-concept.md`
+- `/Users/uludo/Documents/New project/clawresearch/docs/autonomous-research-agent-literature-synthesis.md`
 
 ## Purpose
 
