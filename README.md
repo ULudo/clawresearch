@@ -15,7 +15,7 @@ This repository is intentionally minimal.
 It currently contains:
 
 - the revised concept documents
-- a small Python package scaffold
+- a small TypeScript package scaffold
 - a single `clawresearch` entrypoint
 - a clean starting point for the rewrite on the workstation
 
@@ -52,13 +52,31 @@ The next implementation should **not** begin as:
 - a governance-first system
 - a large multi-component orchestration framework
 
+## Language Decision
+
+The new reset uses TypeScript rather than Python.
+
+That is a product decision, not a claim about what language the agent later researches in.
+
+The reasoning is simple:
+
+- ClawResearch is primarily a local agent product and runtime harness
+- terminal UX, streaming, process orchestration, and packaging are central
+- the actual research workloads can remain polyglot and run through external tools, shells, repos, Docker, or Python environments
+- the harness language should optimize for product flow and developer velocity, not for mirroring the language of downstream experiment code
+
 ## Quickstart
 
 ```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-clawresearch
+npm install
+npm run dev -- --docs
+```
+
+After dependencies are installed, the scaffold can also be built and run as compiled JavaScript:
+
+```bash
+npm run build
+node dist/src/cli.js --docs
 ```
 
 The current command is only a bootstrap shell that points at the reset docs. The real runtime is meant to be rebuilt from here.
@@ -66,7 +84,7 @@ The current command is only a bootstrap shell that points at the reset docs. The
 ## Repo Layout
 
 - `docs/` contains the current source-of-truth concept
-- `src/clawresearch/` contains the reset Python scaffold
+- `src/` contains the reset TypeScript scaffold
 - `tests/` contains only minimal smoke coverage for the new baseline
 
 ## Development Intent
@@ -74,7 +92,7 @@ The current command is only a bootstrap shell that points at the reset docs. The
 The recommended workflow is:
 
 1. pull this repo on the stronger workstation
-2. install it in a dedicated Python 3.12+ virtual environment
+2. install dependencies with Node.js 20+
 3. use the reset concept as the implementation contract
 4. rebuild the runtime incrementally from the console inward
 

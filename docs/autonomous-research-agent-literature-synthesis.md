@@ -994,6 +994,26 @@ The new design should be:
 - research-loop-first, not control-plane-first
 - observable-first, not governance-first
 
+### Implementation language stance
+
+The reset should use TypeScript on Node.js for the runtime harness.
+
+This follows from the actual role of `clawresearch`:
+
+- it is primarily an agent product and orchestration runtime
+- terminal UX and live trace quality are core product concerns
+- streaming, subprocess control, packaging, and installation matter early
+- the language of the harness does not need to match the language of downstream research code
+
+The research workloads themselves remain polyglot:
+
+- Python experiments
+- shell tools
+- Dockerized pipelines
+- existing research repositories
+
+So the implementation language should optimize for product flow and runtime ergonomics rather than mirror the languages used by the experiments under study.
+
 ## Non-Negotiable Design Requirements for the Reset
 
 These are the design requirements for the next attempt, not the full mature end-state.

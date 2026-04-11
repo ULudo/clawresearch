@@ -1,0 +1,35 @@
+{
+  "name": "clawresearch",
+  "version": "0.3.0",
+  "description": "Console-first TypeScript scaffold for an autonomous research runtime",
+  "type": "module",
+  "bin": {
+    "clawresearch": "dist/src/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/src/cli.js",
+    "test": "npm run build && node --test dist/tests/*.test.js"
+  },
+  "keywords": [
+    "agent",
+    "research",
+    "cli",
+    "autonomy"
+  ],
+  "author": "ULudo",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.17.50",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}

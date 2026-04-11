@@ -18,6 +18,20 @@ ClawResearch should restart as:
 
 This is intentionally narrower than the previous direction.
 
+## Implementation Language
+
+The reset should use TypeScript on Node.js rather than Python.
+
+This decision follows from the actual product we are building:
+
+- a local agent harness
+- a strong terminal experience
+- readable streaming traces
+- clean orchestration of external commands and tools
+- simple packaging and installation
+
+The runtime must be able to operate across polyglot research environments, but it does not need to be implemented in the same language as the codebases it studies or modifies.
+
 ## What We Are Not Building First
 
 Not in the first reset core:
