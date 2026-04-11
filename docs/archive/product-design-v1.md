@@ -8,8 +8,8 @@ It is **not** the current source of truth for the ClawResearch reset.
 
 For the current direction, use:
 
-- `/Users/uludo/Documents/New project/clawresearch/docs/reset-development-concept.md`
-- `/Users/uludo/Documents/New project/clawresearch/docs/autonomous-research-agent-literature-synthesis.md`
+- `docs/reset-development-concept.md`
+- `docs/autonomous-research-agent-literature-synthesis.md`
 
 ## Purpose
 

@@ -1,84 +1,81 @@
 # ClawResearch
 
-ClawResearch is being reset around a smaller and more practical goal:
+ClawResearch is being restarted from a much smaller and cleaner foundation.
+
+The repo now reflects a deliberate reset:
 
 > a console-first autonomous research runtime for empirical computational research
 
-The previous implementation taught us a lot, but it also grew too quickly into a platform- and governance-heavy architecture. This repo now treats that first version as prototype history and uses the new concept as the source of truth for the next implementation.
+The first implementation taught us a lot, but it grew too quickly into a platform-heavy prototype. That prototype has been removed from the main code path so the next iteration can start from a clear, debuggable base.
+
+## What This Repo Is Now
+
+This repository is intentionally minimal.
+
+It currently contains:
+
+- the revised concept documents
+- a small Python package scaffold
+- a single `clawresearch` entrypoint
+- a clean starting point for the rewrite on the workstation
+
+It intentionally does **not** currently contain:
+
+- the previous API layer
+- the previous daemon stack
+- the previous approval and policy machinery
+- the previous adapter and orchestration prototype
 
 ## Start Here
 
-If you are pulling this repo to begin the rewrite, read these in order:
+Read these documents in order:
 
-1. `/Users/uludo/Documents/New project/clawresearch/docs/reset-development-concept.md`
-2. `/Users/uludo/Documents/New project/clawresearch/docs/autonomous-research-agent-literature-synthesis.md`
-3. `/Users/uludo/Documents/New project/clawresearch/docs/archive/product-design-v1.md` only if you want to inspect the older direction
+1. `docs/reset-development-concept.md`
+2. `docs/autonomous-research-agent-literature-synthesis.md`
+3. `docs/archive/product-design-v1.md` only if you want to inspect the discarded direction
 
-## Current Direction
+## Reset Direction
 
-The reset version of ClawResearch should be:
+The next implementation should be:
 
 - console-first
 - current-directory-as-project
 - persistent across restarts
 - capable of detached long-running jobs
 - findings-memory-driven
-- backend-agnostic across local and hosted models
+- model- and backend-agnostic
 
-What it should **not** start as:
+The next implementation should **not** begin as:
 
-- a web platform
-- a research management control plane
-- a governance-heavy system
-- a generalized autonomous scientist for every domain
+- a web product
+- a research operations platform
+- a governance-first system
+- a large multi-component orchestration framework
 
-## Reset Priorities
+## Quickstart
 
-The next implementation should begin with:
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+clawresearch
+```
 
-1. `clawresearch` as a single-command console entry
-2. minimal persistent run/session state
-3. detached job execution and reconciliation
-4. readable live trace plus persisted run trace
-5. findings memory with simple maturity states
-6. one solid local-model backend path
+The current command is only a bootstrap shell that points at the reset docs. The real runtime is meant to be rebuilt from here.
 
-## Why the Repo Looks the Way It Does
+## Repo Layout
 
-The current source tree still contains the first prototype implementation. It should be treated as:
+- `docs/` contains the current source-of-truth concept
+- `src/clawresearch/` contains the reset Python scaffold
+- `tests/` contains only minimal smoke coverage for the new baseline
 
-- a source of lessons
-- a source of a few potentially reusable utilities
-- **not** the architectural foundation that must be preserved
+## Development Intent
 
-The reset concept intentionally favors:
+The recommended workflow is:
 
-- directness
-- debuggability
-- real long-running research loops
+1. pull this repo on the stronger workstation
+2. install it in a dedicated Python 3.12+ virtual environment
+3. use the reset concept as the implementation contract
+4. rebuild the runtime incrementally from the console inward
 
-over:
-
-- early approval systems
-- policy-first safety layers
-- UI/platform breadth
-
-## Development Environment
-
-For this project, the recommended primary development machine is the one that already hosts:
-
-- the offline/open model
-- the larger storage budget
-- the heavier experiment runtime
-
-That keeps development and real execution in the same environment.
-
-## Packaging
-
-The current package entrypoints remain in the repo because they are useful reference points during the reset:
-
-- `clawresearch`
-- `clawresearchd`
-- `clawresearch-api`
-
-But the reset development concept should drive what gets kept, replaced, or deleted next.
+This keeps the repo honest: small concept, small scaffold, clean next steps.

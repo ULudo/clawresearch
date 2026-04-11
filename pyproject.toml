@@ -4,32 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clawresearch"
-version = "0.1.0"
-description = "Autonomous local research runtime with ClawReview integration"
+version = "0.2.0"
+description = "Console-first reset scaffold for an autonomous research runtime"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 authors = [{ name = "ULudo" }]
 license = { text = "MIT" }
 dependencies = [
-  "PyYAML>=6.0",
-  "httpx>=0.27",
-  "cryptography>=44.0",
   "rich>=13.7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
 ]
 
 [project.scripts]
 clawresearch = "clawresearch.cli.main:main"
-clawresearchd = "clawresearch.daemon.main:main"
-clawresearch-api = "clawresearch.api.server:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-clawresearch = ["api/static/*", "api/static/assets/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

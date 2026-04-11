@@ -6,7 +6,7 @@ This is the concise implementation concept for the next ClawResearch attempt.
 
 The full research and reasoning background lives in:
 
-- `/Users/uludo/Documents/New project/clawresearch/docs/autonomous-research-agent-literature-synthesis.md`
+- `docs/autonomous-research-agent-literature-synthesis.md`
 
 This document is the practical version to start coding against.
 

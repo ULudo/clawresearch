@@ -11,7 +11,7 @@ The goal is not just to summarize papers. The goal is to extract what the litera
 - what a serious autonomous research system must be able to do
 - how such a system should be engineered if we want publishable, defensible research outputs rather than impressive demos
 
-This document is written as a design input for `/Users/uludo/Documents/New project/clawresearch`.
+This document is written as a design input for the `clawresearch` repository.
 
 ## Sources Reviewed
 
