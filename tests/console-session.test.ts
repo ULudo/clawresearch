@@ -1,8 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { appendFile } from "node:fs/promises";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   type ConsoleIo,
   runPhaseOneConsole
@@ -12,6 +14,9 @@ import type {
   IntakeRequest,
   IntakeResponse
 } from "../src/runtime/intake-backend.js";
+import type { RunController } from "../src/runtime/run-controller.js";
+import { appendRunEvent } from "../src/runtime/run-events.js";
+import { RunStore } from "../src/runtime/run-store.js";
 
 type CapturedIo = ConsoleIo & {
   output: string;
@@ -45,6 +50,130 @@ function createNow(): () => string {
     step += 1;
     return timestamp;
   };
+}
+
+class FakeRunController implements RunController {
+  private nextPid = 4000;
+  private readonly alive = new Set<number>();
+
+  async launch(): Promise<number> {
+    const pid = this.nextPid;
+    this.nextPid += 1;
+    this.alive.add(pid);
+    return pid;
+  }
+
+  async pause(workerPid: number): Promise<void> {
+    if (!this.alive.has(workerPid)) {
+      throw new Error(`process ${workerPid} is not alive`);
+    }
+  }
+
+  async resume(workerPid: number): Promise<void> {
+    if (!this.alive.has(workerPid)) {
+      throw new Error(`process ${workerPid} is not alive`);
+    }
+  }
+
+  isProcessAlive(workerPid: number): boolean {
+    return this.alive.has(workerPid);
+  }
+}
+
+class WatchedFakeRunController implements RunController {
+  private nextPid = 5000;
+  private readonly alive = new Set<number>();
+
+  constructor(
+    private readonly now: () => string,
+    private readonly stepDelayMs = 10
+  ) {}
+
+  async launch(run: { id: string; projectRoot: string; appVersion: string }): Promise<number> {
+    const pid = this.nextPid;
+    this.nextPid += 1;
+    this.alive.add(pid);
+
+    void this.simulateRunLifecycle(run, pid);
+    return pid;
+  }
+
+  async pause(workerPid: number): Promise<void> {
+    if (!this.alive.has(workerPid)) {
+      throw new Error(`process ${workerPid} is not alive`);
+    }
+  }
+
+  async resume(workerPid: number): Promise<void> {
+    if (!this.alive.has(workerPid)) {
+      throw new Error(`process ${workerPid} is not alive`);
+    }
+  }
+
+  isProcessAlive(workerPid: number): boolean {
+    return this.alive.has(workerPid);
+  }
+
+  private async simulateRunLifecycle(
+    run: { id: string; projectRoot: string; appVersion: string },
+    pid: number
+  ): Promise<void> {
+    const store = new RunStore(run.projectRoot, run.appVersion, this.now);
+
+    await delay(this.stepDelayMs);
+    const running = await store.load(run.id);
+    running.status = "running";
+    running.startedAt = running.startedAt ?? this.now();
+    running.statusMessage = "The detached shell job is running.";
+    await store.save(running);
+    await appendRunEvent(running.artifacts.eventsPath, {
+      timestamp: this.now(),
+      kind: "run",
+      message: "Run worker started."
+    });
+    await appendRunEvent(running.artifacts.eventsPath, {
+      timestamp: this.now(),
+      kind: "plan",
+      message: "Persist the research brief, prepare initial run artifacts, and launch the detached bootstrap command."
+    });
+    await appendRunEvent(running.artifacts.eventsPath, {
+      timestamp: this.now(),
+      kind: "next",
+      message: "Launch the initial bootstrap command in the project directory."
+    });
+    await appendRunEvent(running.artifacts.eventsPath, {
+      timestamp: this.now(),
+      kind: "exec",
+      message: "bash -lc clawresearch phase-2 bootstrap"
+    });
+    await appendFile(running.artifacts.stdoutPath, "Bootstrap output\n", "utf8");
+    await appendRunEvent(running.artifacts.eventsPath, {
+      timestamp: this.now(),
+      kind: "stdout",
+      message: "Bootstrap output"
+    });
+
+    await delay(this.stepDelayMs);
+    const completed = await store.load(run.id);
+    completed.status = "completed";
+    completed.workerPid = null;
+    completed.finishedAt = this.now();
+    completed.job.exitCode = 0;
+    completed.job.finishedAt = this.now();
+    completed.statusMessage = "Initial detached run bootstrap completed successfully.";
+    await store.save(completed);
+    await appendRunEvent(completed.artifacts.eventsPath, {
+      timestamp: this.now(),
+      kind: "summary",
+      message: "Initial detached bootstrap finished successfully."
+    });
+    await appendRunEvent(completed.artifacts.eventsPath, {
+      timestamp: this.now(),
+      kind: "run",
+      message: "Initial detached run bootstrap completed successfully."
+    });
+    this.alive.delete(pid);
+  }
 }
 
 class StubIntakeBackend implements IntakeBackend {
@@ -594,7 +723,8 @@ test("startup chat treats greetings as greetings instead of brief fields", async
       projectRoot,
       version: "0.5.0",
       now: createNow(),
-      intakeBackend: new StubIntakeBackend()
+      intakeBackend: new StubIntakeBackend(),
+      runController: new FakeRunController()
     });
 
     assert.equal(code, 0);
@@ -625,7 +755,8 @@ test("phase one console uses the intake backend to refine a stakeholder-style br
       projectRoot,
       version: "0.5.0",
       now: createNow(),
-      intakeBackend: new StubIntakeBackend()
+      intakeBackend: new StubIntakeBackend(),
+      runController: new FakeRunController()
     });
 
     assert.equal(code, 0);
@@ -635,13 +766,17 @@ test("phase one console uses the intake backend to refine a stakeholder-style br
     assert.match(io.output, /Best next question: Is this a literature synthesis, computational exploration, or a bounded mathematical subproblem\?/);
     assert.doesNotMatch(io.output, /structured brief/i);
     assert.match(io.output, /Summary: A bounded computational-exploration project around the Riemann hypothesis/);
-    assert.match(io.output, /Phase 1 handoff saved\./);
+    assert.match(io.output, /Research run started\./);
+    assert.match(io.output, /Status: queued/);
+    assert.match(io.output, /\.clawresearch\/runs\/run-/);
     assert.match(io.output, /Session saved\. Closing ClawResearch\./);
 
     const sessionPath = path.join(projectRoot, ".clawresearch", "session.json");
     const session = JSON.parse(await readFile(sessionPath, "utf8")) as {
       status: string;
       goCount: number;
+      activeRunId: string | null;
+      lastRunId: string | null;
       intake: {
         readiness: string;
         backendLabel: string;
@@ -656,10 +791,16 @@ test("phase one console uses the intake backend to refine a stakeholder-style br
 
     assert.equal(session.status, "ready");
     assert.equal(session.goCount, 1);
+    assert.equal(session.activeRunId, session.lastRunId);
+    assert.notEqual(session.activeRunId, null);
     assert.equal(session.intake.readiness, "ready");
     assert.equal(session.intake.backendLabel, "stub:intake");
     assert.match(session.brief.topic, /Riemann hypothesis/);
     assert.match(session.brief.successCriterion, /reproducible exploratory note/);
+
+    const runStore = new RunStore(projectRoot, "0.5.0", createNow());
+    const run = await runStore.load(session.activeRunId!);
+    assert.equal(run.status, "queued");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -681,7 +822,8 @@ test("phase one console breaks out of repeated clarification loops by drafting a
       projectRoot,
       version: "0.5.0",
       now: createNow(),
-      intakeBackend: new RepeatingQuestionBackend()
+      intakeBackend: new RepeatingQuestionBackend(),
+      runController: new FakeRunController()
     });
 
     assert.equal(code, 0);
@@ -710,7 +852,8 @@ test("phase one console uses the same recovery pattern outside the open-problem 
       projectRoot,
       version: "0.5.0",
       now: createNow(),
-      intakeBackend: new GenericRepeatingBackend()
+      intakeBackend: new GenericRepeatingBackend(),
+      runController: new FakeRunController()
     });
 
     assert.equal(code, 0);
@@ -740,7 +883,8 @@ test("phase one console drafts a research suggestion once the user has provided 
       projectRoot,
       version: "0.5.0",
       now: createNow(),
-      intakeBackend: new DeepClarificationBackend()
+      intakeBackend: new DeepClarificationBackend(),
+      runController: new FakeRunController()
     });
 
     assert.equal(code, 0);
@@ -766,18 +910,20 @@ test("phase one console preserves the exact wording of a complete proposed brief
       projectRoot,
       version: "0.5.0",
       now: createNow(),
-      intakeBackend: new CompleteProposalBackend()
+      intakeBackend: new CompleteProposalBackend(),
+      runController: new FakeRunController()
     });
 
     assert.equal(code, 0);
     assert.match(io.output, /here is a working research brief/i);
-    assert.match(io.output, /Phase 1 handoff saved\./);
-    assert.match(io.output, /Research direction: Review current evidence, compare reported deployment patterns, and identify the clearest displacement mechanisms and gaps for follow-up\./);
+    assert.match(io.output, /Research run started\./);
+    assert.match(io.output, /Status: queued/);
 
     const sessionPath = path.join(projectRoot, ".clawresearch", "session.json");
     const session = JSON.parse(await readFile(sessionPath, "utf8")) as {
       status: string;
       goCount: number;
+      activeRunId: string | null;
       brief: {
         researchDirection: string;
         successCriterion: string;
@@ -789,6 +935,7 @@ test("phase one console preserves the exact wording of a complete proposed brief
 
     assert.equal(session.status, "ready");
     assert.equal(session.goCount, 1);
+    assert.notEqual(session.activeRunId, null);
     assert.equal(session.intake.readiness, "ready");
     assert.equal(
       session.brief.researchDirection,
@@ -798,6 +945,116 @@ test("phase one console preserves the exact wording of a complete proposed brief
       session.brief.successCriterion,
       "Produce a literature-grounded research note that maps current evidence, distinguishes observed effects from speculation, and identifies the strongest next questions for follow-up."
     );
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("phase one console saves a local debug transcript of the interaction", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-transcript-"));
+
+  try {
+    const io = createScriptedIo([
+      "Hi, can you hear me?",
+      "/quit"
+    ]);
+
+    const code = await runPhaseOneConsole(io, {
+      projectRoot,
+      version: "0.7.0",
+      now: createNow(),
+      intakeBackend: new StubIntakeBackend(),
+      runController: new FakeRunController()
+    });
+
+    assert.equal(code, 0);
+
+    const transcript = await readFile(
+      path.join(projectRoot, ".clawresearch", "console-transcript.log"),
+      "utf8"
+    );
+
+    assert.match(transcript, /Debug log: \.clawresearch\/console-transcript\.log/);
+    assert.match(transcript, /consultant\s+What research problem should I investigate/);
+    assert.match(transcript, /clawresearch> Hi, can you hear me\?/);
+    assert.match(transcript, /clawresearch> \/quit/);
+    assert.match(transcript, /system\s+Session saved\. Closing ClawResearch\./);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("phase two console can pause and resume the active detached run", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-pause-resume-"));
+
+  try {
+    const io = createScriptedIo([
+      "I want to study AI job displacement in nursing homes",
+      "/go",
+      "/pause",
+      "/status",
+      "/resume",
+      "/quit"
+    ]);
+
+    const code = await runPhaseOneConsole(io, {
+      projectRoot,
+      version: "0.6.0",
+      now: createNow(),
+      intakeBackend: new CompleteProposalBackend(),
+      runController: new FakeRunController()
+    });
+
+    assert.equal(code, 0);
+    assert.match(io.output, /Research run started\./);
+    assert.match(io.output, /Paused run run-/);
+    assert.match(io.output, /status: paused/);
+    assert.match(io.output, /Resumed run run-/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("phase two console streams live run progress and reports completion", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-watch-run-"));
+  const now = createNow();
+
+  try {
+    const io = createScriptedIo([
+      "I want to study AI job displacement in nursing homes",
+      "/go",
+      "/status",
+      "/quit"
+    ]);
+
+    const code = await runPhaseOneConsole(io, {
+      projectRoot,
+      version: "0.7.0",
+      now,
+      intakeBackend: new CompleteProposalBackend(),
+      runController: new WatchedFakeRunController(now),
+      watchRuns: true,
+      watchPollMs: 5
+    });
+
+    assert.equal(code, 0);
+    assert.match(io.output, /run\s+Research run started\./);
+    assert.match(io.output, /watch\s+Streaming live run activity/);
+    assert.match(io.output, /plan\s+Persist the research brief/);
+    assert.match(io.output, /exec\s+bash -lc clawresearch phase-2 bootstrap/);
+    assert.match(io.output, /stdout\s+Bootstrap output/);
+    assert.match(io.output, /done\s+Run run-/);
+    assert.match(io.output, /status: completed/);
+    assert.match(io.output, /events: \.clawresearch\/runs\/run-.*\/events\.jsonl/);
+
+    const sessionPath = path.join(projectRoot, ".clawresearch", "session.json");
+    const session = JSON.parse(await readFile(sessionPath, "utf8")) as {
+      activeRunId: string | null;
+      lastRunId: string | null;
+    };
+
+    assert.equal(session.activeRunId, null);
+    assert.notEqual(session.lastRunId, null);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -821,18 +1078,20 @@ test("phase one console can complete missing structured fields when the user inv
       projectRoot,
       version: "0.5.0",
       now: createNow(),
-      intakeBackend: new GoCompletionBackend()
+      intakeBackend: new GoCompletionBackend(),
+      runController: new FakeRunController()
     });
 
     assert.equal(code, 0);
     assert.match(io.output, /I can complete the missing brief details from our discussion/i);
-    assert.match(io.output, /Phase 1 handoff saved\./);
-    assert.match(io.output, /Research question: Which algorithmic and computational methods could meaningfully advance numerical study or verification work related to the Riemann Hypothesis\?/);
+    assert.match(io.output, /Research run started\./);
+    assert.match(io.output, /Status: queued/);
 
     const sessionPath = path.join(projectRoot, ".clawresearch", "session.json");
     const session = JSON.parse(await readFile(sessionPath, "utf8")) as {
       status: string;
       goCount: number;
+      activeRunId: string | null;
       brief: {
         researchQuestion: string;
         successCriterion: string;
@@ -841,6 +1100,7 @@ test("phase one console can complete missing structured fields when the user inv
 
     assert.equal(session.status, "ready");
     assert.equal(session.goCount, 1);
+    assert.notEqual(session.activeRunId, null);
     assert.match(session.brief.researchQuestion, /algorithmic and computational methods/);
     assert.match(session.brief.successCriterion, /literature-grounded research note/);
   } finally {
@@ -862,7 +1122,8 @@ test("phase one console reframes an over-ambitious complete brief into a bounded
       projectRoot,
       version: "0.5.0",
       now: createNow(),
-      intakeBackend: new OverambitiousProposalBackend()
+      intakeBackend: new OverambitiousProposalBackend(),
+      runController: new FakeRunController()
     });
 
     assert.equal(code, 0);

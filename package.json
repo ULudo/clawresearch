@@ -1,6 +1,6 @@
 {
   "name": "clawresearch",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Console-first TypeScript scaffold for an autonomous research runtime",
   "type": "module",
   "bin": {

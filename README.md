@@ -72,7 +72,7 @@ npm install
 npm run dev
 ```
 
-That starts the Phase 1 console runtime in the current directory. The startup chat is now meant to behave like a real research intake conversation, backed by a local Ollama model by default.
+That starts the console runtime in the current directory. The startup chat behaves like a real research intake conversation, backed by a local Ollama model by default.
 
 Current local-model assumption:
 
@@ -92,13 +92,15 @@ The intake chat gradually clarifies and captures:
 - research direction
 - success criterion
 
-If the consultant proposes a concrete first-pass brief, `/go` can accept that draft directly and the saved brief should mirror the proposal the model presented.
+If the consultant proposes a concrete first-pass brief, `/go` can accept that draft directly, start a detached local run, stream live progress in the terminal, and persist the run artifacts under the project runtime directory.
 
 Useful slash commands inside the console:
 
 - `/help`
 - `/status`
 - `/go`
+- `/pause`
+- `/resume`
 - `/quit`
 - `/exit`
 
@@ -107,6 +109,32 @@ Minimal runtime state is persisted locally in:
 ```text
 .clawresearch/session.json
 ```
+
+The console also keeps a raw debug transcript of the interaction in:
+
+```text
+.clawresearch/console-transcript.log
+```
+
+Detached runs are stored under:
+
+```text
+.clawresearch/runs/<run-id>/
+```
+
+Each run keeps a small set of debuggable local artifacts, including:
+
+- `run.json`
+- `trace.log`
+- `events.jsonl`
+- `stdout.log`
+- `stderr.log`
+- `brief.json`
+- `summary.md`
+
+`events.jsonl` is the structured event stream the console watches while a run is active. It currently emits small, readable steps such as `plan`, `next`, `exec`, `summary`, `stdout`, and terminal `run` updates.
+
+The current detached worker is still intentionally minimal. It proves the runtime shape, logging, and observability layer, but it does not yet perform a real literature review or full autonomous research loop.
 
 After dependencies are installed, the runtime can also be built and run as compiled JavaScript:
 
@@ -130,7 +158,7 @@ ClawResearch
 Project root: /path/to/project
 Runtime state: .clawresearch/session.json
 
-Phase 1 startup chat is ready.
+Startup research chat is ready.
 This chat should feel like a stakeholder handing a research project to a capable research partner.
 
 What research problem should I investigate for this project, and what kind of outcome would make the work useful to you?
@@ -139,6 +167,15 @@ clawresearch> The main question is whether a cheaper sampling strategy can prese
 clawresearch> Start from a reproducible baseline and compare a couple of bounded ablations.
 clawresearch> Success means staying within 1% of baseline accuracy while cutting runtime by 20%.
 clawresearch> /go
+run        Research run started.
+run        Run id: run-...
+run        Status: queued
+run        Trace: .clawresearch/runs/run-.../trace.log
+run        Events: .clawresearch/runs/run-.../events.jsonl
+watch      Streaming live run activity from .clawresearch/runs/run-.../events.jsonl.
+plan       Persist the research brief, prepare initial run artifacts, and launch the detached bootstrap command.
+exec       bash -lc ...
+done       Run run-... completed.
 ```
 
 ## Repo Layout

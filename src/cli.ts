@@ -13,6 +13,7 @@ import {
   runPhaseOneConsole
 } from "./runtime/console-app.js";
 import type { IntakeBackend } from "./runtime/intake-backend.js";
+import { runDetachedJobWorker } from "./runtime/run-worker.js";
 
 function writeLine(writer: OutputWriter, line = ""): void {
   writer.write(`${line}\n`);
@@ -62,14 +63,26 @@ function renderHelp(writer: OutputWriter): void {
   writeLine(writer, "  clawresearch --help");
   writeLine(writer);
   writeLine(writer, "Default behavior:");
-  writeLine(writer, "  Starts the Phase 1 interactive research chat in the current directory.");
+  writeLine(writer, "  Starts the interactive research chat in the current directory, launches detached runs from `/go`, and streams their saved progress events in the terminal.");
   writeLine(writer);
   writeLine(writer, "Slash commands inside the console:");
   writeLine(writer, "  /help");
   writeLine(writer, "  /status");
   writeLine(writer, "  /go");
+  writeLine(writer, "  /pause");
+  writeLine(writer, "  /resume");
   writeLine(writer, "  /quit");
   writeLine(writer, "  /exit");
+}
+
+function readOptionValue(argv: string[], optionName: string): string | null {
+  const index = argv.indexOf(optionName);
+
+  if (index === -1) {
+    return null;
+  }
+
+  return argv[index + 1] ?? null;
 }
 
 function createConsoleIo(input = process.stdin, output = process.stdout): ConsoleIo {
@@ -107,6 +120,16 @@ export async function main(argv: string[], options: MainOptions = {}): Promise<n
   const packageRoot = await findPackageRoot(moduleDirectory);
   const docs = await resolveDocs(packageRoot);
   const writer = options.writer ?? process.stdout;
+  const runId = readOptionValue(argv, "--run-job");
+  const detachedProjectRoot = readOptionValue(argv, "--project-root");
+
+  if (runId !== null) {
+    return runDetachedJobWorker({
+      projectRoot: detachedProjectRoot ?? process.cwd(),
+      runId,
+      version
+    });
+  }
 
   if (args.has("--version")) {
     writeLine(writer, version);

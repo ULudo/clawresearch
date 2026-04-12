@@ -3,7 +3,7 @@ import path from "node:path";
 
 export const runtimeDirectoryName = ".clawresearch";
 export const sessionFileName = "session.json";
-const schemaVersion = 2;
+const schemaVersion = 3;
 
 export type ResearchBriefField =
   | "topic"
@@ -49,6 +49,8 @@ export type SessionState = {
   status: SessionStatus;
   goCount: number;
   lastGoRequestedAt: string | null;
+  activeRunId: string | null;
+  lastRunId: string | null;
   brief: ResearchBrief;
   intake: IntakeState;
   conversation: ConversationEntry[];
@@ -86,6 +88,8 @@ function createSessionState(projectRoot: string, version: string, timestamp: str
     status: "startup_chat",
     goCount: 0,
     lastGoRequestedAt: null,
+    activeRunId: null,
+    lastRunId: null,
     brief: createEmptyBrief(),
     intake: {
       backendLabel: null,
@@ -120,7 +124,7 @@ function mergeSession(raw: unknown, projectRoot: string, version: string, timest
   const rawSchemaVersion = typeof session.schemaVersion === "number" && Number.isFinite(session.schemaVersion)
     ? session.schemaVersion
     : 0;
-  const isLegacySession = rawSchemaVersion < schemaVersion;
+  const shouldResetLegacyBrief = rawSchemaVersion < 2;
 
   return {
     schemaVersion,
@@ -132,7 +136,9 @@ function mergeSession(raw: unknown, projectRoot: string, version: string, timest
     status: session.status === "ready" ? "ready" : "startup_chat",
     goCount: typeof session.goCount === "number" && Number.isFinite(session.goCount) ? session.goCount : 0,
     lastGoRequestedAt: readString(session.lastGoRequestedAt),
-    brief: isLegacySession
+    activeRunId: readString(session.activeRunId),
+    lastRunId: readString(session.lastRunId),
+    brief: shouldResetLegacyBrief
       ? { ...base.brief }
       : {
         topic: readString(brief.topic),
@@ -161,7 +167,7 @@ function mergeSession(raw: unknown, projectRoot: string, version: string, timest
         return [];
       }
 
-      if (isLegacySession) {
+      if (shouldResetLegacyBrief) {
         if (role !== "user") {
           return [];
         }

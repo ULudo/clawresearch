@@ -87,9 +87,11 @@ test("help flag prints interactive usage and slash commands", async () => {
   const code = await main(["--help"], { writer: sink.writer });
 
   assert.equal(code, 0);
-  assert.match(sink.output, /Starts the Phase 1 interactive research chat/);
+  assert.match(sink.output, /Starts the interactive research chat in the current directory, launches detached runs from `\/go`, and streams their saved progress events in the terminal\./);
   assert.match(sink.output, /\/go/);
   assert.match(sink.output, /\/status/);
+  assert.match(sink.output, /\/pause/);
+  assert.match(sink.output, /\/resume/);
 });
 
 test("default entry launches the console runtime in the current project directory", async () => {
@@ -120,7 +122,7 @@ test("compiled cli still runs when invoked through a symlinked path", async () =
       cwd: path.resolve(".")
     });
 
-    assert.match(stdout, /Starts the Phase 1 interactive research chat/);
+    assert.match(stdout, /Starts the interactive research chat in the current directory, launches detached runs from `\/go`, and streams their saved progress events in the terminal\./);
     assert.match(stdout, /\/quit/);
   } finally {
     await rm(scratchRoot, { recursive: true, force: true });

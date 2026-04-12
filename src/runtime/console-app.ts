@@ -1,4 +1,5 @@
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   appendConversationEntry,
   type ConversationKind,
@@ -14,6 +15,23 @@ import {
   type IntakeRequest,
   type IntakeResponse
 } from "./intake-backend.js";
+import {
+  createDefaultRunController,
+  type RunController
+} from "./run-controller.js";
+import {
+  RunStore,
+  type RunRecord
+} from "./run-store.js";
+import {
+  ConsoleTranscript
+} from "./console-transcript.js";
+import {
+  parseRunEventLines,
+  readRunEventChunk,
+  type RunEventKind,
+  type RunEventRecord
+} from "./run-events.js";
 
 export type OutputWriter = {
   write: (chunk: string) => void;
@@ -30,6 +48,9 @@ type RunOptions = {
   version: string;
   now?: () => string;
   intakeBackend?: IntakeBackend;
+  runController?: RunController;
+  watchRuns?: boolean;
+  watchPollMs?: number;
 };
 
 type BriefUpdate = {
@@ -56,9 +77,38 @@ const directEndStatePattern = /\b(prove|proof|cure|eradicate|eliminate|breakthro
 const boundedModePattern = /\b(literature|survey|review|map|mapping|synthesis|synthesize|evaluate|evaluation|compare|comparison|benchmark|benchmarking|replicat|reproduc|exploratory|exploration|pilot|feasibility|bounded|subproblem|case study|research note|note|prototype|ablation|identify|assessment|assess|scope|follow[- ]?up|baseline|artifact|memo|analysis)\b/i;
 const deliverablePattern = /\b(note|report|analysis|benchmark|evaluation|survey|mapping|synthesis|prototype|experiment|ablation|dataset|replication|reproduction|review|plan|feasibility|baseline|artifact|memo)\b/i;
 const genericFieldPattern = /^(?:algorithmic approaches?|computational methods?|literature review|historical context|theoretical frameworks?|number theory|physics|mathematics|applications?)$/i;
+const taggedLabelWidth = 10;
 
 function writeLine(writer: OutputWriter, line = ""): void {
   writer.write(`${line}\n`);
+}
+
+function createLoggedWriter(baseWriter: OutputWriter, transcript: ConsoleTranscript): OutputWriter {
+  return {
+    write(chunk: string): void {
+      baseWriter.write(chunk);
+      transcript.appendOutput(chunk);
+    }
+  };
+}
+
+function renderTaggedBlock(writer: OutputWriter, tag: string, text: string): void {
+  const lines = text.split(/\r?\n/);
+
+  for (const line of lines) {
+    if (line.length === 0) {
+      writeLine(writer);
+      continue;
+    }
+
+    writeLine(writer, `${tag.padEnd(taggedLabelWidth)} ${line}`);
+  }
+}
+
+function renderTaggedLines(writer: OutputWriter, tag: string, lines: string[]): void {
+  for (const line of lines) {
+    renderTaggedBlock(writer, tag, line);
+  }
 }
 
 function relativeProjectPath(projectRoot: string, targetPath: string): string {
@@ -66,42 +116,51 @@ function relativeProjectPath(projectRoot: string, targetPath: string): string {
   return relativePath.length === 0 ? "." : relativePath;
 }
 
-function renderBanner(writer: OutputWriter, session: SessionState): void {
+function renderBanner(writer: OutputWriter, session: SessionState, transcriptPath: string): void {
   writeLine(writer, "ClawResearch");
   writeLine(writer, "============");
   writeLine(writer, `Project root: ${session.projectRoot}`);
   writeLine(writer, `Runtime state: ${relativeProjectPath(session.projectRoot, session.runtimeDirectory)}/${"session.json"}`);
+  writeLine(writer, `Debug log: ${relativeProjectPath(session.projectRoot, transcriptPath)}`);
   writeLine(writer);
 }
 
 function renderWelcome(writer: OutputWriter, session: SessionState): void {
   if (session.conversation.length === 0) {
-    writeLine(writer, "Phase 1 startup chat is ready.");
+    writeLine(writer, "Startup research chat is ready.");
     writeLine(writer, "This chat should feel like a stakeholder handing a research project to a capable research partner.");
   } else {
     writeLine(writer, "Resuming the saved startup chat for this project.");
   }
 
   writeLine(writer, "The current directory is treated as the project root automatically.");
-  writeLine(writer, "Use `/help` for commands, `/status` for the current brief, `/go` when the brief is genuinely ready, and `/quit` to leave.");
+  writeLine(writer, "Use `/help` for commands, `/status` for the current brief and run state, `/go` to start a detached run when the brief is ready, and `/quit` to leave.");
   writeLine(writer);
 }
 
 function renderHelp(writer: OutputWriter, session: SessionState): void {
   writeLine(writer, "Commands:");
   writeLine(writer, "  /help   Show the command list and input hints");
-  writeLine(writer, "  /status Show the current research brief, open questions, and backend");
-  writeLine(writer, "  /go     Save the current brief as the Phase 1 handoff if it is ready");
+  writeLine(writer, "  /status Show the current research brief, run state, and backend");
+  writeLine(writer, "  /go     Start a detached run from the current research brief");
+  writeLine(writer, "  /pause  Pause the active detached run");
+  writeLine(writer, "  /resume Resume the active detached run");
   writeLine(writer, "  /quit   Save and exit");
   writeLine(writer, "  /exit   Alias for /quit");
   writeLine(writer);
   writeLine(writer, "Input hints:");
   writeLine(writer, "  Talk naturally about the project as if briefing a researcher.");
   writeLine(writer, "  You can still force a specific field with `topic:`, `question:`, `direction:`, or `success:`.");
+  writeLine(writer, "  Detached runs stream progress in the console and save a debug transcript locally.");
   writeLine(writer, `  Local intake backend: ${session.intake.backendLabel ?? "not configured"}`);
 }
 
-function renderStatus(writer: OutputWriter, session: SessionState): void {
+function renderStatus(
+  writer: OutputWriter,
+  session: SessionState,
+  run: RunRecord | null,
+  transcriptPath: string
+): void {
   writeLine(writer, "Current brief:");
   writeLine(writer, `  topic: ${session.brief.topic ?? "<missing>"}`);
   writeLine(writer, `  research question: ${session.brief.researchQuestion ?? "<missing>"}`);
@@ -131,10 +190,30 @@ function renderStatus(writer: OutputWriter, session: SessionState): void {
   }
 
   writeLine(writer);
+  writeLine(writer, "Run:");
+
+  if (run === null) {
+    writeLine(writer, "  none yet");
+  } else {
+    writeLine(writer, `  id: ${run.id}`);
+    writeLine(writer, `  status: ${run.status}`);
+
+    if (run.statusMessage !== null) {
+      writeLine(writer, `  detail: ${run.statusMessage}`);
+    }
+
+    writeLine(writer, `  trace: ${relativeProjectPath(session.projectRoot, run.artifacts.tracePath)}`);
+    writeLine(writer, `  events: ${relativeProjectPath(session.projectRoot, run.artifacts.eventsPath)}`);
+    writeLine(writer, `  stdout: ${relativeProjectPath(session.projectRoot, run.artifacts.stdoutPath)}`);
+    writeLine(writer, `  stderr: ${relativeProjectPath(session.projectRoot, run.artifacts.stderrPath)}`);
+  }
+
+  writeLine(writer);
   writeLine(writer, `Status: ${session.status}`);
   writeLine(writer, `Go requests: ${session.goCount}`);
   writeLine(writer, `Messages saved: ${session.conversation.length}`);
   writeLine(writer, `Backend: ${session.intake.backendLabel ?? "<unknown>"}`);
+  writeLine(writer, `Debug log: ${relativeProjectPath(session.projectRoot, transcriptPath)}`);
 }
 
 function parseExplicitBriefUpdate(input: string): BriefUpdate | null {
@@ -561,6 +640,98 @@ function buildGoNotReadyLines(session: SessionState): string[] {
   return lines;
 }
 
+function eventTag(kind: RunEventKind): string {
+  switch (kind) {
+    case "run":
+      return "run";
+    case "plan":
+      return "plan";
+    case "summary":
+      return "summary";
+    case "next":
+      return "next";
+    case "exec":
+      return "exec";
+    case "stdout":
+      return "stdout";
+    case "stderr":
+      return "stderr";
+  }
+}
+
+function renderRunEvent(writer: OutputWriter, event: RunEventRecord): void {
+  renderTaggedBlock(writer, eventTag(event.kind), event.message);
+}
+
+async function readNewRunEvents(
+  run: RunRecord,
+  cursor: { offset: number; trailingBuffer: string }
+): Promise<RunEventRecord[]> {
+  const chunk = await readRunEventChunk(run.artifacts.eventsPath, cursor.offset);
+  cursor.offset = chunk.nextOffset;
+  const parsed = parseRunEventLines(chunk.content, cursor.trailingBuffer);
+  cursor.trailingBuffer = parsed.trailingBuffer;
+  return parsed.events;
+}
+
+function isTerminalRun(run: RunRecord): boolean {
+  return run.status === "completed" || run.status === "failed";
+}
+
+function createInitialRunCommand(): string[] {
+  return ["bash", "-lc", "clawresearch phase-2 bootstrap"];
+}
+
+async function loadRunIfPresent(
+  runStore: RunStore,
+  runId: string | null
+): Promise<RunRecord | null> {
+  if (runId === null) {
+    return null;
+  }
+
+  try {
+    return await runStore.load(runId);
+  } catch {
+    return null;
+  }
+}
+
+async function reconcileRelevantRun(
+  session: SessionState,
+  store: SessionStore,
+  runStore: RunStore,
+  runController: RunController,
+  now: () => string
+): Promise<RunRecord | null> {
+  let run = await loadRunIfPresent(runStore, session.activeRunId);
+
+  if (run !== null && !isTerminalRun(run) && run.workerPid !== null && !runController.isProcessAlive(run.workerPid)) {
+    run.status = "failed";
+    run.finishedAt = run.finishedAt ?? now();
+    run.workerPid = null;
+    run.statusMessage = "Detached run worker stopped before the run finished cleanly.";
+    await runStore.save(run);
+  }
+
+  if (run !== null && isTerminalRun(run) && session.activeRunId === run.id) {
+    session.activeRunId = null;
+    session.lastRunId = run.id;
+    await store.save(session);
+  }
+
+  if (run !== null) {
+    return run;
+  }
+
+  if (session.activeRunId !== null) {
+    session.activeRunId = null;
+    await store.save(session);
+  }
+
+  return loadRunIfPresent(runStore, session.lastRunId);
+}
+
 function goReadinessFailures(session: SessionState): string[] {
   const failures: string[] = [];
   const missingFields = summarizeMissingFields(session);
@@ -618,13 +789,13 @@ async function emitAssistantTurn(
         await requestAssistantTurn(session, backend, "recover", recoveryReason)
       );
     applyIntakeResponse(session, response);
-    writeLine(writer, response.assistantMessage);
+    renderTaggedBlock(writer, "consultant", response.assistantMessage);
     saveAssistantMessage(session, response.assistantMessage, now());
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown backend failure";
     session.intake.lastError = message;
     const fallback = "The local intake model is unavailable right now. You can keep chatting, use explicit field prefixes, or retry once Ollama is responding again.";
-    writeLine(writer, fallback);
+    renderTaggedBlock(writer, "system", fallback);
     saveAssistantMessage(session, fallback, now(), "system");
   }
 
@@ -661,13 +832,93 @@ async function attemptBriefCompletionForGo(
   return goReadinessFailures(session).length === 0;
 }
 
+async function watchRunProgress(
+  writer: OutputWriter,
+  session: SessionState,
+  store: SessionStore,
+  runStore: RunStore,
+  runController: RunController,
+  run: RunRecord,
+  now: () => string,
+  watchPollMs: number
+): Promise<RunRecord | null> {
+  const cursor = {
+    offset: 0,
+    trailingBuffer: ""
+  };
+
+  renderTaggedBlock(
+    writer,
+    "watch",
+    `Streaming live run activity from ${relativeProjectPath(session.projectRoot, run.artifacts.eventsPath)}.`
+  );
+
+  while (true) {
+    const events = await readNewRunEvents(run, cursor);
+
+    for (const event of events) {
+      renderRunEvent(writer, event);
+    }
+
+    const currentRun = await reconcileRelevantRun(session, store, runStore, runController, now);
+
+    if (currentRun === null) {
+      renderTaggedBlock(writer, "run", "The detached run record is no longer available.");
+      return null;
+    }
+
+    run = currentRun;
+
+    if (isTerminalRun(run)) {
+      const trailingEvents = await readNewRunEvents(run, cursor);
+
+      for (const event of trailingEvents) {
+        renderRunEvent(writer, event);
+      }
+
+      renderTaggedBlock(
+        writer,
+        run.status === "completed" ? "done" : "error",
+        run.status === "completed"
+          ? `Run ${run.id} completed.`
+          : `Run ${run.id} failed.`
+      );
+      return run;
+    }
+
+    await delay(watchPollMs);
+  }
+}
+
 async function handleGoCommand(
   writer: OutputWriter,
   session: SessionState,
   store: SessionStore,
+  runStore: RunStore,
   backend: IntakeBackend,
-  now: () => string
+  runController: RunController,
+  now: () => string,
+  watchRuns: boolean,
+  watchPollMs: number
 ): Promise<void> {
+  const reconciledRun = await reconcileRelevantRun(session, store, runStore, runController, now);
+
+  if (reconciledRun !== null && !isTerminalRun(reconciledRun)) {
+    const lines = [
+      "A detached research run is already active for this project.",
+      `Run id: ${reconciledRun.id}`,
+      `Status: ${reconciledRun.status}`,
+      `Trace: ${relativeProjectPath(session.projectRoot, reconciledRun.artifacts.tracePath)}`,
+      "Use `/status` to inspect it, or `/pause` and `/resume` to control it."
+    ];
+
+    renderTaggedLines(writer, "run", lines);
+
+    saveAssistantMessage(session, lines.join(" "), now(), "command");
+    await store.save(session);
+    return;
+  }
+
   const neededCompletion = summarizeMissingFields(session).length > 0
     || session.intake.readiness !== "ready";
 
@@ -693,9 +944,7 @@ async function handleGoCommand(
   if (failures.length > 0) {
     const lines = buildGoNotReadyLines(session);
 
-    for (const line of lines) {
-      writeLine(writer, line);
-    }
+    renderTaggedLines(writer, "consultant", lines);
 
     saveAssistantMessage(session, lines.join(" "), now(), "command");
     await store.save(session);
@@ -703,23 +952,164 @@ async function handleGoCommand(
   }
 
   session.status = "ready";
-  session.goCount += 1;
-  session.lastGoRequestedAt = now();
+  let run: RunRecord;
 
-  const responseLines = [
-    "Phase 1 handoff saved.",
-    `Topic: ${session.brief.topic}`,
-    `Research question: ${session.brief.researchQuestion}`,
-    `Research direction: ${session.brief.researchDirection}`,
-    `Success criterion: ${session.brief.successCriterion}`,
-    "The autonomous run loop is intentionally deferred to the next phase, but this project now has a saved research brief."
-  ];
-
-  for (const line of responseLines) {
-    writeLine(writer, line);
+  try {
+    run = await runStore.create(session.brief, createInitialRunCommand());
+    const workerPid = await runController.launch(run);
+    run.workerPid = workerPid;
+    run.status = "queued";
+    run.statusMessage = "Detached run launched. Waiting for the run worker to start.";
+    await runStore.save(run);
+    session.activeRunId = run.id;
+    session.lastRunId = run.id;
+    session.goCount += 1;
+    session.lastGoRequestedAt = now();
+    await store.save(session);
+  } catch (error) {
+    const response = error instanceof Error
+      ? `I couldn't start the detached run: ${error.message}`
+      : "I couldn't start the detached run due to an unknown error.";
+    renderTaggedBlock(writer, "error", response);
+    saveAssistantMessage(session, response, now(), "command");
+    await store.save(session);
+    return;
   }
 
+  const responseLines = [
+    "Research run started.",
+    `Run id: ${run.id}`,
+    `Status: ${run.status}`,
+    `Trace: ${relativeProjectPath(session.projectRoot, run.artifacts.tracePath)}`,
+    `Events: ${relativeProjectPath(session.projectRoot, run.artifacts.eventsPath)}`,
+    `Stdout: ${relativeProjectPath(session.projectRoot, run.artifacts.stdoutPath)}`,
+    `Stderr: ${relativeProjectPath(session.projectRoot, run.artifacts.stderrPath)}`,
+    watchRuns
+      ? "The detached run is working in the current project directory, and the console will stream live progress until the current run reaches a terminal state."
+      : "The detached run is working in the current project directory. Use `/status` to inspect it, `/pause` to stop it temporarily, or `/resume` to continue a paused run."
+  ];
+
+  renderTaggedLines(writer, "run", responseLines);
+
   saveAssistantMessage(session, responseLines.join(" "), now(), "command");
+
+  if (watchRuns) {
+    await watchRunProgress(
+      writer,
+      session,
+      store,
+      runStore,
+      runController,
+      run,
+      now,
+      watchPollMs
+    );
+  }
+}
+
+async function handlePauseCommand(
+  writer: OutputWriter,
+  session: SessionState,
+  store: SessionStore,
+  runStore: RunStore,
+  runController: RunController,
+  now: () => string
+): Promise<void> {
+  const run = await reconcileRelevantRun(session, store, runStore, runController, now);
+
+  if (run === null) {
+    const response = "There is no detached run to pause right now.";
+    renderTaggedBlock(writer, "system", response);
+    saveAssistantMessage(session, response, now(), "command");
+    await store.save(session);
+    return;
+  }
+
+  if (isTerminalRun(run)) {
+    const response = `Run ${run.id} is already ${run.status}. There is nothing to pause.`;
+    renderTaggedBlock(writer, "system", response);
+    saveAssistantMessage(session, response, now(), "command");
+    await store.save(session);
+    return;
+  }
+
+  if (run.status === "paused") {
+    const response = `Run ${run.id} is already paused.`;
+    renderTaggedBlock(writer, "system", response);
+    saveAssistantMessage(session, response, now(), "command");
+    await store.save(session);
+    return;
+  }
+
+  if (run.workerPid === null) {
+    const response = `Run ${run.id} does not currently have a live worker process to pause.`;
+    renderTaggedBlock(writer, "system", response);
+    saveAssistantMessage(session, response, now(), "command");
+    await store.save(session);
+    return;
+  }
+
+  await runController.pause(run.workerPid);
+  run.status = "paused";
+  run.statusMessage = "Run paused from the console.";
+  await runStore.save(run);
+
+  const response = `Paused run ${run.id}.`;
+  renderTaggedBlock(writer, "run", response);
+  saveAssistantMessage(session, response, now(), "command");
+  await store.save(session);
+}
+
+async function handleResumeCommand(
+  writer: OutputWriter,
+  session: SessionState,
+  store: SessionStore,
+  runStore: RunStore,
+  runController: RunController,
+  now: () => string
+): Promise<void> {
+  const run = await reconcileRelevantRun(session, store, runStore, runController, now);
+
+  if (run === null) {
+    const response = "There is no detached run to resume right now.";
+    renderTaggedBlock(writer, "system", response);
+    saveAssistantMessage(session, response, now(), "command");
+    await store.save(session);
+    return;
+  }
+
+  if (isTerminalRun(run)) {
+    const response = `Run ${run.id} is already ${run.status}. There is nothing to resume.`;
+    renderTaggedBlock(writer, "system", response);
+    saveAssistantMessage(session, response, now(), "command");
+    await store.save(session);
+    return;
+  }
+
+  if (run.status !== "paused") {
+    const response = `Run ${run.id} is not paused. Its current status is ${run.status}.`;
+    renderTaggedBlock(writer, "system", response);
+    saveAssistantMessage(session, response, now(), "command");
+    await store.save(session);
+    return;
+  }
+
+  if (run.workerPid === null) {
+    const response = `Run ${run.id} does not currently have a live worker process to resume.`;
+    renderTaggedBlock(writer, "system", response);
+    saveAssistantMessage(session, response, now(), "command");
+    await store.save(session);
+    return;
+  }
+
+  await runController.resume(run.workerPid);
+  run.status = "running";
+  run.statusMessage = "Run resumed from the console.";
+  await runStore.save(run);
+
+  const response = `Resumed run ${run.id}.`;
+  renderTaggedBlock(writer, "run", response);
+  saveAssistantMessage(session, response, now(), "command");
   await store.save(session);
 }
 
@@ -748,8 +1138,13 @@ async function handleCommand(
   writer: OutputWriter,
   session: SessionState,
   store: SessionStore,
+  runStore: RunStore,
   backend: IntakeBackend,
-  now: () => string
+  runController: RunController,
+  now: () => string,
+  transcriptPath: string,
+  watchRuns: boolean,
+  watchPollMs: number
 ): Promise<"continue" | "quit"> {
   const timestamp = now();
   saveUserMessage(session, command, timestamp, "command");
@@ -762,26 +1157,36 @@ async function handleCommand(
       return "continue";
     }
     case "/status": {
-      renderStatus(writer, session);
+      const run = await reconcileRelevantRun(session, store, runStore, runController, now);
+      renderStatus(writer, session, run, transcriptPath);
       saveAssistantMessage(session, "Displayed the current research brief.", now(), "command");
       await store.save(session);
       return "continue";
     }
     case "/go": {
-      await handleGoCommand(writer, session, store, backend, now);
+      await handleGoCommand(writer, session, store, runStore, backend, runController, now, watchRuns, watchPollMs);
+      await store.save(session);
+      return "continue";
+    }
+    case "/pause": {
+      await handlePauseCommand(writer, session, store, runStore, runController, now);
+      return "continue";
+    }
+    case "/resume": {
+      await handleResumeCommand(writer, session, store, runStore, runController, now);
       return "continue";
     }
     case "/quit":
     case "/exit": {
       const response = "Session saved. Closing ClawResearch.";
-      writeLine(writer, response);
+      renderTaggedBlock(writer, "system", response);
       saveAssistantMessage(session, response, now(), "command");
       await store.save(session);
       return "quit";
     }
     default: {
       const response = `Unknown command: ${command}. Use \`/help\` to see the available commands.`;
-      writeLine(writer, response);
+      renderTaggedBlock(writer, "system", response);
       saveAssistantMessage(session, response, now(), "command");
       await store.save(session);
       return "continue";
@@ -794,15 +1199,22 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
   const store = new SessionStore(options.projectRoot, options.version, now);
   const session = await store.load();
   const backend = options.intakeBackend ?? createDefaultIntakeBackend();
+  const runStore = new RunStore(options.projectRoot, options.version, now);
+  const runController = options.runController ?? createDefaultRunController();
+  const transcript = new ConsoleTranscript(options.projectRoot);
+  const writer = createLoggedWriter(io.writer, transcript);
+  const watchRuns = options.watchRuns ?? options.runController === undefined;
+  const watchPollMs = options.watchPollMs ?? 150;
 
   session.intake.backendLabel = backend.label;
   await store.save(session);
+  await reconcileRelevantRun(session, store, runStore, runController, now);
 
-  renderBanner(io.writer, session);
-  renderWelcome(io.writer, session);
+  renderBanner(writer, session, transcript.filePath);
+  renderWelcome(writer, session);
 
   await emitAssistantTurn(
-    io.writer,
+    writer,
     session,
     store,
     backend,
@@ -815,25 +1227,38 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
 
     if (line === null) {
       const response = "Input closed. Session saved.";
-      writeLine(io.writer, response);
+      renderTaggedBlock(writer, "system", response);
       saveAssistantMessage(session, response, now(), "system");
       await store.save(session);
       break;
     }
 
+    transcript.appendInput("clawresearch> ", line);
     const input = line.trim();
 
     if (input.length === 0) {
       const response = session.intake.openQuestions[0]
         ?? "Take your time. Tell me more about the research goal or use `/status` to inspect the current brief.";
-      writeLine(io.writer, response);
+      renderTaggedBlock(writer, "system", response);
       saveAssistantMessage(session, response, now(), "system");
       await store.save(session);
       continue;
     }
 
     if (input.startsWith("/")) {
-      const result = await handleCommand(input, io.writer, session, store, backend, now);
+      const result = await handleCommand(
+        input,
+        writer,
+        session,
+        store,
+        runStore,
+        backend,
+        runController,
+        now,
+        transcript.filePath,
+        watchRuns,
+        watchPollMs
+      );
 
       if (result === "quit") {
         break;
@@ -842,7 +1267,7 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
       continue;
     }
 
-    await handleUserInput(input, io.writer, session, store, backend, now);
+    await handleUserInput(input, writer, session, store, backend, now);
   }
 
   io.close?.();
