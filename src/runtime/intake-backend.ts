@@ -26,6 +26,7 @@ export type IntakeRequest = {
 export interface IntakeBackend {
   readonly label: string;
   respond(request: IntakeRequest): Promise<IntakeResponse>;
+  completeBrief?(request: IntakeRequest): Promise<ResearchBrief>;
 }
 
 type OllamaChatResponse = {
@@ -36,6 +37,7 @@ type OllamaChatResponse = {
 
 const defaultHost = process.env.OLLAMA_HOST ?? "127.0.0.1:11434";
 const defaultModel = process.env.CLAWRESEARCH_OLLAMA_MODEL ?? "qwen3:14b";
+const placeholderValuePattern = /^(?:string(?:\s+or\s+null)?|null|n\/a|tbd|unknown)$/i;
 
 function normalizeHost(host: string): string {
   return host.replace(/^https?:\/\//, "");
@@ -98,8 +100,46 @@ function buildInstruction(request: IntakeRequest): string {
   ].filter((line): line is string => line !== null).join("\n");
 }
 
+function buildBriefCompletionInstruction(request: IntakeRequest): string {
+  return [
+    "You are ClawResearch's structured brief completion helper.",
+    "Your only job is to infer any missing brief fields from the existing conversation.",
+    "Use the whole conversation, not just the last turn.",
+    "If the user has already confirmed a drafted brief or direction, convert that confirmed intent into concrete brief fields.",
+    "Do not ask follow-up questions.",
+    "Do not add ambitious claims that are not supported by the conversation.",
+    "Keep existing specific wording when possible, but make missing fields concrete enough for a bounded first-pass research run.",
+    "Only leave a field null if the conversation truly does not provide enough signal.",
+    "",
+    "Return JSON only with this exact shape:",
+    "{",
+    '  "topic": "string or null",',
+    '  "researchQuestion": "string or null",',
+    '  "researchDirection": "string or null",',
+    '  "successCriterion": "string or null"',
+    "}",
+    "",
+    `Project root: ${request.projectRoot}`,
+    `Current brief: ${JSON.stringify(request.brief)}`,
+    `Current open questions: ${JSON.stringify(request.openQuestions)}`,
+    request.recoveryReason !== undefined ? `Completion hint: ${request.recoveryReason}` : null,
+    "",
+    "Conversation so far follows below in chat-message order."
+  ].filter((line): line is string => line !== null).join("\n");
+}
+
 function safeString(value: unknown): string | null {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+
+  if (trimmed.length === 0 || placeholderValuePattern.test(trimmed)) {
+    return null;
+  }
+
+  return trimmed;
 }
 
 function safeStringArray(value: unknown): string[] {
@@ -134,6 +174,19 @@ function normalizeResponse(raw: unknown): IntakeResponse {
     readinessRationale: safeString(response.readinessRationale),
     openQuestions: safeStringArray(response.openQuestions),
     summary: safeString(response.summary)
+  };
+}
+
+function normalizeBrief(raw: unknown): ResearchBrief {
+  const brief = typeof raw === "object" && raw !== null
+    ? raw as Record<string, unknown>
+    : {};
+
+  return {
+    topic: safeString(brief.topic),
+    researchQuestion: safeString(brief.researchQuestion),
+    researchDirection: safeString(brief.researchDirection),
+    successCriterion: safeString(brief.successCriterion)
   };
 }
 
@@ -199,6 +252,45 @@ export class OllamaIntakeBackend implements IntakeBackend {
     }
 
     return normalizeResponse(extractJson(content));
+  }
+
+  async completeBrief(request: IntakeRequest): Promise<ResearchBrief> {
+    const response = await fetch(`http://${normalizeHost(this.host)}/api/chat`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: this.model,
+        stream: false,
+        think: false,
+        format: "json",
+        messages: [
+          {
+            role: "system",
+            content: buildBriefCompletionInstruction(request)
+          },
+          ...request.conversation.map((message) => ({
+            role: message.role,
+            content: message.content
+          }))
+        ]
+      }),
+      signal: AbortSignal.timeout(90_000)
+    });
+
+    if (!response.ok) {
+      throw new Error(`Ollama request failed with ${response.status} ${response.statusText}`);
+    }
+
+    const payload = await response.json() as OllamaChatResponse;
+    const content = payload.message?.content;
+
+    if (typeof content !== "string") {
+      throw new Error("Ollama returned an unexpected response.");
+    }
+
+    return normalizeBrief(extractJson(content));
   }
 }
 

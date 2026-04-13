@@ -141,3 +141,56 @@ test("phase one session files are preserved when the schema adds run tracking", 
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
+
+test("placeholder schema strings are sanitized out of saved sessions on load", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-placeholder-session-"));
+
+  try {
+    const runtimeDirectory = path.join(projectRoot, ".clawresearch");
+    await mkdir(runtimeDirectory, { recursive: true });
+    await writeFile(
+      path.join(runtimeDirectory, "session.json"),
+      JSON.stringify({
+        schemaVersion: 3,
+        appVersion: "0.6.0",
+        projectRoot,
+        runtimeDirectory,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:05.000Z",
+        status: "ready",
+        goCount: 1,
+        lastGoRequestedAt: "2026-01-01T00:00:04.000Z",
+        activeRunId: null,
+        lastRunId: null,
+        brief: {
+          topic: "string or null",
+          researchQuestion: "string or null",
+          researchDirection: "string or null",
+          successCriterion: "string or null"
+        },
+        intake: {
+          backendLabel: "ollama:qwen3:14b",
+          readiness: "ready",
+          rationale: "string or null",
+          openQuestions: [],
+          summary: "string or null",
+          lastError: null
+        },
+        conversation: []
+      }, null, 2),
+      "utf8"
+    );
+
+    const store = new SessionStore(projectRoot, "0.6.0", createNow());
+    const session = await store.load();
+
+    assert.equal(session.brief.topic, null);
+    assert.equal(session.brief.researchQuestion, null);
+    assert.equal(session.brief.researchDirection, null);
+    assert.equal(session.brief.successCriterion, null);
+    assert.equal(session.intake.rationale, "The research brief still needs clarification.");
+    assert.equal(session.intake.summary, null);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});

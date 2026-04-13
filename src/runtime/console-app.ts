@@ -27,6 +27,11 @@ import {
   ConsoleTranscript
 } from "./console-transcript.js";
 import {
+  countMemoryRecordsByType,
+  MemoryStore,
+  type MemoryState
+} from "./memory-store.js";
+import {
   parseRunEventLines,
   readRunEventChunk,
   type RunEventKind,
@@ -159,7 +164,8 @@ function renderStatus(
   writer: OutputWriter,
   session: SessionState,
   run: RunRecord | null,
-  transcriptPath: string
+  transcriptPath: string,
+  memory: MemoryState
 ): void {
   writeLine(writer, "Current brief:");
   writeLine(writer, `  topic: ${session.brief.topic ?? "<missing>"}`);
@@ -206,6 +212,13 @@ function renderStatus(
     writeLine(writer, `  events: ${relativeProjectPath(session.projectRoot, run.artifacts.eventsPath)}`);
     writeLine(writer, `  stdout: ${relativeProjectPath(session.projectRoot, run.artifacts.stdoutPath)}`);
     writeLine(writer, `  stderr: ${relativeProjectPath(session.projectRoot, run.artifacts.stderrPath)}`);
+    writeLine(writer, `  plan: ${relativeProjectPath(session.projectRoot, run.artifacts.planPath)}`);
+    writeLine(writer, `  sources: ${relativeProjectPath(session.projectRoot, run.artifacts.sourcesPath)}`);
+    writeLine(writer, `  synthesis: ${relativeProjectPath(session.projectRoot, run.artifacts.synthesisPath)}`);
+    writeLine(writer, `  claims: ${relativeProjectPath(session.projectRoot, run.artifacts.claimsPath)}`);
+    writeLine(writer, `  verification: ${relativeProjectPath(session.projectRoot, run.artifacts.verificationPath)}`);
+    writeLine(writer, `  next questions: ${relativeProjectPath(session.projectRoot, run.artifacts.nextQuestionsPath)}`);
+    writeLine(writer, `  memory snapshot: ${relativeProjectPath(session.projectRoot, run.artifacts.memoryPath)}`);
   }
 
   writeLine(writer);
@@ -214,6 +227,16 @@ function renderStatus(
   writeLine(writer, `Messages saved: ${session.conversation.length}`);
   writeLine(writer, `Backend: ${session.intake.backendLabel ?? "<unknown>"}`);
   writeLine(writer, `Debug log: ${relativeProjectPath(session.projectRoot, transcriptPath)}`);
+  writeLine(writer);
+  writeLine(writer, "Memory:");
+  writeLine(writer, `  store: ${relativeProjectPath(session.projectRoot, memory.runtimeDirectory)}/${"memory.json"}`);
+  writeLine(writer, `  records: ${memory.recordCount}`);
+
+  const counts = countMemoryRecordsByType(memory);
+  writeLine(
+    writer,
+    `  by type: source ${counts.source}, claim ${counts.claim}, finding ${counts.finding}, question ${counts.question}, idea ${counts.idea}, summary ${counts.summary}, artifact ${counts.artifact}`
+  );
 }
 
 function parseExplicitBriefUpdate(input: string): BriefUpdate | null {
@@ -231,6 +254,84 @@ function parseExplicitBriefUpdate(input: string): BriefUpdate | null {
   return null;
 }
 
+function normalizeDraftLabel(label: string): ResearchBriefField | null {
+  const normalized = normalizeComparableText(label);
+
+  switch (normalized) {
+    case "topic":
+    case "research topic":
+      return "topic";
+    case "question":
+    case "research question":
+      return "researchQuestion";
+    case "direction":
+    case "research direction":
+      return "researchDirection";
+    case "success":
+    case "success criterion":
+      return "successCriterion";
+    default:
+      return null;
+  }
+}
+
+function stripSimpleMarkdown(text: string): string {
+  return text
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/__(.*?)__/g, "$1")
+    .replace(/`([^`]+)`/g, "$1");
+}
+
+function trimDraftFieldTail(value: string): string {
+  return value.replace(
+    /\s+(?:Let me know if|If that framing|If this framing|If that looks right|If this looks right|If you want to adjust|If you'd like to adjust|You can use \/go|I can proceed with that framing|Does this align|Please let me know).*/i,
+    ""
+  ).trim();
+}
+
+function parseDraftBriefFromText(text: string): ResearchBrief {
+  const normalized = stripSimpleMarkdown(text);
+  const brief: ResearchBrief = {
+    topic: null,
+    researchQuestion: null,
+    researchDirection: null,
+    successCriterion: null
+  };
+  const matches = [...normalized.matchAll(/\b(topic|research topic|research question|question|research direction|direction|success criterion|success)\s*:\s*/gi)];
+
+  for (let index = 0; index < matches.length; index += 1) {
+    const match = matches[index];
+
+    if (match?.index === undefined || match[1] === undefined) {
+      continue;
+    }
+
+    const field = normalizeDraftLabel(match[1]);
+
+    if (field === null) {
+      continue;
+    }
+
+    const valueStart = match.index + match[0].length;
+    const valueEnd = matches[index + 1]?.index ?? normalized.length;
+    const value = normalized
+      .slice(valueStart, valueEnd)
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/^[\-*]\s*/, "")
+      .replace(/[.]\s*$/, "")
+      .trim();
+    const trimmedValue = trimDraftFieldTail(value)
+      .trim();
+
+    if (trimmedValue.length > 0 && !isPlaceholderFieldValue(trimmedValue)) {
+      brief[field] = trimmedValue;
+    }
+  }
+
+  return brief;
+}
+
 function summarizeMissingFields(session: SessionState): string[] {
   return Object.entries(session.brief)
     .filter(([, value]) => value === null)
@@ -239,6 +340,10 @@ function summarizeMissingFields(session: SessionState): string[] {
 
 function briefValues(brief: ResearchBrief): string[] {
   return Object.values(brief).filter((value): value is string => value !== null);
+}
+
+function briefSignalCount(brief: ResearchBrief): number {
+  return briefValues(brief).length;
 }
 
 function responseHasCompleteBrief(response: IntakeResponse): boolean {
@@ -310,6 +415,10 @@ function fieldSpecificityScore(value: string): number {
   return score;
 }
 
+function isPlaceholderFieldValue(value: string): boolean {
+  return /^(?:string(?:\s+or\s+null)?|null|n\/a|tbd|unknown)$/i.test(value.trim());
+}
+
 function shouldKeepExistingField(existing: string, incoming: string): boolean {
   const normalizedExisting = normalizeComparableText(existing);
   const normalizedIncoming = normalizeComparableText(incoming);
@@ -328,8 +437,8 @@ function shouldKeepExistingField(existing: string, incoming: string): boolean {
 }
 
 function mergeBriefFieldValue(existing: string | null, incoming: string | null): string | null {
-  if (incoming === null) {
-    return null;
+  if (incoming === null || isPlaceholderFieldValue(incoming)) {
+    return existing;
   }
 
   if (existing !== null && shouldKeepExistingField(existing, incoming)) {
@@ -379,11 +488,24 @@ function briefCanStartFirstPass(brief: ResearchBrief): boolean {
 }
 
 function stabilizeIntakeResponse(session: SessionState, response: IntakeResponse): IntakeResponse {
+  const draftBrief = parseDraftBriefFromText(response.assistantMessage);
   const brief: ResearchBrief = {
-    topic: mergeBriefFieldValue(session.brief.topic, response.brief.topic),
-    researchQuestion: mergeBriefFieldValue(session.brief.researchQuestion, response.brief.researchQuestion),
-    researchDirection: mergeBriefFieldValue(session.brief.researchDirection, response.brief.researchDirection),
-    successCriterion: mergeBriefFieldValue(session.brief.successCriterion, response.brief.successCriterion)
+    topic: mergeBriefFieldValue(
+      mergeBriefFieldValue(session.brief.topic, response.brief.topic),
+      draftBrief.topic
+    ),
+    researchQuestion: mergeBriefFieldValue(
+      mergeBriefFieldValue(session.brief.researchQuestion, response.brief.researchQuestion),
+      draftBrief.researchQuestion
+    ),
+    researchDirection: mergeBriefFieldValue(
+      mergeBriefFieldValue(session.brief.researchDirection, response.brief.researchDirection),
+      draftBrief.researchDirection
+    ),
+    successCriterion: mergeBriefFieldValue(
+      mergeBriefFieldValue(session.brief.successCriterion, response.brief.successCriterion),
+      draftBrief.successCriterion
+    )
   };
   const normalizedResponse: IntakeResponse = {
     ...response,
@@ -404,7 +526,7 @@ function stabilizeIntakeResponse(session: SessionState, response: IntakeResponse
 
 function applyIntakeResponse(session: SessionState, response: IntakeResponse): void {
   for (const [field, value] of Object.entries(response.brief)) {
-    if (value === null) {
+    if (value === null || isPlaceholderFieldValue(value)) {
       session.brief[field as ResearchBriefField] = null;
       session.status = "startup_chat";
       continue;
@@ -547,10 +669,19 @@ function enoughSignalToDraft(session: SessionState, response: IntakeResponse): b
     .filter((message) => message.includes("?"))
     .length;
   const hasTopicSignal = extractTopicHint(session, response) !== null;
+  const briefSignal = briefSignalCount({
+    topic: mergeBriefFieldValue(session.brief.topic, response.brief.topic),
+    researchQuestion: mergeBriefFieldValue(session.brief.researchQuestion, response.brief.researchQuestion),
+    researchDirection: mergeBriefFieldValue(session.brief.researchDirection, response.brief.researchDirection),
+    successCriterion: mergeBriefFieldValue(session.brief.successCriterion, response.brief.successCriterion)
+  });
 
-  return hasTopicSignal
-    && userTurns.length >= 4
-    && assistantQuestions >= 3;
+  return hasTopicSignal && (
+    (userTurns.length >= 3 && assistantQuestions >= 2)
+    || (userTurns.length >= 3 && briefSignal >= 2)
+    || (userTurns.length >= 2 && briefSignal >= 3)
+    || userTurns.length >= 5
+  );
 }
 
 function overambitiousGoalDetected(session: SessionState, response: IntakeResponse): boolean {
@@ -648,8 +779,16 @@ function eventTag(kind: RunEventKind): string {
       return "plan";
     case "summary":
       return "summary";
+    case "memory":
+      return "memory";
+    case "verify":
+      return "verify";
     case "next":
       return "next";
+    case "source":
+      return "source";
+    case "claim":
+      return "claim";
     case "exec":
       return "exec";
     case "stdout":
@@ -679,7 +818,7 @@ function isTerminalRun(run: RunRecord): boolean {
 }
 
 function createInitialRunCommand(): string[] {
-  return ["bash", "-lc", "clawresearch phase-2 bootstrap"];
+  return ["clawresearch", "research-loop", "--mode", "plan-gather-synthesize"];
 }
 
 async function loadRunIfPresent(
@@ -707,11 +846,28 @@ async function reconcileRelevantRun(
   let run = await loadRunIfPresent(runStore, session.activeRunId);
 
   if (run !== null && !isTerminalRun(run) && run.workerPid !== null && !runController.isProcessAlive(run.workerPid)) {
-    run.status = "failed";
-    run.finishedAt = run.finishedAt ?? now();
-    run.workerPid = null;
-    run.statusMessage = "Detached run worker stopped before the run finished cleanly.";
-    await runStore.save(run);
+    const previousUpdatedAt = run.updatedAt;
+    await delay(250);
+
+    const refreshedRun = await loadRunIfPresent(runStore, run.id);
+
+    if (refreshedRun !== null) {
+      run = refreshedRun;
+    }
+
+    if (
+      run !== null
+      && !isTerminalRun(run)
+      && run.workerPid !== null
+      && !runController.isProcessAlive(run.workerPid)
+      && run.updatedAt === previousUpdatedAt
+    ) {
+      run.status = "failed";
+      run.finishedAt = run.finishedAt ?? now();
+      run.workerPid = null;
+      run.statusMessage = "Detached run worker stopped before the run finished cleanly.";
+      await runStore.save(run);
+    }
   }
 
   if (run !== null && isTerminalRun(run) && session.activeRunId === run.id) {
@@ -768,6 +924,130 @@ async function requestAssistantTurn(
   });
 }
 
+async function requestCompletedBrief(
+  session: SessionState,
+  backend: IntakeBackend,
+  completionHint: string
+): Promise<ResearchBrief | null> {
+  if (backend.completeBrief === undefined) {
+    return null;
+  }
+
+  return backend.completeBrief({
+    mode: "recover",
+    projectRoot: session.projectRoot,
+    brief: session.brief,
+    openQuestions: session.intake.openQuestions,
+    conversation: session.conversation
+      .filter((entry) => entry.kind === "chat")
+      .map((entry) => ({
+        role: entry.role,
+        content: entry.text
+      })),
+    recoveryReason: completionHint
+  });
+}
+
+function latestChatEntry(session: SessionState): SessionState["conversation"][number] | null {
+  for (let index = session.conversation.length - 1; index >= 0; index -= 1) {
+    const entry = session.conversation[index];
+
+    if (entry?.kind === "chat") {
+      return entry;
+    }
+  }
+
+  return null;
+}
+
+function looksLikeUserConfirmation(text: string | undefined): boolean {
+  if (text === undefined) {
+    return false;
+  }
+
+  const normalized = normalizeComparableText(text);
+
+  return /^(?:yes|yeah|yep|sure|okay|ok|sounds good|that sounds good|looks good|good|great|perfect|aligned|works for me|let's do that|lets do that|go ahead|proceed|that aligns)(?:\b|$)/.test(normalized);
+}
+
+function assistantMessageLooksLikeDraft(text: string): boolean {
+  return /\b(?:working|research)\s+brief\b/i.test(text)
+    || /\bproposal\b/i.test(text)
+    || /\bpropose(?:d)?\b/i.test(text)
+    || /\bframing\b/i.test(text)
+    || /\bdoes this align\b/i.test(text)
+    || /\bconfirm or adjust\b/i.test(text)
+    || /\bunless you want to\b/i.test(text)
+    || /\bI can proceed with that\b/i.test(text)
+    || /\bcurrent brief\b/i.test(text)
+    || /\bBased on our conversation\b/i.test(text)
+    || /\bTopic\s*:/i.test(text)
+    || /\bResearch question\s*:/i.test(text);
+}
+
+function shouldAttemptPostTurnBriefCompletion(
+  session: SessionState,
+  response: IntakeResponse
+): boolean {
+  if (briefCanStartFirstPass(session.brief)) {
+    return false;
+  }
+
+  if (response.readiness === "ready") {
+    return true;
+  }
+
+  const lastUserMessage = recentChatMessages(session, "user", 1).at(-1);
+
+  if (!looksLikeUserConfirmation(lastUserMessage)) {
+    return false;
+  }
+
+  const previousAssistantMessage = recentChatMessages(session, "assistant", 1).at(-1);
+  const proposedDraftVisible = assistantMessageLooksLikeDraft(response.assistantMessage)
+    || (previousAssistantMessage !== undefined && assistantMessageLooksLikeDraft(previousAssistantMessage))
+    || briefSignalCount(session.brief) >= 2;
+
+  return proposedDraftVisible;
+}
+
+function applyRecoveredBrief(session: SessionState, recoveredBrief: ResearchBrief): void {
+  for (const [field, value] of Object.entries(recoveredBrief)) {
+    const merged = mergeBriefFieldValue(
+      session.brief[field as ResearchBriefField],
+      value
+    );
+
+    if (merged !== null) {
+      setBriefField(session, field as ResearchBriefField, merged);
+    }
+  }
+
+  if (briefCanStartFirstPass(session.brief)) {
+    session.intake.readiness = "ready";
+    session.intake.rationale = "The brief is concrete enough to start a first-pass research run.";
+    session.intake.openQuestions = [];
+    session.intake.summary = session.intake.summary
+      ?? "A concrete first-pass research brief has been reconstructed from the confirmed conversation.";
+    session.intake.lastError = null;
+  }
+}
+
+async function maybeCompleteBriefFromConversation(
+  session: SessionState,
+  backend: IntakeBackend,
+  completionHint: string
+): Promise<boolean> {
+  const completedBrief = await requestCompletedBrief(session, backend, completionHint);
+
+  if (completedBrief === null) {
+    return false;
+  }
+
+  applyRecoveredBrief(session, completedBrief);
+  return briefCanStartFirstPass(session.brief);
+}
+
 async function emitAssistantTurn(
   writer: OutputWriter,
   session: SessionState,
@@ -789,6 +1069,15 @@ async function emitAssistantTurn(
         await requestAssistantTurn(session, backend, "recover", recoveryReason)
       );
     applyIntakeResponse(session, response);
+
+    if (shouldAttemptPostTurnBriefCompletion(session, response)) {
+      await maybeCompleteBriefFromConversation(
+        session,
+        backend,
+        "The conversation appears to have converged on a workable brief. Formalize any remaining missing structured fields from the confirmed draft without changing the user-facing message."
+      );
+    }
+
     renderTaggedBlock(writer, "consultant", response.assistantMessage);
     saveAssistantMessage(session, response.assistantMessage, now());
   } catch (error) {
@@ -828,6 +1117,14 @@ async function attemptBriefCompletionForGo(
     )
   );
   applyIntakeResponse(session, response);
+
+  if (goReadinessFailures(session).length > 0) {
+    await maybeCompleteBriefFromConversation(
+      session,
+      backend,
+      "Fill any remaining missing structured brief fields from the existing conversation so the run can start if enough signal already exists."
+    );
+  }
 
   return goReadinessFailures(session).length === 0;
 }
@@ -919,8 +1216,14 @@ async function handleGoCommand(
     return;
   }
 
-  const neededCompletion = summarizeMissingFields(session).length > 0
-    || session.intake.readiness !== "ready";
+  const recentAssistantDraft = recentChatMessages(session, "assistant", 3)
+    .reverse()
+    .map((message) => parseDraftBriefFromText(message))
+    .find((draft) => briefSignalCount(draft) > 0);
+
+  if (recentAssistantDraft !== undefined) {
+    applyRecoveredBrief(session, recentAssistantDraft);
+  }
 
   if (session.intake.readiness !== "ready" && briefCanStartFirstPass(session.brief)) {
     session.intake.readiness = "ready";
@@ -928,6 +1231,9 @@ async function handleGoCommand(
     session.intake.openQuestions = [];
     await store.save(session);
   }
+
+  const neededCompletion = summarizeMissingFields(session).length > 0
+    || session.intake.readiness !== "ready";
 
   if (neededCompletion && !briefCanStartFirstPass(session.brief)) {
     try {
@@ -984,6 +1290,11 @@ async function handleGoCommand(
     `Events: ${relativeProjectPath(session.projectRoot, run.artifacts.eventsPath)}`,
     `Stdout: ${relativeProjectPath(session.projectRoot, run.artifacts.stdoutPath)}`,
     `Stderr: ${relativeProjectPath(session.projectRoot, run.artifacts.stderrPath)}`,
+    `Plan: ${relativeProjectPath(session.projectRoot, run.artifacts.planPath)}`,
+    `Sources: ${relativeProjectPath(session.projectRoot, run.artifacts.sourcesPath)}`,
+    `Synthesis: ${relativeProjectPath(session.projectRoot, run.artifacts.synthesisPath)}`,
+    `Verification: ${relativeProjectPath(session.projectRoot, run.artifacts.verificationPath)}`,
+    `Memory: ${relativeProjectPath(session.projectRoot, run.artifacts.memoryPath)}`,
     watchRuns
       ? "The detached run is working in the current project directory, and the console will stream live progress until the current run reaches a terminal state."
       : "The detached run is working in the current project directory. Use `/status` to inspect it, `/pause` to stop it temporarily, or `/resume` to continue a paused run."
@@ -1139,6 +1450,7 @@ async function handleCommand(
   session: SessionState,
   store: SessionStore,
   runStore: RunStore,
+  memoryStore: MemoryStore,
   backend: IntakeBackend,
   runController: RunController,
   now: () => string,
@@ -1158,7 +1470,8 @@ async function handleCommand(
     }
     case "/status": {
       const run = await reconcileRelevantRun(session, store, runStore, runController, now);
-      renderStatus(writer, session, run, transcriptPath);
+      const memory = await memoryStore.load();
+      renderStatus(writer, session, run, transcriptPath, memory);
       saveAssistantMessage(session, "Displayed the current research brief.", now(), "command");
       await store.save(session);
       return "continue";
@@ -1200,6 +1513,7 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
   const session = await store.load();
   const backend = options.intakeBackend ?? createDefaultIntakeBackend();
   const runStore = new RunStore(options.projectRoot, options.version, now);
+  const memoryStore = new MemoryStore(options.projectRoot, now);
   const runController = options.runController ?? createDefaultRunController();
   const transcript = new ConsoleTranscript(options.projectRoot);
   const writer = createLoggedWriter(io.writer, transcript);
@@ -1213,14 +1527,13 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
   renderBanner(writer, session, transcript.filePath);
   renderWelcome(writer, session);
 
-  await emitAssistantTurn(
-    writer,
-    session,
-    store,
-    backend,
-    session.conversation.some((entry) => entry.kind === "chat") ? "resume" : "start",
-    now
-  );
+  const initialChatEntry = latestChatEntry(session);
+
+  if (initialChatEntry === null) {
+    await emitAssistantTurn(writer, session, store, backend, "start", now);
+  } else if (initialChatEntry.role === "user") {
+    await emitAssistantTurn(writer, session, store, backend, "resume", now);
+  }
 
   while (true) {
     const line = await io.prompt("clawresearch> ");
@@ -1252,6 +1565,7 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
         session,
         store,
         runStore,
+        memoryStore,
         backend,
         runController,
         now,

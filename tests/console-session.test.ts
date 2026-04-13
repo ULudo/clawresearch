@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { appendFile } from "node:fs/promises";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -134,23 +134,23 @@ class WatchedFakeRunController implements RunController {
     await appendRunEvent(running.artifacts.eventsPath, {
       timestamp: this.now(),
       kind: "plan",
-      message: "Persist the research brief, prepare initial run artifacts, and launch the detached bootstrap command."
+      message: "Plan the research mode and generate initial search queries."
     });
     await appendRunEvent(running.artifacts.eventsPath, {
       timestamp: this.now(),
       kind: "next",
-      message: "Launch the initial bootstrap command in the project directory."
+      message: "Gather local and literature sources for the planned first-pass investigation."
     });
     await appendRunEvent(running.artifacts.eventsPath, {
       timestamp: this.now(),
       kind: "exec",
-      message: "bash -lc clawresearch phase-2 bootstrap"
+      message: "clawresearch research-loop --mode plan-gather-synthesize"
     });
-    await appendFile(running.artifacts.stdoutPath, "Bootstrap output\n", "utf8");
+    await appendFile(running.artifacts.stdoutPath, "Research backend: stub\n", "utf8");
     await appendRunEvent(running.artifacts.eventsPath, {
       timestamp: this.now(),
-      kind: "stdout",
-      message: "Bootstrap output"
+      kind: "source",
+      message: "brief-1: AI adoption and job displacement in nursing homes (project_brief; no external locator)"
     });
 
     await delay(this.stepDelayMs);
@@ -160,19 +160,106 @@ class WatchedFakeRunController implements RunController {
     completed.finishedAt = this.now();
     completed.job.exitCode = 0;
     completed.job.finishedAt = this.now();
-    completed.statusMessage = "Initial detached run bootstrap completed successfully.";
+    completed.statusMessage = "Minimal explicit research loop completed successfully.";
     await store.save(completed);
     await appendRunEvent(completed.artifacts.eventsPath, {
       timestamp: this.now(),
       kind: "summary",
-      message: "Initial detached bootstrap finished successfully."
+      message: "The initial source-grounded research pass identified a few stable themes and follow-up questions."
+    });
+    await appendRunEvent(completed.artifacts.eventsPath, {
+      timestamp: this.now(),
+      kind: "claim",
+      message: "Current deployment evidence suggests displacement risk is uneven across role categories. [brief-1]"
+    });
+    await appendRunEvent(completed.artifacts.eventsPath, {
+      timestamp: this.now(),
+      kind: "next",
+      message: "Which nursing-home job categories appear most exposed to partial automation in current deployments?"
     });
     await appendRunEvent(completed.artifacts.eventsPath, {
       timestamp: this.now(),
       kind: "run",
-      message: "Initial detached run bootstrap completed successfully."
+      message: "Minimal explicit research loop completed successfully."
     });
     this.alive.delete(pid);
+  }
+}
+
+class RaceyWatchedRunController implements RunController {
+  private nextPid = 6000;
+  private readonly alive = new Set<number>();
+
+  constructor(
+    private readonly now: () => string,
+    private readonly stepDelayMs = 10
+  ) {}
+
+  async launch(run: { id: string; projectRoot: string; appVersion: string }): Promise<number> {
+    const pid = this.nextPid;
+    this.nextPid += 1;
+    this.alive.add(pid);
+
+    void this.simulateRunLifecycle(run, pid);
+    return pid;
+  }
+
+  async pause(workerPid: number): Promise<void> {
+    if (!this.alive.has(workerPid)) {
+      throw new Error(`process ${workerPid} is not alive`);
+    }
+  }
+
+  async resume(workerPid: number): Promise<void> {
+    if (!this.alive.has(workerPid)) {
+      throw new Error(`process ${workerPid} is not alive`);
+    }
+  }
+
+  isProcessAlive(workerPid: number): boolean {
+    return this.alive.has(workerPid);
+  }
+
+  private async simulateRunLifecycle(
+    run: { id: string; projectRoot: string; appVersion: string },
+    pid: number
+  ): Promise<void> {
+    const store = new RunStore(run.projectRoot, run.appVersion, this.now);
+
+    await delay(this.stepDelayMs);
+    const running = await store.load(run.id);
+    running.status = "running";
+    running.startedAt = running.startedAt ?? this.now();
+    running.statusMessage = "The detached shell job is running.";
+    await store.save(running);
+    await appendRunEvent(running.artifacts.eventsPath, {
+      timestamp: this.now(),
+      kind: "run",
+      message: "Run worker started."
+    });
+
+    await delay(this.stepDelayMs);
+    this.alive.delete(pid);
+
+    await delay(this.stepDelayMs * 6);
+    const completed = await store.load(run.id);
+    completed.status = "completed";
+    completed.workerPid = null;
+    completed.finishedAt = this.now();
+    completed.job.exitCode = 0;
+    completed.job.finishedAt = this.now();
+    completed.statusMessage = "Minimal explicit research loop completed successfully.";
+    await store.save(completed);
+    await appendRunEvent(completed.artifacts.eventsPath, {
+      timestamp: this.now(),
+      kind: "summary",
+      message: "The delayed completion write landed after the worker process exited."
+    });
+    await appendRunEvent(completed.artifacts.eventsPath, {
+      timestamp: this.now(),
+      kind: "run",
+      message: "Minimal explicit research loop completed successfully."
+    });
   }
 }
 
@@ -585,6 +672,144 @@ class GoCompletionBackend implements IntakeBackend {
   }
 }
 
+class CompletionFallbackBackend implements IntakeBackend {
+  readonly label = "stub:completion-fallback";
+
+  async respond(request: IntakeRequest): Promise<IntakeResponse> {
+    const lastUserMessage = [...request.conversation]
+      .reverse()
+      .find((message) => message.role === "user")
+      ?.content;
+
+    if (request.mode === "start") {
+      return {
+        assistantMessage: "Hello! I'm ClawResearch's research intake consultant. What topic are you interested in?",
+        brief: {
+          topic: null,
+          researchQuestion: null,
+          researchDirection: null,
+          successCriterion: null
+        },
+        readiness: "needs_clarification",
+        readinessRationale: "The project has not been described yet.",
+        openQuestions: ["What topic should the project address?"],
+        summary: null
+      };
+    }
+
+    if (lastUserMessage === "Riemann hypothesis") {
+      return {
+        assistantMessage: "What computational aspect are you most interested in?",
+        brief: {
+          topic: "Riemann Hypothesis",
+          researchQuestion: null,
+          researchDirection: null,
+          successCriterion: null
+        },
+        readiness: "needs_clarification",
+        readinessRationale: "The topic is set, but the project mode is still unclear.",
+        openQuestions: ["Which computational aspect matters most?"],
+        summary: null
+      };
+    }
+
+    if (lastUserMessage === "computational approaches") {
+      return {
+        assistantMessage: "Are you looking at algorithmic improvements, numerical verification, or something else?",
+        brief: {
+          topic: "Riemann Hypothesis",
+          researchQuestion: null,
+          researchDirection: null,
+          successCriterion: null
+        },
+        readiness: "needs_clarification",
+        readinessRationale: "The topic is still broad.",
+        openQuestions: ["Which computational approach should the project focus on?"],
+        summary: null
+      };
+    }
+
+    if (lastUserMessage === "algorithmic improvements") {
+      return {
+        assistantMessage: "What kind of algorithmic improvement do you want to investigate?",
+        brief: {
+          topic: "Riemann Hypothesis",
+          researchQuestion: null,
+          researchDirection: null,
+          successCriterion: null
+        },
+        readiness: "needs_clarification",
+        readinessRationale: "The improvement target is still underspecified.",
+        openQuestions: ["Which kind of improvement should the project target?"],
+        summary: null
+      };
+    }
+
+    if (lastUserMessage === "optimizing existing algorithms") {
+      return {
+        assistantMessage: "Based on our conversation, I've drafted a preliminary research brief. The topic is the Riemann Hypothesis, the direction is optimizing existing algorithms in computational approaches, and success means identifying optimizations that improve computational efficiency in verifying zeros or related problems. Does this align with your goals?",
+        brief: {
+          topic: "Riemann Hypothesis",
+          researchQuestion: null,
+          researchDirection: "Optimize existing algorithms used in computational approaches to the Riemann Hypothesis.",
+          successCriterion: "Identify effective optimizations that improve computational efficiency in verifying zeros or related problems."
+        },
+        readiness: "needs_clarification",
+        readinessRationale: "The research question is still missing.",
+        openQuestions: ["What specific research question should guide the optimization work?"],
+        summary: null
+      };
+    }
+
+    if (lastUserMessage === "yes") {
+      return {
+        assistantMessage: "Great! Since you've confirmed the brief aligns with your goals, we can proceed with this as the initial research focus.",
+        brief: {
+          topic: "Riemann Hypothesis",
+          researchQuestion: null,
+          researchDirection: "Optimize existing algorithms used in computational approaches to the Riemann Hypothesis.",
+          successCriterion: "Identify effective optimizations that improve computational efficiency in verifying zeros or related problems."
+        },
+        readiness: "needs_clarification",
+        readinessRationale: "The research question is still missing.",
+        openQuestions: ["What specific research question should guide the optimization work?"],
+        summary: null
+      };
+    }
+
+    return {
+      assistantMessage: "Tell me a bit more about the project.",
+      brief: request.brief,
+      readiness: "needs_clarification",
+      readinessRationale: "The project still needs clarification.",
+      openQuestions: ["What additional detail should shape this project?"],
+      summary: null
+    };
+  }
+
+  async completeBrief(): Promise<{
+    topic: string;
+    researchQuestion: string;
+    researchDirection: string;
+    successCriterion: string;
+  }> {
+    return {
+      topic: "Riemann Hypothesis",
+      researchQuestion: "How can existing algorithms used in computational work on the Riemann Hypothesis be optimized to reduce computational complexity?",
+      researchDirection: "Optimize existing algorithms used in computational approaches to the Riemann Hypothesis.",
+      successCriterion: "Identify effective optimizations that improve computational efficiency in verifying zeros or related problems."
+    };
+  }
+}
+
+class FailingResumeBackend implements IntakeBackend {
+  readonly label = "stub:failing-resume";
+
+  async respond(): Promise<IntakeResponse> {
+    throw new Error("resume backend should not have been called");
+  }
+}
+
 class CompleteProposalBackend implements IntakeBackend {
   readonly label = "stub:complete-proposal";
 
@@ -627,6 +852,71 @@ class CompleteProposalBackend implements IntakeBackend {
         readinessRationale: "The user may still want to adjust the framing, but the brief is already usable.",
         openQuestions: ["Does this framing match the project you want to run?"],
         summary: "A complete first-pass brief on AI-related displacement risks in nursing-home work."
+      };
+    }
+
+    return {
+      assistantMessage: "Tell me more about the project you want to run.",
+      brief: request.brief,
+      readiness: "needs_clarification",
+      readinessRationale: "The project still needs clarification.",
+      openQuestions: ["What should the project investigate?"],
+      summary: null
+    };
+  }
+}
+
+class MessageOnlyProposalBackend implements IntakeBackend {
+  readonly label = "stub:message-only-proposal";
+
+  async respond(request: IntakeRequest): Promise<IntakeResponse> {
+    const lastUserMessage = [...request.conversation]
+      .reverse()
+      .find((message) => message.role === "user")
+      ?.content;
+
+    if (request.mode === "start") {
+      return {
+        assistantMessage: "Hello! I'm ClawResearch's research intake consultant. What project would you like to hand off?",
+        brief: {
+          topic: null,
+          researchQuestion: null,
+          researchDirection: null,
+          successCriterion: null
+        },
+        readiness: "needs_clarification",
+        readinessRationale: "The project has not been described yet.",
+        openQuestions: ["What should the project investigate?"],
+        summary: null
+      };
+    }
+
+    if (request.mode === "recover") {
+      throw new Error("recover should not be called when the visible draft already contains a complete brief");
+    }
+
+    if (lastUserMessage === "I want to study autonomous research agents") {
+      return {
+        assistantMessage: [
+          "Based on what you've said, here is a working research brief:",
+          "",
+          "**Topic**: Autonomous research agents",
+          "**Research Question**: What design and implementation practices make autonomous research agents more likely to produce successful and publishable research outputs?",
+          "**Research Direction**: Review current agent architectures, workflow patterns, and evaluation practices, then identify the most credible design patterns and implementation tradeoffs for a first-pass synthesis.",
+          "**Success Criterion**: Produce a source-grounded research note that maps the strongest design patterns, highlights major implementation tradeoffs, and identifies the clearest next questions for follow-up.",
+          "",
+          "If that framing looks right, you can use /go immediately."
+        ].join("\n"),
+        brief: {
+          topic: "Autonomous research agents",
+          researchQuestion: null,
+          researchDirection: null,
+          successCriterion: null
+        },
+        readiness: "needs_clarification",
+        readinessRationale: "The visible draft is ready for confirmation even though the structured fields were only partially filled.",
+        openQuestions: ["Does this framing match the project you want to run?"],
+        summary: "A complete first-pass brief on autonomous research agents is visible in the proposed draft."
       };
     }
 
@@ -950,6 +1240,57 @@ test("phase one console preserves the exact wording of a complete proposed brief
   }
 });
 
+test("phase one console can start from a visible drafted brief even when the backend left structured fields incomplete", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-visible-draft-go-"));
+
+  try {
+    const io = createScriptedIo([
+      "I want to study autonomous research agents",
+      "/go",
+      "/quit"
+    ]);
+
+    const code = await runPhaseOneConsole(io, {
+      projectRoot,
+      version: "0.5.0",
+      now: createNow(),
+      intakeBackend: new MessageOnlyProposalBackend(),
+      runController: new FakeRunController()
+    });
+
+    assert.equal(code, 0);
+    assert.match(io.output, /working research brief/i);
+    assert.match(io.output, /Research run started\./);
+    assert.doesNotMatch(io.output, /I'm not ready to start the run yet\./);
+
+    const sessionPath = path.join(projectRoot, ".clawresearch", "session.json");
+    const session = JSON.parse(await readFile(sessionPath, "utf8")) as {
+      status: string;
+      goCount: number;
+      activeRunId: string | null;
+      brief: {
+        topic: string;
+        researchQuestion: string;
+        researchDirection: string;
+        successCriterion: string;
+      };
+      intake: {
+        readiness: string;
+      };
+    };
+
+    assert.equal(session.status, "ready");
+    assert.equal(session.goCount, 1);
+    assert.notEqual(session.activeRunId, null);
+    assert.equal(session.intake.readiness, "ready");
+    assert.match(session.brief.researchQuestion, /design and implementation practices/i);
+    assert.match(session.brief.researchDirection, /workflow patterns/i);
+    assert.match(session.brief.successCriterion, /source-grounded research note/i);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("phase one console saves a local debug transcript of the interaction", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-transcript-"));
 
@@ -979,6 +1320,83 @@ test("phase one console saves a local debug transcript of the interaction", asyn
     assert.match(transcript, /clawresearch> Hi, can you hear me\?/);
     assert.match(transcript, /clawresearch> \/quit/);
     assert.match(transcript, /system\s+Session saved\. Closing ClawResearch\./);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("phase one console does not inject a new assistant turn when resuming a session that already ends on an assistant chat message", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-resume-awaiting-user-"));
+  const runtimeDirectory = path.join(projectRoot, ".clawresearch");
+
+  try {
+    await mkdir(runtimeDirectory, { recursive: true });
+    await writeFile(
+      path.join(runtimeDirectory, "session.json"),
+      JSON.stringify({
+        schemaVersion: 3,
+        appVersion: "0.7.0",
+        projectRoot,
+        runtimeDirectory,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:02.000Z",
+        status: "startup_chat",
+        goCount: 0,
+        lastGoRequestedAt: null,
+        activeRunId: null,
+        lastRunId: null,
+        brief: {
+          topic: "Riemann Hypothesis",
+          researchQuestion: null,
+          researchDirection: null,
+          successCriterion: null
+        },
+        intake: {
+          backendLabel: "stub:prior",
+          readiness: "needs_clarification",
+          rationale: "The project still needs clarification.",
+          openQuestions: [
+            "Which specific angle should the project investigate?"
+          ],
+          summary: null,
+          lastError: null
+        },
+        conversation: [
+          {
+            id: "1",
+            kind: "chat",
+            role: "user",
+            text: "I want to study the Riemann Hypothesis.",
+            timestamp: "2026-01-01T00:00:00.000Z"
+          },
+          {
+            id: "2",
+            kind: "chat",
+            role: "assistant",
+            text: "Which specific angle should the project investigate?",
+            timestamp: "2026-01-01T00:00:01.000Z"
+          }
+        ]
+      }, null, 2),
+      "utf8"
+    );
+
+    const io = createScriptedIo([
+      "/quit"
+    ]);
+
+    const code = await runPhaseOneConsole(io, {
+      projectRoot,
+      version: "0.7.0",
+      now: createNow(),
+      intakeBackend: new FailingResumeBackend(),
+      runController: new FakeRunController()
+    });
+
+    assert.equal(code, 0);
+    assert.match(io.output, /Resuming the saved startup chat for this project\./);
+    assert.doesNotMatch(io.output, /resume backend should not have been called/i);
+    assert.doesNotMatch(io.output, /consultant\s+Which specific angle should the project investigate\?/);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -1040,9 +1458,10 @@ test("phase two console streams live run progress and reports completion", async
     assert.equal(code, 0);
     assert.match(io.output, /run\s+Research run started\./);
     assert.match(io.output, /watch\s+Streaming live run activity/);
-    assert.match(io.output, /plan\s+Persist the research brief/);
-    assert.match(io.output, /exec\s+bash -lc clawresearch phase-2 bootstrap/);
-    assert.match(io.output, /stdout\s+Bootstrap output/);
+    assert.match(io.output, /plan\s+Plan the research mode and generate initial search queries\./);
+    assert.match(io.output, /exec\s+clawresearch research-loop --mode plan-gather-synthesize/);
+    assert.match(io.output, /source\s+brief-1: AI adoption and job displacement in nursing homes/);
+    assert.match(io.output, /claim\s+Current deployment evidence suggests displacement risk is uneven across role categories/);
     assert.match(io.output, /done\s+Run run-/);
     assert.match(io.output, /status: completed/);
     assert.match(io.output, /events: \.clawresearch\/runs\/run-.*\/events\.jsonl/);
@@ -1055,6 +1474,81 @@ test("phase two console streams live run progress and reports completion", async
 
     assert.equal(session.activeRunId, null);
     assert.notEqual(session.lastRunId, null);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("phase two console watcher does not misreport failure when the worker exits just before the final completed state is saved", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-watch-race-"));
+  const now = createNow();
+
+  try {
+    const io = createScriptedIo([
+      "I want to study AI job displacement in nursing homes",
+      "/go",
+      "/status",
+      "/quit"
+    ]);
+
+    const code = await runPhaseOneConsole(io, {
+      projectRoot,
+      version: "0.7.0",
+      now,
+      intakeBackend: new CompleteProposalBackend(),
+      runController: new RaceyWatchedRunController(now),
+      watchRuns: true,
+      watchPollMs: 5
+    });
+
+    assert.equal(code, 0);
+    assert.doesNotMatch(io.output, /error\s+Run run-.* failed\./);
+    assert.match(io.output, /done\s+Run run-/);
+    assert.match(io.output, /status: completed/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("phase one console formalizes missing structured fields after the user confirms a drafted brief, even before /go", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-confirmed-draft-"));
+
+  try {
+    const io = createScriptedIo([
+      "Riemann hypothesis",
+      "computational approaches",
+      "algorithmic improvements",
+      "optimizing existing algorithms",
+      "yes",
+      "/status",
+      "/quit"
+    ]);
+
+    const code = await runPhaseOneConsole(io, {
+      projectRoot,
+      version: "0.7.0",
+      now: createNow(),
+      intakeBackend: new CompletionFallbackBackend(),
+      runController: new FakeRunController()
+    });
+
+    assert.equal(code, 0);
+    assert.match(io.output, /Great! Since you've confirmed the brief aligns with your goals/i);
+    assert.match(io.output, /Readiness: ready/);
+    assert.match(io.output, /research question: How can existing algorithms used in computational work on the Riemann Hypothesis be optimized to reduce computational complexity\?/);
+
+    const sessionPath = path.join(projectRoot, ".clawresearch", "session.json");
+    const session = JSON.parse(await readFile(sessionPath, "utf8")) as {
+      intake: {
+        readiness: string;
+      };
+      brief: {
+        researchQuestion: string | null;
+      };
+    };
+
+    assert.equal(session.intake.readiness, "ready");
+    assert.match(session.brief.researchQuestion ?? "", /reduce computational complexity/i);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -1103,6 +1597,54 @@ test("phase one console can complete missing structured fields when the user inv
     assert.notEqual(session.activeRunId, null);
     assert.match(session.brief.researchQuestion, /algorithmic and computational methods/);
     assert.match(session.brief.successCriterion, /literature-grounded research note/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("phase one console can recover a missing structured field from a confirmed draft during /go", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-completion-fallback-"));
+
+  try {
+    const io = createScriptedIo([
+      "Riemann hypothesis",
+      "computational approaches",
+      "algorithmic improvements",
+      "optimizing existing algorithms",
+      "yes",
+      "/go",
+      "/quit"
+    ]);
+
+    const code = await runPhaseOneConsole(io, {
+      projectRoot,
+      version: "0.6.0",
+      now: createNow(),
+      intakeBackend: new CompletionFallbackBackend(),
+      runController: new FakeRunController()
+    });
+
+    assert.equal(code, 0);
+    assert.match(io.output, /Research run started\./);
+    assert.match(io.output, /Status: queued/);
+
+    const sessionPath = path.join(projectRoot, ".clawresearch", "session.json");
+    const session = JSON.parse(await readFile(sessionPath, "utf8")) as {
+      intake: {
+        readiness: string;
+      };
+      brief: {
+        researchQuestion: string | null;
+      };
+      activeRunId: string | null;
+    };
+
+    assert.equal(session.intake.readiness, "ready");
+    assert.notEqual(session.activeRunId, null);
+    assert.match(
+      session.brief.researchQuestion ?? "",
+      /optimized to reduce computational complexity/i
+    );
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

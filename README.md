@@ -110,6 +110,12 @@ Minimal runtime state is persisted locally in:
 .clawresearch/session.json
 ```
 
+The runtime now also keeps a small structured memory in:
+
+```text
+.clawresearch/memory.json
+```
+
 The console also keeps a raw debug transcript of the interaction in:
 
 ```text
@@ -130,11 +136,46 @@ Each run keeps a small set of debuggable local artifacts, including:
 - `stdout.log`
 - `stderr.log`
 - `brief.json`
+- `plan.json`
+- `sources.json`
+- `synthesis.md`
+- `claims.json`
+- `verification.json`
+- `next-questions.json`
 - `summary.md`
+- `memory.json`
 
-`events.jsonl` is the structured event stream the console watches while a run is active. It currently emits small, readable steps such as `plan`, `next`, `exec`, `summary`, `stdout`, and terminal `run` updates.
+`events.jsonl` is the structured event stream the console watches while a run is active. It currently emits small, readable steps such as `plan`, `source`, `claim`, `next`, `exec`, `summary`, and terminal `run` updates.
 
-The current detached worker is still intentionally minimal. It proves the runtime shape, logging, and observability layer, but it does not yet perform a real literature review or full autonomous research loop.
+The project-level memory is intentionally simple rather than graph-heavy. It stores typed records such as:
+
+- `source`
+- `claim`
+- `finding`
+- `question`
+- `idea`
+- `summary`
+- `artifact`
+
+Each record has a stable id, lightweight links to related records, and enough metadata to debug how a run's outputs connect without introducing a large orchestration system.
+
+That memory is now also used actively by later runs. The planner and source gatherer receive a summarized project memory context so the next pass can build on prior findings, questions, ideas, and artifacts instead of starting cold each time.
+
+The detached worker now runs a minimal explicit research loop. It is still intentionally small, but it no longer just boots and exits. The current loop does this:
+
+- plan a bounded research mode
+- run a dedicated literature-review subsystem for review-style tasks, with task-aware paper ranking instead of generic web browsing
+- gather sources from relevant local text files plus public OpenAlex literature search, with Wikipedia background fallback when literature retrieval is empty or malformed
+- use relevant project memory to shape planning and retrieval
+- synthesize themes
+- record claims with explicit evidence references
+- verify claim provenance, support status, and explicit unknown or unverified gaps
+- produce next-step research questions
+- write a small structured memory batch into both the run directory and the project runtime memory store
+
+It is still not a full autonomous scientist yet. The current loop is best understood as a source-grounded first research pass with inspectable artifacts.
+
+When the run is clearly a literature-review task, ClawResearch now switches to a specialized literature subsystem. That subsystem builds a task-aware literature profile, ranks papers by domain and task fit rather than pure keyword overlap, and uses a literature-specific synthesis prompt that emphasizes thematic comparison, citation grounding, and explicit gap identification.
 
 After dependencies are installed, the runtime can also be built and run as compiled JavaScript:
 
@@ -172,9 +213,18 @@ run        Run id: run-...
 run        Status: queued
 run        Trace: .clawresearch/runs/run-.../trace.log
 run        Events: .clawresearch/runs/run-.../events.jsonl
+run        Plan: .clawresearch/runs/run-.../plan.json
+run        Sources: .clawresearch/runs/run-.../sources.json
+run        Synthesis: .clawresearch/runs/run-.../synthesis.md
+run        Verification: .clawresearch/runs/run-.../verification.json
+run        Memory: .clawresearch/runs/run-.../memory.json
 watch      Streaming live run activity from .clawresearch/runs/run-.../events.jsonl.
-plan       Persist the research brief, prepare initial run artifacts, and launch the detached bootstrap command.
-exec       bash -lc ...
+plan       Plan the research mode and generate initial search queries.
+source     web-1: ...
+claim      ...
+verify     Verified 1 claims against 2 sources. 1 supported, 0 partially supported, 0 unverified, 0 explicit unknown.
+memory     Recorded 15 structured memory records (15 new, 0 updated).
+next       ...
 done       Run run-... completed.
 ```
 

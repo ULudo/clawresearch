@@ -4,6 +4,7 @@ import path from "node:path";
 export const runtimeDirectoryName = ".clawresearch";
 export const sessionFileName = "session.json";
 const schemaVersion = 3;
+const placeholderValuePattern = /^(?:string(?:\s+or\s+null)?|null|n\/a|tbd|unknown)$/i;
 
 export type ResearchBriefField =
   | "topic"
@@ -112,7 +113,14 @@ function asObject(value: unknown): Record<string, unknown> {
 }
 
 function readString(value: unknown): string | null {
-  return typeof value === "string" && value.trim().length > 0 ? value : null;
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  return trimmed.length > 0 && !placeholderValuePattern.test(trimmed)
+    ? trimmed
+    : null;
 }
 
 function mergeSession(raw: unknown, projectRoot: string, version: string, timestamp: string): SessionState {

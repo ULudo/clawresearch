@@ -5,7 +5,11 @@ export type RunEventKind =
   | "run"
   | "plan"
   | "summary"
+  | "memory"
+  | "verify"
   | "next"
+  | "source"
+  | "claim"
   | "exec"
   | "stdout"
   | "stderr";

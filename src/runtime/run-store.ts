@@ -31,7 +31,14 @@ export type RunArtifactRecord = {
   stdoutPath: string;
   stderrPath: string;
   briefPath: string;
+  planPath: string;
+  sourcesPath: string;
+  synthesisPath: string;
+  claimsPath: string;
+  verificationPath: string;
+  nextQuestionsPath: string;
   summaryPath: string;
+  memoryPath: string;
 };
 
 export type RunRecord = {
@@ -153,7 +160,14 @@ function createRunRecord(
       stdoutPath: path.join(runDirectory, "stdout.log"),
       stderrPath: path.join(runDirectory, "stderr.log"),
       briefPath: path.join(runDirectory, "brief.json"),
-      summaryPath: path.join(runDirectory, "summary.md")
+      planPath: path.join(runDirectory, "plan.json"),
+      sourcesPath: path.join(runDirectory, "sources.json"),
+      synthesisPath: path.join(runDirectory, "synthesis.md"),
+      claimsPath: path.join(runDirectory, "claims.json"),
+      verificationPath: path.join(runDirectory, "verification.json"),
+      nextQuestionsPath: path.join(runDirectory, "next-questions.json"),
+      summaryPath: path.join(runDirectory, "summary.md"),
+      memoryPath: path.join(runDirectory, "memory.json")
     }
   };
 }
@@ -201,7 +215,14 @@ function mergeRunRecord(
       stdoutPath: readString(artifacts.stdoutPath) ?? path.join(runDirectory, "stdout.log"),
       stderrPath: readString(artifacts.stderrPath) ?? path.join(runDirectory, "stderr.log"),
       briefPath: readString(artifacts.briefPath) ?? path.join(runDirectory, "brief.json"),
-      summaryPath: readString(artifacts.summaryPath) ?? path.join(runDirectory, "summary.md")
+      planPath: readString(artifacts.planPath) ?? path.join(runDirectory, "plan.json"),
+      sourcesPath: readString(artifacts.sourcesPath) ?? path.join(runDirectory, "sources.json"),
+      synthesisPath: readString(artifacts.synthesisPath) ?? path.join(runDirectory, "synthesis.md"),
+      claimsPath: readString(artifacts.claimsPath) ?? path.join(runDirectory, "claims.json"),
+      verificationPath: readString(artifacts.verificationPath) ?? path.join(runDirectory, "verification.json"),
+      nextQuestionsPath: readString(artifacts.nextQuestionsPath) ?? path.join(runDirectory, "next-questions.json"),
+      summaryPath: readString(artifacts.summaryPath) ?? path.join(runDirectory, "summary.md"),
+      memoryPath: readString(artifacts.memoryPath) ?? path.join(runDirectory, "memory.json")
     }
   };
 }
@@ -255,7 +276,14 @@ export class RunStore {
     run.artifacts.stdoutPath = path.join(run.artifacts.runDirectory, "stdout.log");
     run.artifacts.stderrPath = path.join(run.artifacts.runDirectory, "stderr.log");
     run.artifacts.briefPath = path.join(run.artifacts.runDirectory, "brief.json");
+    run.artifacts.planPath = path.join(run.artifacts.runDirectory, "plan.json");
+    run.artifacts.sourcesPath = path.join(run.artifacts.runDirectory, "sources.json");
+    run.artifacts.synthesisPath = path.join(run.artifacts.runDirectory, "synthesis.md");
+    run.artifacts.claimsPath = path.join(run.artifacts.runDirectory, "claims.json");
+    run.artifacts.verificationPath = path.join(run.artifacts.runDirectory, "verification.json");
+    run.artifacts.nextQuestionsPath = path.join(run.artifacts.runDirectory, "next-questions.json");
     run.artifacts.summaryPath = path.join(run.artifacts.runDirectory, "summary.md");
+    run.artifacts.memoryPath = path.join(run.artifacts.runDirectory, "memory.json");
     await writeRunFile(this.projectRoot, run);
   }
 }
