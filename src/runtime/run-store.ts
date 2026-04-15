@@ -33,6 +33,7 @@ export type RunArtifactRecord = {
   briefPath: string;
   planPath: string;
   sourcesPath: string;
+  literaturePath: string;
   synthesisPath: string;
   claimsPath: string;
   verificationPath: string;
@@ -162,6 +163,7 @@ function createRunRecord(
       briefPath: path.join(runDirectory, "brief.json"),
       planPath: path.join(runDirectory, "plan.json"),
       sourcesPath: path.join(runDirectory, "sources.json"),
+      literaturePath: path.join(runDirectory, "literature.json"),
       synthesisPath: path.join(runDirectory, "synthesis.md"),
       claimsPath: path.join(runDirectory, "claims.json"),
       verificationPath: path.join(runDirectory, "verification.json"),
@@ -217,6 +219,7 @@ function mergeRunRecord(
       briefPath: readString(artifacts.briefPath) ?? path.join(runDirectory, "brief.json"),
       planPath: readString(artifacts.planPath) ?? path.join(runDirectory, "plan.json"),
       sourcesPath: readString(artifacts.sourcesPath) ?? path.join(runDirectory, "sources.json"),
+      literaturePath: readString(artifacts.literaturePath) ?? path.join(runDirectory, "literature.json"),
       synthesisPath: readString(artifacts.synthesisPath) ?? path.join(runDirectory, "synthesis.md"),
       claimsPath: readString(artifacts.claimsPath) ?? path.join(runDirectory, "claims.json"),
       verificationPath: readString(artifacts.verificationPath) ?? path.join(runDirectory, "verification.json"),

@@ -28,7 +28,16 @@ function capture(): { output: string; writer: { write: (chunk: string) => void }
 
 function createScriptedIo(lines: string[]): ConsoleIo & { output: string } {
   const sink = capture();
-  const queue = [...lines];
+  const queue = [
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    ...lines
+  ];
 
   return {
     get output() {
@@ -87,7 +96,8 @@ test("help flag prints interactive usage and slash commands", async () => {
   const code = await main(["--help"], { writer: sink.writer });
 
   assert.equal(code, 0);
-  assert.match(sink.output, /Starts the interactive research chat in the current directory, launches detached runs from `\/go`, and streams their saved progress events in the terminal\./);
+  assert.match(sink.output, /Starts the TUI research console in the current directory, launches detached runs from `\/go`, and streams their saved progress events in the terminal\./);
+  assert.match(sink.output, /Use `--plain` to force the older line-oriented console/);
   assert.match(sink.output, /\/go/);
   assert.match(sink.output, /\/status/);
   assert.match(sink.output, /\/pause/);
@@ -122,7 +132,7 @@ test("compiled cli still runs when invoked through a symlinked path", async () =
       cwd: path.resolve(".")
     });
 
-    assert.match(stdout, /Starts the interactive research chat in the current directory, launches detached runs from `\/go`, and streams their saved progress events in the terminal\./);
+    assert.match(stdout, /Starts the TUI research console in the current directory, launches detached runs from `\/go`, and streams their saved progress events in the terminal\./);
     assert.match(stdout, /\/quit/);
   } finally {
     await rm(scratchRoot, { recursive: true, force: true });

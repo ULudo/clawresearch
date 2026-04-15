@@ -109,7 +109,7 @@ test("planning backend includes project memory context in the prompt it sends to
   }
 });
 
-test("synthesis backend switches to the specialized literature-review prompt for literature synthesis runs", async () => {
+test("synthesis backend uses canonical papers in the specialized literature-review prompt", async () => {
   const originalFetch = globalThis.fetch;
   let capturedPrompt = "";
 
@@ -153,21 +153,56 @@ test("synthesis backend switches to the specialized literature-review prompt for
         searchQueries: ["autonomous research agents literature review"],
         localFocus: ["evaluation practices"]
       },
-      sources: [
+      papers: [
         {
-          id: "web-1",
-          kind: "openalex_work",
+          id: "paper-1",
+          key: "doi:10.1000/agents",
           title: "Design Patterns for Autonomous Research Agents",
-          locator: "https://example.org/agents",
           citation: "Example Author (2026). Design Patterns for Autonomous Research Agents.",
-          excerpt: "This review compares architecture choices and evaluation practices."
+          abstract: "This review compares architecture choices and evaluation practices.",
+          year: 2026,
+          authors: ["Example Author"],
+          venue: "AI Systems Review",
+          discoveredVia: ["openalex"],
+          identifiers: {
+            doi: "10.1000/agents",
+            pmid: null,
+            pmcid: null,
+            arxivId: null
+          },
+          discoveryRecords: [],
+          accessCandidates: [],
+          bestAccessUrl: "https://example.org/agents.pdf",
+          bestAccessProvider: "openalex",
+          accessMode: "fulltext_open",
+          fulltextFormat: "pdf",
+          license: null,
+          tdmAllowed: true,
+          contentStatus: {
+            abstractAvailable: true,
+            fulltextAvailable: true,
+            fulltextFetched: false,
+            fulltextExtracted: false
+          },
+          screeningStage: "fulltext",
+          screeningDecision: "include",
+          screeningRationale: "Highly relevant.",
+          accessErrors: [],
+          tags: [],
+          runIds: [],
+          linkedThemeIds: [],
+          linkedClaimIds: [],
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z"
         }
       ]
     });
 
     assert.match(capturedPrompt, /dedicated literature-review synthesis module/i);
     assert.match(capturedPrompt, /Treat this as a literature review subsystem/i);
-    assert.match(capturedPrompt, /Literature review profile:/);
+    assert.match(capturedPrompt, /Sources:/);
+    assert.match(capturedPrompt, /canonical_paper/);
+    assert.match(capturedPrompt, /agents\.pdf/);
     assert.match(capturedPrompt, /Do not treat a loosely related background source as direct evidence/i);
   } finally {
     globalThis.fetch = originalFetch;

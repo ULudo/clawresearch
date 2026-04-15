@@ -27,10 +27,34 @@ import {
   ConsoleTranscript
 } from "./console-transcript.js";
 import {
+  buildLiteratureContext,
+  LiteratureStore,
+  type LiteratureState
+} from "./literature-store.js";
+import {
   countMemoryRecordsByType,
   MemoryStore,
   type MemoryState
 } from "./memory-store.js";
+import {
+  authStatesForSelectedProviders,
+  formatSelectedLiteratureProviders,
+  projectConfigPath,
+  providerSelectionLines,
+  suggestedAuthRefForProvider,
+  setProviderAuthRef,
+  parseLiteratureProviderSelection,
+  ProjectConfigStore,
+  type ProjectConfigState
+} from "./project-config-store.js";
+import {
+  createProviderSelectionLines,
+  formatSelectedProviderLabels,
+  getSourceProviderDefinition,
+  parseProviderSelection,
+  type SourceProviderCategory,
+  type SourceProviderId
+} from "./provider-registry.js";
 import {
   parseRunEventLines,
   readRunEventChunk,
@@ -48,7 +72,7 @@ export type ConsoleIo = {
   close?: () => void;
 };
 
-type RunOptions = {
+export type RunOptions = {
   projectRoot: string;
   version: string;
   now?: () => string;
@@ -116,7 +140,7 @@ function renderTaggedLines(writer: OutputWriter, tag: string, lines: string[]): 
   }
 }
 
-function relativeProjectPath(projectRoot: string, targetPath: string): string {
+export function relativeProjectPath(projectRoot: string, targetPath: string): string {
   const relativePath = path.relative(projectRoot, targetPath);
   return relativePath.length === 0 ? "." : relativePath;
 }
@@ -139,14 +163,32 @@ function renderWelcome(writer: OutputWriter, session: SessionState): void {
   }
 
   writeLine(writer, "The current directory is treated as the project root automatically.");
-  writeLine(writer, "Use `/help` for commands, `/status` for the current brief and run state, `/go` to start a detached run when the brief is ready, and `/quit` to leave.");
+  writeLine(writer, "Use `/help` for commands, `/status` for the current brief and run state, `/sources` to inspect literature providers, `/go` to start a detached run when the brief is ready, and `/quit` to leave.");
   writeLine(writer);
 }
 
-function renderHelp(writer: OutputWriter, session: SessionState): void {
+function renderLiteratureSetup(
+  writer: OutputWriter,
+  session: SessionState,
+  projectConfig: ProjectConfigState
+): void {
+  if (session.conversation.length > 0) {
+    return;
+  }
+
+  writeLine(writer, "Provider-aware literature sources are configured for this project:");
+  writeLine(writer, `  scholarly: ${formatSelectedProviderLabels(projectConfig.sources.scholarly.selectedProviderIds)}`);
+  writeLine(writer, `  background: ${formatSelectedProviderLabels(projectConfig.sources.background.selectedProviderIds)}`);
+  writeLine(writer, `  local project files: ${projectConfig.sources.local.projectFilesEnabled ? "on" : "off"}`);
+  writeLine(writer, "Use `scholarly: ...`, `background: ...`, `local: on|off`, or `sources: ...` to update them later.");
+  writeLine(writer);
+}
+
+export function renderHelp(writer: OutputWriter, session: SessionState): void {
   writeLine(writer, "Commands:");
   writeLine(writer, "  /help   Show the command list and input hints");
   writeLine(writer, "  /status Show the current research brief, run state, and backend");
+  writeLine(writer, "  /sources Show the current literature providers for this project");
   writeLine(writer, "  /go     Start a detached run from the current research brief");
   writeLine(writer, "  /pause  Pause the active detached run");
   writeLine(writer, "  /resume Resume the active detached run");
@@ -156,16 +198,19 @@ function renderHelp(writer: OutputWriter, session: SessionState): void {
   writeLine(writer, "Input hints:");
   writeLine(writer, "  Talk naturally about the project as if briefing a researcher.");
   writeLine(writer, "  You can still force a specific field with `topic:`, `question:`, `direction:`, or `success:`.");
+  writeLine(writer, "  You can configure providers with `scholarly: openalex, arxiv`, `background: wikipedia`, `local: off`, or `sources: openalex, crossref`.");
   writeLine(writer, "  Detached runs stream progress in the console and save a debug transcript locally.");
   writeLine(writer, `  Local intake backend: ${session.intake.backendLabel ?? "not configured"}`);
 }
 
-function renderStatus(
+export function renderStatus(
   writer: OutputWriter,
   session: SessionState,
   run: RunRecord | null,
   transcriptPath: string,
-  memory: MemoryState
+  memory: MemoryState,
+  projectConfig: ProjectConfigState,
+  literature: LiteratureState
 ): void {
   writeLine(writer, "Current brief:");
   writeLine(writer, `  topic: ${session.brief.topic ?? "<missing>"}`);
@@ -214,6 +259,7 @@ function renderStatus(
     writeLine(writer, `  stderr: ${relativeProjectPath(session.projectRoot, run.artifacts.stderrPath)}`);
     writeLine(writer, `  plan: ${relativeProjectPath(session.projectRoot, run.artifacts.planPath)}`);
     writeLine(writer, `  sources: ${relativeProjectPath(session.projectRoot, run.artifacts.sourcesPath)}`);
+    writeLine(writer, `  literature: ${relativeProjectPath(session.projectRoot, run.artifacts.literaturePath)}`);
     writeLine(writer, `  synthesis: ${relativeProjectPath(session.projectRoot, run.artifacts.synthesisPath)}`);
     writeLine(writer, `  claims: ${relativeProjectPath(session.projectRoot, run.artifacts.claimsPath)}`);
     writeLine(writer, `  verification: ${relativeProjectPath(session.projectRoot, run.artifacts.verificationPath)}`);
@@ -237,6 +283,28 @@ function renderStatus(
     writer,
     `  by type: source ${counts.source}, claim ${counts.claim}, finding ${counts.finding}, question ${counts.question}, idea ${counts.idea}, summary ${counts.summary}, artifact ${counts.artifact}`
   );
+  writeLine(writer);
+  writeLine(writer, "Literature:");
+  writeLine(writer, `  config: ${relativeProjectPath(session.projectRoot, projectConfigPath(session.projectRoot))}`);
+  writeLine(writer, `  scholarly: ${formatSelectedProviderLabels(projectConfig.sources.scholarly.selectedProviderIds)}`);
+  writeLine(writer, `  background: ${formatSelectedProviderLabels(projectConfig.sources.background.selectedProviderIds)}`);
+  writeLine(writer, `  local project files: ${projectConfig.sources.local.projectFilesEnabled ? "on" : "off"}`);
+  writeLine(writer, `  store: ${relativeProjectPath(session.projectRoot, literature.runtimeDirectory)}/${"literature/library.json"}`);
+  writeLine(writer, `  canonical papers: ${literature.paperCount}`);
+  writeLine(writer, `  theme boards: ${literature.themeCount}`);
+  writeLine(writer, `  review notebooks: ${literature.notebookCount}`);
+
+  for (const authState of authStatesForSelectedProviders(projectConfig)) {
+    const statusLabel = authState.status.replace(/_/g, " ");
+    const refLabel = authState.authRef === null ? "no env ref" : authState.authRef;
+    writeLine(writer, `  auth ${authState.definition.label}: ${statusLabel} (${refLabel})`);
+  }
+
+  const literatureContext = buildLiteratureContext(literature, session.brief);
+
+  if (literatureContext.available && literatureContext.queryHints.length > 0) {
+    writeLine(writer, `  current hints: ${literatureContext.queryHints.slice(0, 4).join(" | ")}`);
+  }
 }
 
 function parseExplicitBriefUpdate(input: string): BriefUpdate | null {
@@ -252,6 +320,279 @@ function parseExplicitBriefUpdate(input: string): BriefUpdate | null {
   }
 
   return null;
+}
+
+type SourceSelectionUpdate = {
+  category: SourceProviderCategory | "local";
+  value: string;
+};
+
+function parseSourceSelectionUpdate(input: string): SourceSelectionUpdate | null {
+  const match = input.match(/^(sources?|scholarly|background|local|literature sources?)\s*:\s*(.+)$/i);
+  const rawCategory = match?.[1]?.trim().toLowerCase();
+  const value = match?.[2]?.trim();
+
+  if (rawCategory === undefined || value === undefined) {
+    return null;
+  }
+
+  switch (rawCategory) {
+    case "sources":
+    case "source":
+    case "literature source":
+    case "literature sources":
+    case "scholarly":
+      return {
+        category: "scholarly",
+        value
+      };
+    case "background":
+      return {
+        category: "background",
+        value
+      };
+    case "local":
+      return {
+        category: "local",
+        value
+      };
+    default:
+      return null;
+  }
+}
+
+function parseLocalToggle(value: string): boolean | null {
+  const normalized = value.trim().toLowerCase();
+
+  switch (normalized) {
+    case "on":
+    case "true":
+    case "yes":
+    case "default":
+      return true;
+    case "off":
+    case "false":
+    case "no":
+    case "none":
+      return false;
+    default:
+      return null;
+  }
+}
+
+export function renderSources(
+  writer: OutputWriter,
+  session: SessionState,
+  projectConfig: ProjectConfigState
+): void {
+  writeLine(writer, "Providers for this project:");
+  writeLine(writer, "  Scholarly:");
+  for (const line of createProviderSelectionLines("scholarly", projectConfig.sources.scholarly.selectedProviderIds)) {
+    writeLine(writer, `    ${line}`);
+  }
+  writeLine(writer, "  Background:");
+  for (const line of createProviderSelectionLines("background", projectConfig.sources.background.selectedProviderIds)) {
+    writeLine(writer, `    ${line}`);
+  }
+  writeLine(writer, `  Local project files: ${projectConfig.sources.local.projectFilesEnabled ? "on" : "off"}`);
+  writeLine(writer, "  Auth:");
+  const authStates = authStatesForSelectedProviders(projectConfig);
+  if (authStates.length === 0) {
+    writeLine(writer, "    none needed");
+  } else {
+    for (const authState of authStates) {
+      writeLine(
+        writer,
+        `    ${authState.definition.label}: ${authState.status.replace(/_/g, " ")}${authState.authRef === null ? "" : ` (${authState.authRef})`}`
+      );
+    }
+  }
+  writeLine(writer, `Config: ${relativeProjectPath(session.projectRoot, projectConfigPath(session.projectRoot))}`);
+  writeLine(writer);
+  writeLine(writer, "Update with `scholarly: openalex, arxiv`, `background: wikipedia`, `local: off`, or `sources: openalex, crossref`.");
+}
+
+async function promptProviderAuthRefs(
+  io: ConsoleIo,
+  transcript: ConsoleTranscript,
+  writer: OutputWriter,
+  projectConfig: ProjectConfigState,
+  providerIds: SourceProviderId[]
+): Promise<boolean> {
+  for (const providerId of providerIds) {
+    const definition = getSourceProviderDefinition(providerId);
+
+    if (definition.authMode === "none") {
+      continue;
+    }
+
+    const suggestedAuthRef = suggestedAuthRefForProvider(projectConfig, providerId);
+    const promptText = definition.authMode === "optional_api_key"
+      ? `${definition.label} auth env var [optional, example ${suggestedAuthRef ?? "ENV_VAR_NAME"}; Enter leaves it unset]: `
+      : `${definition.label} auth env var [required, example ${suggestedAuthRef ?? "ENV_VAR_NAME"}; Enter leaves it unavailable]: `;
+    const response = await io.prompt(promptText);
+
+    if (response === null) {
+      return false;
+    }
+
+    transcript.appendInput(promptText, response);
+    const trimmed = response.trim();
+
+    if (trimmed.length === 0) {
+      setProviderAuthRef(projectConfig, providerId, null);
+      writeLine(
+        writer,
+        definition.authMode === "optional_api_key"
+          ? `Leaving ${definition.label} without an auth env ref for now.`
+          : `Leaving ${definition.label} unavailable until an auth env ref is configured.`
+      );
+      continue;
+    }
+
+    setProviderAuthRef(projectConfig, providerId, trimmed);
+    writeLine(writer, `Saved ${definition.label} auth ref: ${trimmed}`);
+  }
+
+  return true;
+}
+
+async function promptSetupInput(
+  io: ConsoleIo,
+  transcript: ConsoleTranscript,
+  writer: OutputWriter,
+  session: SessionState,
+  projectConfig: ProjectConfigState,
+  promptText: string
+): Promise<string | null> {
+  while (true) {
+    const response = await io.prompt(promptText);
+
+    if (response === null) {
+      return null;
+    }
+
+    transcript.appendInput(promptText, response);
+    const trimmed = response.trim();
+
+    if (!trimmed.startsWith("/")) {
+      return response;
+    }
+
+    switch (trimmed) {
+      case "/sources":
+        renderSources(writer, session, projectConfig);
+        continue;
+      case "/help":
+        writeLine(writer, "Source setup commands:");
+        writeLine(writer, "  `/sources` Show the current grouped source configuration.");
+        writeLine(writer, "  `/quit` Exit before completing source setup.");
+        writeLine(writer, "  Press Enter to keep the displayed defaults for the current prompt.");
+        continue;
+      case "/quit":
+      case "/exit":
+        writeLine(writer, "Session saved. Closing ClawResearch.");
+        return null;
+      default:
+        writeLine(writer, "Finish source setup first, or use `/sources`, `/help`, or `/quit` here.");
+        continue;
+    }
+  }
+}
+
+async function runInitialSourceSetup(
+  io: ConsoleIo,
+  transcript: ConsoleTranscript,
+  writer: OutputWriter,
+  session: SessionState,
+  projectConfig: ProjectConfigState,
+  projectConfigStore: ProjectConfigStore
+): Promise<boolean> {
+  if (projectConfig.sources.explicitlyConfigured) {
+    return true;
+  }
+
+  writeLine(writer, "Source setup");
+  writeLine(writer, "------------");
+  writeLine(writer, "Scholarly providers:");
+  for (const line of providerSelectionLines("scholarly")) {
+    writeLine(writer, `  ${line}`);
+  }
+  writeLine(writer, `Default scholarly selection: ${formatSelectedProviderLabels(projectConfig.sources.scholarly.selectedProviderIds)}`);
+  const scholarlyPrompt = "scholarly> ";
+  const scholarlyInput = await promptSetupInput(io, transcript, writer, session, projectConfig, scholarlyPrompt);
+
+  if (scholarlyInput === null) {
+    return false;
+  }
+
+  const scholarlySelection = scholarlyInput.trim().length === 0
+    ? projectConfig.sources.scholarly.selectedProviderIds
+    : parseProviderSelection(scholarlyInput, "scholarly");
+
+  if (scholarlySelection === null) {
+    writeLine(writer, "Could not parse that scholarly provider selection. Keeping defaults.");
+  } else {
+    projectConfig.sources.scholarly.selectedProviderIds = scholarlySelection;
+  }
+
+  writeLine(writer, "Background providers:");
+  for (const line of providerSelectionLines("background")) {
+    writeLine(writer, `  ${line}`);
+  }
+  writeLine(writer, `Default background selection: ${formatSelectedProviderLabels(projectConfig.sources.background.selectedProviderIds)}`);
+  const backgroundPrompt = "background> ";
+  const backgroundInput = await promptSetupInput(io, transcript, writer, session, projectConfig, backgroundPrompt);
+
+  if (backgroundInput === null) {
+    return false;
+  }
+
+  const backgroundSelection = backgroundInput.trim().length === 0
+    ? projectConfig.sources.background.selectedProviderIds
+    : parseProviderSelection(backgroundInput, "background");
+
+  if (backgroundSelection === null) {
+    writeLine(writer, "Could not parse that background selection. Keeping defaults.");
+  } else {
+    projectConfig.sources.background.selectedProviderIds = backgroundSelection;
+  }
+
+  const localPrompt = "local> ";
+  writeLine(writer, `Local project files are currently ${projectConfig.sources.local.projectFilesEnabled ? "on" : "off"}. Type \`on\` or \`off\`, or press Enter to keep the default.`);
+  const localInput = await promptSetupInput(io, transcript, writer, session, projectConfig, localPrompt);
+
+  if (localInput === null) {
+    return false;
+  }
+
+  if (localInput.trim().length > 0) {
+    const localSetting = parseLocalToggle(localInput);
+
+    if (localSetting !== null) {
+      projectConfig.sources.local.projectFilesEnabled = localSetting;
+    } else {
+      writeLine(writer, "Could not parse that local-files setting. Keeping the default.");
+    }
+  }
+
+  const authPrompted = await promptProviderAuthRefs(
+    io,
+    transcript,
+    writer,
+    projectConfig,
+    projectConfig.sources.scholarly.selectedProviderIds
+  );
+
+  if (!authPrompted) {
+    return false;
+  }
+
+  projectConfig.sources.explicitlyConfigured = true;
+  await projectConfigStore.save(projectConfig);
+  writeLine(writer, `Saved source configuration to ${relativeProjectPath(projectConfig.projectRoot, projectConfigPath(projectConfig.projectRoot))}.`);
+  writeLine(writer);
+  return true;
 }
 
 function normalizeDraftLabel(label: string): ResearchBriefField | null {
@@ -777,6 +1118,8 @@ function eventTag(kind: RunEventKind): string {
       return "run";
     case "plan":
       return "plan";
+    case "literature":
+      return "literature";
     case "summary":
       return "summary";
     case "memory":
@@ -813,7 +1156,7 @@ async function readNewRunEvents(
   return parsed.events;
 }
 
-function isTerminalRun(run: RunRecord): boolean {
+export function isTerminalRun(run: RunRecord): boolean {
   return run.status === "completed" || run.status === "failed";
 }
 
@@ -836,7 +1179,7 @@ async function loadRunIfPresent(
   }
 }
 
-async function reconcileRelevantRun(
+export async function reconcileRelevantRun(
   session: SessionState,
   store: SessionStore,
   runStore: RunStore,
@@ -1048,7 +1391,7 @@ async function maybeCompleteBriefFromConversation(
   return briefCanStartFirstPass(session.brief);
 }
 
-async function emitAssistantTurn(
+export async function emitAssistantTurn(
   writer: OutputWriter,
   session: SessionState,
   store: SessionStore,
@@ -1160,11 +1503,18 @@ async function watchRunProgress(
     const currentRun = await reconcileRelevantRun(session, store, runStore, runController, now);
 
     if (currentRun === null) {
-      renderTaggedBlock(writer, "run", "The detached run record is no longer available.");
-      return null;
-    }
+      await delay(Math.max(250, watchPollMs));
+      const retriedRun = await reconcileRelevantRun(session, store, runStore, runController, now);
 
-    run = currentRun;
+      if (retriedRun === null) {
+        renderTaggedBlock(writer, "run", "The detached run record is no longer available.");
+        return null;
+      }
+
+      run = retriedRun;
+    } else {
+      run = currentRun;
+    }
 
     if (isTerminalRun(run)) {
       const trailingEvents = await readNewRunEvents(run, cursor);
@@ -1187,7 +1537,7 @@ async function watchRunProgress(
   }
 }
 
-async function handleGoCommand(
+export async function handleGoCommand(
   writer: OutputWriter,
   session: SessionState,
   store: SessionStore,
@@ -1292,6 +1642,7 @@ async function handleGoCommand(
     `Stderr: ${relativeProjectPath(session.projectRoot, run.artifacts.stderrPath)}`,
     `Plan: ${relativeProjectPath(session.projectRoot, run.artifacts.planPath)}`,
     `Sources: ${relativeProjectPath(session.projectRoot, run.artifacts.sourcesPath)}`,
+    `Literature: ${relativeProjectPath(session.projectRoot, run.artifacts.literaturePath)}`,
     `Synthesis: ${relativeProjectPath(session.projectRoot, run.artifacts.synthesisPath)}`,
     `Verification: ${relativeProjectPath(session.projectRoot, run.artifacts.verificationPath)}`,
     `Memory: ${relativeProjectPath(session.projectRoot, run.artifacts.memoryPath)}`,
@@ -1318,7 +1669,7 @@ async function handleGoCommand(
   }
 }
 
-async function handlePauseCommand(
+export async function handlePauseCommand(
   writer: OutputWriter,
   session: SessionState,
   store: SessionStore,
@@ -1371,7 +1722,7 @@ async function handlePauseCommand(
   await store.save(session);
 }
 
-async function handleResumeCommand(
+export async function handleResumeCommand(
   writer: OutputWriter,
   session: SessionState,
   store: SessionStore,
@@ -1424,14 +1775,97 @@ async function handleResumeCommand(
   await store.save(session);
 }
 
-async function handleUserInput(
+export async function handleUserInput(
   input: string,
+  io: ConsoleIo,
+  transcript: ConsoleTranscript,
   writer: OutputWriter,
   session: SessionState,
   store: SessionStore,
+  projectConfig: ProjectConfigState,
+  projectConfigStore: ProjectConfigStore,
   backend: IntakeBackend,
   now: () => string
 ): Promise<void> {
+  const sourceSelection = parseSourceSelectionUpdate(input);
+
+  if (sourceSelection !== null) {
+    const providerIds = sourceSelection.category === "local"
+      ? null
+      : (sourceSelection.category === "scholarly"
+        ? parseLiteratureProviderSelection(sourceSelection.value)
+        : parseProviderSelection(sourceSelection.value, "background"));
+    saveUserMessage(session, input, now(), "command");
+
+    if (sourceSelection.category === "local") {
+      const localSetting = parseLocalToggle(sourceSelection.value);
+
+      if (localSetting === null) {
+        const response = "I couldn't parse that local-files setting. Use `local: on` or `local: off`.";
+        renderTaggedBlock(writer, "system", response);
+        saveAssistantMessage(session, response, now(), "command");
+        await store.save(session);
+        return;
+      }
+
+      projectConfig.sources.local.projectFilesEnabled = localSetting;
+      projectConfig.sources.explicitlyConfigured = true;
+      await projectConfigStore.save(projectConfig);
+
+      const response = `Updated local project files for this project: ${localSetting ? "on" : "off"}.`;
+      renderTaggedBlock(writer, "system", response);
+      saveAssistantMessage(session, response, now(), "command");
+      await store.save(session);
+      return;
+    }
+
+    if (providerIds === null) {
+      const response = sourceSelection.category === "scholarly"
+        ? "I couldn't parse that scholarly-provider selection. Use names like `scholarly: openalex, arxiv`, `sources: openalex, crossref`, `sources: none`, or `sources: all`."
+        : "I couldn't parse that background-provider selection. Use names like `background: wikipedia` or `background: none`.";
+      renderTaggedBlock(writer, "system", response);
+      saveAssistantMessage(session, response, now(), "command");
+      await store.save(session);
+      return;
+    }
+
+    if (sourceSelection.category === "scholarly") {
+      projectConfig.sources.scholarly.selectedProviderIds = providerIds;
+      const authPrompted = await promptProviderAuthRefs(
+        io,
+        transcript,
+        writer,
+        projectConfig,
+        providerIds
+      );
+
+      if (!authPrompted) {
+        const response = "Input closed while configuring provider auth refs. Session saved.";
+        renderTaggedBlock(writer, "system", response);
+        saveAssistantMessage(session, response, now(), "command");
+        await store.save(session);
+        return;
+      }
+    } else {
+      projectConfig.sources.background.selectedProviderIds = providerIds;
+    }
+
+    projectConfig.sources.explicitlyConfigured = true;
+    await projectConfigStore.save(projectConfig);
+
+    const responseLines = [
+      sourceSelection.category === "scholarly"
+        ? `Updated scholarly providers for this project: ${formatSelectedLiteratureProviders(providerIds)}.`
+        : `Updated background providers for this project: ${formatSelectedLiteratureProviders(providerIds)}.`,
+      `Config saved to ${relativeProjectPath(session.projectRoot, projectConfigPath(session.projectRoot))}.`
+    ];
+
+    renderTaggedLines(writer, "system", responseLines);
+    saveAssistantMessage(session, responseLines.join(" "), now(), "command");
+    await store.save(session);
+    return;
+  }
+
   const timestamp = now();
   saveUserMessage(session, input, timestamp);
 
@@ -1451,6 +1885,9 @@ async function handleCommand(
   store: SessionStore,
   runStore: RunStore,
   memoryStore: MemoryStore,
+  literatureStore: LiteratureStore,
+  projectConfig: ProjectConfigState,
+  projectConfigStore: ProjectConfigStore,
   backend: IntakeBackend,
   runController: RunController,
   now: () => string,
@@ -1471,8 +1908,19 @@ async function handleCommand(
     case "/status": {
       const run = await reconcileRelevantRun(session, store, runStore, runController, now);
       const memory = await memoryStore.load();
-      renderStatus(writer, session, run, transcriptPath, memory);
+      const currentProjectConfig = await projectConfigStore.load();
+      projectConfig.sources = currentProjectConfig.sources;
+      const literature = await literatureStore.load();
+      renderStatus(writer, session, run, transcriptPath, memory, currentProjectConfig, literature);
       saveAssistantMessage(session, "Displayed the current research brief.", now(), "command");
+      await store.save(session);
+      return "continue";
+    }
+    case "/sources": {
+      const currentProjectConfig = await projectConfigStore.load();
+      projectConfig.sources = currentProjectConfig.sources;
+      renderSources(writer, session, currentProjectConfig);
+      saveAssistantMessage(session, "Displayed the configured literature providers.", now(), "command");
       await store.save(session);
       return "continue";
     }
@@ -1514,6 +1962,9 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
   const backend = options.intakeBackend ?? createDefaultIntakeBackend();
   const runStore = new RunStore(options.projectRoot, options.version, now);
   const memoryStore = new MemoryStore(options.projectRoot, now);
+  const literatureStore = new LiteratureStore(options.projectRoot, now);
+  const projectConfigStore = new ProjectConfigStore(options.projectRoot, now);
+  const projectConfig = await projectConfigStore.load();
   const runController = options.runController ?? createDefaultRunController();
   const transcript = new ConsoleTranscript(options.projectRoot);
   const writer = createLoggedWriter(io.writer, transcript);
@@ -1526,6 +1977,21 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
 
   renderBanner(writer, session, transcript.filePath);
   renderWelcome(writer, session);
+  const setupCompleted = await runInitialSourceSetup(
+    io,
+    transcript,
+    writer,
+    session,
+    projectConfig,
+    projectConfigStore
+  );
+
+  if (!setupCompleted) {
+    io.close?.();
+    return 0;
+  }
+
+  renderLiteratureSetup(writer, session, projectConfig);
 
   const initialChatEntry = latestChatEntry(session);
 
@@ -1566,6 +2032,9 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
         store,
         runStore,
         memoryStore,
+        literatureStore,
+        projectConfig,
+        projectConfigStore,
         backend,
         runController,
         now,
@@ -1581,7 +2050,7 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
       continue;
     }
 
-    await handleUserInput(input, writer, session, store, backend, now);
+    await handleUserInput(input, io, transcript, writer, session, store, projectConfig, projectConfigStore, backend, now);
   }
 
   io.close?.();

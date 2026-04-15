@@ -72,7 +72,20 @@ npm install
 npm run dev
 ```
 
-That starts the console runtime in the current directory. The startup chat behaves like a real research intake conversation, backed by a local Ollama model by default.
+That starts the TUI runtime in the current directory. The default experience is now a small terminal UI with:
+
+- a checklist-style provider selector for scholarly, background, and local sources
+- a persistent chat transcript instead of a one-line prompt loop
+- a bottom chat field for talking to the intake consultant
+- a pinned brief/status view while the conversation evolves
+
+If you want the old line-oriented console for scripting, pipes, or debugging, use:
+
+```bash
+npm run dev -- --plain
+```
+
+The startup chat still behaves like a real research intake conversation, backed by a local Ollama model by default.
 
 Current local-model assumption:
 
@@ -98,11 +111,34 @@ Useful slash commands inside the console:
 
 - `/help`
 - `/status`
+- `/sources`
 - `/go`
 - `/pause`
 - `/resume`
 - `/quit`
 - `/exit`
+
+New projects now open a source-selection checklist at startup. The default selection is:
+
+- scholarly: `openalex`, `crossref`, `arxiv`, `dblp`, `pubmed`, `europe-pmc`, `core`, `unpaywall`
+- background: none
+- local project files: on
+
+Inside the TUI, use:
+
+- `Up` and `Down` to move through the provider list
+- `Space` or `Enter` to toggle a provider
+- `S` to save the current selection
+- `Esc` to leave the overlay
+
+`/sources` reopens the checklist later. The older text commands such as `scholarly: ...`, `background: ...`, `local: off`, and `sources: ...` are still accepted in plain mode and remain available as compatibility inputs.
+
+After provider selection, ClawResearch asks only for env-var references for providers that may need credentials. It never stores raw secrets in repo-tracked config. For example:
+
+```text
+openalex auth env var [optional, example OPENALEX_API_KEY; Enter leaves it unset]:
+unpaywall auth env var [required, example UNPAYWALL_EMAIL; Enter leaves it unavailable]:
+```
 
 Minimal runtime state is persisted locally in:
 
@@ -110,10 +146,22 @@ Minimal runtime state is persisted locally in:
 .clawresearch/session.json
 ```
 
+Project-level literature configuration is persisted in:
+
+```text
+.clawresearch/project-config.json
+```
+
 The runtime now also keeps a small structured memory in:
 
 ```text
 .clawresearch/memory.json
+```
+
+The dedicated literature store now lives in:
+
+```text
+.clawresearch/literature/library.json
 ```
 
 The console also keeps a raw debug transcript of the interaction in:
@@ -138,6 +186,7 @@ Each run keeps a small set of debuggable local artifacts, including:
 - `brief.json`
 - `plan.json`
 - `sources.json`
+- `literature.json`
 - `synthesis.md`
 - `claims.json`
 - `verification.json`
@@ -161,11 +210,25 @@ Each record has a stable id, lightweight links to related records, and enough me
 
 That memory is now also used actively by later runs. The planner and source gatherer receive a summarized project memory context so the next pass can build on prior findings, questions, ideas, and artifacts instead of starting cold each time.
 
+ClawResearch now also keeps a separate literature-oriented store instead of flattening papers into generic memory only. That store currently maintains:
+
+- canonical paper cards
+- theme boards
+- review notebooks
+
+This keeps the literature review path easier to inspect and easier for an LLM to reuse as a compact working context on later runs.
+
 The detached worker now runs a minimal explicit research loop. It is still intentionally small, but it no longer just boots and exits. The current loop does this:
 
 - plan a bounded research mode
 - run a dedicated literature-review subsystem for review-style tasks, with task-aware paper ranking instead of generic web browsing
-- gather sources from relevant local text files plus public OpenAlex literature search, with Wikipedia background fallback when literature retrieval is empty or malformed
+- plan provider-aware retrieval queries from the brief, project memory, and literature memory
+- route scholarly discovery by domain instead of looping over a flat provider list
+- gather raw scholarly hits from `openalex`, `crossref`, `arxiv`, `dblp`, `pubmed`, `europe-pmc`, `core`, and `unpaywall` resolution when configured
+- keep background and local context separate from scholarly review
+- merge duplicate provider hits into canonical papers
+- resolve the best legal reading path per paper before synthesis
+- persist canonical paper access state, screening decisions, and provider auth status
 - use relevant project memory to shape planning and retrieval
 - synthesize themes
 - record claims with explicit evidence references
@@ -175,7 +238,9 @@ The detached worker now runs a minimal explicit research loop. It is still inten
 
 It is still not a full autonomous scientist yet. The current loop is best understood as a source-grounded first research pass with inspectable artifacts.
 
-When the run is clearly a literature-review task, ClawResearch now switches to a specialized literature subsystem. That subsystem builds a task-aware literature profile, ranks papers by domain and task fit rather than pure keyword overlap, and uses a literature-specific synthesis prompt that emphasizes thematic comparison, citation grounding, and explicit gap identification.
+When the run is clearly a literature-review task, ClawResearch now switches to a specialized literature subsystem. That subsystem builds a task-aware literature profile, ranks papers by domain and task fit rather than pure keyword overlap, merges provider duplicates into canonical papers, and uses a literature-specific synthesis prompt that emphasizes thematic comparison, citation grounding, and explicit gap identification.
+
+`sources.json` now keeps raw provider hits, routing notes, and merge diagnostics. `literature.json` keeps the canonical paper set, access state, screening state, and provider-auth status that mattered for the run.
 
 After dependencies are installed, the runtime can also be built and run as compiled JavaScript:
 
@@ -215,6 +280,7 @@ run        Trace: .clawresearch/runs/run-.../trace.log
 run        Events: .clawresearch/runs/run-.../events.jsonl
 run        Plan: .clawresearch/runs/run-.../plan.json
 run        Sources: .clawresearch/runs/run-.../sources.json
+run        Literature: .clawresearch/runs/run-.../literature.json
 run        Synthesis: .clawresearch/runs/run-.../synthesis.md
 run        Verification: .clawresearch/runs/run-.../verification.json
 run        Memory: .clawresearch/runs/run-.../memory.json

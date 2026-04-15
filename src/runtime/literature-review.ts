@@ -1,4 +1,5 @@
 import type { ProjectMemoryContext } from "./memory-store.js";
+import type { LiteratureContext } from "./literature-store.js";
 import type { ResearchPlan } from "./research-backend.js";
 import type { ResearchBrief } from "./session-store.js";
 
@@ -432,6 +433,7 @@ export function buildLiteratureSynthesisInstruction(input: {
   projectRoot: string;
   brief: ResearchBrief;
   plan: ResearchPlan;
+  literatureContext?: LiteratureContext;
   sources: Array<{
     id: string;
     kind: string;
@@ -493,6 +495,16 @@ export function buildLiteratureSynthesisInstruction(input: {
     `Brief: ${JSON.stringify(input.brief)}`,
     `Plan: ${JSON.stringify(input.plan)}`,
     `Literature review profile: ${JSON.stringify(profile)}`,
+    `Prior literature memory context: ${JSON.stringify(input.literatureContext ?? {
+      available: false,
+      paperCount: 0,
+      themeCount: 0,
+      notebookCount: 0,
+      papers: [],
+      themes: [],
+      notebooks: [],
+      queryHints: []
+    })}`,
     `Sources: ${JSON.stringify(input.sources)}`
   ].join("\n");
 }

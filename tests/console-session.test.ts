@@ -24,7 +24,16 @@ type CapturedIo = ConsoleIo & {
 
 function createScriptedIo(lines: string[]): CapturedIo {
   let output = "";
-  const queue = [...lines];
+  const queue = [
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    ...lines
+  ];
 
   return {
     get output() {

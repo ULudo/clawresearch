@@ -1,8 +1,5 @@
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import type { ProjectMemoryContext } from "./memory-store.js";
-import type { ResearchBrief } from "./session-store.js";
-import type { ResearchPlan } from "./research-backend.js";
 import {
   assessLiteratureSource,
   buildLiteratureReviewProfile,
@@ -10,6 +7,30 @@ import {
   type LiteratureReviewProfile,
   type LiteratureSourceAssessment
 } from "./literature-review.js";
+import type {
+  CanonicalPaper,
+  PaperAccessMode,
+  PaperAccessRecord,
+  PaperDiscoveryRecord,
+  PaperFulltextFormat,
+  PaperIdentifiers,
+  LiteratureContext
+} from "./literature-store.js";
+import { createLiteratureEntityId } from "./literature-store.js";
+import type { ProjectMemoryContext } from "./memory-store.js";
+import {
+  defaultBackgroundProviderIds,
+  defaultScholarlyProviderIds,
+  getSourceProviderDefinition,
+  normalizeProviderId,
+  providerAuthStatus,
+  type ProviderAuthStatus,
+  type SourceProviderCategory,
+  type SourceProviderDomain,
+  type SourceProviderId
+} from "./provider-registry.js";
+import type { ResearchPlan } from "./research-backend.js";
+import type { ResearchBrief } from "./session-store.js";
 
 const ignoredDirectories = new Set([
   ".git",
@@ -23,31 +44,106 @@ const textExtensions = new Set([
   ".txt",
   ".rst",
   ".yaml",
-  ".yml"
+  ".yml",
+  ".json"
 ]);
 
 const openAlexBaseUrl = process.env.CLAWRESEARCH_OPENALEX_BASE_URL ?? "https://api.openalex.org";
+const crossrefBaseUrl = process.env.CLAWRESEARCH_CROSSREF_BASE_URL ?? "https://api.crossref.org";
+const arxivBaseUrl = process.env.CLAWRESEARCH_ARXIV_BASE_URL ?? "http://export.arxiv.org";
+const dblpBaseUrl = process.env.CLAWRESEARCH_DBLP_BASE_URL ?? "https://dblp.org";
+const pubmedBaseUrl = process.env.CLAWRESEARCH_PUBMED_BASE_URL ?? "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
+const europePmcBaseUrl = process.env.CLAWRESEARCH_EUROPE_PMC_BASE_URL ?? "https://www.ebi.ac.uk/europepmc/webservices/rest";
+const coreBaseUrl = process.env.CLAWRESEARCH_CORE_BASE_URL ?? "https://api.core.ac.uk/v3";
+const unpaywallBaseUrl = process.env.CLAWRESEARCH_UNPAYWALL_BASE_URL ?? "https://api.unpaywall.org/v2";
 const wikipediaBaseUrl = process.env.CLAWRESEARCH_WIKIPEDIA_BASE_URL ?? "https://en.wikipedia.org";
+
+const stopTokens = new Set([
+  "about",
+  "after",
+  "approach",
+  "approaches",
+  "background",
+  "current",
+  "design",
+  "implementation",
+  "investigate",
+  "literature",
+  "problem",
+  "project",
+  "question",
+  "research",
+  "review",
+  "study",
+  "successful",
+  "topic",
+  "what",
+  "which"
+]);
+
+const preservedShortTokens = new Set([
+  "ai",
+  "ml",
+  "nlp",
+  "rl",
+  "llm",
+  "dna",
+  "rna"
+]);
+
+const csAiCuePattern = /\b(ai|ml|machine learning|deep learning|language model|llm|nlp|computer vision|autonomous|agent|algorithm|algorithms|software|systems|robot|robotics)\b/i;
+const biomedicalCuePattern = /\b(biomedical|medicine|medical|clinical|patient|patients|drug|therapy|disease|genome|protein|cell|hospital|nursing home|nursing homes|healthcare|caregiver|pubmed)\b/i;
 
 export type ResearchSourceKind =
   | "project_brief"
   | "local_file"
-  | "openalex_work"
-  | "wikipedia_article";
+  | "scholarly_hit"
+  | "background_article";
+
+export type ResearchSourceCategory =
+  | "brief"
+  | "local"
+  | "scholarly"
+  | "background";
 
 export type ResearchSource = {
   id: string;
+  providerId: SourceProviderId | null;
+  category: ResearchSourceCategory;
   kind: ResearchSourceKind;
   title: string;
   locator: string | null;
   citation: string;
   excerpt: string;
+  year: number | null;
+  authors: string[];
+  venue: string | null;
+  identifiers: Partial<PaperIdentifiers>;
+  access: Partial<PaperAccessRecord> | null;
   assessment?: LiteratureSourceAssessment;
+};
+
+export type ProviderAuthSnapshot = {
+  providerId: SourceProviderId;
+  authRef: string | null;
+  status: ProviderAuthStatus;
+};
+
+export type RoutingPlan = {
+  domain: SourceProviderDomain | "mixed";
+  plannedQueries: string[];
+  discoveryProviderIds: SourceProviderId[];
+  resolverProviderIds: SourceProviderId[];
+  acquisitionProviderIds: SourceProviderId[];
 };
 
 export type ResearchSourceGatherResult = {
   sources: ResearchSource[];
+  canonicalPapers: CanonicalPaper[];
   notes: string[];
+  routing: RoutingPlan;
+  mergeDiagnostics: string[];
+  authStatus: ProviderAuthSnapshot[];
   literatureReview?: {
     active: boolean;
     profile: LiteratureReviewProfile;
@@ -64,140 +160,69 @@ export type ResearchSourceGatherRequest = {
   brief: ResearchBrief;
   plan: ResearchPlan;
   memoryContext: ProjectMemoryContext;
+  literatureContext?: LiteratureContext;
+  providerIds?: SourceProviderId[];
+  scholarlyProviderIds?: SourceProviderId[];
+  backgroundProviderIds?: SourceProviderId[];
+  projectFilesEnabled?: boolean;
+  authRefs?: Partial<Record<SourceProviderId, string | null>>;
 };
 
 export interface ResearchSourceGatherer {
   gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult>;
 }
 
-type OpenAlexWork = {
-  id?: string;
-  display_name?: string;
-  publication_year?: number;
-  authorships?: Array<{
-    author?: {
-      display_name?: string;
-    };
-  }>;
-  primary_location?: {
-    source?: {
-      display_name?: string;
-    };
-    landing_page_url?: string;
-  };
-  doi?: string;
-  abstract_inverted_index?: Record<string, number[]>;
+type RawCandidate = {
+  providerId: SourceProviderId;
+  title: string;
+  locator: string | null;
+  citation: string;
+  excerpt: string;
+  year: number | null;
+  authors: string[];
+  venue: string | null;
+  identifiers: Partial<PaperIdentifiers>;
+  access: Partial<PaperAccessRecord> | null;
 };
 
-type OpenAlexResponse = {
-  results?: OpenAlexWork[];
-};
-
-type WikipediaSearchResponse = {
-  query?: {
-    search?: Array<{
-      title?: string;
-    }>;
-  };
-};
-
-type WikipediaSummaryResponse = {
-  title?: string;
-  extract?: string;
-  content_urls?: {
-    desktop?: {
-      page?: string;
-    };
-  };
-};
-
-const stopTokens = new Set([
-  "about",
-  "after",
-  "alternative",
-  "analysis",
-  "approaches",
-  "approach",
-  "current",
-  "evaluation",
-  "existing",
-  "flaws",
-  "focus",
-  "hypothesis",
-  "identify",
-  "identifying",
-  "literature",
-  "method",
-  "methodologies",
-  "methods",
-  "potential",
-  "proof",
-  "proofs",
-  "question",
-  "research",
-  "strategies",
-  "strategy",
-  "study",
-  "technique",
-  "techniques",
-  "theory",
-  "through"
-]);
-
-const preservedShortTokens = new Set([
-  "ai",
-  "agi",
-  "api",
-  "cpu",
-  "cv",
-  "dna",
-  "gpu",
-  "llm",
-  "ml",
-  "nlp",
-  "rna",
-  "rl",
-  "ui",
-  "ux"
-]);
-
-const shortTokenAliases: Record<string, string[]> = {
-  ai: ["artificial intelligence"],
-  agi: ["artificial general intelligence"],
-  cv: ["computer vision"],
-  llm: ["large language model", "large language models"],
-  ml: ["machine learning"],
-  nlp: ["natural language processing"],
-  rl: ["reinforcement learning"]
-};
-
-type AnchorPhrase = {
-  scope: "primary" | "secondary";
-  text: string;
-  tokens: string[];
+type AccessResolution = {
+  best: PaperAccessRecord;
+  candidates: PaperAccessRecord[];
+  accessErrors: string[];
 };
 
 function normalizeWhitespace(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
-function excerptText(text: string, limit = 1200): string {
+function excerptText(text: string, limit = 1600): string {
   const normalized = normalizeWhitespace(text);
   return normalized.length <= limit
     ? normalized
     : `${normalized.slice(0, limit - 3)}...`;
 }
 
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return typeof value === "object" && value !== null
-    ? value as Record<string, unknown>
-    : null;
-}
-
-function stringOrNull(value: unknown): string | null {
+function safeString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0
     ? value.trim()
     : null;
+}
+
+function safeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value)
+    ? value
+    : null;
+}
+
+function readStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((entry) => {
+    const text = safeString(entry);
+    return text === null ? [] : [text];
+  });
 }
 
 function tokenize(text: string): string[] {
@@ -207,28 +232,24 @@ function tokenize(text: string): string[] {
     .filter((token) => token.length >= 4 || preservedShortTokens.has(token));
 }
 
-function normalizePhraseToken(token: string): string {
-  if (token.endsWith("ies") && token.length > 4) {
-    return `${token.slice(0, -3)}y`;
+function uniqueStrings(values: Array<string | null | undefined>): string[] {
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+
+  for (const value of values) {
+    const text = typeof value === "string"
+      ? normalizeWhitespace(value)
+      : "";
+
+    if (text.length === 0 || seen.has(text)) {
+      continue;
+    }
+
+    seen.add(text);
+    normalized.push(text);
   }
 
-  if (token.endsWith("s") && token.length > 4) {
-    return token.slice(0, -1);
-  }
-
-  return token;
-}
-
-function phraseTokens(text: string): string[] {
-  return tokenize(text).map((token) => normalizePhraseToken(token));
-}
-
-function shortSignalTokens(text: string | null): string[] {
-  if (text === null) {
-    return [];
-  }
-
-  return tokenize(text).filter((token) => preservedShortTokens.has(token));
+  return normalized;
 }
 
 function overlapScore(text: string, referenceTokens: Set<string>): number {
@@ -244,335 +265,448 @@ function overlapScore(text: string, referenceTokens: Set<string>): number {
   return score;
 }
 
-function uniqueStrings(values: Array<string | null | undefined>): string[] {
-  const unique = new Set<string>();
-
-  for (const value of values) {
-    const normalized = typeof value === "string"
-      ? normalizeWhitespace(value)
-      : "";
-
-    if (normalized.length === 0) {
-      continue;
-    }
-
-    unique.add(normalized);
-  }
-
-  return [...unique];
+function slug(text: string): string {
+  return normalizeWhitespace(text.toLowerCase())
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
-function salientQueryTail(text: string | null): string {
-  if (text === null) {
-    return "";
-  }
+function titleHeuristicKey(title: string, year: number | null, authors: string[]): string {
+  const authorKey = authors[0] === undefined
+    ? "anon"
+    : slug(authors[0].split(/\s+/).slice(-1)[0] ?? authors[0]);
 
-  return tokenize(text)
-    .filter((token) => !stopTokens.has(token))
-    .slice(0, 5)
-    .join(" ");
+  return `${slug(title)}:${year ?? "na"}:${authorKey}`;
 }
 
-function extractAnchorPhrases(text: string | null): string[] {
-  if (text === null) {
-    return [];
+function normalizeDoi(doi: string | null): string | null {
+  if (doi === null) {
+    return null;
   }
 
-  const filteredTokens = tokenize(text)
-    .filter((token) => !stopTokens.has(token));
-
-  if (filteredTokens.length === 0) {
-    return [];
-  }
-
-  const anchors = new Set<string>();
-
-  if (filteredTokens.length <= 3) {
-    anchors.add(filteredTokens.join(" "));
-  }
-
-  if (filteredTokens.length >= 2) {
-    anchors.add(filteredTokens.slice(0, 2).join(" "));
-    anchors.add(filteredTokens.slice(-2).join(" "));
-  } else {
-    anchors.add(filteredTokens[0]!);
-  }
-
-  if (filteredTokens.length >= 3) {
-    anchors.add(filteredTokens.slice(-3).join(" "));
-  }
-
-  const segmentMatch = normalizeWhitespace(text.toLowerCase())
-    .replace(/[^a-z0-9\s-]/g, " ")
-    .match(/\b(?:in|for|of|on|about|around|within|across|between|toward|towards|into|via|using)\s+([a-z0-9\s-]{4,})$/i);
-
-  if (segmentMatch?.[1] !== undefined) {
-    const segmentTokens = tokenize(segmentMatch[1])
-      .filter((token) => !stopTokens.has(token));
-
-    if (segmentTokens.length > 0) {
-      anchors.add(segmentTokens.slice(-3).join(" "));
-
-      if (segmentTokens.length >= 2) {
-        anchors.add(segmentTokens.slice(-2).join(" "));
-      }
-    }
-  }
-
-  return [...anchors]
-    .map((anchor) => normalizeWhitespace(anchor))
-    .filter((anchor) => anchor.length > 0);
+  return doi
+    .replace(/^https?:\/\/(dx\.)?doi\.org\//i, "")
+    .trim()
+    .toLowerCase();
 }
 
-function extractPrimaryTopicAnchors(text: string | null): string[] {
-  if (text === null) {
-    return [];
+function normalizeArxivId(value: string | null): string | null {
+  if (value === null) {
+    return null;
   }
 
-  const normalized = normalizeWhitespace(text.toLowerCase())
-    .replace(/[^a-z0-9\s-]/g, " ");
-  const fullTokens = normalized
-    .split(/\s+/)
-    .filter((token) => token.length >= 3 || preservedShortTokens.has(token));
-
-  if (fullTokens.length === 0) {
-    return [];
-  }
-
-  const anchors = new Set<string>();
-
-  if (fullTokens.length <= 4) {
-    anchors.add(fullTokens.join(" "));
-  }
-
-  if (fullTokens.length >= 2) {
-    anchors.add(fullTokens.slice(0, 2).join(" "));
-    anchors.add(fullTokens.slice(-2).join(" "));
-  } else {
-    anchors.add(fullTokens[0]!);
-  }
-
-  if (fullTokens.length >= 3) {
-    anchors.add(fullTokens.slice(0, 3).join(" "));
-    anchors.add(fullTokens.slice(-3).join(" "));
-  }
-
-  return [...anchors]
-    .map((anchor) => normalizeWhitespace(anchor))
-    .filter((anchor) => anchor.length > 0);
+  return value
+    .replace(/^https?:\/\/arxiv\.org\/abs\//i, "")
+    .replace(/^arxiv:/i, "")
+    .trim();
 }
 
-function scopedAnchorPhrases(
-  scope: AnchorPhrase["scope"],
-  texts: Array<string | null | undefined>,
-  limit: number
-): AnchorPhrase[] {
-  return uniqueStrings(texts.flatMap((text) => extractAnchorPhrases(text ?? null)))
-    .flatMap((text) => {
-      const tokens = phraseTokens(text);
-
-      if (tokens.length === 0) {
-        return [];
-      }
-
-      return [{
-        scope,
-        text,
-        tokens
-      }];
-    })
-    .slice(0, limit);
-}
-
-function buildAnchorPhrases(request: ResearchSourceGatherRequest): AnchorPhrase[] {
-  return [
-    ...uniqueStrings([
-      ...extractPrimaryTopicAnchors(request.brief.topic),
-      ...extractAnchorPhrases(request.brief.topic)
-    ]).flatMap((text) => {
-      const tokens = phraseTokens(text);
-
-      if (tokens.length === 0) {
-        return [];
-      }
-
-      return [{
-        scope: "primary" as const,
-        text,
-        tokens
-      }];
-    }).slice(0, 5),
-    ...scopedAnchorPhrases("secondary", [
-      request.brief.researchQuestion,
-      request.brief.researchDirection,
-      ...request.plan.localFocus
-    ], 5)
-  ].slice(0, 8);
-}
-
-function containsOrderedAnchor(textTokens: string[], anchorTokens: string[], maxGap = 2): boolean {
-  if (anchorTokens.length === 0) {
-    return false;
-  }
-
-  if (anchorTokens.length === 1) {
-    return textTokens.includes(anchorTokens[0]!);
-  }
-
-  for (let startIndex = 0; startIndex < textTokens.length; startIndex += 1) {
-    if (textTokens[startIndex] !== anchorTokens[0]) {
-      continue;
-    }
-
-    let textIndex = startIndex;
-    let matched = true;
-
-    for (let anchorIndex = 1; anchorIndex < anchorTokens.length; anchorIndex += 1) {
-      const nextAnchorToken = anchorTokens[anchorIndex]!;
-      let foundIndex = -1;
-
-      for (let candidateIndex = textIndex + 1; candidateIndex < textTokens.length; candidateIndex += 1) {
-        if (candidateIndex - textIndex - 1 > maxGap) {
-          break;
-        }
-
-        if (textTokens[candidateIndex] === nextAnchorToken) {
-          foundIndex = candidateIndex;
-          break;
-        }
-      }
-
-      if (foundIndex === -1) {
-        matched = false;
-        break;
-      }
-
-      textIndex = foundIndex;
-    }
-
-    if (matched) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function countAnchorMatches(
-  textTokens: string[],
-  anchors: AnchorPhrase[]
-): {
-  primaryStrong: number;
-  primaryWeak: number;
-  secondaryStrong: number;
-  secondaryWeak: number;
-} {
-  let primaryStrong = 0;
-  let primaryWeak = 0;
-  let secondaryStrong = 0;
-  let secondaryWeak = 0;
-
-  for (const anchor of anchors) {
-    const matches = containsOrderedAnchor(textTokens, anchor.tokens);
-
-    if (!matches) {
-      continue;
-    }
-
-    if (anchor.tokens.length >= 2) {
-      if (anchor.scope === "primary") {
-        primaryStrong += 1;
-      } else {
-        secondaryStrong += 1;
-      }
-    } else {
-      if (anchor.scope === "primary") {
-        primaryWeak += 1;
-      } else {
-        secondaryWeak += 1;
-      }
-    }
-  }
-
-  return {
-    primaryStrong,
-    primaryWeak,
-    secondaryStrong,
-    secondaryWeak
-  };
-}
-
-function matchesRequiredShortToken(text: string, tokens: string[]): boolean {
-  const normalized = normalizeWhitespace(text.toLowerCase());
-  const textTokenSet = new Set(tokenize(text));
-
-  return tokens.some((token) => (
-    textTokenSet.has(token)
-    || (shortTokenAliases[token] ?? []).some((alias) => normalized.includes(alias))
-  ));
-}
-
-function buildOpenAlexQueries(
+function readAuthRef(
   request: ResearchSourceGatherRequest,
-  literatureProfile: LiteratureReviewProfile | null
-): string[] {
-  const topic = request.brief.topic;
-  const questionTail = salientQueryTail(request.brief.researchQuestion);
-  const anchorQueries = buildAnchorPhrases(request)
-    .map((anchor) => anchor.text);
+  providerId: SourceProviderId
+): string | null {
+  const configured = request.authRefs !== undefined
+    && Object.prototype.hasOwnProperty.call(request.authRefs, providerId)
+    ? request.authRefs[providerId]
+    : getSourceProviderDefinition(providerId).defaultEnvVarName;
 
-  return uniqueStrings([
-    ...request.memoryContext.queryHints,
-    ...request.memoryContext.queryHints.map((hint) => {
-      if (topic === null) {
-        return hint;
-      }
-
-      return `${topic} ${hint}`;
-    }),
-    ...anchorQueries,
-    ...anchorQueries.map((anchor) => (
-      questionTail.length > 0
-        ? `${anchor} ${questionTail}`
-        : null
-    )),
-    ...(literatureProfile?.searchQueries ?? []),
-    ...(request.plan.searchQueries ?? []),
-    topic,
-    topic !== null && questionTail.length > 0
-      ? `${topic} ${questionTail}`
-      : null,
-    request.brief.researchQuestion,
-    request.brief.researchDirection
-  ]).slice(0, 8);
+  return typeof configured === "string" && configured.trim().length > 0
+    ? configured.trim()
+    : null;
 }
 
-async function collectCandidateTextFiles(
-  projectRoot: string,
-  currentDirectory = projectRoot,
-  relativeDirectory = "",
-  output: string[] = []
-): Promise<string[]> {
-  if (output.length >= 200) {
-    return output;
-  }
+function authSnapshots(
+  request: ResearchSourceGatherRequest,
+  scholarlyProviderIds: SourceProviderId[],
+  backgroundProviderIds: SourceProviderId[],
+  projectFilesEnabled: boolean
+): ProviderAuthSnapshot[] {
+  const providerIds = uniqueProviderIds([
+    ...(projectFilesEnabled ? ["project_files" as const] : []),
+    ...scholarlyProviderIds,
+    ...backgroundProviderIds
+  ]);
 
-  const entries = await readdir(currentDirectory, { withFileTypes: true });
+  return providerIds.map((providerId) => {
+    const authRef = readAuthRef(request, providerId);
+    const definition = getSourceProviderDefinition(providerId);
+    const envName = authRef;
+    const availableRef = envName !== null
+      && typeof process.env[envName] === "string"
+      && process.env[envName]!.trim().length > 0
+      ? envName
+      : null;
 
-  for (const entry of entries) {
-    if (output.length >= 200) {
-      break;
+    return {
+      providerId,
+      authRef: envName,
+      status: providerAuthStatus(providerId, availableRef)
+    };
+  });
+}
+
+function uniqueProviderIds(providerIds: SourceProviderId[]): SourceProviderId[] {
+  const seen = new Set<SourceProviderId>();
+  const normalized: SourceProviderId[] = [];
+
+  for (const providerId of providerIds) {
+    if (seen.has(providerId)) {
+      continue;
     }
 
-    const absolutePath = path.join(currentDirectory, entry.name);
-    const relativePath = path.join(relativeDirectory, entry.name);
+    seen.add(providerId);
+    normalized.push(providerId);
+  }
 
-    if (entry.isDirectory()) {
-      if (ignoredDirectories.has(entry.name)) {
+  return normalized;
+}
+
+function selectedScholarlyProviderIds(request: ResearchSourceGatherRequest): SourceProviderId[] {
+  if (request.scholarlyProviderIds !== undefined) {
+    return uniqueProviderIds(request.scholarlyProviderIds);
+  }
+
+  if (request.providerIds !== undefined) {
+    return uniqueProviderIds(
+      request.providerIds.filter((providerId) => getSourceProviderDefinition(providerId).category === "scholarly")
+    );
+  }
+
+  return defaultScholarlyProviderIds();
+}
+
+function selectedBackgroundProviderIds(request: ResearchSourceGatherRequest): SourceProviderId[] {
+  if (request.backgroundProviderIds !== undefined) {
+    return uniqueProviderIds(request.backgroundProviderIds);
+  }
+
+  if (request.providerIds !== undefined) {
+    return uniqueProviderIds(
+      request.providerIds.filter((providerId) => getSourceProviderDefinition(providerId).category === "background")
+    );
+  }
+
+  return defaultBackgroundProviderIds();
+}
+
+function projectFilesEnabled(request: ResearchSourceGatherRequest): boolean {
+  if (typeof request.projectFilesEnabled === "boolean") {
+    return request.projectFilesEnabled;
+  }
+
+  if (request.providerIds !== undefined) {
+    return request.providerIds.includes("project_files");
+  }
+
+  return true;
+}
+
+function classifyDomain(brief: ResearchBrief, plan: ResearchPlan): SourceProviderDomain | "mixed" {
+  const combined = [
+    brief.topic,
+    brief.researchQuestion,
+    brief.researchDirection,
+    plan.objective,
+    ...plan.searchQueries
+  ].filter((value): value is string => typeof value === "string")
+    .join(" ");
+
+  const csAi = csAiCuePattern.test(combined);
+  const biomedical = biomedicalCuePattern.test(combined);
+
+  if (csAi && biomedical) {
+    return "mixed";
+  }
+
+  if (biomedical) {
+    return "biomedical";
+  }
+
+  if (csAi) {
+    return "cs_ai";
+  }
+
+  return "mixed";
+}
+
+function buildQueryPlan(request: ResearchSourceGatherRequest): string[] {
+  const primaryTopic = request.brief.topic ?? request.plan.objective;
+  const topicPhrase = compactQueryPhrase(primaryTopic, 8) ?? primaryTopic;
+  const explicitQueries = uniqueStrings(request.plan.searchQueries);
+  const focusQueries = uniqueStrings([
+    compactQueryPhrase(request.brief.researchQuestion, 7),
+    compactQueryPhrase(request.brief.researchDirection, 7),
+    compactQueryPhrase(request.brief.successCriterion, 7),
+    ...request.plan.localFocus.map((focus) => compactQueryPhrase(focus, 5)),
+    ...explicitQueries.map((query) => compactQueryPhrase(query, 8))
+  ]);
+  const literatureHints = request.literatureContext?.queryHints ?? [];
+  const memoryHints = request.memoryContext.queryHints ?? [];
+  const buckets = [
+    explicitQueries,
+    focusQueries.map((query) => `${topicPhrase} ${query}`),
+    memoryHints.map((hint) => `${topicPhrase} ${compactQueryPhrase(hint, 6) ?? hint}`),
+    literatureHints.map((hint) => `${topicPhrase} ${compactQueryPhrase(hint, 6) ?? hint}`),
+    [topicPhrase]
+  ];
+
+  return interleaveUniqueQueries(buckets, 8);
+}
+
+function interleaveUniqueQueries(buckets: string[][], limit: number): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  const maxBucketLength = Math.max(0, ...buckets.map((bucket) => bucket.length));
+
+  for (let index = 0; index < maxBucketLength && result.length < limit; index += 1) {
+    for (const bucket of buckets) {
+      const candidate = bucket[index];
+
+      if (candidate === undefined || seen.has(candidate)) {
         continue;
       }
 
-      await collectCandidateTextFiles(projectRoot, absolutePath, relativePath, output);
+      seen.add(candidate);
+      result.push(candidate);
+
+      if (result.length >= limit) {
+        break;
+      }
+    }
+  }
+
+  return result;
+}
+
+function compactQueryPhrase(text: string | null | undefined, limit = 6): string | null {
+  if (typeof text !== "string") {
+    return null;
+  }
+
+  const tokens = tokenize(text)
+    .filter((token) => !stopTokens.has(token))
+    .slice(0, limit);
+
+  return tokens.length > 0 ? tokens.join(" ") : null;
+}
+
+function topicAnchorTokens(request: ResearchSourceGatherRequest): Set<string> {
+  return new Set([
+    ...(compactQueryPhrase(request.brief.topic ?? request.plan.objective, 8)?.split(" ") ?? []),
+    ...(compactQueryPhrase(request.brief.researchQuestion, 7)?.split(" ") ?? []),
+    ...request.plan.localFocus.flatMap((focus) => compactQueryPhrase(focus, 5)?.split(" ") ?? [])
+  ].filter((token) => token.length > 0));
+}
+
+function containsTopicPhrase(source: ResearchSource, request: ResearchSourceGatherRequest): boolean {
+  const topicPhrase = compactQueryPhrase(request.brief.topic ?? request.plan.objective, 8);
+
+  if (topicPhrase === null) {
+    return false;
+  }
+
+  const haystack = normalizeWhitespace(`${source.title} ${source.excerpt}`.toLowerCase());
+  return haystack.includes(topicPhrase.toLowerCase());
+}
+
+function routeProviders(
+  domain: SourceProviderDomain | "mixed",
+  scholarlyProviderIds: SourceProviderId[]
+): RoutingPlan {
+  const selected = new Set(scholarlyProviderIds);
+  const preferredDiscovery = domain === "cs_ai"
+    ? ["openalex", "arxiv", "dblp", "crossref", "core", "unpaywall"]
+    : domain === "biomedical"
+      ? ["pubmed", "europe_pmc", "openalex", "crossref", "core", "unpaywall"]
+      : ["openalex", "crossref", "arxiv", "dblp", "pubmed", "europe_pmc", "core", "unpaywall"];
+  const discoveryProviderIds = preferredDiscovery
+    .filter((providerId) => selected.has(providerId as SourceProviderId))
+    .map((providerId) => providerId as SourceProviderId)
+    .filter((providerId) => getSourceProviderDefinition(providerId).roles.includes("discovery"));
+  const resolverProviderIds = preferredDiscovery
+    .filter((providerId) => selected.has(providerId as SourceProviderId))
+    .map((providerId) => providerId as SourceProviderId)
+    .filter((providerId) => getSourceProviderDefinition(providerId).roles.includes("resolver"));
+  const acquisitionProviderIds = preferredDiscovery
+    .filter((providerId) => selected.has(providerId as SourceProviderId))
+    .map((providerId) => providerId as SourceProviderId)
+    .filter((providerId) => getSourceProviderDefinition(providerId).roles.includes("acquisition"));
+
+  return {
+    domain,
+    plannedQueries: [],
+    discoveryProviderIds,
+    resolverProviderIds,
+    acquisitionProviderIds
+  };
+}
+
+async function fetchJson(url: URL, init?: RequestInit): Promise<unknown> {
+  const response = await fetch(url, {
+    ...init,
+    signal: AbortSignal.timeout(30_000)
+  });
+
+  if (!response.ok) {
+    throw new Error(`${url.origin} responded with ${response.status} ${response.statusText}`);
+  }
+
+  return response.json();
+}
+
+async function fetchText(url: URL, init?: RequestInit): Promise<string> {
+  const response = await fetch(url, {
+    ...init,
+    signal: AbortSignal.timeout(30_000)
+  });
+
+  if (!response.ok) {
+    throw new Error(`${url.origin} responded with ${response.status} ${response.statusText}`);
+  }
+
+  return response.text();
+}
+
+function authorsToCitation(authors: string[], year: number | null, title: string, venue: string | null): string {
+  const authorText = authors.length === 0
+    ? "Unknown author"
+    : authors.length === 1
+      ? authors[0]!
+      : `${authors[0]} et al.`;
+
+  return `${authorText} (${year ?? "n.d."}). ${title}.${venue === null ? "" : ` ${venue}.`}`;
+}
+
+function decodeOpenAlexAbstract(value: unknown): string {
+  if (typeof value !== "object" || value === null) {
+    return "";
+  }
+
+  const index = value as Record<string, number[]>;
+  const positioned: Array<{ position: number; word: string }> = [];
+
+  for (const [word, positions] of Object.entries(index)) {
+    for (const position of positions) {
+      if (Number.isInteger(position)) {
+        positioned.push({ position, word });
+      }
+    }
+  }
+
+  return positioned
+    .sort((left, right) => left.position - right.position)
+    .map((entry) => entry.word)
+    .join(" ");
+}
+
+function accessRecord(
+  providerId: SourceProviderId,
+  url: string | null,
+  accessMode: PaperAccessMode,
+  fulltextFormat: PaperFulltextFormat,
+  note: string | null,
+  options: {
+    license?: string | null;
+    tdmAllowed?: boolean | null;
+  } = {}
+): PaperAccessRecord {
+  return {
+    providerId,
+    url,
+    accessMode,
+    fulltextFormat,
+    license: options.license ?? null,
+    tdmAllowed: options.tdmAllowed ?? null,
+    note
+  };
+}
+
+function makeSourceId(providerId: SourceProviderId, title: string, locator: string | null): string {
+  return `${providerId}:${locator ?? slug(title)}`;
+}
+
+function toResearchSource(candidate: RawCandidate): ResearchSource {
+  return {
+    id: makeSourceId(candidate.providerId, candidate.title, candidate.locator),
+    providerId: candidate.providerId,
+    category: getSourceProviderDefinition(candidate.providerId).category === "background"
+      ? "background"
+      : "scholarly",
+    kind: getSourceProviderDefinition(candidate.providerId).category === "background"
+      ? "background_article"
+      : "scholarly_hit",
+    title: candidate.title,
+    locator: candidate.locator,
+    citation: candidate.citation,
+    excerpt: excerptText(candidate.excerpt),
+    year: candidate.year,
+    authors: candidate.authors,
+    venue: candidate.venue,
+    identifiers: candidate.identifiers,
+    access: candidate.access
+  };
+}
+
+function selectBestAccess(candidates: PaperAccessRecord[]): PaperAccessRecord {
+  const ranked = [...candidates].sort((left, right) => accessRank(right) - accessRank(left));
+  return ranked[0] ?? accessRecord("crossref", null, "metadata_only", "none", "No access candidates were available.");
+}
+
+function accessRank(record: PaperAccessRecord): number {
+  switch (record.accessMode) {
+    case "fulltext_open":
+      return 6;
+    case "fulltext_licensed":
+      return 5;
+    case "abstract_available":
+      return 4;
+    case "metadata_only":
+      return 3;
+    case "needs_credentials":
+      return 2;
+    case "fulltext_blocked":
+      return 1;
+  }
+}
+
+function screeningForSource(
+  source: ResearchSource,
+  profile: LiteratureReviewProfile | null
+): { assessment: LiteratureSourceAssessment | undefined; accepted: boolean } {
+  if (profile === null) {
+    const referenceTokens = new Set(tokenize(`${source.title} ${source.citation}`));
+    const score = overlapScore(`${source.title} ${source.excerpt}`, referenceTokens);
+    return {
+      assessment: undefined,
+      accepted: score >= 2 || tokenize(source.title).length >= 2
+    };
+  }
+
+  const assessment = assessLiteratureSource(profile, {
+    title: source.title,
+    excerpt: source.excerpt,
+    citation: source.citation
+  });
+
+  return {
+    assessment,
+    accepted: assessment.accepted
+  };
+}
+
+async function walkTextFiles(projectRoot: string, currentDirectory = projectRoot): Promise<string[]> {
+  const entries = await readdir(currentDirectory, { withFileTypes: true });
+  const results: string[] = [];
+
+  for (const entry of entries) {
+    if (ignoredDirectories.has(entry.name)) {
+      continue;
+    }
+
+    const absolutePath = path.join(currentDirectory, entry.name);
+
+    if (entry.isDirectory()) {
+      results.push(...await walkTextFiles(projectRoot, absolutePath));
       continue;
     }
 
@@ -584,678 +718,1132 @@ async function collectCandidateTextFiles(
       continue;
     }
 
-    output.push(path.join(projectRoot, relativePath));
+    results.push(path.relative(projectRoot, absolutePath));
   }
 
-  return output;
-}
-
-async function gatherLocalFileSources(
-  request: ResearchSourceGatherRequest
-): Promise<ResearchSource[]> {
-  const candidateFiles = await collectCandidateTextFiles(request.projectRoot);
-  const referenceTokens = new Set([
-    ...tokenize(request.brief.topic ?? ""),
-    ...tokenize(request.brief.researchQuestion ?? ""),
-    ...tokenize(request.brief.researchDirection ?? ""),
-    ...request.plan.searchQueries.flatMap(tokenize),
-    ...request.plan.localFocus.flatMap(tokenize),
-    ...request.memoryContext.queryHints.flatMap(tokenize),
-    ...request.memoryContext.localFileHints.flatMap(tokenize)
-  ]);
-
-  const scored = await Promise.all(candidateFiles.map(async (filePath) => {
-    try {
-      const contents = await readFile(filePath, "utf8");
-      const score = overlapScore(filePath, referenceTokens) + overlapScore(contents.slice(0, 3000), referenceTokens);
-      return {
-        filePath,
-        score,
-        contents
-      };
-    } catch {
-      return null;
-    }
-  }));
-
-  return scored
-    .filter((entry): entry is { filePath: string; score: number; contents: string } => entry !== null)
-    .sort((left, right) => right.score - left.score)
-    .slice(0, 4)
-    .map((entry, index) => ({
-      id: `local-${index + 1}`,
-      kind: "local_file" as const,
-      title: path.relative(request.projectRoot, entry.filePath),
-      locator: entry.filePath,
-      citation: path.relative(request.projectRoot, entry.filePath),
-      excerpt: excerptText(entry.contents)
-    }));
+  return results;
 }
 
 export async function collectResearchLocalFileHints(
   projectRoot: string,
   brief: ResearchBrief
 ): Promise<string[]> {
-  const candidateFiles = await collectCandidateTextFiles(projectRoot);
+  const files = await walkTextFiles(projectRoot);
   const referenceTokens = new Set([
-    ...tokenize(brief.topic ?? ""),
-    ...tokenize(brief.researchQuestion ?? ""),
-    ...tokenize(brief.researchDirection ?? "")
+    ...(brief.topic === null ? [] : tokenize(brief.topic)),
+    ...(brief.researchQuestion === null ? [] : tokenize(brief.researchQuestion)),
+    ...(brief.researchDirection === null ? [] : tokenize(brief.researchDirection))
   ]);
 
-  const scored = await Promise.all(candidateFiles.map(async (filePath) => {
-    try {
-      const contents = await readFile(filePath, "utf8");
-      return {
-        filePath,
-        score: overlapScore(filePath, referenceTokens) + overlapScore(contents.slice(0, 2500), referenceTokens)
-      };
-    } catch {
-      return null;
-    }
-  }));
-
-  return scored
-    .filter((entry): entry is { filePath: string; score: number } => entry !== null)
-    .sort((left, right) => right.score - left.score)
-    .slice(0, 8)
-    .map((entry) => path.relative(projectRoot, entry.filePath));
+  return files
+    .sort((left, right) => overlapScore(right, referenceTokens) - overlapScore(left, referenceTokens))
+    .slice(0, 12);
 }
 
-function invertAbstract(index: Record<string, number[]> | undefined): string | null {
-  if (index === undefined || index === null || typeof index !== "object") {
-    return null;
+async function gatherLocalProjectFiles(
+  request: ResearchSourceGatherRequest
+): Promise<ResearchSource[]> {
+  if (!projectFilesEnabled(request)) {
+    return [];
   }
 
-  const tokens: string[] = [];
+  const referenceTokens = new Set([
+    ...(request.brief.topic === null ? [] : tokenize(request.brief.topic)),
+    ...(request.brief.researchQuestion === null ? [] : tokenize(request.brief.researchQuestion)),
+    ...(request.brief.researchDirection === null ? [] : tokenize(request.brief.researchDirection)),
+    ...request.plan.localFocus.flatMap(tokenize)
+  ]);
+  const files = await walkTextFiles(request.projectRoot);
+  const ranked = files
+    .map((relativePath) => ({
+      relativePath,
+      score: overlapScore(relativePath, referenceTokens)
+    }))
+    .sort((left, right) => right.score - left.score)
+    .slice(0, 4);
+  const sources: ResearchSource[] = [];
 
-  for (const [word, positions] of Object.entries(index)) {
-    if (!Array.isArray(positions)) {
+  for (const file of ranked) {
+    const contents = await readFile(path.join(request.projectRoot, file.relativePath), "utf8");
+
+    sources.push({
+      id: `local:${file.relativePath}`,
+      providerId: "project_files",
+      category: "local",
+      kind: "local_file",
+      title: file.relativePath,
+      locator: file.relativePath,
+      citation: `Local project file: ${file.relativePath}`,
+      excerpt: excerptText(contents),
+      year: null,
+      authors: [],
+      venue: null,
+      identifiers: {},
+      access: {
+        providerId: "project_files",
+        url: file.relativePath,
+        accessMode: "fulltext_open",
+        fulltextFormat: "none",
+        note: "Project file available locally."
+      }
+    });
+  }
+
+  return sources;
+}
+
+async function queryOpenAlex(query: string): Promise<RawCandidate[]> {
+  const url = new URL("/works", openAlexBaseUrl);
+  url.searchParams.set("search", query);
+  url.searchParams.set("per-page", "5");
+  const payload = await fetchJson(url);
+  const record = typeof payload === "object" && payload !== null
+    ? payload as { results?: unknown[] }
+    : {};
+  const results = Array.isArray(record.results) ? record.results : [];
+
+  return results.flatMap((entry) => {
+    const raw = typeof entry === "object" && entry !== null
+      ? entry as Record<string, unknown>
+      : {};
+    const title = safeString(raw.display_name);
+
+    if (title === null) {
+      return [];
+    }
+
+    const authorships = Array.isArray(raw.authorships) ? raw.authorships : [];
+    const authors = authorships.flatMap((authorship) => {
+      const author = typeof authorship === "object" && authorship !== null
+        ? authorship as Record<string, unknown>
+        : {};
+      const authorRecord = typeof author.author === "object" && author.author !== null
+        ? author.author as Record<string, unknown>
+        : {};
+      const name = safeString(authorRecord.display_name);
+      return name === null ? [] : [name];
+    });
+    const primaryLocation = typeof raw.primary_location === "object" && raw.primary_location !== null
+      ? raw.primary_location as Record<string, unknown>
+      : {};
+    const sourceRecord = typeof primaryLocation.source === "object" && primaryLocation.source !== null
+      ? primaryLocation.source as Record<string, unknown>
+      : {};
+    const locator = safeString(primaryLocation.landing_page_url) ?? safeString(raw.id);
+    const excerpt = decodeOpenAlexAbstract(raw.abstract_inverted_index);
+    const doi = normalizeDoi(safeString(raw.doi));
+    const bestOaLocation = typeof raw.best_oa_location === "object" && raw.best_oa_location !== null
+      ? raw.best_oa_location as Record<string, unknown>
+      : {};
+    const pdfUrl = safeString(bestOaLocation.pdf_url) ?? safeString(bestOaLocation.landing_page_url);
+    const access = pdfUrl !== null
+      ? accessRecord("openalex", pdfUrl, "fulltext_open", pdfUrl.endsWith(".pdf") ? "pdf" : "html", "OpenAlex reported an open access location.")
+      : excerpt.length > 0
+        ? accessRecord("openalex", locator, "abstract_available", "none", "OpenAlex metadata included an abstract.")
+        : accessRecord("openalex", locator, "metadata_only", "none", "OpenAlex returned metadata only.");
+
+    return [{
+      providerId: "openalex" as const,
+      title,
+      locator,
+      citation: authorsToCitation(authors, safeInteger(raw.publication_year), title, safeString(sourceRecord.display_name)),
+      excerpt,
+      year: safeInteger(raw.publication_year),
+      authors,
+      venue: safeString(sourceRecord.display_name),
+      identifiers: {
+        doi
+      },
+      access
+    }];
+  });
+}
+
+async function queryCrossref(query: string): Promise<RawCandidate[]> {
+  const url = new URL("/works", crossrefBaseUrl);
+  url.searchParams.set("query.bibliographic", query);
+  url.searchParams.set("rows", "5");
+  const payload = await fetchJson(url);
+  const record = typeof payload === "object" && payload !== null
+    ? payload as { message?: { items?: unknown[] } }
+    : {};
+  const items = Array.isArray(record.message?.items) ? record.message?.items ?? [] : [];
+
+  return items.flatMap((entry) => {
+    const item = typeof entry === "object" && entry !== null
+      ? entry as Record<string, unknown>
+      : {};
+    const title = Array.isArray(item.title)
+      ? safeString(item.title[0])
+      : safeString(item.title);
+
+    if (title === null) {
+      return [];
+    }
+
+    const authors = Array.isArray(item.author)
+      ? item.author.flatMap((author) => {
+        const record = typeof author === "object" && author !== null
+          ? author as Record<string, unknown>
+          : {};
+        const given = safeString(record.given);
+        const family = safeString(record.family);
+        return normalizeWhitespace([given, family].filter((value): value is string => value !== null).join(" ")).length === 0
+          ? []
+          : [normalizeWhitespace([given, family].filter((value): value is string => value !== null).join(" "))];
+      })
+      : [];
+    const issued = typeof item.issued === "object" && item.issued !== null
+      ? item.issued as { "date-parts"?: number[][] }
+      : undefined;
+    const year = Array.isArray(issued?.["date-parts"])
+      ? safeInteger(issued?.["date-parts"]?.[0]?.[0])
+      : null;
+    const venue = Array.isArray(item["container-title"])
+      ? safeString(item["container-title"][0])
+      : null;
+    const doi = normalizeDoi(safeString(item.DOI));
+    const locator = safeString(item.URL) ?? (doi === null ? null : `https://doi.org/${doi}`);
+
+    return [{
+      providerId: "crossref" as const,
+      title,
+      locator,
+      citation: authorsToCitation(authors, year, title, venue),
+      excerpt: safeString(item.abstract) ?? "",
+      year,
+      authors,
+      venue,
+      identifiers: {
+        doi
+      },
+      access: accessRecord("crossref", locator, "metadata_only", "none", "Crossref returned metadata resolution.")
+    }];
+  });
+}
+
+function parseArxivEntries(xml: string): RawCandidate[] {
+  const entries = xml.split(/<entry>/g).slice(1);
+
+  return entries.flatMap((entry) => {
+    const title = entry.match(/<title>\s*([\s\S]*?)\s*<\/title>/i)?.[1]
+      ?.replace(/\s+/g, " ")
+      .trim() ?? null;
+
+    if (title === null) {
+      return [];
+    }
+
+    const summary = entry.match(/<summary>\s*([\s\S]*?)\s*<\/summary>/i)?.[1]
+      ?.replace(/\s+/g, " ")
+      .trim() ?? "";
+    const id = entry.match(/<id>\s*([\s\S]*?)\s*<\/id>/i)?.[1]?.trim() ?? null;
+    const published = entry.match(/<published>\s*(\d{4})/i)?.[1] ?? null;
+    const authors = [...entry.matchAll(/<name>\s*([\s\S]*?)\s*<\/name>/gi)]
+      .map((match) => match[1]?.replace(/\s+/g, " ").trim())
+      .filter((value): value is string => typeof value === "string" && value.length > 0);
+    const arxivId = normalizeArxivId(id);
+    const locator = id;
+    const pdfUrl = arxivId === null ? null : `https://arxiv.org/pdf/${arxivId}.pdf`;
+
+    return [{
+      providerId: "arxiv" as const,
+      title,
+      locator,
+      citation: authorsToCitation(authors, published === null ? null : Number(published), title, "arXiv"),
+      excerpt: summary,
+      year: published === null ? null : Number(published),
+      authors,
+      venue: "arXiv",
+      identifiers: {
+        arxivId
+      },
+      access: accessRecord("arxiv", pdfUrl, "fulltext_open", "pdf", "arXiv provides direct PDF access.")
+    }];
+  });
+}
+
+async function queryArxiv(query: string): Promise<RawCandidate[]> {
+  const url = new URL("/api/query", arxivBaseUrl);
+  url.searchParams.set("search_query", `all:${query}`);
+  url.searchParams.set("max_results", "5");
+  const xml = await fetchText(url);
+  return parseArxivEntries(xml);
+}
+
+async function queryDblp(query: string): Promise<RawCandidate[]> {
+  const url = new URL("/search/publ/api", dblpBaseUrl);
+  url.searchParams.set("q", query);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("h", "5");
+  const payload = await fetchJson(url);
+  const record = typeof payload === "object" && payload !== null
+    ? payload as { result?: { hits?: { hit?: unknown[] | unknown } } }
+    : {};
+  const hitValue = record.result?.hits?.hit;
+  const hits = Array.isArray(hitValue)
+    ? hitValue
+    : hitValue === undefined
+      ? []
+      : [hitValue];
+
+  return hits.flatMap((entry) => {
+    const info = typeof entry === "object" && entry !== null
+      ? (entry as { info?: Record<string, unknown> }).info ?? {}
+      : {};
+    const title = safeString(info.title);
+
+    if (title === null) {
+      return [];
+    }
+
+    const authors = Array.isArray((info.authors as { author?: unknown[] | unknown } | undefined)?.author)
+      ? ((info.authors as { author?: unknown[] }).author ?? []).flatMap((author) => safeString(author) ?? [])
+      : safeString((info.authors as { author?: unknown } | undefined)?.author) === null
+        ? []
+        : [safeString((info.authors as { author?: unknown }).author)!];
+
+    return [{
+      providerId: "dblp" as const,
+      title,
+      locator: safeString(info.url),
+      citation: authorsToCitation(authors, safeInteger(Number(info.year)), title, safeString(info.venue)),
+      excerpt: "",
+      year: safeInteger(Number(info.year)),
+      authors,
+      venue: safeString(info.venue),
+      identifiers: {
+        doi: normalizeDoi(safeString(info.doi))
+      },
+      access: accessRecord("dblp", safeString(info.url), "metadata_only", "none", "DBLP returned bibliographic metadata.")
+    }];
+  });
+}
+
+async function queryPubmed(query: string, apiKey: string | null): Promise<RawCandidate[]> {
+  const searchUrl = new URL("esearch.fcgi", pubmedBaseUrl.endsWith("/") ? pubmedBaseUrl : `${pubmedBaseUrl}/`);
+  searchUrl.searchParams.set("db", "pubmed");
+  searchUrl.searchParams.set("retmode", "json");
+  searchUrl.searchParams.set("retmax", "5");
+  searchUrl.searchParams.set("term", query);
+  if (apiKey !== null) {
+    searchUrl.searchParams.set("api_key", apiKey);
+  }
+
+  const searchPayload = await fetchJson(searchUrl) as {
+    esearchresult?: { idlist?: string[] };
+  };
+  const ids = Array.isArray(searchPayload.esearchresult?.idlist)
+    ? searchPayload.esearchresult?.idlist ?? []
+    : [];
+
+  if (ids.length === 0) {
+    return [];
+  }
+
+  const summaryUrl = new URL("esummary.fcgi", pubmedBaseUrl.endsWith("/") ? pubmedBaseUrl : `${pubmedBaseUrl}/`);
+  summaryUrl.searchParams.set("db", "pubmed");
+  summaryUrl.searchParams.set("retmode", "json");
+  summaryUrl.searchParams.set("id", ids.join(","));
+  if (apiKey !== null) {
+    summaryUrl.searchParams.set("api_key", apiKey);
+  }
+
+  const summaryPayload = await fetchJson(summaryUrl) as {
+    result?: Record<string, Record<string, unknown>>;
+  };
+
+  return ids.flatMap((id) => {
+    const item = summaryPayload.result?.[id] ?? {};
+    const title = safeString(item.title);
+
+    if (title === null) {
+      return [];
+    }
+
+    const authors = Array.isArray(item.authors)
+      ? item.authors.flatMap((author) => {
+        const record = typeof author === "object" && author !== null
+          ? author as Record<string, unknown>
+          : {};
+        const name = safeString(record.name);
+        return name === null ? [] : [name];
+      })
+      : [];
+
+    return [{
+      providerId: "pubmed" as const,
+      title,
+      locator: `https://pubmed.ncbi.nlm.nih.gov/${id}/`,
+      citation: authorsToCitation(authors, Number.parseInt((safeString(item.pubdate) ?? "").slice(0, 4), 10) || null, title, safeString(item.fulljournalname)),
+      excerpt: "",
+      year: Number.parseInt((safeString(item.pubdate) ?? "").slice(0, 4), 10) || null,
+      authors,
+      venue: safeString(item.fulljournalname),
+      identifiers: {
+        pmid: id,
+        doi: normalizeDoi(
+          Array.isArray(item.articleids)
+            ? safeString((item.articleids.find((articleId) => {
+              const record = typeof articleId === "object" && articleId !== null
+                ? articleId as Record<string, unknown>
+                : {};
+              return safeString(record.idtype) === "doi";
+            }) as Record<string, unknown> | undefined)?.value)
+            : null
+        )
+      },
+      access: accessRecord("pubmed", `https://pubmed.ncbi.nlm.nih.gov/${id}/`, "metadata_only", "none", "PubMed returned biomedical metadata.")
+    }];
+  });
+}
+
+async function queryEuropePmc(query: string): Promise<RawCandidate[]> {
+  const url = new URL("search", europePmcBaseUrl.endsWith("/") ? europePmcBaseUrl : `${europePmcBaseUrl}/`);
+  url.searchParams.set("query", query);
+  url.searchParams.set("format", "json");
+  url.searchParams.set("pageSize", "5");
+  const payload = await fetchJson(url) as {
+    resultList?: { result?: Array<Record<string, unknown>> };
+  };
+  const results = Array.isArray(payload.resultList?.result)
+    ? payload.resultList?.result ?? []
+    : [];
+
+  return results.flatMap((entry) => {
+    const title = safeString(entry.title);
+
+    if (title === null) {
+      return [];
+    }
+
+    const pmcid = safeString(entry.pmcid);
+    const locator = safeString(entry.fullTextUrl) ?? safeString(entry.journalUrl) ?? (pmcid === null ? null : `https://europepmc.org/article/PMC/${pmcid}`);
+    const excerpt = safeString(entry.abstractText) ?? "";
+    const access = pmcid !== null
+      ? accessRecord("europe_pmc", locator, "fulltext_open", "html", "Europe PMC exposed an OA full-text route.")
+      : excerpt.length > 0
+        ? accessRecord("europe_pmc", locator, "abstract_available", "none", "Europe PMC returned an abstract.")
+        : accessRecord("europe_pmc", locator, "metadata_only", "none", "Europe PMC returned metadata only.");
+
+    return [{
+      providerId: "europe_pmc" as const,
+      title,
+      locator,
+      citation: authorsToCitation(uniqueStrings([safeString(entry.authorString)]), safeInteger(Number(entry.pubYear)), title, safeString(entry.journalTitle)),
+      excerpt,
+      year: safeInteger(Number(entry.pubYear)),
+      authors: uniqueStrings([safeString(entry.authorString)]),
+      venue: safeString(entry.journalTitle),
+      identifiers: {
+        doi: normalizeDoi(safeString(entry.doi)),
+        pmid: safeString(entry.pmid),
+        pmcid
+      },
+      access
+    }];
+  });
+}
+
+async function queryCore(query: string, apiKey: string | null): Promise<RawCandidate[]> {
+  if (apiKey === null) {
+    return [];
+  }
+
+  const url = new URL("/search/works", coreBaseUrl);
+  url.searchParams.set("q", query);
+  url.searchParams.set("limit", "5");
+  const payload = await fetchJson(url, {
+    headers: {
+      Authorization: `Bearer ${apiKey}`
+    }
+  }) as {
+    results?: Array<Record<string, unknown>>;
+  };
+  const results = Array.isArray(payload.results) ? payload.results : [];
+
+  return results.flatMap((entry) => {
+    const title = safeString(entry.title);
+
+    if (title === null) {
+      return [];
+    }
+
+    return [{
+      providerId: "core" as const,
+      title,
+      locator: safeString(entry.downloadUrl) ?? safeString(entry.id),
+      citation: authorsToCitation(readStringArray(entry.authors), safeInteger(Number(entry.yearPublished)), title, safeString(entry.publisher)),
+      excerpt: safeString(entry.abstract) ?? "",
+      year: safeInteger(Number(entry.yearPublished)),
+      authors: readStringArray(entry.authors),
+      venue: safeString(entry.publisher),
+      identifiers: {
+        doi: normalizeDoi(safeString(entry.doi))
+      },
+      access: accessRecord("core", safeString(entry.downloadUrl) ?? safeString(entry.id), "fulltext_open", "pdf", "CORE returned an open full-text route.")
+    }];
+  });
+}
+
+async function queryWikipedia(query: string): Promise<RawCandidate[]> {
+  const searchUrl = new URL("/w/api.php", wikipediaBaseUrl);
+  searchUrl.searchParams.set("action", "query");
+  searchUrl.searchParams.set("list", "search");
+  searchUrl.searchParams.set("srsearch", query);
+  searchUrl.searchParams.set("format", "json");
+  searchUrl.searchParams.set("srlimit", "3");
+  const searchPayload = await fetchJson(searchUrl) as {
+    query?: { search?: Array<{ title?: string }> };
+  };
+  const titles = Array.isArray(searchPayload.query?.search)
+    ? searchPayload.query?.search?.flatMap((result) => safeString(result.title) ?? []) ?? []
+    : [];
+  const candidates: RawCandidate[] = [];
+
+  for (const title of titles.slice(0, 3)) {
+    const summaryUrl = new URL(`/api/rest_v1/page/summary/${encodeURIComponent(title)}`, wikipediaBaseUrl);
+    const summaryPayload = await fetchJson(summaryUrl) as {
+      title?: string;
+      extract?: string;
+      content_urls?: { desktop?: { page?: string } };
+    };
+    const resolvedTitle = safeString(summaryPayload.title) ?? title;
+    const extract = safeString(summaryPayload.extract) ?? "";
+    const locator = safeString(summaryPayload.content_urls?.desktop?.page);
+
+    candidates.push({
+      providerId: "wikipedia",
+      title: resolvedTitle,
+      locator,
+      citation: `Wikipedia: ${resolvedTitle}`,
+      excerpt: extract,
+      year: null,
+      authors: [],
+      venue: "Wikipedia",
+      identifiers: {},
+      access: accessRecord("wikipedia", locator, "fulltext_open", "html", "Wikipedia background fallback.")
+    });
+  }
+
+  return candidates;
+}
+
+function mergeKeyForSource(source: ResearchSource): string {
+  const doi = normalizeDoi(source.identifiers.doi ?? null);
+
+  if (doi !== null) {
+    return `doi:${doi}`;
+  }
+
+  if (source.identifiers.pmid !== undefined && source.identifiers.pmid !== null) {
+    return `pmid:${source.identifiers.pmid}`;
+  }
+
+  if (source.identifiers.pmcid !== undefined && source.identifiers.pmcid !== null) {
+    return `pmcid:${source.identifiers.pmcid}`;
+  }
+
+  if (source.identifiers.arxivId !== undefined && source.identifiers.arxivId !== null) {
+    return `arxiv:${normalizeArxivId(source.identifiers.arxivId)}`;
+  }
+
+  return `heuristic:${titleHeuristicKey(source.title, source.year, source.authors)}`;
+}
+
+async function resolveWithUnpaywall(
+  paper: CanonicalPaper,
+  email: string | null
+): Promise<PaperAccessRecord[]> {
+  const doi = paper.identifiers.doi;
+
+  if (doi === null || email === null) {
+    return [];
+  }
+
+  const url = new URL(`/${encodeURIComponent(doi)}`, unpaywallBaseUrl);
+  url.searchParams.set("email", email);
+  const payload = await fetchJson(url) as Record<string, unknown>;
+  const bestLocation = typeof payload.best_oa_location === "object" && payload.best_oa_location !== null
+    ? payload.best_oa_location as Record<string, unknown>
+    : {};
+  const pdfUrl = safeString(bestLocation.url_for_pdf);
+  const landingPageUrl = safeString(bestLocation.url);
+  const chosenUrl = pdfUrl ?? landingPageUrl;
+
+  if (chosenUrl === null) {
+    return [];
+  }
+
+  return [
+    accessRecord(
+      "unpaywall",
+      chosenUrl,
+      "fulltext_open",
+      pdfUrl !== null ? "pdf" : "html",
+      "Unpaywall resolved a legal OA route."
+    )
+  ];
+}
+
+function resolveFromExistingCandidates(paper: CanonicalPaper): AccessResolution {
+  const candidates = paper.accessCandidates.length > 0
+    ? paper.accessCandidates
+    : [accessRecord("crossref", paper.bestAccessUrl, "metadata_only", "none", "No explicit access candidate was recorded.")];
+
+  return {
+    best: selectBestAccess(candidates),
+    candidates,
+    accessErrors: []
+  };
+}
+
+function screeningStageFromAccess(accessMode: PaperAccessMode): "title" | "abstract" | "fulltext" {
+  if (accessMode === "fulltext_open" || accessMode === "fulltext_licensed") {
+    return "fulltext";
+  }
+
+  if (accessMode === "abstract_available") {
+    return "abstract";
+  }
+
+  return "title";
+}
+
+function screeningDecision(
+  sourceIds: string[],
+  sources: ResearchSource[],
+  stage: "title" | "abstract" | "fulltext",
+  assessment: LiteratureSourceAssessment | null
+): { decision: "include" | "background" | "exclude" | "uncertain"; rationale: string | null } {
+  if (assessment !== null && !assessment.accepted) {
+    return {
+      decision: "exclude",
+      rationale: assessment.rationale
+    };
+  }
+
+  if (stage === "fulltext") {
+    return {
+      decision: "include",
+      rationale: assessment?.rationale ?? "The paper is directly readable at full text."
+    };
+  }
+
+  if (stage === "abstract") {
+    return {
+      decision: "include",
+      rationale: assessment?.rationale ?? "The paper can be screened at the abstract level."
+    };
+  }
+
+  const scholarlySources = sources.filter((source) => sourceIds.includes(source.id) && source.category === "scholarly");
+
+  return scholarlySources.length > 0
+    ? {
+      decision: "uncertain",
+      rationale: assessment?.rationale ?? "Only metadata/title-level screening was possible."
+    }
+    : {
+      decision: "background",
+      rationale: "This item is background-only and was not treated as a core scholarly paper."
+    };
+}
+
+function canonicalPaperFromSources(
+  key: string,
+  sources: ResearchSource[],
+  resolverCandidates: PaperAccessRecord[]
+): CanonicalPaper {
+  const primary = [...sources].sort((left, right) => {
+    const leftAccess = left.access === null || left.access.accessMode === undefined ? 0 : accessRank(left.access as PaperAccessRecord);
+    const rightAccess = right.access === null || right.access.accessMode === undefined ? 0 : accessRank(right.access as PaperAccessRecord);
+    return rightAccess - leftAccess || (right.excerpt.length - left.excerpt.length);
+  })[0]!;
+  const identifiers: PaperIdentifiers = {
+    doi: normalizeDoi(primary.identifiers.doi ?? null),
+    pmid: primary.identifiers.pmid ?? null,
+    pmcid: primary.identifiers.pmcid ?? null,
+    arxivId: normalizeArxivId(primary.identifiers.arxivId ?? null)
+  };
+
+  for (const source of sources) {
+    identifiers.doi = normalizeDoi(source.identifiers.doi ?? identifiers.doi) ?? identifiers.doi;
+    identifiers.pmid = source.identifiers.pmid ?? identifiers.pmid;
+    identifiers.pmcid = source.identifiers.pmcid ?? identifiers.pmcid;
+    identifiers.arxivId = normalizeArxivId(source.identifiers.arxivId ?? identifiers.arxivId) ?? identifiers.arxivId;
+  }
+
+  const accessCandidates = [
+    ...sources.flatMap((source) => source.access === null ? [] : [source.access as PaperAccessRecord]),
+    ...resolverCandidates
+  ];
+  const access = resolveFromExistingCandidates({
+    id: createLiteratureEntityId("paper", key),
+    key,
+    title: primary.title,
+    citation: primary.citation,
+    abstract: primary.excerpt.length > 0 ? primary.excerpt : null,
+    year: primary.year,
+    authors: primary.authors,
+    venue: primary.venue,
+    discoveredVia: [],
+    identifiers,
+    discoveryRecords: [],
+    accessCandidates,
+    bestAccessUrl: primary.locator,
+    bestAccessProvider: primary.providerId,
+    accessMode: "metadata_only",
+    fulltextFormat: "none",
+    license: null,
+    tdmAllowed: null,
+    contentStatus: {
+      abstractAvailable: primary.excerpt.length > 0,
+      fulltextAvailable: false,
+      fulltextFetched: false,
+      fulltextExtracted: false
+    },
+    screeningStage: "title",
+    screeningDecision: "uncertain",
+    screeningRationale: null,
+    accessErrors: [],
+    tags: [],
+    runIds: [],
+    linkedThemeIds: [],
+    linkedClaimIds: [],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  });
+  const assessment = sources
+    .map((source) => source.assessment ?? null)
+    .find((candidate) => candidate !== null) ?? null;
+  const stage = screeningStageFromAccess(access.best.accessMode);
+  const screening = screeningDecision(sources.map((source) => source.id), sources, stage, assessment);
+
+  return {
+    id: createLiteratureEntityId("paper", key),
+    key,
+    title: primary.title,
+    citation: primary.citation,
+    abstract: primary.excerpt.length > 0 ? primary.excerpt : null,
+    year: primary.year,
+    authors: uniqueStrings(sources.flatMap((source) => source.authors)),
+    venue: primary.venue,
+    discoveredVia: uniqueStrings(sources.flatMap((source) => source.providerId === null ? [] : [source.providerId]))
+      .map((providerId) => normalizeProviderId(providerId))
+      .flatMap((providerId) => providerId === null ? [] : [providerId]),
+    identifiers,
+    discoveryRecords: sources.flatMap((source) => source.providerId === null ? [] : [{
+      providerId: source.providerId,
+      sourceId: source.id,
+      title: source.title,
+      locator: source.locator,
+      citation: source.citation,
+      year: source.year
+    } satisfies PaperDiscoveryRecord]),
+    accessCandidates: access.candidates,
+    bestAccessUrl: access.best.url,
+    bestAccessProvider: access.best.providerId,
+    accessMode: access.best.accessMode,
+    fulltextFormat: access.best.fulltextFormat,
+    license: access.best.license,
+    tdmAllowed: access.best.tdmAllowed,
+    contentStatus: {
+      abstractAvailable: primary.excerpt.length > 0 || access.best.accessMode !== "metadata_only",
+      fulltextAvailable: access.best.accessMode === "fulltext_open" || access.best.accessMode === "fulltext_licensed",
+      fulltextFetched: false,
+      fulltextExtracted: false
+    },
+    screeningStage: stage,
+    screeningDecision: screening.decision,
+    screeningRationale: screening.rationale,
+    accessErrors: access.accessErrors,
+    tags: [],
+    runIds: [],
+    linkedThemeIds: [],
+    linkedClaimIds: [],
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function sourceTokensForBrief(request: ResearchSourceGatherRequest): Set<string> {
+  return new Set([
+    ...(request.brief.topic === null ? [] : tokenize(request.brief.topic)),
+    ...(request.brief.researchQuestion === null ? [] : tokenize(request.brief.researchQuestion)),
+    ...(request.brief.researchDirection === null ? [] : tokenize(request.brief.researchDirection)),
+    ...request.plan.localFocus.flatMap(tokenize)
+  ]);
+}
+
+function filterCandidates(
+  rawCandidates: RawCandidate[],
+  request: ResearchSourceGatherRequest,
+  profile: LiteratureReviewProfile | null
+): { sources: ResearchSource[]; notes: string[]; assessments: Array<{ sourceId: string; title: string; assessment: LiteratureSourceAssessment }> } {
+  const notes: string[] = [];
+  const assessments: Array<{ sourceId: string; title: string; assessment: LiteratureSourceAssessment }> = [];
+  const acceptedSources: ResearchSource[] = [];
+  const referenceTokens = sourceTokensForBrief(request);
+  const anchorTokens = topicAnchorTokens(request);
+  let filtered = 0;
+
+  for (const candidate of rawCandidates) {
+    const source = toResearchSource(candidate);
+    const screening = screeningForSource(source, profile);
+    const heuristicScore = overlapScore(`${source.title} ${source.excerpt}`, referenceTokens);
+
+    if (screening.assessment !== undefined) {
+      source.assessment = screening.assessment;
+    }
+
+    if (screening.assessment !== undefined) {
+      assessments.push({
+        sourceId: source.id,
+        title: source.title,
+        assessment: screening.assessment
+      });
+    }
+
+    const anchorScore = overlapScore(`${source.title} ${source.excerpt}`, anchorTokens);
+    const topicPhraseMatch = containsTopicPhrase(source, request);
+    const accepted = (screening.accepted || heuristicScore >= 3)
+      && (anchorTokens.size === 0 || anchorScore >= 2 || topicPhraseMatch);
+
+    if (!accepted) {
+      filtered += 1;
       continue;
     }
 
-    for (const position of positions) {
-      if (typeof position === "number" && Number.isInteger(position) && position >= 0) {
-        tokens[position] = word;
-      }
-    }
+    acceptedSources.push(source);
   }
 
-  const abstract = tokens.filter((token) => typeof token === "string" && token.length > 0).join(" ");
-  return abstract.length > 0 ? abstract : null;
-}
-
-function openAlexAuthors(work: OpenAlexWork): string {
-  const names = (work.authorships ?? [])
-    .map((authorship) => authorship.author?.display_name)
-    .filter((name): name is string => typeof name === "string" && name.trim().length > 0)
-    .slice(0, 3);
-
-  if (names.length === 0) {
-    return "Unknown authors";
-  }
-
-  return names.join(", ");
-}
-
-async function searchOpenAlex(query: string): Promise<OpenAlexWork[]> {
-  const url = new URL("/works", openAlexBaseUrl);
-  url.searchParams.set("search", query);
-  url.searchParams.set("per-page", "4");
-
-  const response = await fetch(url, {
-    headers: {
-      "accept": "application/json"
-    },
-    signal: AbortSignal.timeout(20_000)
-  });
-
-  if (!response.ok) {
-    throw new Error(`OpenAlex request failed with ${response.status} ${response.statusText}`);
-  }
-
-  const payload = asRecord(await response.json());
-
-  if (payload === null) {
-    throw new Error("OpenAlex returned a malformed JSON payload.");
-  }
-
-  const results = payload.results;
-  return Array.isArray(results)
-    ? results.filter((entry): entry is OpenAlexWork => typeof entry === "object" && entry !== null)
-    : [];
-}
-
-async function searchWikipediaTitles(query: string): Promise<string[]> {
-  const url = new URL("/w/api.php", wikipediaBaseUrl);
-  url.searchParams.set("action", "query");
-  url.searchParams.set("list", "search");
-  url.searchParams.set("srsearch", query);
-  url.searchParams.set("format", "json");
-  url.searchParams.set("utf8", "1");
-  url.searchParams.set("srlimit", "5");
-  url.searchParams.set("origin", "*");
-
-  const response = await fetch(url, {
-    headers: {
-      "accept": "application/json"
-    },
-    signal: AbortSignal.timeout(15_000)
-  });
-
-  if (!response.ok) {
-    throw new Error(`Wikipedia request failed with ${response.status} ${response.statusText}`);
-  }
-
-  const payload = asRecord(await response.json());
-  const queryRecord = payload === null ? null : asRecord(payload.query);
-  const searchResults = queryRecord === null ? [] : queryRecord.search;
-
-  return (Array.isArray(searchResults) ? searchResults : [])
-    .map((result) => normalizeWhitespace(result.title ?? ""))
-    .filter((title) => title.length > 0);
-}
-
-async function fetchWikipediaSummary(title: string): Promise<ResearchSource | null> {
-  const url = new URL(`/api/rest_v1/page/summary/${encodeURIComponent(title)}`, wikipediaBaseUrl);
-
-  const response = await fetch(url, {
-    headers: {
-      "accept": "application/json"
-    },
-    signal: AbortSignal.timeout(15_000)
-  });
-
-  if (!response.ok) {
-    throw new Error(`Wikipedia summary request failed with ${response.status} ${response.statusText}`);
-  }
-
-  const payload = asRecord(await response.json());
-
-  if (payload === null) {
-    throw new Error("Wikipedia summary returned a malformed JSON payload.");
-  }
-
-  const summaryTitle = stringOrNull(payload.title) ?? title;
-  const extract = stringOrNull(payload.extract);
-  const contentUrls = asRecord(payload.content_urls);
-  const desktopUrls = contentUrls === null ? null : asRecord(contentUrls.desktop);
-  const pageUrl = desktopUrls === null ? null : stringOrNull(desktopUrls.page);
-
-  if (extract === null) {
-    return null;
+  if (filtered > 0) {
+    notes.push(`Filtered ${filtered} weakly matched scholarly candidates during screening.`);
   }
 
   return {
-    id: "",
-    kind: "wikipedia_article",
-    title: summaryTitle,
-    locator: pageUrl,
-    citation: `${summaryTitle}. Wikipedia.`,
-    excerpt: excerptText(extract)
+    sources: acceptedSources,
+    notes,
+    assessments
   };
 }
 
-async function rescueQueriesFromWikipedia(
+function backgroundFilter(
+  candidates: RawCandidate[],
   request: ResearchSourceGatherRequest
-): Promise<{ queries: string[]; notes: string[] }> {
-  const notes: string[] = [];
-  const suggestions = new Set<string>();
+): ResearchSource[] {
+  const referenceTokens = sourceTokensForBrief(request);
 
-  for (const seedQuery of uniqueStrings([
-    request.brief.topic,
-    request.plan.searchQueries[0]
-  ])) {
-    try {
-      const titles = await searchWikipediaTitles(seedQuery);
-
-      for (const title of titles.slice(0, 3)) {
-        if (title.toLowerCase() !== seedQuery.toLowerCase()) {
-          suggestions.add(title);
-        }
-      }
-    } catch (error) {
-      const message = error instanceof Error
-        ? error.message
-        : "Unknown Wikipedia failure.";
-      notes.push(`Wikipedia rescue query failed for "${seedQuery}": ${message}`);
-    }
-  }
-
-  const rescuedQueries = [...suggestions].flatMap((title) => {
-    const questionTail = salientQueryTail(request.brief.researchQuestion);
-
-    return uniqueStrings([
-      title,
-      questionTail.length > 0 ? `${title} ${questionTail}` : null
-    ]);
-  });
-
-  if (rescuedQueries.length > 0) {
-    notes.push(`Added ${rescuedQueries.length} rescue queries from Wikipedia title suggestions.`);
-  }
-
-  return {
-    queries: rescuedQueries,
-    notes
-  };
+  return candidates
+    .map(toResearchSource)
+    .filter((source) => overlapScore(`${source.title} ${source.excerpt}`, referenceTokens) >= 2)
+    .slice(0, 3);
 }
 
-async function gatherOpenAlexSources(
-  request: ResearchSourceGatherRequest,
-  literatureProfile: LiteratureReviewProfile | null
-): Promise<ResearchSourceGatherResult> {
-  const notes: string[] = [];
-  const candidates: Array<ResearchSource & { score: number }> = [];
-  const seenTitles = new Set<string>();
-  const attemptedQueries = new Set<string>();
-  let filteredLowRelevanceCount = 0;
-  let titleOnlyCandidateCount = 0;
-  const referenceTokens = new Set([
-    ...tokenize(request.brief.topic ?? ""),
-    ...tokenize(request.brief.researchQuestion ?? ""),
-    ...tokenize(request.brief.researchDirection ?? ""),
-    ...request.plan.searchQueries.flatMap(tokenize),
-    ...request.plan.localFocus.flatMap(tokenize),
-    ...request.memoryContext.queryHints.flatMap(tokenize),
-    ...request.memoryContext.localFileHints.flatMap(tokenize)
-  ]);
-  const anchorPhrases = buildAnchorPhrases(request);
-  const primaryStrongAnchorCount = anchorPhrases.filter((anchor) => anchor.scope === "primary" && anchor.tokens.length >= 2).length;
-  const hasPrimaryStrongAnchors = anchorPhrases.some((anchor) => anchor.scope === "primary" && anchor.tokens.length >= 2);
-  const hasStrongAnchors = anchorPhrases.some((anchor) => anchor.tokens.length >= 2);
-  const requiredShortTokens = uniqueStrings([
-    ...shortSignalTokens(request.brief.topic),
-    ...shortSignalTokens(request.brief.researchQuestion)
-  ]);
-  const normalizedTopic = normalizeWhitespace((request.brief.topic ?? "").toLowerCase());
-  const searchQueries = buildOpenAlexQueries(request, literatureProfile);
+async function queryProvider(
+  providerId: SourceProviderId,
+  queries: string[],
+  request: ResearchSourceGatherRequest
+): Promise<RawCandidate[]> {
+  const authRef = readAuthRef(request, providerId);
+  const authValue = authRef === null ? null : process.env[authRef] ?? null;
+  const definition = getSourceProviderDefinition(providerId);
 
-  async function collectFromQuery(query: string): Promise<void> {
-    if (attemptedQueries.has(query.toLowerCase())) {
-      return;
+  if (
+    (definition.authMode === "required_api_key" || definition.authMode === "institution_token")
+    && (authValue === null || authValue.trim().length === 0)
+  ) {
+    return [];
+  }
+
+  const results: RawCandidate[] = [];
+
+  for (const query of queries.slice(0, 4)) {
+    switch (providerId) {
+      case "openalex":
+        results.push(...await queryOpenAlex(query));
+        break;
+      case "crossref":
+        results.push(...await queryCrossref(query));
+        break;
+      case "arxiv":
+        results.push(...await queryArxiv(query));
+        break;
+      case "dblp":
+        results.push(...await queryDblp(query));
+        break;
+      case "pubmed":
+        results.push(...await queryPubmed(query, authValue));
+        break;
+      case "europe_pmc":
+        results.push(...await queryEuropePmc(query));
+        break;
+      case "core":
+        results.push(...await queryCore(query, authValue));
+        break;
+      case "wikipedia":
+        results.push(...await queryWikipedia(query));
+        break;
+      default:
+        break;
+    }
+  }
+
+  return dedupeRawCandidates(results);
+}
+
+function dedupeRawCandidates(candidates: RawCandidate[]): RawCandidate[] {
+  const seen = new Set<string>();
+  const normalized: RawCandidate[] = [];
+
+  for (const candidate of candidates) {
+    const key = `${candidate.providerId}:${candidate.locator ?? candidate.title}`;
+
+    if (seen.has(key)) {
+      continue;
     }
 
-    attemptedQueries.add(query.toLowerCase());
+    seen.add(key);
+    normalized.push(candidate);
+  }
 
+  return normalized;
+}
+
+async function resolveCanonicalAccess(
+  paper: CanonicalPaper,
+  routing: RoutingPlan,
+  request: ResearchSourceGatherRequest
+): Promise<AccessResolution> {
+  const extraCandidates: PaperAccessRecord[] = [];
+  const errors: string[] = [];
+  let missingCredentials = false;
+
+  for (const providerId of routing.resolverProviderIds) {
     try {
-      const works = await searchOpenAlex(query);
+      if (providerId === "unpaywall") {
+        const emailRef = readAuthRef(request, "unpaywall");
+        const emailValue = emailRef === null ? null : process.env[emailRef] ?? null;
 
-      for (const work of works) {
-        const title = normalizeWhitespace(work.display_name ?? "");
-
-        if (title.length === 0) {
-          continue;
+        if (emailValue === null || emailValue.trim().length === 0) {
+          missingCredentials = true;
         }
 
-        const normalizedTitle = title.toLowerCase();
-
-        if (seenTitles.has(normalizedTitle)) {
-          continue;
-        }
-
-        const abstract = invertAbstract(work.abstract_inverted_index);
-        const excerpt = abstract ?? `OpenAlex did not provide an abstract for this work. Title-only evidence: ${title}.`;
-
-        seenTitles.add(normalizedTitle);
-
-        const sourceName = work.primary_location?.source?.display_name ?? "OpenAlex";
-        const year = work.publication_year ?? "n.d.";
-        const locator = work.doi ?? work.primary_location?.landing_page_url ?? work.id ?? null;
-        const combinedTokens = phraseTokens(`${title} ${abstract ?? ""}`);
-        const anchorMatches = countAnchorMatches(combinedTokens, anchorPhrases);
-        const referenceOverlap = overlapScore(title, referenceTokens) * 3
-          + overlapScore(abstract ?? "", referenceTokens);
-        const shortTokenMatch = requiredShortTokens.length === 0
-          || matchesRequiredShortToken(`${title} ${abstract ?? ""}`, requiredShortTokens);
-        const score = referenceOverlap
-          + anchorMatches.primaryStrong * 10
-          + anchorMatches.primaryWeak * 3
-          + anchorMatches.secondaryStrong * 5
-          + anchorMatches.secondaryWeak
-          + (normalizedTopic.length > 0 && normalizedTitle.includes(normalizedTopic) ? 5 : 0)
-          - (abstract === null ? 4 : 0);
-        const relevantEnough = hasPrimaryStrongAnchors
-          ? primaryStrongAnchorCount >= 2
-            ? anchorMatches.primaryStrong >= 2
-            : anchorMatches.primaryStrong >= 1 || referenceOverlap >= 14
-          : hasStrongAnchors
-            ? anchorMatches.primaryStrong + anchorMatches.secondaryStrong > 0 || referenceOverlap >= 7
-            : referenceOverlap >= 3 || anchorMatches.primaryWeak + anchorMatches.secondaryWeak > 0;
-        const titleOnlyRelevantEnough = abstract !== null
-          ? relevantEnough
-          : (anchorMatches.primaryStrong >= 1 || normalizedTitle.includes(normalizedTopic))
-            && referenceOverlap >= 3;
-
-        if (!titleOnlyRelevantEnough || !shortTokenMatch) {
-          filteredLowRelevanceCount += 1;
-          continue;
-        }
-
-        if (abstract === null) {
-          titleOnlyCandidateCount += 1;
-        }
-
-        const candidate: ResearchSource & { score: number } = {
-          id: "",
-          kind: "openalex_work",
-          title,
-          locator,
-          citation: `${openAlexAuthors(work)} (${year}). ${title}. ${sourceName}.`,
-          excerpt: excerptText(excerpt),
-          score
-        };
-
-        if (literatureProfile !== null) {
-          const assessment = assessLiteratureSource(literatureProfile, candidate);
-
-          if (!assessment.accepted) {
-            filteredLowRelevanceCount += 1;
-            continue;
-          }
-
-          candidate.assessment = assessment;
-          candidate.score = Math.max(candidate.score, assessment.totalScore);
-        }
-
-        candidates.push(candidate);
+        extraCandidates.push(...await resolveWithUnpaywall(paper, emailValue));
       }
     } catch (error) {
-      const message = error instanceof Error
-        ? error.message
-        : "Unknown OpenAlex failure.";
-      notes.push(`OpenAlex query failed for "${query}": ${message}`);
+      errors.push(`${providerId}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  for (const query of searchQueries.slice(0, 5)) {
-    await collectFromQuery(query);
-  }
+  let candidates = uniqueAccessCandidates([
+    ...paper.accessCandidates,
+    ...extraCandidates
+  ]);
+  const hasReadableCandidate = candidates.some((candidate) => (
+    candidate.accessMode === "abstract_available"
+    || candidate.accessMode === "fulltext_open"
+    || candidate.accessMode === "fulltext_licensed"
+  ));
+  let best: PaperAccessRecord;
 
   if (candidates.length === 0) {
-    const rescue = await rescueQueriesFromWikipedia(request);
-    notes.push(...rescue.notes);
+    best = accessRecord(
+      paper.bestAccessProvider ?? "crossref",
+      paper.bestAccessUrl,
+      "metadata_only",
+      "none",
+      "No better reading route was found."
+    );
+    candidates = [best];
+  } else if (!hasReadableCandidate && missingCredentials) {
+    best = accessRecord(
+      paper.bestAccessProvider ?? paper.discoveryRecords[0]?.providerId ?? "crossref",
+      paper.bestAccessUrl,
+      "needs_credentials",
+      "none",
+      "Selected provider credentials are still required before this paper can be read."
+    );
+    candidates = uniqueAccessCandidates([...candidates, best]);
+  } else if (!hasReadableCandidate && paper.bestAccessUrl !== null) {
+    best = accessRecord(
+      paper.bestAccessProvider ?? paper.discoveryRecords[0]?.providerId ?? "crossref",
+      paper.bestAccessUrl,
+      "fulltext_blocked",
+      "none",
+      "The paper was discovered, but no legal readable route was resolved."
+    );
+    candidates = uniqueAccessCandidates([...candidates, best]);
+  } else {
+    best = selectBestAccess(candidates);
+  }
 
-    for (const query of rescue.queries.slice(0, 5)) {
-      await collectFromQuery(query);
+  return {
+    best,
+    candidates,
+    accessErrors: errors
+  };
+}
+
+function uniqueAccessCandidates(candidates: PaperAccessRecord[]): PaperAccessRecord[] {
+  const seen = new Set<string>();
+  const normalized: PaperAccessRecord[] = [];
+
+  for (const candidate of candidates) {
+    const key = `${candidate.providerId}:${candidate.url ?? "none"}:${candidate.accessMode}:${candidate.fulltextFormat}`;
+
+    if (seen.has(key)) {
+      continue;
     }
+
+    seen.add(key);
+    normalized.push(candidate);
   }
 
-  if (filteredLowRelevanceCount > 0) {
-    notes.push(`Filtered ${filteredLowRelevanceCount} low-relevance OpenAlex candidates that did not match the project anchors closely enough.`);
-  }
-
-  if (titleOnlyCandidateCount > 0) {
-    notes.push(`Retained ${titleOnlyCandidateCount} strongly matched OpenAlex works even though OpenAlex did not provide abstracts for them.`);
-  }
-
-  return {
-    sources: candidates
-      .sort((left, right) => right.score - left.score)
-      .slice(0, 6)
-      .map((candidate, index) => ({
-        id: `web-${index + 1}`,
-        kind: candidate.kind,
-        title: candidate.title,
-        locator: candidate.locator,
-        citation: candidate.citation,
-        excerpt: candidate.excerpt,
-        assessment: candidate.assessment
-      })),
-    notes
-  };
-}
-
-function sourceReferenceOverlap(
-  source: Pick<ResearchSource, "title" | "excerpt">,
-  referenceTokens: Set<string>
-): number {
-  return overlapScore(source.title, referenceTokens) * 3
-    + overlapScore(source.excerpt, referenceTokens);
-}
-
-function sourceAnchorMatches(
-  source: Pick<ResearchSource, "title" | "excerpt">,
-  anchorPhrases: AnchorPhrase[]
-): ReturnType<typeof countAnchorMatches> {
-  return countAnchorMatches(
-    phraseTokens(`${source.title} ${source.excerpt}`),
-    anchorPhrases
-  );
-}
-
-function sourceMatchesProjectAnchors(
-  source: Pick<ResearchSource, "title" | "excerpt">,
-  anchorPhrases: AnchorPhrase[],
-  referenceTokens: Set<string>,
-  requiredShortTokens: string[],
-  normalizedTopic: string,
-  primaryStrongAnchorCount: number,
-  hasPrimaryStrongAnchors: boolean,
-  hasStrongAnchors: boolean
-): { relevantEnough: boolean; score: number; shortTokenMatch: boolean } {
-  const anchorMatches = sourceAnchorMatches(source, anchorPhrases);
-  const referenceOverlap = sourceReferenceOverlap(source, referenceTokens);
-  const shortTokenMatch = requiredShortTokens.length === 0
-    || matchesRequiredShortToken(`${source.title} ${source.excerpt}`, requiredShortTokens);
-  const score = referenceOverlap
-    + anchorMatches.primaryStrong * 10
-    + anchorMatches.primaryWeak * 3
-    + anchorMatches.secondaryStrong * 5
-    + anchorMatches.secondaryWeak
-    + (normalizedTopic.length > 0 && source.title.toLowerCase().includes(normalizedTopic) ? 5 : 0);
-  const relevantEnough = hasPrimaryStrongAnchors
-    ? primaryStrongAnchorCount >= 2
-      ? anchorMatches.primaryStrong >= 2
-      : anchorMatches.primaryStrong >= 1 || referenceOverlap >= 14
-    : hasStrongAnchors
-      ? anchorMatches.primaryStrong + anchorMatches.secondaryStrong > 0 || referenceOverlap >= 7
-      : referenceOverlap >= 3 || anchorMatches.primaryWeak + anchorMatches.secondaryWeak > 0;
-
-  return {
-    relevantEnough,
-    score,
-    shortTokenMatch
-  };
-}
-
-async function gatherWikipediaFallbackSources(
-  request: ResearchSourceGatherRequest,
-  existingTitles: Set<string>,
-  literatureProfile: LiteratureReviewProfile | null
-): Promise<ResearchSourceGatherResult> {
-  const notes: string[] = [];
-  const candidates: Array<ResearchSource & { score: number }> = [];
-  const attemptedTitles = new Set<string>();
-  let filteredLowRelevanceCount = 0;
-  const referenceTokens = new Set([
-    ...tokenize(request.brief.topic ?? ""),
-    ...tokenize(request.brief.researchQuestion ?? ""),
-    ...tokenize(request.brief.researchDirection ?? ""),
-    ...request.plan.searchQueries.flatMap(tokenize),
-    ...request.plan.localFocus.flatMap(tokenize),
-    ...request.memoryContext.queryHints.flatMap(tokenize),
-    ...request.memoryContext.localFileHints.flatMap(tokenize)
-  ]);
-  const anchorPhrases = buildAnchorPhrases(request);
-  const primaryStrongAnchorCount = anchorPhrases.filter((anchor) => anchor.scope === "primary" && anchor.tokens.length >= 2).length;
-  const hasPrimaryStrongAnchors = anchorPhrases.some((anchor) => anchor.scope === "primary" && anchor.tokens.length >= 2);
-  const hasStrongAnchors = anchorPhrases.some((anchor) => anchor.tokens.length >= 2);
-  const requiredShortTokens = uniqueStrings([
-    ...shortSignalTokens(request.brief.topic),
-    ...shortSignalTokens(request.brief.researchQuestion)
-  ]);
-  const normalizedTopic = normalizeWhitespace((request.brief.topic ?? "").toLowerCase());
-  const seedQueries = uniqueStrings([
-    request.brief.topic,
-    ...request.plan.searchQueries,
-    ...request.memoryContext.queryHints
-  ]).slice(0, 4);
-
-  for (const query of seedQueries) {
-    try {
-      const titles = await searchWikipediaTitles(query);
-
-      for (const title of titles.slice(0, 3)) {
-        const normalizedTitle = title.toLowerCase();
-
-        if (attemptedTitles.has(normalizedTitle) || existingTitles.has(normalizedTitle)) {
-          continue;
-        }
-
-        attemptedTitles.add(normalizedTitle);
-
-        try {
-          const source = await fetchWikipediaSummary(title);
-
-          if (source === null) {
-            continue;
-          }
-
-          if (literatureProfile !== null) {
-            const assessment = assessLiteratureSource(literatureProfile, source);
-
-            if (!assessment.accepted) {
-              filteredLowRelevanceCount += 1;
-              continue;
-            }
-
-            source.assessment = assessment;
-          }
-
-          const profile = sourceMatchesProjectAnchors(
-            source,
-            anchorPhrases,
-            referenceTokens,
-            requiredShortTokens,
-            normalizedTopic,
-            primaryStrongAnchorCount,
-            hasPrimaryStrongAnchors,
-            hasStrongAnchors
-          );
-
-          if (!profile.relevantEnough || !profile.shortTokenMatch) {
-            filteredLowRelevanceCount += 1;
-            continue;
-          }
-
-          candidates.push({
-            ...source,
-            score: profile.score
-          });
-        } catch (error) {
-          const message = error instanceof Error
-            ? error.message
-            : "Unknown Wikipedia summary failure.";
-          notes.push(`Wikipedia summary failed for "${title}": ${message}`);
-        }
-      }
-    } catch (error) {
-      const message = error instanceof Error
-        ? error.message
-        : "Unknown Wikipedia search failure.";
-      notes.push(`Wikipedia fallback search failed for "${query}": ${message}`);
-    }
-  }
-
-  if (filteredLowRelevanceCount > 0) {
-    notes.push(`Filtered ${filteredLowRelevanceCount} low-relevance Wikipedia fallback candidates.`);
-  }
-
-  const sources = candidates
-    .sort((left, right) => right.score - left.score)
-    .slice(0, 3)
-    .map((candidate, index) => ({
-      ...candidate,
-      id: `wiki-${index + 1}`
-    }));
-
-  if (sources.length > 0) {
-    notes.push(`Collected ${sources.length} Wikipedia fallback background sources.`);
-  }
-
-  return {
-    sources,
-    notes
-  };
+  return normalized;
 }
 
 export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
   async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
-    const briefSource: ResearchSource = {
-      id: "brief-1",
-      kind: "project_brief",
-      title: request.brief.topic ?? "Project brief",
-      locator: null,
-      citation: "User-provided project brief.",
-      excerpt: excerptText([
-        `Topic: ${request.brief.topic ?? "<missing>"}`,
-        `Research question: ${request.brief.researchQuestion ?? "<missing>"}`,
-        `Research direction: ${request.brief.researchDirection ?? "<missing>"}`,
-        `Success criterion: ${request.brief.successCriterion ?? "<missing>"}`
-      ].join(" "))
-    };
-
-    const localSources = await gatherLocalFileSources(request);
-    const literatureProfile = shouldUseLiteratureReviewSubsystem(request.plan, request.brief)
+    const scholarlyProviderIds = selectedScholarlyProviderIds(request);
+    const backgroundProviderIds = selectedBackgroundProviderIds(request);
+    const localEnabled = projectFilesEnabled(request);
+    const authStatus = authSnapshots(request, scholarlyProviderIds, backgroundProviderIds, localEnabled);
+    const notes: string[] = [];
+    const mergeDiagnostics: string[] = [];
+    const queries = buildQueryPlan(request);
+    const domain = classifyDomain(request.brief, request.plan);
+    const routing = routeProviders(domain, scholarlyProviderIds);
+    routing.plannedQueries = queries;
+    const literatureReviewActive = shouldUseLiteratureReviewSubsystem(request.plan, request.brief);
+    const literatureProfile = literatureReviewActive
       ? buildLiteratureReviewProfile({
         brief: request.brief,
         plan: request.plan,
         memoryContext: request.memoryContext
       })
       : null;
-    const webSources = await gatherOpenAlexSources(request, literatureProfile);
-    const wikipediaSources = webSources.sources.length === 0
-      ? await gatherWikipediaFallbackSources(
-        request,
-        new Set(webSources.sources.map((source) => source.title.toLowerCase())),
-        literatureProfile
-      )
-      : { sources: [], notes: [] };
-    const sources = [
-      briefSource,
+    const selectedAssessments: Array<{ sourceId: string; title: string; assessment: LiteratureSourceAssessment }> = [];
+    const localSources = await gatherLocalProjectFiles(request);
+    const scholarlySources: ResearchSource[] = [];
+    const backgroundSources: ResearchSource[] = [];
+
+    if (literatureProfile !== null) {
+      notes.push("Literature review subsystem active.");
+      if (literatureProfile.taskAttributes.length > 0) {
+        notes.push(`Task-aware paper ranking attributes: ${literatureProfile.taskAttributes.join(", ")}.`);
+      }
+    }
+
+    notes.push(`Query planning produced ${queries.length} retrieval queries.`);
+    notes.push(`Domain-aware routing selected ${routing.discoveryProviderIds.join(", ") || "no scholarly discovery providers"}.`);
+
+    for (const providerId of routing.discoveryProviderIds) {
+      try {
+        const rawCandidates = await queryProvider(providerId, queries, request);
+        const filtered = filterCandidates(rawCandidates, request, literatureProfile);
+        scholarlySources.push(...filtered.sources);
+        notes.push(...filtered.notes);
+        selectedAssessments.push(...filtered.assessments);
+        notes.push(`Collected ${filtered.sources.length} screened scholarly hits from ${getSourceProviderDefinition(providerId).label}.`);
+      } catch (error) {
+        notes.push(`${getSourceProviderDefinition(providerId).label} query failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    for (const providerId of backgroundProviderIds) {
+      try {
+        const rawCandidates = await queryProvider(providerId, queries, request);
+        const filtered = backgroundFilter(rawCandidates, request);
+        backgroundSources.push(...filtered);
+        notes.push(`Collected ${filtered.length} background sources from ${getSourceProviderDefinition(providerId).label}.`);
+      } catch (error) {
+        notes.push(`${getSourceProviderDefinition(providerId).label} background query failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    const groupedSources = new Map<string, ResearchSource[]>();
+    const heuristicIndex = new Map<string, string>();
+
+    for (const source of scholarlySources) {
+      const key = mergeKeyForSource(source);
+      const heuristicKey = `heuristic:${titleHeuristicKey(source.title, source.year, source.authors)}`;
+      const existingKey = groupedSources.has(key)
+        ? key
+        : heuristicIndex.get(heuristicKey) ?? key;
+      const group = groupedSources.get(existingKey) ?? [];
+      group.push(source);
+      groupedSources.set(existingKey, group);
+      heuristicIndex.set(heuristicKey, existingKey);
+    }
+
+    const canonicalPapers: CanonicalPaper[] = [];
+
+    for (const [key, group] of groupedSources.entries()) {
+      const provisional = canonicalPaperFromSources(key, group, []);
+      const resolved = await resolveCanonicalAccess(provisional, routing, request);
+      const paper = canonicalPaperFromSources(key, group, resolved.candidates).id === provisional.id
+        ? {
+          ...canonicalPaperFromSources(key, group, resolved.candidates),
+          bestAccessUrl: resolved.best.url,
+          bestAccessProvider: resolved.best.providerId,
+          accessMode: resolved.best.accessMode,
+          fulltextFormat: resolved.best.fulltextFormat,
+          license: resolved.best.license,
+          tdmAllowed: resolved.best.tdmAllowed,
+          accessErrors: resolved.accessErrors
+        }
+        : provisional;
+
+      canonicalPapers.push(paper);
+
+      if (group.length > 1) {
+        mergeDiagnostics.push(`Merged ${group.length} provider hits into canonical paper ${paper.id}.`);
+      }
+    }
+
+    notes.push(`Canonical merge produced ${canonicalPapers.length} scholarly papers from ${scholarlySources.length} discovery hits.`);
+
+    const allSources: ResearchSource[] = [
+      {
+        id: "brief:project",
+        providerId: null,
+        category: "brief",
+        kind: "project_brief",
+        title: request.brief.topic ?? request.plan.objective,
+        locator: null,
+        citation: "User-provided project brief.",
+        excerpt: excerptText([
+          request.brief.topic,
+          request.brief.researchQuestion,
+          request.brief.researchDirection,
+          request.brief.successCriterion
+        ].filter((value): value is string => typeof value === "string").join(" | ")),
+        year: null,
+        authors: [],
+        venue: null,
+        identifiers: {},
+        access: null
+      },
       ...localSources,
-      ...webSources.sources,
-      ...wikipediaSources.sources
+      ...scholarlySources,
+      ...backgroundSources
     ];
 
     return {
-      sources,
-      notes: [
-        ...(literatureProfile === null
-          ? []
-          : [
-            `Literature review subsystem active. Domain anchors: ${literatureProfile.domainAnchors.join(", ") || "none"}.`,
-            literatureProfile.taskAttributes.length > 0
-              ? `Task-aware paper ranking attributes: ${literatureProfile.taskAttributes.join(", ")}.`
-              : "Task-aware paper ranking is active, but no explicit literature attributes were detected beyond the topic."
-          ]),
-        localSources.length > 0
-          ? `Collected ${localSources.length} relevant local project files.`
-          : "No relevant local project files were selected.",
-        webSources.sources.length > 0
-          ? `Collected ${webSources.sources.length} OpenAlex literature sources.`
-          : "No OpenAlex literature sources were collected.",
-        ...wikipediaSources.notes,
-        request.memoryContext.available
-          ? `Used ${request.memoryContext.recordCount} prior memory records to shape retrieval and focus areas.`
-          : "No prior project memory was available for retrieval guidance.",
-        ...webSources.notes
-      ],
+      sources: allSources,
+      canonicalPapers,
+      notes,
+      routing,
+      mergeDiagnostics,
+      authStatus,
       literatureReview: literatureProfile === null
         ? null
         : {
           active: true,
           profile: literatureProfile,
-          selectedAssessments: sources.flatMap((source) => (
-            source.assessment === undefined
-              ? []
-              : [{
-                sourceId: source.id,
-                title: source.title,
-                assessment: source.assessment
-              }]
-          ))
+          selectedAssessments
         }
     };
   }

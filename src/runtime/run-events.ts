@@ -4,6 +4,7 @@ import path from "node:path";
 export type RunEventKind =
   | "run"
   | "plan"
+  | "literature"
   | "summary"
   | "memory"
   | "verify"

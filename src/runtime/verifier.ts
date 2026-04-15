@@ -1,9 +1,12 @@
 import { createMemoryRecordId } from "./memory-store.js";
 import type { ResearchClaim } from "./research-backend.js";
-import type { ResearchSource, ResearchSourceKind } from "./research-sources.js";
+import type {
+  CanonicalPaper,
+  PaperAccessMode
+} from "./literature-store.js";
 import type { ResearchBrief } from "./session-store.js";
 
-const verificationSchemaVersion = 1;
+const verificationSchemaVersion = 2;
 const unknownPattern = /\b(?:unknown|unclear|unverified|insufficient|not enough|no direct evidence|limited evidence|remains incomplete)\b/i;
 
 export type ClaimSupportStatus =
@@ -21,19 +24,21 @@ export type ClaimConfidence =
 export type SourceProvenance = {
   sourceId: string;
   sourceRecordId: string;
-  kind: ResearchSourceKind;
+  providerIds: string[];
   title: string;
   citation: string;
   locator: string | null;
+  accessMode: PaperAccessMode;
 };
 
 export type ClaimEvidenceLink = {
   sourceId: string;
   sourceRecordId: string;
-  kind: ResearchSourceKind;
+  providerIds: string[];
   title: string;
   citation: string;
   locator: string | null;
+  accessMode: PaperAccessMode;
   excerpt: string;
 };
 
@@ -76,75 +81,68 @@ export type VerificationReport = {
 
 export type VerificationRequest = {
   brief: ResearchBrief;
-  sources: ResearchSource[];
+  papers: CanonicalPaper[];
   claims: ResearchClaim[];
 };
 
-function sourceRecordId(source: ResearchSource): string {
-  if (source.kind === "project_brief") {
-    return createMemoryRecordId(
-      "source",
-      [
-        source.kind,
-        source.title,
-        source.citation,
-        source.excerpt
-      ].join(" | ")
-    );
-  }
-
-  return createMemoryRecordId(
-    "source",
-    `${source.kind}:${source.locator ?? source.citation ?? source.title}`
-  );
+function sourceRecordId(source: CanonicalPaper): string {
+  return createMemoryRecordId("source", `paper:${source.id}`);
 }
 
 function claimRecordId(claim: ResearchClaim): string {
   return createMemoryRecordId("claim", claim.claim);
 }
 
-function toProvenance(source: ResearchSource): SourceProvenance {
+function toProvenance(source: CanonicalPaper): SourceProvenance {
   return {
     sourceId: source.id,
     sourceRecordId: sourceRecordId(source),
-    kind: source.kind,
+    providerIds: source.discoveredVia,
     title: source.title,
     citation: source.citation,
-    locator: source.locator
+    locator: source.bestAccessUrl,
+    accessMode: source.accessMode
   };
 }
 
-function toEvidenceLink(source: ResearchSource): ClaimEvidenceLink {
+function toEvidenceLink(source: CanonicalPaper): ClaimEvidenceLink {
   return {
     sourceId: source.id,
     sourceRecordId: sourceRecordId(source),
-    kind: source.kind,
+    providerIds: source.discoveredVia,
     title: source.title,
     citation: source.citation,
-    locator: source.locator,
-    excerpt: source.excerpt
+    locator: source.bestAccessUrl,
+    accessMode: source.accessMode,
+    excerpt: source.abstract ?? `${source.accessMode} via ${source.bestAccessProvider ?? "unknown"}`
   };
 }
 
-function supportProfile(claim: ResearchClaim, sources: ResearchSource[]): {
+function supportStrength(accessMode: PaperAccessMode): number {
+  switch (accessMode) {
+    case "fulltext_open":
+      return 4;
+    case "fulltext_licensed":
+      return 3;
+    case "abstract_available":
+      return 2;
+    case "metadata_only":
+      return 1;
+    case "needs_credentials":
+    case "fulltext_blocked":
+      return 0;
+  }
+}
+
+function supportProfile(claim: ResearchClaim, papers: CanonicalPaper[]): {
   supportStatus: ClaimSupportStatus;
   confidence: ClaimConfidence;
   notes: string[];
 } {
   const notes: string[] = [];
-  const externalSources = sources.filter((source) => source.kind !== "project_brief");
 
-  if (sources.length === 0) {
-    notes.push("No cited sources were available to verify this claim.");
-    return {
-      supportStatus: "unverified",
-      confidence: "low",
-      notes
-    };
-  }
-
-  if (externalSources.length === 0) {
-    notes.push("The claim is only linked to the project brief, not to an evidence-bearing source.");
+  if (papers.length === 0) {
+    notes.push("No cited canonical papers were available to verify this claim.");
     return {
       supportStatus: "unverified",
       confidence: "low",
@@ -153,7 +151,7 @@ function supportProfile(claim: ResearchClaim, sources: ResearchSource[]): {
   }
 
   if (unknownPattern.test(`${claim.claim} ${claim.evidence}`)) {
-    notes.push("The claim itself expresses uncertainty or absence of direct evidence.");
+    notes.push("The claim itself remains explicit about unknown or limited evidence.");
     return {
       supportStatus: "unknown",
       confidence: "unknown",
@@ -161,8 +159,11 @@ function supportProfile(claim: ResearchClaim, sources: ResearchSource[]): {
     };
   }
 
-  if (externalSources.length >= 2) {
-    notes.push("The claim is linked to multiple evidence-bearing sources.");
+  const readablePapers = papers.filter((paper) => supportStrength(paper.accessMode) >= 2);
+  const blockedPapers = papers.filter((paper) => supportStrength(paper.accessMode) === 0);
+
+  if (readablePapers.length >= 2) {
+    notes.push("The claim is linked to multiple readable papers with accessible evidence.");
     return {
       supportStatus: "supported",
       confidence: "high",
@@ -170,28 +171,46 @@ function supportProfile(claim: ResearchClaim, sources: ResearchSource[]): {
     };
   }
 
-  notes.push("The claim is linked to a single evidence-bearing source.");
+  if (readablePapers.length === 1) {
+    notes.push(`The claim is linked to one readable paper at ${readablePapers[0]!.accessMode}.`);
+    return {
+      supportStatus: "supported",
+      confidence: readablePapers[0]!.accessMode === "abstract_available" ? "medium" : "high",
+      notes
+    };
+  }
+
+  if (blockedPapers.length > 0) {
+    notes.push("The cited papers were discovered, but the best legal reading route remains blocked or still needs credentials.");
+    return {
+      supportStatus: "unverified",
+      confidence: "low",
+      notes
+    };
+  }
+
+  notes.push("Only metadata-level records were available, so the claim remains only partially grounded.");
   return {
-    supportStatus: "supported",
-    confidence: "medium",
+    supportStatus: "partially_supported",
+    confidence: "low",
     notes
   };
 }
 
 function summarizeReport(report: VerificationReport, brief: ResearchBrief): string {
   if (report.verifiedClaims.length === 0) {
-    return `No synthesized claims were available to verify for ${brief.topic ?? "this project"}. Current state remains explicit about unknowns and unverified gaps.`;
+    return `No synthesized claims were available to verify for ${brief.topic ?? "this project"}. The run stayed explicit about unknowns and evidence gaps.`;
   }
 
   return [
-    `Verified ${report.counts.claims} claims against ${report.counts.sources} sources.`,
+    `Verified ${report.counts.claims} claims against ${report.counts.sources} canonical papers.`,
     `${report.counts.supported} supported, ${report.counts.partiallySupported} partially supported, ${report.counts.unverified} unverified, ${report.counts.unknown} explicit unknown.`
   ].join(" ");
 }
 
 export function verifyResearchClaims(request: VerificationRequest): VerificationReport {
-  const sourceMap = new Map(request.sources.map((source) => [source.id, source]));
-  const sourceProvenance = request.sources.map(toProvenance);
+  const sourceMap = new Map(request.papers.map((paper) => [paper.id, paper]));
+  const sourceProvenance = request.papers.map(toProvenance);
   const verifiedClaims = request.claims.map((claim) => {
     const matchedSources = claim.sourceIds.flatMap((sourceId) => {
       const source = sourceMap.get(sourceId);
@@ -202,7 +221,7 @@ export function verifyResearchClaims(request: VerificationRequest): Verification
     const notes = [...profile.notes];
 
     if (missingSourceIds.length > 0) {
-      notes.push(`Missing cited sources: ${missingSourceIds.join(", ")}.`);
+      notes.push(`Missing cited canonical papers: ${missingSourceIds.join(", ")}.`);
     }
 
     let supportStatus = profile.supportStatus;
@@ -242,8 +261,8 @@ export function verifyResearchClaims(request: VerificationRequest): Verification
     unknowns.push("No synthesized claims were available for verification in this run.");
   }
 
-  if (request.sources.filter((source) => source.kind !== "project_brief").length === 0) {
-    unknowns.push("No evidence-bearing sources beyond the project brief were available for verification.");
+  if (request.papers.length === 0) {
+    unknowns.push("No canonical papers were available for verification.");
   }
 
   const counts: VerificationCounts = {
@@ -252,10 +271,10 @@ export function verifyResearchClaims(request: VerificationRequest): Verification
     partiallySupported: verifiedClaims.filter((claim) => claim.supportStatus === "partially_supported").length,
     unverified: verifiedClaims.filter((claim) => claim.supportStatus === "unverified").length,
     unknown: verifiedClaims.filter((claim) => claim.supportStatus === "unknown").length,
-    sources: request.sources.length
+    sources: request.papers.length
   };
 
-  const overallStatus = request.sources.filter((source) => source.kind !== "project_brief").length === 0
+  const overallStatus = request.papers.length === 0
     ? "insufficient_evidence"
     : counts.unverified > 0 || counts.unknown > 0 || counts.partiallySupported > 0
       ? "mixed"

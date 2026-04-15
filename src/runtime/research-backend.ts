@@ -1,6 +1,9 @@
 import type { ResearchBrief } from "./session-store.js";
 import type { ProjectMemoryContext } from "./memory-store.js";
-import type { ResearchSource } from "./research-sources.js";
+import type {
+  CanonicalPaper,
+  LiteratureContext
+} from "./literature-store.js";
 import {
   buildLiteratureSynthesisInstruction,
   shouldUseLiteratureReviewSubsystem
@@ -41,13 +44,15 @@ export type ResearchPlanningRequest = {
   brief: ResearchBrief;
   localFiles: string[];
   memoryContext: ProjectMemoryContext;
+  literatureContext?: LiteratureContext;
 };
 
 export type ResearchSynthesisRequest = {
   projectRoot: string;
   brief: ResearchBrief;
   plan: ResearchPlan;
-  sources: ResearchSource[];
+  papers: CanonicalPaper[];
+  literatureContext?: LiteratureContext;
 };
 
 export interface ResearchBackend {
@@ -183,6 +188,17 @@ function normalizeSynthesis(raw: unknown, brief: ResearchBrief): ResearchSynthes
 }
 
 function planningInstruction(request: ResearchPlanningRequest): string {
+  const literatureContext = request.literatureContext ?? {
+    available: false,
+    paperCount: 0,
+    themeCount: 0,
+    notebookCount: 0,
+    papers: [],
+    themes: [],
+    notebooks: [],
+    queryHints: []
+  };
+
   return [
     "You are ClawResearch's planning module for a console-first autonomous research runtime.",
     "Plan a bounded first-pass research mode using the brief and local project context.",
@@ -213,18 +229,37 @@ function planningInstruction(request: ResearchPlanningRequest): string {
     `Project root: ${request.projectRoot}`,
     `Brief: ${JSON.stringify(request.brief)}`,
     `Local files: ${JSON.stringify(request.localFiles.slice(0, 20))}`,
-    `Project memory context: ${JSON.stringify(request.memoryContext)}`
+    `Project memory context: ${JSON.stringify(request.memoryContext)}`,
+    `Literature memory context: ${JSON.stringify(literatureContext)}`
   ].join("\n");
 }
 
 function synthesisInstruction(request: ResearchSynthesisRequest): string {
-  const condensedSources = request.sources.map((source) => ({
-    id: source.id,
-    kind: source.kind,
-    title: source.title,
-    locator: source.locator,
-    citation: source.citation,
-    excerpt: source.excerpt
+  const literatureContext = request.literatureContext ?? {
+    available: false,
+    paperCount: 0,
+    themeCount: 0,
+    notebookCount: 0,
+    papers: [],
+    themes: [],
+    notebooks: [],
+    queryHints: []
+  };
+  const condensedPapers = request.papers.map((paper) => ({
+    id: paper.id,
+    title: paper.title,
+    citation: paper.citation,
+    year: paper.year,
+    authors: paper.authors,
+    venue: paper.venue,
+    abstract: paper.abstract,
+    bestAccessUrl: paper.bestAccessUrl,
+    bestAccessProvider: paper.bestAccessProvider,
+    accessMode: paper.accessMode,
+    fulltextFormat: paper.fulltextFormat,
+    screeningStage: paper.screeningStage,
+    screeningDecision: paper.screeningDecision,
+    identifiers: paper.identifiers
   }));
 
   if (shouldUseLiteratureReviewSubsystem(request.plan, request.brief)) {
@@ -232,7 +267,15 @@ function synthesisInstruction(request: ResearchSynthesisRequest): string {
       projectRoot: request.projectRoot,
       brief: request.brief,
       plan: request.plan,
-      sources: condensedSources
+      sources: condensedPapers.map((paper) => ({
+        id: paper.id,
+        kind: "canonical_paper",
+        title: paper.title,
+        locator: paper.bestAccessUrl,
+        citation: paper.citation,
+        excerpt: paper.abstract ?? `${paper.accessMode} via ${paper.bestAccessProvider ?? "unknown"}`
+      })),
+      literatureContext
     });
   }
 
@@ -259,7 +302,8 @@ function synthesisInstruction(request: ResearchSynthesisRequest): string {
     `Project root: ${request.projectRoot}`,
     `Brief: ${JSON.stringify(request.brief)}`,
     `Plan: ${JSON.stringify(request.plan)}`,
-    `Sources: ${JSON.stringify(condensedSources)}`
+    `Canonical papers: ${JSON.stringify(condensedPapers)}`,
+    `Literature memory context: ${JSON.stringify(literatureContext)}`
   ].join("\n");
 }
 

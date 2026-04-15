@@ -14,6 +14,7 @@ import {
 } from "./runtime/console-app.js";
 import type { IntakeBackend } from "./runtime/intake-backend.js";
 import { runDetachedJobWorker } from "./runtime/run-worker.js";
+import { runTerminalUi } from "./runtime/terminal-ui.js";
 
 function writeLine(writer: OutputWriter, line = ""): void {
   writer.write(`${line}\n`);
@@ -58,16 +59,19 @@ function renderDocs(writer: OutputWriter, packageRoot: string, resetDoc: string,
 function renderHelp(writer: OutputWriter): void {
   writeLine(writer, "Usage:");
   writeLine(writer, "  clawresearch");
+  writeLine(writer, "  clawresearch --plain");
   writeLine(writer, "  clawresearch --docs");
   writeLine(writer, "  clawresearch --version");
   writeLine(writer, "  clawresearch --help");
   writeLine(writer);
   writeLine(writer, "Default behavior:");
-  writeLine(writer, "  Starts the interactive research chat in the current directory, launches detached runs from `/go`, and streams their saved progress events in the terminal.");
+  writeLine(writer, "  Starts the TUI research console in the current directory, launches detached runs from `/go`, and streams their saved progress events in the terminal.");
+  writeLine(writer, "  Use `--plain` to force the older line-oriented console for scripts, pipes, or debugging.");
   writeLine(writer);
   writeLine(writer, "Slash commands inside the console:");
   writeLine(writer, "  /help");
   writeLine(writer, "  /status");
+  writeLine(writer, "  /sources");
   writeLine(writer, "  /go");
   writeLine(writer, "  /pause");
   writeLine(writer, "  /resume");
@@ -147,6 +151,15 @@ export async function main(argv: string[], options: MainOptions = {}): Promise<n
   }
 
   const io = options.io ?? createConsoleIo();
+  const forcePlain = args.has("--plain");
+
+  if (!forcePlain && options.io === undefined && process.stdin.isTTY && process.stdout.isTTY) {
+    return runTerminalUi({
+      projectRoot: options.projectRoot ?? process.cwd(),
+      version,
+      intakeBackend: options.intakeBackend
+    });
+  }
 
   return runPhaseOneConsole(io, {
     projectRoot: options.projectRoot ?? process.cwd(),
