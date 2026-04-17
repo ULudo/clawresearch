@@ -139,6 +139,11 @@ function summarizeSource(source: ResearchSource): string {
   return `${source.id}: ${source.title} (${source.kind}; ${locator})`;
 }
 
+function summarizeReviewedPaper(paper: CanonicalPaper): string {
+  const venue = paper.venue ?? "unknown venue";
+  return `${paper.id}: ${paper.title} (${venue}; ${paper.accessMode}; ${paper.screeningDecision})`;
+}
+
 function summarizeClaim(claim: ResearchClaim): string {
   const sources = claim.sourceIds.length > 0
     ? ` [${claim.sourceIds.join(", ")}]`
@@ -148,6 +153,18 @@ function summarizeClaim(claim: ResearchClaim): string {
 
 function summarizeVerifiedClaim(claim: VerifiedClaim): string {
   return `${claim.supportStatus} (${claim.confidence}): ${claim.claim}`;
+}
+
+function reviewWorkflowLines(gathered: ResearchSourceGatherResult): string[] {
+  return [
+    `- Title screened: ${gathered.reviewWorkflow.counts.titleScreened}`,
+    `- Abstract screened: ${gathered.reviewWorkflow.counts.abstractScreened}`,
+    `- Full-text screened: ${gathered.reviewWorkflow.counts.fulltextScreened}`,
+    `- Included after review: ${gathered.reviewWorkflow.counts.included}`,
+    `- Blocked or credential-limited: ${gathered.reviewWorkflow.counts.blocked}`,
+    `- Selected for synthesis: ${gathered.reviewWorkflow.counts.selectedForSynthesis}`,
+    `- Deferred included papers: ${gathered.reviewWorkflow.counts.deferred}`
+  ];
 }
 
 function researchSummaryMarkdown(
@@ -165,6 +182,7 @@ function researchSummaryMarkdown(
     `- Objective: ${plan.objective}`,
     `- Raw sources gathered: ${gathered.sources.length}`,
     `- Canonical papers retained: ${gathered.canonicalPapers.length}`,
+    `- Reviewed papers selected for synthesis: ${gathered.reviewedPapers.length}`,
     "",
     "## Executive Summary",
     "",
@@ -173,6 +191,10 @@ function researchSummaryMarkdown(
     "## Verification",
     "",
     verification.summary,
+    "",
+    "## Review Workflow",
+    "",
+    ...reviewWorkflowLines(gathered),
     "",
     "## Main Themes",
     ""
@@ -229,6 +251,11 @@ function synthesisMarkdown(
     `- Resolver providers: ${gathered.routing.resolverProviderIds.join(", ") || "none"}`,
     `- Raw sources gathered: ${gathered.sources.length}`,
     `- Canonical papers retained: ${gathered.canonicalPapers.length}`,
+    `- Reviewed papers selected for synthesis: ${gathered.reviewedPapers.length}`,
+    "",
+    "## Review Workflow",
+    "",
+    ...reviewWorkflowLines(gathered),
     "",
     "## Executive Summary",
     "",
@@ -272,14 +299,19 @@ function synthesisMarkdown(
     }
   }
 
-  lines.push("", "## Canonical Papers", "");
+  lines.push("", "## Reviewed Papers", "");
 
-  if (gathered.canonicalPapers.length === 0) {
-    lines.push("- No canonical papers were retained.");
+  if (gathered.reviewedPapers.length === 0) {
+    lines.push("- No reviewed papers were selected for synthesis.");
   } else {
-    for (const paper of gathered.canonicalPapers) {
+    for (const paper of gathered.reviewedPapers) {
       lines.push(`- ${paper.id}: ${paper.citation} [${paper.accessMode}]`);
     }
+  }
+
+  if (gathered.reviewWorkflow.counts.deferred > 0) {
+    lines.push("", "## Deferred Included Papers", "");
+    lines.push(`- ${gathered.reviewWorkflow.counts.deferred} additional included papers were kept in the review backlog for later synthesis passes.`);
   }
 
   lines.push("", "## Next-Step Questions", "");
@@ -739,7 +771,10 @@ async function writeLiteratureSnapshot(
   await writeJsonArtifact(run.artifacts.literaturePath, {
     storePath: relativeArtifactPath(run.projectRoot, literatureStore.filePath),
     paperCount: gathered.canonicalPapers.length,
+    reviewedPaperCount: gathered.reviewedPapers.length,
     papers: gathered.canonicalPapers,
+    reviewedPapers: gathered.reviewedPapers,
+    reviewWorkflow: gathered.reviewWorkflow,
     mergeDiagnostics: gathered.mergeDiagnostics,
     authStatus: gathered.authStatus,
     inserted: result.inserted,
@@ -799,7 +834,11 @@ function insufficientEvidenceSynthesisMarkdown(
     "",
     "## Why The Run Stopped",
     "",
-    "The current run did not retain any readable or screenable canonical papers, so it stopped before generating paper-grounded claims.",
+    "The current run did not retain any sufficiently reviewed papers to support paper-grounded synthesis, so it stopped before generating claims.",
+    "",
+    "## Review Workflow",
+    "",
+    ...reviewWorkflowLines(gathered),
     "",
     "## Planned Research Mode",
     "",
@@ -919,24 +958,37 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       authStatus: gathered.authStatus,
       notes: gathered.notes,
       rawSources: gathered.sources,
+      reviewWorkflow: gathered.reviewWorkflow,
       mergeDiagnostics: gathered.mergeDiagnostics,
       literatureReview: gathered.literatureReview ?? null
     });
     await appendTrace(run, now, `Gathered ${gathered.sources.length} raw sources and ${gathered.canonicalPapers.length} canonical papers.`);
     await appendEvent(run, now, "summary", `Gathered ${gathered.canonicalPapers.length} canonical papers for synthesis.`);
+    await appendEvent(
+      run,
+      now,
+      "literature",
+      `Review workflow: title ${gathered.reviewWorkflow.counts.titleScreened}, abstract ${gathered.reviewWorkflow.counts.abstractScreened}, full-text ${gathered.reviewWorkflow.counts.fulltextScreened}, included ${gathered.reviewWorkflow.counts.included}, selected ${gathered.reviewWorkflow.counts.selectedForSynthesis}.`
+    );
 
     for (const note of gathered.notes) {
       await appendStdout(run, note);
     }
 
-    for (const source of gathered.sources.slice(0, 6)) {
-      await appendEvent(run, now, "source", summarizeSource(source));
-      await appendStdout(run, `Source selected: ${summarizeSource(source)}`);
+    const previewPapers = gathered.reviewedPapers.length > 0
+      ? gathered.reviewedPapers.slice(0, 4)
+      : gathered.canonicalPapers.slice(0, 4);
+
+    for (const paper of previewPapers) {
+      await appendEvent(run, now, "source", summarizeReviewedPaper(paper));
+      await appendStdout(run, `Reviewed paper: ${summarizeReviewedPaper(paper)}`);
     }
 
-    if (gathered.canonicalPapers.length === 0) {
+    if (gathered.canonicalPapers.length === 0 || gathered.reviewedPapers.length === 0) {
       const nextQuestions = insufficientEvidenceNextQuestions(plan);
-      const failureMessage = "Literature retrieval did not retain any canonical papers that could ground synthesis. The run stopped before unsupported synthesis.";
+      const failureMessage = gathered.canonicalPapers.length === 0
+        ? "Literature retrieval did not retain any canonical papers that could ground synthesis. The run stopped before unsupported synthesis."
+        : "The review workflow did not retain any sufficiently reviewed papers for synthesis. The run stopped before unsupported synthesis.";
       const verification = verifyResearchClaims({
         brief: run.brief,
         papers: [],
@@ -1034,18 +1086,18 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       return 1;
     }
 
-    await appendEvent(run, now, "next", "Synthesize themes, claims, and next-step questions from the canonical paper set.");
+    await appendEvent(run, now, "next", "Synthesize themes, claims, and next-step questions from the reviewed paper set.");
 
     const synthesis = await researchBackend.synthesizeResearch({
       projectRoot: run.projectRoot,
       brief: run.brief,
       plan,
-      papers: gathered.canonicalPapers,
+      papers: gathered.reviewedPapers,
       literatureContext
     });
     const verification = verifyResearchClaims({
       brief: run.brief,
-      papers: gathered.canonicalPapers,
+      papers: gathered.reviewedPapers,
       claims: synthesis.claims
     });
 

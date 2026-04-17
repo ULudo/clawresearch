@@ -92,6 +92,66 @@ function safeSourceIdArray(value: unknown): string[] {
   return safeStringArray(value, 6);
 }
 
+function uniqueSourceIds(sourceIds: string[]): string[] {
+  return [...new Set(sourceIds)];
+}
+
+function editDistanceAtMostOne(left: string, right: string): boolean {
+  if (left === right) {
+    return true;
+  }
+
+  if (Math.abs(left.length - right.length) > 1) {
+    return false;
+  }
+
+  let i = 0;
+  let j = 0;
+  let edits = 0;
+
+  while (i < left.length && j < right.length) {
+    if (left[i] === right[j]) {
+      i += 1;
+      j += 1;
+      continue;
+    }
+
+    edits += 1;
+
+    if (edits > 1) {
+      return false;
+    }
+
+    if (left.length > right.length) {
+      i += 1;
+    } else if (right.length > left.length) {
+      j += 1;
+    } else {
+      i += 1;
+      j += 1;
+    }
+  }
+
+  if (i < left.length || j < right.length) {
+    edits += 1;
+  }
+
+  return edits <= 1;
+}
+
+function reconcileSourceIds(sourceIds: string[], allowedSourceIds: string[]): string[] {
+  const allowed = new Set(allowedSourceIds);
+
+  return uniqueSourceIds(sourceIds.flatMap((sourceId) => {
+    if (allowed.has(sourceId)) {
+      return [sourceId];
+    }
+
+    const closeMatches = allowedSourceIds.filter((candidate) => editDistanceAtMostOne(sourceId, candidate));
+    return closeMatches.length === 1 ? [closeMatches[0]!] : [];
+  }));
+}
+
 function extractJson(text: string): unknown {
   try {
     return JSON.parse(text);
@@ -125,7 +185,7 @@ function normalizePlan(raw: unknown, brief: ResearchBrief): ResearchPlan {
   };
 }
 
-function normalizeThemes(value: unknown): ResearchTheme[] {
+function normalizeThemes(value: unknown, allowedSourceIds: string[] = []): ResearchTheme[] {
   if (!Array.isArray(value)) {
     return [];
   }
@@ -144,12 +204,12 @@ function normalizeThemes(value: unknown): ResearchTheme[] {
     return [{
       title,
       summary,
-      sourceIds: safeSourceIdArray(record.sourceIds)
+      sourceIds: reconcileSourceIds(safeSourceIdArray(record.sourceIds), allowedSourceIds)
     }];
   }).slice(0, 6);
 }
 
-function normalizeClaims(value: unknown): ResearchClaim[] {
+function normalizeClaims(value: unknown, allowedSourceIds: string[] = []): ResearchClaim[] {
   if (!Array.isArray(value)) {
     return [];
   }
@@ -168,12 +228,12 @@ function normalizeClaims(value: unknown): ResearchClaim[] {
     return [{
       claim,
       evidence,
-      sourceIds: safeSourceIdArray(record.sourceIds)
+      sourceIds: reconcileSourceIds(safeSourceIdArray(record.sourceIds), allowedSourceIds)
     }];
   }).slice(0, 8);
 }
 
-function normalizeSynthesis(raw: unknown, brief: ResearchBrief): ResearchSynthesis {
+function normalizeSynthesis(raw: unknown, brief: ResearchBrief, allowedSourceIds: string[] = []): ResearchSynthesis {
   const record = typeof raw === "object" && raw !== null
     ? raw as Record<string, unknown>
     : {};
@@ -181,8 +241,8 @@ function normalizeSynthesis(raw: unknown, brief: ResearchBrief): ResearchSynthes
   return {
     executiveSummary: safeString(record.executiveSummary)
       ?? `This first-pass run synthesized the available sources around ${brief.topic ?? "the requested topic"}.`,
-    themes: normalizeThemes(record.themes),
-    claims: normalizeClaims(record.claims),
+    themes: normalizeThemes(record.themes, allowedSourceIds),
+    claims: normalizeClaims(record.claims, allowedSourceIds),
     nextQuestions: safeStringArray(record.nextQuestions, 6)
   };
 }
@@ -259,6 +319,8 @@ function synthesisInstruction(request: ResearchSynthesisRequest): string {
     fulltextFormat: paper.fulltextFormat,
     screeningStage: paper.screeningStage,
     screeningDecision: paper.screeningDecision,
+    screeningRationale: paper.screeningRationale,
+    tags: paper.tags,
     identifiers: paper.identifiers
   }));
 
@@ -273,7 +335,10 @@ function synthesisInstruction(request: ResearchSynthesisRequest): string {
         title: paper.title,
         locator: paper.bestAccessUrl,
         citation: paper.citation,
-        excerpt: paper.abstract ?? `${paper.accessMode} via ${paper.bestAccessProvider ?? "unknown"}`
+        excerpt: paper.abstract ?? `${paper.accessMode} via ${paper.bestAccessProvider ?? "unknown"}`,
+        screeningDecision: paper.screeningDecision,
+        screeningRationale: paper.screeningRationale,
+        tags: paper.tags
       })),
       literatureContext
     });
@@ -373,7 +438,7 @@ export class OllamaResearchBackend implements ResearchBackend {
       synthesisInstruction(request)
     );
 
-    return normalizeSynthesis(raw, request.brief);
+    return normalizeSynthesis(raw, request.brief, request.papers.map((paper) => paper.id));
   }
 }
 

@@ -188,7 +188,7 @@ test("synthesis backend uses canonical papers in the specialized literature-revi
           screeningDecision: "include",
           screeningRationale: "Highly relevant.",
           accessErrors: [],
-          tags: [],
+          tags: ["quality:high", "quality-signal:journal-like-venue"],
           runIds: [],
           linkedThemeIds: [],
           linkedClaimIds: [],
@@ -203,7 +203,111 @@ test("synthesis backend uses canonical papers in the specialized literature-revi
     assert.match(capturedPrompt, /Sources:/);
     assert.match(capturedPrompt, /canonical_paper/);
     assert.match(capturedPrompt, /agents\.pdf/);
+    assert.match(capturedPrompt, /Use only exact sourceIds from the provided reviewed paper set/i);
+    assert.match(capturedPrompt, /quality:low/i);
     assert.match(capturedPrompt, /Do not treat a loosely related background source as direct evidence/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("synthesis backend reconciles near-miss source ids to the reviewed paper set", async () => {
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (): Promise<Response> => {
+      return new Response(JSON.stringify({
+        message: {
+          content: JSON.stringify({
+            executiveSummary: "A literature-grounded summary.",
+            themes: [
+              {
+                title: "Technique families",
+                summary: "The literature clusters around a few families.",
+                sourceIds: ["paper-pv8531"]
+              }
+            ],
+            claims: [
+              {
+                claim: "Mollifier methods remain central.",
+                evidence: "Reviewed papers emphasize mollifier limitations.",
+                sourceIds: ["paper-pv8531"]
+              }
+            ],
+            nextQuestions: ["Which obstacle matters most next?"]
+          })
+        }
+      }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json"
+        }
+      });
+    };
+
+    const backend = new OllamaResearchBackend("127.0.0.1:11434", "stub-model");
+    const synthesis = await backend.synthesizeResearch({
+      projectRoot: "/tmp/project",
+      brief: {
+        topic: "Riemann Hypothesis",
+        researchQuestion: "Which technique families matter most?",
+        researchDirection: "Review proof-technique families.",
+        successCriterion: "Produce a grounded technique map."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Synthesize proof-technique families.",
+        rationale: "This is a literature review task.",
+        searchQueries: ["Riemann Hypothesis proof techniques"],
+        localFocus: ["mollifier methods"]
+      },
+      papers: [
+        {
+          id: "paper-pv8536",
+          key: "doi:10.1000/mollifier",
+          title: "Mollifier Methods for the Riemann Hypothesis",
+          citation: "Example Author (2025). Mollifier Methods for the Riemann Hypothesis.",
+          abstract: "Survey of mollifier methods and known limitations.",
+          year: 2025,
+          authors: ["Example Author"],
+          venue: "Journal of Number Theory",
+          discoveredVia: ["openalex"],
+          identifiers: {
+            doi: "10.1000/mollifier",
+            pmid: null,
+            pmcid: null,
+            arxivId: null
+          },
+          discoveryRecords: [],
+          accessCandidates: [],
+          bestAccessUrl: "https://example.org/mollifier.pdf",
+          bestAccessProvider: "openalex",
+          accessMode: "fulltext_open",
+          fulltextFormat: "pdf",
+          license: null,
+          tdmAllowed: true,
+          contentStatus: {
+            abstractAvailable: true,
+            fulltextAvailable: true,
+            fulltextFetched: false,
+            fulltextExtracted: false
+          },
+          screeningStage: "fulltext",
+          screeningDecision: "include",
+          screeningRationale: "Highly relevant.",
+          accessErrors: [],
+          tags: ["quality:high", "quality-signal:journal-like-venue"],
+          runIds: [],
+          linkedThemeIds: [],
+          linkedClaimIds: [],
+          createdAt: "2026-01-01T00:00:00.000Z",
+          updatedAt: "2026-01-01T00:00:00.000Z"
+        }
+      ]
+    });
+
+    assert.deepEqual(synthesis.themes[0]?.sourceIds, ["paper-pv8536"]);
+    assert.deepEqual(synthesis.claims[0]?.sourceIds, ["paper-pv8536"]);
   } finally {
     globalThis.fetch = originalFetch;
   }

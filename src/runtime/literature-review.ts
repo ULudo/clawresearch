@@ -52,6 +52,21 @@ const preservedShortTokens = new Set([
   "rl"
 ]);
 
+const anchorStopTokens = new Set([
+  ...[...stopTokens].filter((token) => token !== "research"),
+  "and",
+  "for",
+  "the",
+  "its",
+  "with",
+  "from",
+  "into",
+  "using",
+  "used",
+  "among",
+  "across"
+]);
+
 export type LiteratureTaskAttribute =
   | "survey"
   | "comparison"
@@ -187,27 +202,29 @@ function extractTopicAnchors(text: string | null): string[] {
   const tokens = normalizeText(text)
     .split(/\s+/)
     .filter((token) => token.length >= 3 || preservedShortTokens.has(token));
+  const topicalTokens = tokens.filter((token) => !anchorStopTokens.has(token));
+  const anchorTokens = topicalTokens.length > 0 ? topicalTokens : tokens;
 
-  if (tokens.length === 0) {
+  if (anchorTokens.length === 0) {
     return [];
   }
 
   const anchors = new Set<string>();
 
-  if (tokens.length <= 5) {
-    anchors.add(tokens.join(" "));
+  if (anchorTokens.length <= 5) {
+    anchors.add(anchorTokens.join(" "));
   }
 
-  if (tokens.length >= 2) {
-    anchors.add(tokens.slice(0, 2).join(" "));
-    anchors.add(tokens.slice(-2).join(" "));
+  if (anchorTokens.length >= 2) {
+    anchors.add(anchorTokens.slice(0, 2).join(" "));
+    anchors.add(anchorTokens.slice(-2).join(" "));
   } else {
-    anchors.add(tokens[0]!);
+    anchors.add(anchorTokens[0]!);
   }
 
-  if (tokens.length >= 3) {
-    anchors.add(tokens.slice(0, 3).join(" "));
-    anchors.add(tokens.slice(-3).join(" "));
+  if (anchorTokens.length >= 3) {
+    anchors.add(anchorTokens.slice(0, 3).join(" "));
+    anchors.add(anchorTokens.slice(-3).join(" "));
   }
 
   return [...anchors]
@@ -351,10 +368,17 @@ export function buildLiteratureReviewProfile(input: {
   plan: ResearchPlan;
   memoryContext: ProjectMemoryContext;
 }): LiteratureReviewProfile {
+  const topicTokens = new Set(phraseTokens(input.brief.topic ?? input.plan.objective));
+  const queryAnchors = input.plan.searchQueries
+    .flatMap((query) => extractTopicAnchors(query))
+    .filter((anchor) => {
+      const anchorTokens = phraseTokens(anchor);
+      return anchorTokens.some((token) => topicTokens.has(token));
+    });
   const domainAnchors = uniqueStrings([
     ...extractTopicAnchors(input.brief.topic),
-    ...input.plan.searchQueries
-      .map((query) => extractTopicAnchors(query)[0] ?? null)
+    ...(input.brief.researchQuestion === null ? [] : extractTopicAnchors(input.brief.researchQuestion)),
+    ...queryAnchors
   ]).slice(0, 6);
   const focusConcepts = deriveFocusConcepts(input.brief, input.plan);
   const taskAttributes = deriveTaskAttributes(input.brief, input.plan);
@@ -366,7 +390,7 @@ export function buildLiteratureReviewProfile(input: {
     ...domainAnchors.flatMap((anchor) => focusConcepts.slice(0, 3).map((focus) => `${anchor} ${focus}`)),
     ...input.memoryContext.queryHints.map((hint) => `${primaryAnchor} ${hint}`),
     primaryAnchor
-  ]).slice(0, 8);
+  ]).slice(0, 24);
   const rationale = [
     domainAnchors.length > 0
       ? `Literature review will prioritize the domain anchors: ${domainAnchors.join(", ")}.`
@@ -441,6 +465,9 @@ export function buildLiteratureSynthesisInstruction(input: {
     locator: string | null;
     citation: string;
     excerpt: string;
+    screeningDecision?: string;
+    screeningRationale?: string | null;
+    tags?: string[];
   }>;
 }): string {
   const profile = buildLiteratureReviewProfile({
@@ -475,7 +502,11 @@ export function buildLiteratureSynthesisInstruction(input: {
     "Treat this as a literature review subsystem, not generic web browsing and not a free-form brainstorm.",
     "Synthesize prior work by theme and approach family, not as an unstructured list of papers.",
     "Be strict about citation grounding: every claim must be explicitly tied to sourceIds.",
+    "Use only exact sourceIds from the provided reviewed paper set.",
     "Prefer claims about approach families, comparisons, methodological limitations, coverage gaps, and research opportunities.",
+    "Prefer sources with stronger screening and quality signals when there is tension across the reviewed set.",
+    "Treat quality:low and quality-signal:repository-*, quality-signal:grand-claim-title, or quality-signal:revision-like-title as caution flags rather than strong evidence.",
+    "Do not let repository-style uploads, self-asserted proofs, or repeated revision-series papers dominate the synthesis if stronger sources exist.",
     "Do not treat a loosely related background source as direct evidence for the target research problem.",
     "If the source set is thin, say so clearly and keep the claims narrow.",
     "",

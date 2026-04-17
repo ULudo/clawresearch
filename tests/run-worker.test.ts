@@ -80,6 +80,51 @@ function canonicalPaper(overrides: Partial<CanonicalPaper> = {}): CanonicalPaper
   };
 }
 
+function reviewWorkflowFor(papers: CanonicalPaper[], reviewedPaperIds?: string[]) {
+  const reviewedIds = reviewedPaperIds ?? papers
+    .filter((paper) => paper.screeningDecision === "include")
+    .map((paper) => paper.id);
+  const blockedIds = papers
+    .filter((paper) => paper.accessMode === "needs_credentials" || paper.accessMode === "fulltext_blocked")
+    .map((paper) => paper.id);
+  const excludedIds = papers
+    .filter((paper) => paper.screeningDecision === "exclude" || paper.screeningDecision === "background")
+    .map((paper) => paper.id);
+  const uncertainIds = papers
+    .filter((paper) => paper.screeningDecision === "uncertain")
+    .map((paper) => paper.id);
+  const abstractIds = papers
+    .filter((paper) => paper.screeningStage === "abstract" || paper.screeningStage === "fulltext")
+    .map((paper) => paper.id);
+  const fulltextIds = papers
+    .filter((paper) => paper.screeningStage === "fulltext")
+    .map((paper) => paper.id);
+
+  return {
+    titleScreenedPaperIds: papers.map((paper) => paper.id),
+    abstractScreenedPaperIds: abstractIds,
+    fulltextScreenedPaperIds: fulltextIds,
+    includedPaperIds: papers.filter((paper) => paper.screeningDecision === "include").map((paper) => paper.id),
+    excludedPaperIds: excludedIds,
+    uncertainPaperIds: uncertainIds,
+    blockedPaperIds: blockedIds,
+    synthesisPaperIds: reviewedIds,
+    deferredPaperIds: [],
+    counts: {
+      titleScreened: papers.length,
+      abstractScreened: abstractIds.length,
+      fulltextScreened: fulltextIds.length,
+      included: papers.filter((paper) => paper.screeningDecision === "include").length,
+      excluded: excludedIds.length,
+      uncertain: uncertainIds.length,
+      blocked: blockedIds.length,
+      selectedForSynthesis: reviewedIds.length,
+      deferred: 0
+    },
+    notes: []
+  };
+}
+
 class StubResearchBackend implements ResearchBackend {
   readonly label = "stub:research";
   capturedPaperIds: string[] = [];
@@ -128,6 +173,10 @@ class StubResearchBackend implements ResearchBackend {
 
 class StubSourceGatherer implements ResearchSourceGatherer {
   async gather(): Promise<ResearchSourceGatherResult> {
+    const papers = [
+      canonicalPaper()
+    ];
+
     return {
       notes: [
         "Collected 1 OpenAlex literature source."
@@ -172,9 +221,8 @@ class StubSourceGatherer implements ResearchSourceGatherer {
           }
         }
       ],
-      canonicalPapers: [
-        canonicalPaper()
-      ],
+      canonicalPapers: papers,
+      reviewedPapers: papers,
       routing: {
         domain: "mixed",
         plannedQueries: ["Riemann Hypothesis proof techniques"],
@@ -191,7 +239,8 @@ class StubSourceGatherer implements ResearchSourceGatherer {
           authRef: "OPENALEX_API_KEY",
           status: "missing_optional"
         }
-      ]
+      ],
+      reviewWorkflow: reviewWorkflowFor(papers)
     };
   }
 }
@@ -220,6 +269,7 @@ class NoEvidenceSourceGatherer implements ResearchSourceGatherer {
         }
       ],
       canonicalPapers: [],
+      reviewedPapers: [],
       routing: {
         domain: "mixed",
         plannedQueries: ["Riemann Hypothesis"],
@@ -228,7 +278,8 @@ class NoEvidenceSourceGatherer implements ResearchSourceGatherer {
         acquisitionProviderIds: []
       },
       mergeDiagnostics: [],
-      authStatus: []
+      authStatus: [],
+      reviewWorkflow: reviewWorkflowFor([])
     };
   }
 }
@@ -268,27 +319,29 @@ class LiteratureAwareSourceGatherer implements ResearchSourceGatherer {
   async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
     assert.equal(request.literatureContext?.available, true);
     assert.match(request.literatureContext?.queryHints.join(" | ") ?? "", /mollifier/i);
+    const papers = [
+      canonicalPaper({
+        id: "paper-2",
+        key: "doi:10.1000/mollifier",
+        title: "Mollifier methods for the Riemann Hypothesis",
+        citation: "Example Author (2025). Mollifier methods for the Riemann Hypothesis.",
+        abstract: "Survey of mollifier methods and known limitations.",
+        identifiers: {
+          doi: "10.1000/mollifier",
+          pmid: null,
+          pmcid: null,
+          arxivId: null
+        }
+      })
+    ];
 
     return {
       notes: [
         "Used prior literature memory to focus retrieval on mollifier methods."
       ],
       sources: [],
-      canonicalPapers: [
-        canonicalPaper({
-          id: "paper-2",
-          key: "doi:10.1000/mollifier",
-          title: "Mollifier methods for the Riemann Hypothesis",
-          citation: "Example Author (2025). Mollifier methods for the Riemann Hypothesis.",
-          abstract: "Survey of mollifier methods and known limitations.",
-          identifiers: {
-            doi: "10.1000/mollifier",
-            pmid: null,
-            pmcid: null,
-            arxivId: null
-          }
-        })
-      ],
+      canonicalPapers: papers,
+      reviewedPapers: papers,
       routing: {
         domain: "mixed",
         plannedQueries: ["mollifier methods Riemann Hypothesis limitations"],
@@ -297,7 +350,8 @@ class LiteratureAwareSourceGatherer implements ResearchSourceGatherer {
         acquisitionProviderIds: []
       },
       mergeDiagnostics: [],
-      authStatus: []
+      authStatus: [],
+      reviewWorkflow: reviewWorkflowFor(papers)
     };
   }
 }
@@ -350,6 +404,226 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     assert.match(JSON.stringify(verificationArtifact), /paper-1/);
     assert.match(literatureStoreContents, /"paperCount": 1/);
     assert.match(memoryContents, /paper-1/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("run worker synthesizes from the reviewed subset instead of the full canonical harvest", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-reviewed-subset-"));
+  const now = createNow();
+
+  class ReviewedSubsetSourceGatherer implements ResearchSourceGatherer {
+    async gather(): Promise<ResearchSourceGatherResult> {
+      const includedPaper = canonicalPaper({
+        id: "paper-reviewed",
+        key: "doi:10.1000/reviewed",
+        title: "Reviewed full-text survey",
+        citation: "Example Author (2024). Reviewed full-text survey.",
+        identifiers: {
+          doi: "10.1000/reviewed",
+          pmid: null,
+          pmcid: null,
+          arxivId: null
+        }
+      });
+      const blockedPaper = canonicalPaper({
+        id: "paper-blocked",
+        key: "doi:10.1000/blocked",
+        title: "Blocked but possibly relevant paper",
+        citation: "Example Author (2025). Blocked but possibly relevant paper.",
+        bestAccessUrl: "https://example.org/blocked",
+        bestAccessProvider: "crossref",
+        accessMode: "needs_credentials",
+        fulltextFormat: "none",
+        contentStatus: {
+          abstractAvailable: false,
+          fulltextAvailable: false,
+          fulltextFetched: false,
+          fulltextExtracted: false
+        },
+        screeningStage: "title",
+        screeningDecision: "uncertain",
+        screeningRationale: "Title-level match only; access is blocked.",
+        identifiers: {
+          doi: "10.1000/blocked",
+          pmid: null,
+          pmcid: null,
+          arxivId: null
+        }
+      });
+      const papers = [includedPaper, blockedPaper];
+
+      return {
+        notes: [
+          "Collected a reviewed full-text paper and one blocked backlog paper."
+        ],
+        sources: [],
+        canonicalPapers: papers,
+        reviewedPapers: [includedPaper],
+        routing: {
+          domain: "general",
+          plannedQueries: ["reviewed subset test"],
+          discoveryProviderIds: ["openalex"],
+          resolverProviderIds: [],
+          acquisitionProviderIds: []
+        },
+        mergeDiagnostics: [],
+        authStatus: [],
+        reviewWorkflow: reviewWorkflowFor(papers, ["paper-reviewed"])
+      };
+    }
+  }
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "Riemann Hypothesis",
+      researchQuestion: "Which papers should ground synthesis?",
+      researchDirection: "Use only reviewed papers for synthesis.",
+      successCriterion: "Avoid synthesizing from blocked papers."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarly.selectedProviderIds = ["openalex"];
+    projectConfig.sources.explicitlyConfigured = true;
+    await projectConfigStore.save(projectConfig);
+
+    const backend = new StubResearchBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer: new ReviewedSubsetSourceGatherer()
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const summary = await readFile(completedRun.artifacts.summaryPath, "utf8");
+    const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as Record<string, unknown>;
+
+    assert.equal(exitCode, 0);
+    assert.deepEqual(backend.capturedPaperIds, ["paper-reviewed"]);
+    assert.match(summary, /Reviewed papers selected for synthesis: 1/);
+    assert.match(JSON.stringify(sourcesArtifact), /reviewWorkflow/);
+    assert.match(JSON.stringify(sourcesArtifact), /paper-blocked/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("run worker previews reviewed papers instead of raw-source noise in the live logs", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-preview-"));
+  const now = createNow();
+
+  class PreviewSourceGatherer implements ResearchSourceGatherer {
+    async gather(): Promise<ResearchSourceGatherResult> {
+      const reviewedPaper = canonicalPaper({
+        id: "paper-reviewed-preview",
+        key: "doi:10.1000/reviewed-preview",
+        title: "Reviewed survey of autonomous research agents",
+        citation: "Example Author (2025). Reviewed survey of autonomous research agents.",
+        venue: "AI Systems Review",
+        identifiers: {
+          doi: "10.1000/reviewed-preview",
+          pmid: null,
+          pmcid: null,
+          arxivId: null
+        }
+      });
+
+      return {
+        notes: [
+          "Collected one relevant reviewed paper and one noisy raw hit."
+        ],
+        sources: [
+          {
+            id: "brief:project",
+            providerId: null,
+            category: "brief",
+            kind: "project_brief",
+            title: "autonomous research agents",
+            locator: null,
+            citation: "User-provided project brief.",
+            excerpt: "Topic: autonomous research agents.",
+            year: null,
+            authors: [],
+            venue: null,
+            identifiers: {},
+            access: null
+          },
+          {
+            id: "openalex:https://example.org/noise",
+            providerId: "openalex",
+            category: "scholarly",
+            kind: "scholarly_hit",
+            title: "Irrelevant sewer flooding review",
+            locator: "https://example.org/noise",
+            citation: "Noise Author (2024). Irrelevant sewer flooding review.",
+            excerpt: "This should not be previewed once the reviewed set exists.",
+            year: 2024,
+            authors: ["Noise Author"],
+            venue: "Noise Journal",
+            identifiers: {},
+            access: {
+              providerId: "openalex",
+              url: "https://example.org/noise",
+              accessMode: "metadata_only",
+              fulltextFormat: "none",
+              note: "Noise"
+            }
+          }
+        ],
+        canonicalPapers: [reviewedPaper],
+        reviewedPapers: [reviewedPaper],
+        routing: {
+          domain: "cs_ai",
+          plannedQueries: ["autonomous research agents"],
+          discoveryProviderIds: ["openalex"],
+          resolverProviderIds: [],
+          acquisitionProviderIds: []
+        },
+        mergeDiagnostics: [],
+        authStatus: [],
+        reviewWorkflow: reviewWorkflowFor([reviewedPaper], ["paper-reviewed-preview"])
+      };
+    }
+  }
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "autonomous research agents",
+      researchQuestion: "Which papers should be previewed in the console?",
+      researchDirection: "Preview reviewed papers rather than raw-source noise.",
+      successCriterion: "Keep the live console focused on the reviewed set."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarly.selectedProviderIds = ["openalex"];
+    projectConfig.sources.explicitlyConfigured = true;
+    await projectConfigStore.save(projectConfig);
+
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: new StubResearchBackend(),
+      sourceGatherer: new PreviewSourceGatherer()
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+    const events = await readFile(completedRun.artifacts.eventsPath, "utf8");
+
+    assert.equal(exitCode, 0);
+    assert.match(stdout, /Reviewed paper: paper-reviewed-preview: Reviewed survey of autonomous research agents/);
+    assert.doesNotMatch(stdout, /Source selected:/);
+    assert.doesNotMatch(events, /Irrelevant sewer flooding review/);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -463,6 +737,96 @@ test("run worker fails honestly when no canonical papers are retained", async ()
     assert.equal(exitCode, 1);
     assert.equal(completedRun.status, "failed");
     assert.match(summary, /did not retain any canonical papers/i);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("run worker fails honestly when retrieval found papers but review retained none for synthesis", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-no-reviewed-"));
+  const now = createNow();
+
+  class NoReviewedSubsetSourceGatherer implements ResearchSourceGatherer {
+    async gather(): Promise<ResearchSourceGatherResult> {
+      const papers = [
+        canonicalPaper({
+          id: "paper-blocked",
+          key: "doi:10.1000/blocked",
+          title: "Blocked title-only paper",
+          citation: "Example Author (2025). Blocked title-only paper.",
+          bestAccessUrl: "https://example.org/blocked",
+          bestAccessProvider: "crossref",
+          accessMode: "needs_credentials",
+          fulltextFormat: "none",
+          contentStatus: {
+            abstractAvailable: false,
+            fulltextAvailable: false,
+            fulltextFetched: false,
+            fulltextExtracted: false
+          },
+          screeningStage: "title",
+          screeningDecision: "uncertain",
+          screeningRationale: "Potentially relevant but not reviewed deeply enough.",
+          identifiers: {
+            doi: "10.1000/blocked",
+            pmid: null,
+            pmcid: null,
+            arxivId: null
+          }
+        })
+      ];
+
+      return {
+        notes: [
+          "Retrieved one title-level paper but no reviewed subset."
+        ],
+        sources: [],
+        canonicalPapers: papers,
+        reviewedPapers: [],
+        routing: {
+          domain: "general",
+          plannedQueries: ["blocked review test"],
+          discoveryProviderIds: ["openalex"],
+          resolverProviderIds: [],
+          acquisitionProviderIds: []
+        },
+        mergeDiagnostics: [],
+        authStatus: [],
+        reviewWorkflow: reviewWorkflowFor(papers, [])
+      };
+    }
+  }
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "Riemann Hypothesis",
+      researchQuestion: "Which sources should be retained after review?",
+      researchDirection: "Fail when review retains nothing.",
+      successCriterion: "Avoid unsupported synthesis."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarly.selectedProviderIds = ["openalex"];
+    projectConfig.sources.explicitlyConfigured = true;
+    await projectConfigStore.save(projectConfig);
+
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: new StubResearchBackend(),
+      sourceGatherer: new NoReviewedSubsetSourceGatherer()
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const summary = await readFile(completedRun.artifacts.summaryPath, "utf8");
+
+    assert.equal(exitCode, 1);
+    assert.equal(completedRun.status, "failed");
+    assert.match(summary, /did not retain any sufficiently reviewed papers/i);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
