@@ -16,10 +16,14 @@ import {
   MemoryStore,
   type MemoryRecordInput
 } from "./memory-store.js";
+import { applyCredentialsToEnvironment, CredentialStore } from "./credential-store.js";
 import {
   authStatesForSelectedProviders,
   formatSelectedLiteratureProviders,
-  ProjectConfigStore
+  ProjectConfigStore,
+  selectedGeneralWebProviders,
+  selectedProviderIdsForCategory,
+  selectedScholarlySourceProviders
 } from "./project-config-store.js";
 import type {
   ResearchBackend,
@@ -864,16 +868,22 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
   const sourceGatherer = options.sourceGatherer ?? createDefaultResearchSourceGatherer();
   const projectConfigStore = new ProjectConfigStore(options.projectRoot, now);
   const projectConfig = await projectConfigStore.load();
+  const credentialStore = new CredentialStore(options.projectRoot, now);
+  const credentials = await credentialStore.load();
+  applyCredentialsToEnvironment(credentials);
   const literatureStore = new LiteratureStore(options.projectRoot, now);
   const projectLiterature = await literatureStore.load();
   const literatureContext = buildLiteratureContext(projectLiterature, run.brief);
   const memoryStore = new MemoryStore(options.projectRoot, now);
   const projectMemory = await memoryStore.load();
   const memoryContext = buildProjectMemoryContext(projectMemory, run.brief);
-  const scholarlyProviders = projectConfig.sources.scholarly.selectedProviderIds;
-  const backgroundProviders = projectConfig.sources.background.selectedProviderIds;
-  const localEnabled = projectConfig.sources.local.projectFilesEnabled;
-  const providerAuthStates = authStatesForSelectedProviders(projectConfig);
+  const scholarlyDiscoveryProviders = selectedProviderIdsForCategory(projectConfig, "scholarlyDiscovery");
+  const publisherFullTextProviders = selectedProviderIdsForCategory(projectConfig, "publisherFullText");
+  const oaRetrievalHelperProviders = selectedProviderIdsForCategory(projectConfig, "oaRetrievalHelpers");
+  const scholarlyProviders = selectedScholarlySourceProviders(projectConfig);
+  const generalWebProviders = selectedGeneralWebProviders(projectConfig);
+  const localEnabled = projectConfig.sources.localContext.projectFilesEnabled;
+  const providerAuthStates = authStatesForSelectedProviders(projectConfig, credentials);
 
   try {
     run.workerPid = process.pid;
@@ -910,14 +920,16 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     await appendEvent(run, now, "plan", "Plan the research mode and generate initial retrieval queries.");
     await appendStdout(run, `Research backend: ${researchBackend.label}`);
     await appendStdout(run, `Run loop command: ${run.job.command.join(" ")}`);
-    await appendStdout(run, `Selected scholarly providers: ${formatSelectedLiteratureProviders(scholarlyProviders)}`);
-    await appendStdout(run, `Selected background providers: ${formatSelectedLiteratureProviders(backgroundProviders)}`);
-    await appendStdout(run, `Local project files: ${localEnabled ? "enabled" : "disabled"}`);
+    await appendStdout(run, `Selected scholarly-discovery providers: ${formatSelectedLiteratureProviders(scholarlyDiscoveryProviders)}`);
+    await appendStdout(run, `Selected publisher/full-text providers: ${formatSelectedLiteratureProviders(publisherFullTextProviders)}`);
+    await appendStdout(run, `Selected OA/retrieval helpers: ${formatSelectedLiteratureProviders(oaRetrievalHelperProviders)}`);
+    await appendStdout(run, `Selected general-web providers: ${formatSelectedLiteratureProviders(generalWebProviders)}`);
+    await appendStdout(run, `Local context: ${localEnabled ? "enabled" : "disabled"}`);
 
     for (const authState of providerAuthStates) {
       await appendStdout(
         run,
-        `Provider auth: ${authState.definition.label} -> ${authState.status}${authState.authRef === null ? "" : ` (${authState.authRef})`}`
+        `Provider auth: ${authState.definition.label} -> ${authState.status}`
       );
     }
 
@@ -945,15 +957,27 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       memoryContext,
       literatureContext,
       scholarlyProviderIds: scholarlyProviders,
-      backgroundProviderIds: backgroundProviders,
+      generalWebProviderIds: generalWebProviders,
       projectFilesEnabled: localEnabled,
-      authRefs: projectConfig.sources.authRefs
+      credentials
     });
 
     await writeJsonArtifact(run.artifacts.sourcesPath, {
+      sourceConfig: {
+        scholarlyDiscoveryProviders,
+        publisherFullTextProviders,
+        oaRetrievalHelperProviders,
+        generalWebProviders,
+        localContextEnabled: localEnabled,
+        configuredCredentials: providerAuthStates
+          .filter((state) => state.configuredFieldIds.length > 0)
+          .map((state) => ({
+            providerId: state.providerId,
+            fields: state.configuredFieldIds
+          }))
+      },
       scholarlyProviders,
-      backgroundProviders,
-      projectFilesEnabled: localEnabled,
+      generalWebProviders,
       routing: gathered.routing,
       authStatus: gathered.authStatus,
       notes: gathered.notes,

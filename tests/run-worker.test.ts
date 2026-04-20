@@ -236,7 +236,9 @@ class StubSourceGatherer implements ResearchSourceGatherer {
       authStatus: [
         {
           providerId: "openalex",
-          authRef: "OPENALEX_API_KEY",
+          configuredFieldIds: [],
+          missingRequiredFieldIds: [],
+          missingOptionalFieldIds: ["api_key"],
           status: "missing_optional"
         }
       ],
@@ -371,9 +373,11 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
 
     const projectConfigStore = new ProjectConfigStore(projectRoot, now);
     const projectConfig = await projectConfigStore.load();
-    projectConfig.sources.scholarly.selectedProviderIds = ["openalex"];
-    projectConfig.sources.background.selectedProviderIds = [];
-    projectConfig.sources.local.projectFilesEnabled = false;
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.localContext.projectFilesEnabled = false;
     projectConfig.sources.explicitlyConfigured = true;
     await projectConfigStore.save(projectConfig);
 
@@ -398,6 +402,7 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     assert.equal(completedRun.status, "completed");
     assert.deepEqual(backend.capturedPaperIds, ["paper-1"]);
     assert.match(JSON.stringify(sourcesArtifact), /rawSources/);
+    assert.match(JSON.stringify(sourcesArtifact), /sourceConfig/);
     assert.match(JSON.stringify(sourcesArtifact), /mergeDiagnostics/);
     assert.match(JSON.stringify(literatureArtifact), /paper-1/);
     assert.match(JSON.stringify(literatureArtifact), /fulltext_open/);
@@ -486,7 +491,10 @@ test("run worker synthesizes from the reviewed subset instead of the full canoni
 
     const projectConfigStore = new ProjectConfigStore(projectRoot, now);
     const projectConfig = await projectConfigStore.load();
-    projectConfig.sources.scholarly.selectedProviderIds = ["openalex"];
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
     projectConfig.sources.explicitlyConfigured = true;
     await projectConfigStore.save(projectConfig);
 
@@ -603,7 +611,10 @@ test("run worker previews reviewed papers instead of raw-source noise in the liv
 
     const projectConfigStore = new ProjectConfigStore(projectRoot, now);
     const projectConfig = await projectConfigStore.load();
-    projectConfig.sources.scholarly.selectedProviderIds = ["openalex"];
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
     projectConfig.sources.explicitlyConfigured = true;
     await projectConfigStore.save(projectConfig);
 
@@ -682,7 +693,10 @@ test("run worker uses prior literature memory to inform planning and retrieval",
 
     const projectConfigStore = new ProjectConfigStore(projectRoot, now);
     const projectConfig = await projectConfigStore.load();
-    projectConfig.sources.scholarly.selectedProviderIds = ["openalex"];
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
     projectConfig.sources.explicitlyConfigured = true;
     await projectConfigStore.save(projectConfig);
 
@@ -718,7 +732,10 @@ test("run worker fails honestly when no canonical papers are retained", async ()
 
     const projectConfigStore = new ProjectConfigStore(projectRoot, now);
     const projectConfig = await projectConfigStore.load();
-    projectConfig.sources.scholarly.selectedProviderIds = ["openalex"];
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
     projectConfig.sources.explicitlyConfigured = true;
     await projectConfigStore.save(projectConfig);
 
@@ -808,7 +825,10 @@ test("run worker fails honestly when retrieval found papers but review retained 
 
     const projectConfigStore = new ProjectConfigStore(projectRoot, now);
     const projectConfig = await projectConfigStore.load();
-    projectConfig.sources.scholarly.selectedProviderIds = ["openalex"];
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
     projectConfig.sources.explicitlyConfigured = true;
     await projectConfigStore.save(projectConfig);
 

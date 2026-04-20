@@ -4,6 +4,9 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
+  credentialStorePath,
+} from "../src/runtime/credential-store.js";
+import {
   type ConsoleIo,
   runPhaseOneConsole
 } from "../src/runtime/console-app.js";
@@ -79,21 +82,18 @@ class MinimalIntakeBackend implements IntakeBackend {
   }
 }
 
-test("console startup configures grouped source categories and stores auth env refs without secrets", async () => {
+test("console startup configures grouped source categories and stores direct credentials outside project config", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-console-sources-"));
-  const originalOpenAlexKey = process.env.OPENALEX_API_KEY;
-  const originalUnpaywallEmail = process.env.UNPAYWALL_TEST_EMAIL;
 
   try {
-    delete process.env.OPENALEX_API_KEY;
-    process.env.UNPAYWALL_TEST_EMAIL = "research@example.org";
-
     const io = createScriptedIo([
-      "openalex, unpaywall",
+      "openalex",
+      "none",
+      "unpaywall",
       "wikipedia",
       "off",
       "",
-      "UNPAYWALL_TEST_EMAIL",
+      "research@example.org",
       "/sources",
       "/quit"
     ]);
@@ -108,34 +108,27 @@ test("console startup configures grouped source categories and stores auth env r
 
     assert.equal(exitCode, 0);
     assert.match(io.output, /Source setup/);
-    assert.match(io.output, /Leaving openalex without an auth env ref for now\./);
-    assert.match(io.output, /Saved unpaywall auth ref: UNPAYWALL_TEST_EMAIL/);
+    assert.match(io.output, /Leaving openalex api key empty for now\./);
+    assert.match(io.output, /Saved unpaywall email\./);
     assert.match(io.output, /Providers for this project:/);
     assert.match(io.output, /openalex: missing optional/);
-    assert.match(io.output, /unpaywall: configured \(UNPAYWALL_TEST_EMAIL\)/);
-    assert.match(io.output, /Local project files: off/);
+    assert.match(io.output, /unpaywall: configured \(configured: email\)/);
+    assert.match(io.output, /Local context: off/);
 
     const configContents = await readFile(projectConfigPath(projectRoot), "utf8");
+    const credentialsContents = await readFile(credentialStorePath(projectRoot), "utf8");
 
     assert.match(configContents, /"sources"/);
-    assert.match(configContents, /"scholarly"/);
-    assert.match(configContents, /"background"/);
+    assert.match(configContents, /"scholarlyDiscovery"/);
+    assert.match(configContents, /"publisherFullText"/);
+    assert.match(configContents, /"oaRetrievalHelpers"/);
+    assert.match(configContents, /"generalWeb"/);
+    assert.match(configContents, /"localContext"/);
     assert.match(configContents, /"projectFilesEnabled": false/);
-    assert.match(configContents, /"openalex": null/);
-    assert.match(configContents, /"UNPAYWALL_TEST_EMAIL"/);
     assert.doesNotMatch(configContents, /research@example\.org/);
+    assert.match(credentialsContents, /"unpaywall"/);
+    assert.match(credentialsContents, /"email": "research@example\.org"/);
   } finally {
-    if (originalOpenAlexKey === undefined) {
-      delete process.env.OPENALEX_API_KEY;
-    } else {
-      process.env.OPENALEX_API_KEY = originalOpenAlexKey;
-    }
-
-    if (originalUnpaywallEmail === undefined) {
-      delete process.env.UNPAYWALL_TEST_EMAIL;
-    } else {
-      process.env.UNPAYWALL_TEST_EMAIL = originalUnpaywallEmail;
-    }
 
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -147,6 +140,9 @@ test("source setup accepts slash commands like /sources before the intake chat s
   try {
     const io = createScriptedIo([
       "/sources",
+      "",
+      "",
+      "",
       "",
       "",
       "",

@@ -14,22 +14,27 @@ import {
 function sampleConfig(): ProjectConfigState {
   const store = new ProjectConfigStore("/tmp/clawresearch-ui-model");
   return {
-    schemaVersion: 2,
+    schemaVersion: 5,
     projectRoot: store.projectRoot,
     runtimeDirectory: `${store.projectRoot}/.clawresearch`,
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
     sources: {
-      scholarly: {
-        selectedProviderIds: ["openalex", "arxiv"]
+      scholarlyDiscovery: {
+        selectedProviderIds: ["openalex"]
       },
-      background: {
+      publisherFullText: {
+        selectedProviderIds: ["arxiv"]
+      },
+      oaRetrievalHelpers: {
         selectedProviderIds: []
       },
-      local: {
+      generalWeb: {
+        selectedProviderIds: []
+      },
+      localContext: {
         projectFilesEnabled: true
       },
-      authRefs: {},
       explicitlyConfigured: true
     }
   };
@@ -39,16 +44,16 @@ test("source checklist toggles scholarly providers and local files", () => {
   const config = sampleConfig();
   const entries = buildSourceChecklistEntries(config);
   const openAlexEntry = entries.find((entry) => entry.providerId === "openalex");
-  const localEntry = entries.find((entry) => entry.category === "local");
+  const localEntry = entries.find((entry) => entry.category === "localContext");
 
   assert.ok(openAlexEntry);
   assert.ok(localEntry);
 
   const withoutOpenAlex = toggleSourceChecklistEntry(config, openAlexEntry);
-  assert.deepEqual(withoutOpenAlex.sources.scholarly.selectedProviderIds, ["arxiv"]);
+  assert.deepEqual(withoutOpenAlex.sources.scholarlyDiscovery.selectedProviderIds, []);
 
   const localOff = toggleSourceChecklistEntry(withoutOpenAlex, localEntry);
-  assert.equal(localOff.sources.local.projectFilesEnabled, false);
+  assert.equal(localOff.sources.localContext.projectFilesEnabled, false);
 });
 
 test("source checklist render shows checkboxes and a focused row", () => {
@@ -56,6 +61,10 @@ test("source checklist render shows checkboxes and a focused row", () => {
 
   assert.match(output, /ClawResearch source setup/);
   assert.match(output, /Space or Enter to toggle, S to save, Esc to cancel/);
+  assert.match(output, /Scholarly Discovery/);
+  assert.match(output, /Publisher \/ Full Text/);
+  assert.match(output, /OA \/ Retrieval Helpers/);
+  assert.match(output, /General Web/);
   assert.match(output, /> \[x\] openalex - Broad scholarly discovery/);
   assert.match(output, /\[x\] arxiv - Preprint discovery and direct access/);
   assert.match(output, /\[x\] project files - Use local markdown and text files/);
@@ -101,18 +110,18 @@ test("auth prompt frame stays focused on the credential question", () => {
     subtitle: "project: /tmp/research-test  backend: ollama:qwen  auth setup",
     providerLabel: "pubmed",
     providerDescription: "Biomedical discovery through NCBI PubMed and E-utilities.",
-    guidanceLines: authPromptGuidance("pubmed"),
-    inputLabel: "pubmed env ref [optional; example NCBI_API_KEY]",
-    inputValue: "NCBI_API_KEY_",
-    footerHint: "Enter saves this provider, blank input leaves it unset"
+    guidanceLines: authPromptGuidance("pubmed", "api_key"),
+    inputLabel: "pubmed ncbi api key [optional]",
+    inputValue: "secret-key_",
+    footerHint: "Enter saves this value, blank leaves it unset"
   });
 
   assert.match(output, /Provider auth/);
   assert.match(output, /Provider: pubmed/);
-  assert.match(output, /Without an NCBI API key, PubMed can still be queried/);
-  assert.match(output, /Leave it blank to continue without it, or type the env-var name you want ClawResearch to use\./);
+  assert.match(output, /PubMed works without an NCBI API key/);
+  assert.match(output, /Leave it blank to continue without it\./);
   assert.match(output, /Input/);
-  assert.match(output, /pubmed env ref \[optional; example NCBI_API_KEY\]/);
+  assert.match(output, /pubmed ncbi api key \[optional\]/);
   assert.doesNotMatch(output, /Chat --------------------------------/);
   assert.doesNotMatch(output, /Brief --------------------------------/);
 });

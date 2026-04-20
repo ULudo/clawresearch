@@ -74,7 +74,7 @@ npm run dev
 
 That starts the TUI runtime in the current directory. The default experience is now a small terminal UI with:
 
-- a checklist-style provider selector for scholarly, background, and local sources
+- a checklist-style provider selector for scholarly discovery, publisher/full-text, OA-helper, general-web, and local-context sources
 - a persistent chat transcript instead of a one-line prompt loop
 - a bottom chat field for talking to the intake consultant
 - a pinned brief/status view while the conversation evolves
@@ -120,9 +120,11 @@ Useful slash commands inside the console:
 
 New projects now open a source-selection checklist at startup. The default selection is:
 
-- scholarly: `openalex`, `crossref`, `arxiv`, `dblp`, `pubmed`, `europe-pmc`, `core`, `unpaywall`
-- background: none
-- local project files: on
+- scholarly discovery: `openalex`, `crossref`, `dblp`, `pubmed`
+- publisher / full text: `arxiv`, `europe-pmc`
+- OA / retrieval helpers: `core`, `unpaywall`
+- general web: none
+- local context: on
 
 Inside the TUI, use:
 
@@ -131,13 +133,19 @@ Inside the TUI, use:
 - `S` to save the current selection
 - `Esc` to leave the overlay
 
-`/sources` reopens the checklist later. The older text commands such as `scholarly: ...`, `background: ...`, `local: off`, and `sources: ...` are still accepted in plain mode and remain available as compatibility inputs.
+`/sources` reopens the checklist later. The text commands `scholarly: ...`, `publishers: ...`, `helpers: ...`, `web: ...`, `local: off`, and `sources: ...` are accepted in plain mode, with `sources: ...` kept as a compatibility alias for scholarly discovery.
 
-After provider selection, ClawResearch asks only for env-var references for providers that may need credentials. It never stores raw secrets in repo-tracked config. For example:
+The second wave of credentialed providers is selectable now too, but stays off by default:
+
+- scholarly discovery: `elsevier`
+- publisher / full text: `ieee-xplore`, `springer-nature`
+
+After provider selection, ClawResearch asks for the actual key, token, or email directly. It stores those credentials only in the local runtime folder and mirrors the expected environment-variable names in the background when the runtime starts. For example:
 
 ```text
-openalex auth env var [optional, example OPENALEX_API_KEY; Enter leaves it unset]:
-unpaywall auth env var [required, example UNPAYWALL_EMAIL; Enter leaves it unavailable]:
+openalex api key [optional; Enter leaves it unset]:
+unpaywall email [required; Enter leaves it unavailable]:
+elsevier institution token [optional; Enter leaves it unset]:
 ```
 
 Minimal runtime state is persisted locally in:
@@ -150,6 +158,12 @@ Project-level literature configuration is persisted in:
 
 ```text
 .clawresearch/project-config.json
+```
+
+Project-level credentials are persisted locally in:
+
+```text
+.clawresearch/credentials.json
 ```
 
 The runtime now also keeps a small structured memory in:
@@ -224,8 +238,10 @@ The detached worker now runs a minimal explicit research loop. It is still inten
 - run a dedicated literature-review subsystem for review-style tasks, with task-aware paper ranking instead of generic web browsing
 - plan provider-aware retrieval queries from the brief, project memory, and literature memory
 - route scholarly discovery by domain instead of looping over a flat provider list
-- gather raw scholarly hits from `openalex`, `crossref`, `arxiv`, `dblp`, `pubmed`, `europe-pmc`, `core`, and `unpaywall` resolution when configured
-- keep background and local context separate from scholarly review
+- gather raw discovery hits from `openalex`, `crossref`, `arxiv`, `dblp`, `pubmed`, `europe-pmc`, `ieee-xplore`, `elsevier`, and `springer-nature`
+- use `core` and `unpaywall` as OA and retrieval helpers when configured
+- use publisher-specific access resolution to prefer readable OA routes and honestly mark entitlement-gated papers
+- keep general-web and local context separate from scholarly review
 - merge duplicate provider hits into canonical papers
 - resolve the best legal reading path per paper before synthesis
 - persist canonical paper access state, screening decisions, and provider auth status

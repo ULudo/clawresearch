@@ -229,7 +229,7 @@ test("care-heavy AI briefs route biomedical providers before broad discovery", a
   }
 });
 
-test("general mathematical briefs avoid biomedical discovery providers by default", async () => {
+test("mathematical briefs route through mathematics-aware providers by default", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-routing-general-"));
   const originalFetch = globalThis.fetch;
   const seenPaths: string[] = [];
@@ -271,13 +271,131 @@ test("general mathematical briefs avoid biomedical discovery providers by defaul
         localFocus: ["number theory", "prime numbers"]
       },
       memoryContext: emptyMemoryContext(),
-      scholarlyProviderIds: ["openalex", "crossref", "arxiv", "dblp", "pubmed", "europe_pmc"]
+      scholarlyProviderIds: ["openalex", "crossref", "arxiv", "dblp", "pubmed", "europe_pmc", "elsevier", "ieee_xplore"]
     });
 
-    assert.equal(gathered.routing.domain, "general");
-    assert.deepEqual(gathered.routing.discoveryProviderIds, ["openalex", "crossref", "arxiv", "dblp"]);
+    assert.equal(gathered.routing.domain, "mathematics");
+    assert.deepEqual(gathered.routing.discoveryProviderIds, ["openalex", "arxiv", "crossref", "elsevier", "dblp", "ieee_xplore"]);
     assert.ok(!seenPaths.includes("/entrez/eutils/esearch.fcgi"));
     assert.ok(!seenPaths.includes("/europepmc/webservices/rest/search"));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("mathematical briefs are not pulled into cs-ai routing by generated computational search queries", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-routing-math-computational-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.pathname === "/works") {
+        return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      if (url.pathname === "/api/query") {
+        return new Response(`<?xml version="1.0" encoding="UTF-8"?><feed></feed>`, { status: 200, headers: { "content-type": "application/atom+xml" } });
+      }
+
+      if (url.pathname === "/works") {
+        return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      if (url.pathname === "/content/search/scopus") {
+        return new Response(JSON.stringify({ "search-results": { entry: [] } }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      if (url.pathname === "/api/v1/search/articles") {
+        return new Response(JSON.stringify({ articles: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "Riemann Hypothesis",
+        researchQuestion: "What new computational approaches could be applied to the Riemann Hypothesis?",
+        researchDirection: "Review computational work in number theory and zeta-function analysis.",
+        successCriterion: "Produce a grounded synthesis of realistic computational directions."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Evaluate computational approaches around the Riemann Hypothesis.",
+        rationale: "This is a mathematics problem that may involve computational methods but still belongs to number theory.",
+        searchQueries: [
+          "machine learning applications in analytic number theory",
+          "high-performance computing for number theory problems",
+          "riemann hypothesis computational methods"
+        ],
+        localFocus: ["number theory", "zeta function"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: ["openalex", "crossref", "arxiv", "dblp", "elsevier", "ieee_xplore"]
+    });
+
+    assert.equal(gathered.routing.domain, "mathematics");
+    assert.deepEqual(gathered.routing.discoveryProviderIds.slice(0, 4), ["openalex", "arxiv", "crossref", "elsevier"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("social-science briefs prioritize broad scholarly and publisher sources over cs-only indexes", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-routing-social-science-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.pathname === "/works") {
+        return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      if (url.pathname === "/content/search/scopus") {
+        return new Response(JSON.stringify({ "search-results": { entry: [] } }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      if (url.pathname === "/meta/v2/json") {
+        return new Response(JSON.stringify({ records: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      if (url.pathname === "/api/query") {
+        return new Response(`<?xml version="1.0" encoding="UTF-8"?><feed></feed>`, { status: 200, headers: { "content-type": "application/atom+xml" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "AI adoption and employment effects in social services",
+        researchQuestion: "How is AI adoption affecting jobs, workforce organization, and policy responses in social services?",
+        researchDirection: "Review labor-market effects, policy responses, and organizational change.",
+        successCriterion: "Produce a literature-grounded synthesis of employment and policy effects."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Map employment, workforce, and policy effects of AI adoption in social services.",
+        rationale: "This is a social-science and policy literature review, not a computer-science systems review.",
+        searchQueries: ["AI adoption employment policy social services"],
+        localFocus: ["employment", "policy", "workforce"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: ["openalex", "crossref", "elsevier", "springer_nature", "dblp", "arxiv"]
+    });
+
+    assert.equal(gathered.routing.domain, "social_science");
+    assert.deepEqual(gathered.routing.discoveryProviderIds.slice(0, 4), ["openalex", "crossref", "elsevier", "springer_nature"]);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
@@ -974,6 +1092,377 @@ test("review workflow collapses revision-style series into one reviewed paper", 
     assert.ok(gathered.reviewWorkflow.notes.some((note) => /Collapsed 2 near-duplicate/i.test(note)));
   } finally {
     globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("ieee xplore discovery yields canonical papers with honest access state", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-ieee-"));
+  const originalFetch = globalThis.fetch;
+  const originalApiKey = process.env.IEEE_XPLORE_API_KEY;
+
+  try {
+    process.env.IEEE_XPLORE_API_KEY = "ieee-test-key";
+
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "ieeexploreapi.ieee.org" && url.pathname === "/api/v1/search/articles") {
+        return new Response(JSON.stringify({
+          articles: [
+            {
+              title: "Benchmarking autonomous research agents in engineering workflows",
+              abstract: "Autonomous research agents engineering workflows evaluation benchmarks reproducibility.",
+              publication_year: 2025,
+              publication_title: "IEEE Transactions on Engineering Management",
+              doi: "10.1109/example.2025.1",
+              accessType: "Open Access",
+              html_url: "https://ieeexplore.ieee.org/document/1",
+              pdf_url: "https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber=1",
+              authors: {
+                authors: [
+                  {
+                    full_name: "Ada Lovelace"
+                  }
+                ]
+              }
+            }
+          ]
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "autonomous research agents",
+        researchQuestion: "How are engineering workflows benchmarked?",
+        researchDirection: "Review benchmark design and reproducibility.",
+        successCriterion: "Produce a benchmark-grounded synthesis."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review engineering benchmark papers for autonomous research agents.",
+        rationale: "IEEE Xplore should contribute engineering-oriented discovery.",
+        searchQueries: ["autonomous research agents engineering benchmarks"],
+        localFocus: ["benchmarks", "reproducibility"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: ["ieee_xplore"]
+    });
+
+    assert.equal(gathered.canonicalPapers.length, 1);
+    assert.equal(gathered.canonicalPapers[0]?.bestAccessProvider, "ieee_xplore");
+    assert.equal(gathered.canonicalPapers[0]?.accessMode, "fulltext_open");
+    assert.equal(gathered.canonicalPapers[0]?.authors[0], "Ada Lovelace");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalApiKey === undefined) {
+      delete process.env.IEEE_XPLORE_API_KEY;
+    } else {
+      process.env.IEEE_XPLORE_API_KEY = originalApiKey;
+    }
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("elsevier discovery and acquisition upgrade a canonical paper to licensed full text", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-elsevier-"));
+  const originalFetch = globalThis.fetch;
+  const originalScopusKey = process.env.SCOPUS_API_KEY;
+  const originalInstitutionToken = process.env.SCIENCEDIRECT_INSTITUTION_TOKEN;
+
+  try {
+    process.env.SCOPUS_API_KEY = "elsevier-test-key";
+    process.env.SCIENCEDIRECT_INSTITUTION_TOKEN = "inst-token";
+
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.elsevier.com" && url.pathname === "/content/search/scopus") {
+        assert.equal(url.searchParams.get("view"), "STANDARD");
+        return new Response(JSON.stringify({
+          "search-results": {
+            entry: [
+              {
+                "dc:title": "Autonomous research agents for scientific planning",
+                "dc:description": "Autonomous research agents scientific planning literature review and evaluation.",
+                "prism:publicationName": "Journal of Research Systems",
+                "prism:coverDate": "2025-02-01",
+                "prism:doi": "10.1016/j.example.2025.1001",
+                "prism:url": "https://api.elsevier.com/content/abstract/scopus_id/123456",
+                authors: {
+                  author: [
+                    {
+                      given: "Grace",
+                      surname: "Hopper"
+                    }
+                  ]
+                },
+                openaccessArticle: false
+              }
+            ]
+          }
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      if (url.hostname === "api.elsevier.com" && url.pathname === "/content/search/sciencedirect") {
+        return new Response(JSON.stringify({
+          "search-results": {
+            entry: [
+              {
+                "dc:title": "Autonomous research agents for scientific planning",
+                "dc:description": "Autonomous research agents scientific planning literature review and evaluation.",
+                "prism:publicationName": "Journal of Research Systems",
+                "prism:coverDate": "2025-02-01",
+                "prism:doi": "10.1016/j.example.2025.1001",
+                "prism:url": "https://api.elsevier.com/content/article/pii/S000000000000001",
+                authors: {
+                  author: [
+                    {
+                      given: "Grace",
+                      surname: "Hopper"
+                    }
+                  ]
+                },
+                openaccessArticle: false
+              }
+            ]
+          }
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "autonomous research agents",
+        researchQuestion: "How should planning loops be structured?",
+        researchDirection: "Review planning strategies and evaluation setups.",
+        successCriterion: "Produce a planning-grounded synthesis."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review planning-loop papers for autonomous research agents.",
+        rationale: "Scopus discovery should merge with ScienceDirect publisher access when available.",
+        searchQueries: ["autonomous research agents scientific planning"],
+        localFocus: ["planning", "evaluation"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: ["elsevier"]
+    });
+
+    assert.equal(gathered.canonicalPapers.length, 1);
+    assert.equal(gathered.canonicalPapers[0]?.bestAccessProvider, "elsevier");
+    assert.equal(gathered.canonicalPapers[0]?.accessMode, "fulltext_licensed");
+    assert.equal(gathered.canonicalPapers[0]?.identifiers.doi, "10.1016/j.example.2025.1001");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalScopusKey === undefined) {
+      delete process.env.SCOPUS_API_KEY;
+    } else {
+      process.env.SCOPUS_API_KEY = originalScopusKey;
+    }
+    if (originalInstitutionToken === undefined) {
+      delete process.env.SCIENCEDIRECT_INSTITUTION_TOKEN;
+    } else {
+      process.env.SCIENCEDIRECT_INSTITUTION_TOKEN = originalInstitutionToken;
+    }
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("elsevier discovery keeps scopus results even when the science direct entitlement route fails", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-elsevier-fallback-"));
+  const originalFetch = globalThis.fetch;
+  const originalScopusKey = process.env.SCOPUS_API_KEY;
+  const originalInstitutionToken = process.env.SCIENCEDIRECT_INSTITUTION_TOKEN;
+
+  try {
+    process.env.SCOPUS_API_KEY = "elsevier-test-key";
+    process.env.SCIENCEDIRECT_INSTITUTION_TOKEN = "bad-inst-token";
+
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.elsevier.com" && url.pathname === "/content/search/scopus") {
+        return new Response(JSON.stringify({
+          "search-results": {
+            entry: [
+              {
+                "dc:title": "Autonomous research agents for scientific planning",
+                "dc:description": "Autonomous research agents scientific planning literature review and evaluation.",
+                "prism:publicationName": "Journal of Research Systems",
+                "prism:coverDate": "2025-02-01",
+                "prism:doi": "10.1016/j.example.2025.1001",
+                "prism:url": "https://api.elsevier.com/content/abstract/scopus_id/123456",
+                authors: {
+                  author: [
+                    {
+                      given: "Grace",
+                      surname: "Hopper"
+                    }
+                  ]
+                },
+                openaccessArticle: false
+              }
+            ]
+          }
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      if (url.hostname === "api.elsevier.com" && url.pathname === "/content/search/sciencedirect") {
+        return new Response(JSON.stringify({
+          error: "unauthorized"
+        }), { status: 401, statusText: "Unauthorized", headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "autonomous research agents",
+        researchQuestion: "How should planning loops be structured?",
+        researchDirection: "Review planning strategies and evaluation setups.",
+        successCriterion: "Produce a planning-grounded synthesis."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review planning-loop papers for autonomous research agents.",
+        rationale: "Scopus discovery should still work even when ScienceDirect entitlement fails.",
+        searchQueries: ["autonomous research agents scientific planning"],
+        localFocus: ["planning", "evaluation"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: ["elsevier"]
+    });
+
+    assert.equal(gathered.canonicalPapers.length, 1);
+    assert.equal(gathered.canonicalPapers[0]?.bestAccessProvider, "elsevier");
+    assert.match(gathered.notes.join("\n"), /Canonical merge produced 1 scholarly papers/i);
+    assert.doesNotMatch(gathered.notes.join("\n"), /elsevier query failed/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalScopusKey === undefined) {
+      delete process.env.SCOPUS_API_KEY;
+    } else {
+      process.env.SCOPUS_API_KEY = originalScopusKey;
+    }
+    if (originalInstitutionToken === undefined) {
+      delete process.env.SCIENCEDIRECT_INSTITUTION_TOKEN;
+    } else {
+      process.env.SCIENCEDIRECT_INSTITUTION_TOKEN = originalInstitutionToken;
+    }
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("springer nature discovery and OA lookup resolve an open full-text route", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-springer-"));
+  const originalFetch = globalThis.fetch;
+  const originalApiKey = process.env.SPRINGER_NATURE_API_KEY;
+
+  try {
+    process.env.SPRINGER_NATURE_API_KEY = "springer-test-key";
+
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.springernature.com" && url.pathname === "/meta/v2/json") {
+        return new Response(JSON.stringify({
+          records: [
+            {
+              title: "Autonomous research agents and reproducible literature synthesis",
+              abstract: "Autonomous research agents reproducible literature synthesis evaluation methods.",
+              publicationDate: "2025-03-01",
+              publicationName: "AI and Society",
+              doi: "10.1007/example-2025-1",
+              creators: [
+                {
+                  creator: "Karen Sparck Jones"
+                }
+              ],
+              url: [
+                {
+                  format: "html",
+                  value: "https://link.springer.com/article/10.1007/example-2025-1"
+                }
+              ]
+            }
+          ]
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      if (url.hostname === "api.springernature.com" && url.pathname === "/openaccess/json") {
+        return new Response(JSON.stringify({
+          records: [
+            {
+              title: "Autonomous research agents and reproducible literature synthesis",
+              abstract: "Autonomous research agents reproducible literature synthesis evaluation methods.",
+              publicationDate: "2025-03-01",
+              publicationName: "AI and Society",
+              doi: "10.1007/example-2025-1",
+              creators: [
+                {
+                  creator: "Karen Sparck Jones"
+                }
+              ],
+              url: [
+                {
+                  format: "pdf",
+                  value: "https://media.springernature.com/full/springer-static/pdf/example.pdf"
+                }
+              ],
+              license: "CC BY 4.0"
+            }
+          ]
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "autonomous research agents",
+        researchQuestion: "How can literature synthesis be made reproducible?",
+        researchDirection: "Review synthesis workflows and evaluation practices.",
+        successCriterion: "Produce a reproducibility-grounded synthesis."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review reproducible literature-synthesis workflows for autonomous research agents.",
+        rationale: "Springer Nature should contribute publisher metadata and OA access routes.",
+        searchQueries: ["autonomous research agents reproducible literature synthesis"],
+        localFocus: ["literature synthesis", "reproducibility"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: ["springer_nature"]
+    });
+
+    assert.equal(gathered.canonicalPapers.length, 1);
+    assert.equal(gathered.canonicalPapers[0]?.bestAccessProvider, "springer_nature");
+    assert.equal(gathered.canonicalPapers[0]?.accessMode, "fulltext_open");
+    assert.equal(gathered.canonicalPapers[0]?.fulltextFormat, "pdf");
+    assert.equal(gathered.canonicalPapers[0]?.license, "CC BY 4.0");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalApiKey === undefined) {
+      delete process.env.SPRINGER_NATURE_API_KEY;
+    } else {
+      process.env.SPRINGER_NATURE_API_KEY = originalApiKey;
+    }
     await rm(projectRoot, { recursive: true, force: true });
   }
 });

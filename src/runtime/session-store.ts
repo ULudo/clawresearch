@@ -129,10 +129,6 @@ function mergeSession(raw: unknown, projectRoot: string, version: string, timest
   const brief = asObject(session.brief);
   const intake = asObject(session.intake);
   const conversation = Array.isArray(session.conversation) ? session.conversation : [];
-  const rawSchemaVersion = typeof session.schemaVersion === "number" && Number.isFinite(session.schemaVersion)
-    ? session.schemaVersion
-    : 0;
-  const shouldResetLegacyBrief = rawSchemaVersion < 2;
 
   return {
     schemaVersion,
@@ -146,14 +142,12 @@ function mergeSession(raw: unknown, projectRoot: string, version: string, timest
     lastGoRequestedAt: readString(session.lastGoRequestedAt),
     activeRunId: readString(session.activeRunId),
     lastRunId: readString(session.lastRunId),
-    brief: shouldResetLegacyBrief
-      ? { ...base.brief }
-      : {
-        topic: readString(brief.topic),
-        researchQuestion: readString(brief.researchQuestion),
-        researchDirection: readString(brief.researchDirection),
-        successCriterion: readString(brief.successCriterion)
-      },
+    brief: {
+      topic: readString(brief.topic),
+      researchQuestion: readString(brief.researchQuestion),
+      researchDirection: readString(brief.researchDirection),
+      successCriterion: readString(brief.successCriterion)
+    },
     intake: {
       backendLabel: readString(intake.backendLabel),
       readiness: intake.readiness === "ready" ? "ready" : "needs_clarification",
@@ -173,16 +167,6 @@ function mergeSession(raw: unknown, projectRoot: string, version: string, timest
 
       if (role === null || text === null || itemTimestamp === null) {
         return [];
-      }
-
-      if (shouldResetLegacyBrief) {
-        if (role !== "user") {
-          return [];
-        }
-
-        if (text.startsWith("/")) {
-          return [];
-        }
       }
 
       return [{

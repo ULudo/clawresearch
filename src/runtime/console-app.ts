@@ -37,22 +37,29 @@ import {
   type MemoryState
 } from "./memory-store.js";
 import {
+  applyCredentialsToEnvironment,
+  CredentialStore,
+  credentialStorePath,
+  setCredentialValue,
+  type CredentialStoreState
+} from "./credential-store.js";
+import {
   authStatesForSelectedProviders,
+  selectedProviderIdsForCategory,
+  selectedScholarlySourceProviders,
   formatSelectedLiteratureProviders,
   projectConfigPath,
   providerSelectionLines,
-  suggestedAuthRefForProvider,
-  setProviderAuthRef,
-  parseLiteratureProviderSelection,
   ProjectConfigStore,
+  type ConfigurableProviderCategory,
   type ProjectConfigState
 } from "./project-config-store.js";
 import {
   createProviderSelectionLines,
   formatSelectedProviderLabels,
   getSourceProviderDefinition,
+  providerCredentialFields,
   parseProviderSelection,
-  type SourceProviderCategory,
   type SourceProviderId
 } from "./provider-registry.js";
 import {
@@ -112,6 +119,35 @@ function writeLine(writer: OutputWriter, line = ""): void {
   writer.write(`${line}\n`);
 }
 
+function authStateDetail(
+  authState: ReturnType<typeof authStatesForSelectedProviders>[number]
+): string {
+  const parts: string[] = [];
+
+  if (authState.configuredFieldIds.length > 0) {
+    parts.push(`configured: ${authState.configuredFieldIds.join(", ")}`);
+  }
+
+  if (authState.missingRequiredFieldIds.length > 0) {
+    parts.push(`missing required: ${authState.missingRequiredFieldIds.join(", ")}`);
+  }
+
+  if (authState.missingOptionalFieldIds.length > 0) {
+    parts.push(`missing optional: ${authState.missingOptionalFieldIds.join(", ")}`);
+  }
+
+  return parts.join("; ");
+}
+
+function credentialPromptLabel(providerLabel: string, fieldLabel: string): string {
+  const normalizedProvider = providerLabel.trim().toLowerCase();
+  const normalizedField = fieldLabel.trim().toLowerCase();
+
+  return normalizedField.startsWith(normalizedProvider)
+    ? normalizedField
+    : `${normalizedProvider} ${normalizedField}`;
+}
+
 function createLoggedWriter(baseWriter: OutputWriter, transcript: ConsoleTranscript): OutputWriter {
   return {
     write(chunk: string): void {
@@ -167,6 +203,67 @@ function renderWelcome(writer: OutputWriter, session: SessionState): void {
   writeLine(writer);
 }
 
+const providerCategoryMetadata: Array<{
+  category: ConfigurableProviderCategory;
+  title: string;
+  summaryLabel: string;
+  promptLabel: string;
+  commandExample: string;
+}> = [
+  {
+    category: "scholarlyDiscovery",
+    title: "Scholarly discovery",
+    summaryLabel: "scholarly discovery",
+    promptLabel: "scholarly",
+    commandExample: "scholarly: openalex, crossref"
+  },
+  {
+    category: "publisherFullText",
+    title: "Publisher / full text",
+    summaryLabel: "publisher/full text",
+    promptLabel: "publishers",
+    commandExample: "publishers: arxiv, europe-pmc"
+  },
+  {
+    category: "oaRetrievalHelpers",
+    title: "OA / retrieval helpers",
+    summaryLabel: "OA/retrieval helpers",
+    promptLabel: "helpers",
+    commandExample: "helpers: core, unpaywall"
+  },
+  {
+    category: "generalWeb",
+    title: "General web",
+    summaryLabel: "general web",
+    promptLabel: "web",
+    commandExample: "web: wikipedia"
+  }
+];
+
+function categorySummaryLabel(category: ConfigurableProviderCategory): string {
+  return providerCategoryMetadata.find((entry) => entry.category === category)?.summaryLabel ?? category;
+}
+
+function categoryPromptLabel(category: ConfigurableProviderCategory): string {
+  return providerCategoryMetadata.find((entry) => entry.category === category)?.promptLabel ?? category;
+}
+
+function configuredSourceSummaryLines(projectConfig: ProjectConfigState): string[] {
+  return [
+    ...providerCategoryMetadata.map((entry) => `  ${entry.summaryLabel}: ${formatSelectedProviderLabels(selectedProviderIdsForCategory(projectConfig, entry.category))}`),
+    `  local context: ${projectConfig.sources.localContext.projectFilesEnabled ? "on" : "off"}`
+  ];
+}
+
+function writeConfiguredSourceSummary(
+  writer: OutputWriter,
+  projectConfig: ProjectConfigState
+): void {
+  for (const line of configuredSourceSummaryLines(projectConfig)) {
+    writeLine(writer, line);
+  }
+}
+
 function renderLiteratureSetup(
   writer: OutputWriter,
   session: SessionState,
@@ -177,10 +274,8 @@ function renderLiteratureSetup(
   }
 
   writeLine(writer, "Provider-aware literature sources are configured for this project:");
-  writeLine(writer, `  scholarly: ${formatSelectedProviderLabels(projectConfig.sources.scholarly.selectedProviderIds)}`);
-  writeLine(writer, `  background: ${formatSelectedProviderLabels(projectConfig.sources.background.selectedProviderIds)}`);
-  writeLine(writer, `  local project files: ${projectConfig.sources.local.projectFilesEnabled ? "on" : "off"}`);
-  writeLine(writer, "Use `scholarly: ...`, `background: ...`, `local: on|off`, or `sources: ...` to update them later.");
+  writeConfiguredSourceSummary(writer, projectConfig);
+  writeLine(writer, "Use `scholarly: ...`, `publishers: ...`, `helpers: ...`, `web: ...`, `local: on|off`, or `sources: ...` to update them later.");
   writeLine(writer);
 }
 
@@ -198,7 +293,7 @@ export function renderHelp(writer: OutputWriter, session: SessionState): void {
   writeLine(writer, "Input hints:");
   writeLine(writer, "  Talk naturally about the project as if briefing a researcher.");
   writeLine(writer, "  You can still force a specific field with `topic:`, `question:`, `direction:`, or `success:`.");
-  writeLine(writer, "  You can configure providers with `scholarly: openalex, arxiv`, `background: wikipedia`, `local: off`, or `sources: openalex, crossref`.");
+  writeLine(writer, "  You can configure providers with `scholarly: openalex, crossref`, `publishers: arxiv, europe-pmc`, `helpers: core, unpaywall`, `web: wikipedia`, `local: off`, or `sources: openalex, crossref`.");
   writeLine(writer, "  Detached runs stream progress in the console and save a debug transcript locally.");
   writeLine(writer, `  Local intake backend: ${session.intake.backendLabel ?? "not configured"}`);
 }
@@ -210,7 +305,8 @@ export function renderStatus(
   transcriptPath: string,
   memory: MemoryState,
   projectConfig: ProjectConfigState,
-  literature: LiteratureState
+  literature: LiteratureState,
+  credentials: CredentialStoreState
 ): void {
   writeLine(writer, "Current brief:");
   writeLine(writer, `  topic: ${session.brief.topic ?? "<missing>"}`);
@@ -286,18 +382,16 @@ export function renderStatus(
   writeLine(writer);
   writeLine(writer, "Literature:");
   writeLine(writer, `  config: ${relativeProjectPath(session.projectRoot, projectConfigPath(session.projectRoot))}`);
-  writeLine(writer, `  scholarly: ${formatSelectedProviderLabels(projectConfig.sources.scholarly.selectedProviderIds)}`);
-  writeLine(writer, `  background: ${formatSelectedProviderLabels(projectConfig.sources.background.selectedProviderIds)}`);
-  writeLine(writer, `  local project files: ${projectConfig.sources.local.projectFilesEnabled ? "on" : "off"}`);
+  writeConfiguredSourceSummary(writer, projectConfig);
   writeLine(writer, `  store: ${relativeProjectPath(session.projectRoot, literature.runtimeDirectory)}/${"literature/library.json"}`);
   writeLine(writer, `  canonical papers: ${literature.paperCount}`);
   writeLine(writer, `  theme boards: ${literature.themeCount}`);
   writeLine(writer, `  review notebooks: ${literature.notebookCount}`);
 
-  for (const authState of authStatesForSelectedProviders(projectConfig)) {
+  for (const authState of authStatesForSelectedProviders(projectConfig, credentials)) {
     const statusLabel = authState.status.replace(/_/g, " ");
-    const refLabel = authState.authRef === null ? "no env ref" : authState.authRef;
-    writeLine(writer, `  auth ${authState.definition.label}: ${statusLabel} (${refLabel})`);
+    const detail = authStateDetail(authState);
+    writeLine(writer, `  auth ${authState.definition.label}: ${statusLabel}${detail.length === 0 ? "" : ` (${detail})`}`);
   }
 
   const literatureContext = buildLiteratureContext(literature, session.brief);
@@ -323,12 +417,12 @@ function parseExplicitBriefUpdate(input: string): BriefUpdate | null {
 }
 
 type SourceSelectionUpdate = {
-  category: SourceProviderCategory | "local";
+  category: ConfigurableProviderCategory | "localContext";
   value: string;
 };
 
 function parseSourceSelectionUpdate(input: string): SourceSelectionUpdate | null {
-  const match = input.match(/^(sources?|scholarly|background|local|literature sources?)\s*:\s*(.+)$/i);
+  const match = input.match(/^(sources?|scholarly|scholarly discovery|publishers?|publisher(?:\/| )full(?:[- ]|)text|fulltext|oa|oa helpers?|helpers?|general web|web|background|local|literature sources?)\s*:\s*(.+)$/i);
   const rawCategory = match?.[1]?.trim().toLowerCase();
   const value = match?.[2]?.trim();
 
@@ -342,18 +436,41 @@ function parseSourceSelectionUpdate(input: string): SourceSelectionUpdate | null
     case "literature source":
     case "literature sources":
     case "scholarly":
+    case "scholarly discovery":
       return {
-        category: "scholarly",
+        category: "scholarlyDiscovery",
         value
       };
+    case "publisher":
+    case "publishers":
+    case "publisher fulltext":
+    case "publisher full text":
+    case "publisher/fulltext":
+    case "publisher/full text":
+    case "fulltext":
+      return {
+        category: "publisherFullText",
+        value
+      };
+    case "oa":
+    case "oa helper":
+    case "oa helpers":
+    case "helper":
+    case "helpers":
+      return {
+        category: "oaRetrievalHelpers",
+        value
+      };
+    case "general web":
+    case "web":
     case "background":
       return {
-        category: "background",
+        category: "generalWeb",
         value
       };
     case "local":
       return {
-        category: "local",
+        category: "localContext",
         value
       };
     default:
@@ -380,78 +497,94 @@ function parseLocalToggle(value: string): boolean | null {
   }
 }
 
+function invalidProviderSelectionMessage(category: ConfigurableProviderCategory): string {
+  switch (category) {
+    case "scholarlyDiscovery":
+      return "I couldn't parse that scholarly-discovery selection. Use names like `scholarly: openalex, crossref`, `sources: openalex, crossref`, `sources: none`, or `sources: all`.";
+    case "publisherFullText":
+      return "I couldn't parse that publisher/full-text selection. Use names like `publishers: arxiv, europe-pmc` or `publishers: none`.";
+    case "oaRetrievalHelpers":
+      return "I couldn't parse that OA/helper selection. Use names like `helpers: core, unpaywall` or `helpers: none`.";
+    case "generalWeb":
+      return "I couldn't parse that general-web selection. Use names like `web: wikipedia` or `web: none`.";
+  }
+}
+
+function updatedProviderSelectionMessage(
+  category: ConfigurableProviderCategory,
+  providerIds: SourceProviderId[]
+): string {
+  return `Updated ${categorySummaryLabel(category)} providers for this project: ${formatSelectedLiteratureProviders(providerIds)}.`;
+}
+
 export function renderSources(
   writer: OutputWriter,
   session: SessionState,
-  projectConfig: ProjectConfigState
+  projectConfig: ProjectConfigState,
+  credentials: CredentialStoreState
 ): void {
   writeLine(writer, "Providers for this project:");
-  writeLine(writer, "  Scholarly:");
-  for (const line of createProviderSelectionLines("scholarly", projectConfig.sources.scholarly.selectedProviderIds)) {
-    writeLine(writer, `    ${line}`);
+  for (const entry of providerCategoryMetadata) {
+    writeLine(writer, `  ${entry.title}:`);
+    for (const line of createProviderSelectionLines(entry.category, selectedProviderIdsForCategory(projectConfig, entry.category))) {
+      writeLine(writer, `    ${line}`);
+    }
   }
-  writeLine(writer, "  Background:");
-  for (const line of createProviderSelectionLines("background", projectConfig.sources.background.selectedProviderIds)) {
-    writeLine(writer, `    ${line}`);
-  }
-  writeLine(writer, `  Local project files: ${projectConfig.sources.local.projectFilesEnabled ? "on" : "off"}`);
+  writeLine(writer, `  Local context: ${projectConfig.sources.localContext.projectFilesEnabled ? "on" : "off"}`);
   writeLine(writer, "  Auth:");
-  const authStates = authStatesForSelectedProviders(projectConfig);
+  const authStates = authStatesForSelectedProviders(projectConfig, credentials);
   if (authStates.length === 0) {
     writeLine(writer, "    none needed");
   } else {
     for (const authState of authStates) {
       writeLine(
         writer,
-        `    ${authState.definition.label}: ${authState.status.replace(/_/g, " ")}${authState.authRef === null ? "" : ` (${authState.authRef})`}`
+        `    ${authState.definition.label}: ${authState.status.replace(/_/g, " ")}${authStateDetail(authState).length === 0 ? "" : ` (${authStateDetail(authState)})`}`
       );
     }
   }
   writeLine(writer, `Config: ${relativeProjectPath(session.projectRoot, projectConfigPath(session.projectRoot))}`);
+  writeLine(writer, `Credentials: ${relativeProjectPath(session.projectRoot, credentialStorePath(session.projectRoot))}`);
   writeLine(writer);
-  writeLine(writer, "Update with `scholarly: openalex, arxiv`, `background: wikipedia`, `local: off`, or `sources: openalex, crossref`.");
+  writeLine(writer, "Update with `scholarly: openalex, crossref`, `publishers: arxiv, europe-pmc`, `helpers: core, unpaywall`, `web: wikipedia`, `local: off`, or `sources: openalex, crossref`.");
 }
 
-async function promptProviderAuthRefs(
+async function promptProviderCredentials(
   io: ConsoleIo,
   transcript: ConsoleTranscript,
   writer: OutputWriter,
-  projectConfig: ProjectConfigState,
+  credentials: CredentialStoreState,
   providerIds: SourceProviderId[]
 ): Promise<boolean> {
   for (const providerId of providerIds) {
     const definition = getSourceProviderDefinition(providerId);
+    for (const field of providerCredentialFields(providerId)) {
+      const label = credentialPromptLabel(definition.label, field.label);
+      const promptText = `${label} [${field.required ? "required" : "optional"}; Enter leaves it ${field.required ? "unavailable" : "unset"}]: `;
+      const response = await io.prompt(promptText);
 
-    if (definition.authMode === "none") {
-      continue;
+      if (response === null) {
+        return false;
+      }
+
+      transcript.appendInput(promptText, response.trim().length === 0 ? "[blank]" : "[secret redacted]");
+      const trimmed = response.trim();
+
+      if (trimmed.length === 0) {
+        setCredentialValue(credentials, providerId, field.id, null);
+        writeLine(
+          writer,
+          field.required
+            ? `Leaving ${label} unset for now.`
+            : `Leaving ${label} empty for now.`
+        );
+        continue;
+      }
+
+      setCredentialValue(credentials, providerId, field.id, trimmed);
+      applyCredentialsToEnvironment(credentials);
+      writeLine(writer, `Saved ${label}.`);
     }
-
-    const suggestedAuthRef = suggestedAuthRefForProvider(projectConfig, providerId);
-    const promptText = definition.authMode === "optional_api_key"
-      ? `${definition.label} auth env var [optional, example ${suggestedAuthRef ?? "ENV_VAR_NAME"}; Enter leaves it unset]: `
-      : `${definition.label} auth env var [required, example ${suggestedAuthRef ?? "ENV_VAR_NAME"}; Enter leaves it unavailable]: `;
-    const response = await io.prompt(promptText);
-
-    if (response === null) {
-      return false;
-    }
-
-    transcript.appendInput(promptText, response);
-    const trimmed = response.trim();
-
-    if (trimmed.length === 0) {
-      setProviderAuthRef(projectConfig, providerId, null);
-      writeLine(
-        writer,
-        definition.authMode === "optional_api_key"
-          ? `Leaving ${definition.label} without an auth env ref for now.`
-          : `Leaving ${definition.label} unavailable until an auth env ref is configured.`
-      );
-      continue;
-    }
-
-    setProviderAuthRef(projectConfig, providerId, trimmed);
-    writeLine(writer, `Saved ${definition.label} auth ref: ${trimmed}`);
   }
 
   return true;
@@ -463,6 +596,7 @@ async function promptSetupInput(
   writer: OutputWriter,
   session: SessionState,
   projectConfig: ProjectConfigState,
+  credentials: CredentialStoreState,
   promptText: string
 ): Promise<string | null> {
   while (true) {
@@ -481,7 +615,7 @@ async function promptSetupInput(
 
     switch (trimmed) {
       case "/sources":
-        renderSources(writer, session, projectConfig);
+        renderSources(writer, session, projectConfig, credentials);
         continue;
       case "/help":
         writeLine(writer, "Source setup commands:");
@@ -506,7 +640,9 @@ async function runInitialSourceSetup(
   writer: OutputWriter,
   session: SessionState,
   projectConfig: ProjectConfigState,
-  projectConfigStore: ProjectConfigStore
+  projectConfigStore: ProjectConfigStore,
+  credentialStore: CredentialStore,
+  credentials: CredentialStoreState
 ): Promise<boolean> {
   if (projectConfig.sources.explicitlyConfigured) {
     return true;
@@ -514,53 +650,33 @@ async function runInitialSourceSetup(
 
   writeLine(writer, "Source setup");
   writeLine(writer, "------------");
-  writeLine(writer, "Scholarly providers:");
-  for (const line of providerSelectionLines("scholarly")) {
-    writeLine(writer, `  ${line}`);
-  }
-  writeLine(writer, `Default scholarly selection: ${formatSelectedProviderLabels(projectConfig.sources.scholarly.selectedProviderIds)}`);
-  const scholarlyPrompt = "scholarly> ";
-  const scholarlyInput = await promptSetupInput(io, transcript, writer, session, projectConfig, scholarlyPrompt);
+  for (const entry of providerCategoryMetadata) {
+    writeLine(writer, `${entry.title} providers:`);
+    for (const line of providerSelectionLines(entry.category)) {
+      writeLine(writer, `  ${line}`);
+    }
+    writeLine(writer, `Default ${entry.summaryLabel} selection: ${formatSelectedProviderLabels(selectedProviderIdsForCategory(projectConfig, entry.category))}`);
+    const prompt = `${categoryPromptLabel(entry.category)}> `;
+    const input = await promptSetupInput(io, transcript, writer, session, projectConfig, credentials, prompt);
 
-  if (scholarlyInput === null) {
-    return false;
-  }
+    if (input === null) {
+      return false;
+    }
 
-  const scholarlySelection = scholarlyInput.trim().length === 0
-    ? projectConfig.sources.scholarly.selectedProviderIds
-    : parseProviderSelection(scholarlyInput, "scholarly");
+    const selection = input.trim().length === 0
+      ? selectedProviderIdsForCategory(projectConfig, entry.category)
+      : parseProviderSelection(input, entry.category);
 
-  if (scholarlySelection === null) {
-    writeLine(writer, "Could not parse that scholarly provider selection. Keeping defaults.");
-  } else {
-    projectConfig.sources.scholarly.selectedProviderIds = scholarlySelection;
-  }
-
-  writeLine(writer, "Background providers:");
-  for (const line of providerSelectionLines("background")) {
-    writeLine(writer, `  ${line}`);
-  }
-  writeLine(writer, `Default background selection: ${formatSelectedProviderLabels(projectConfig.sources.background.selectedProviderIds)}`);
-  const backgroundPrompt = "background> ";
-  const backgroundInput = await promptSetupInput(io, transcript, writer, session, projectConfig, backgroundPrompt);
-
-  if (backgroundInput === null) {
-    return false;
-  }
-
-  const backgroundSelection = backgroundInput.trim().length === 0
-    ? projectConfig.sources.background.selectedProviderIds
-    : parseProviderSelection(backgroundInput, "background");
-
-  if (backgroundSelection === null) {
-    writeLine(writer, "Could not parse that background selection. Keeping defaults.");
-  } else {
-    projectConfig.sources.background.selectedProviderIds = backgroundSelection;
+    if (selection === null) {
+      writeLine(writer, `Could not parse that ${entry.summaryLabel} provider selection. Keeping defaults.`);
+    } else {
+      projectConfig.sources[entry.category].selectedProviderIds = selection;
+    }
   }
 
   const localPrompt = "local> ";
-  writeLine(writer, `Local project files are currently ${projectConfig.sources.local.projectFilesEnabled ? "on" : "off"}. Type \`on\` or \`off\`, or press Enter to keep the default.`);
-  const localInput = await promptSetupInput(io, transcript, writer, session, projectConfig, localPrompt);
+  writeLine(writer, `Local project files are currently ${projectConfig.sources.localContext.projectFilesEnabled ? "on" : "off"}. Type \`on\` or \`off\`, or press Enter to keep the default.`);
+  const localInput = await promptSetupInput(io, transcript, writer, session, projectConfig, credentials, localPrompt);
 
   if (localInput === null) {
     return false;
@@ -570,18 +686,18 @@ async function runInitialSourceSetup(
     const localSetting = parseLocalToggle(localInput);
 
     if (localSetting !== null) {
-      projectConfig.sources.local.projectFilesEnabled = localSetting;
+      projectConfig.sources.localContext.projectFilesEnabled = localSetting;
     } else {
       writeLine(writer, "Could not parse that local-files setting. Keeping the default.");
     }
   }
 
-  const authPrompted = await promptProviderAuthRefs(
+  const authPrompted = await promptProviderCredentials(
     io,
     transcript,
     writer,
-    projectConfig,
-    projectConfig.sources.scholarly.selectedProviderIds
+    credentials,
+    selectedScholarlySourceProviders(projectConfig)
   );
 
   if (!authPrompted) {
@@ -590,6 +706,7 @@ async function runInitialSourceSetup(
 
   projectConfig.sources.explicitlyConfigured = true;
   await projectConfigStore.save(projectConfig);
+  await credentialStore.save(credentials);
   writeLine(writer, `Saved source configuration to ${relativeProjectPath(projectConfig.projectRoot, projectConfigPath(projectConfig.projectRoot))}.`);
   writeLine(writer);
   return true;
@@ -1784,20 +1901,20 @@ export async function handleUserInput(
   store: SessionStore,
   projectConfig: ProjectConfigState,
   projectConfigStore: ProjectConfigStore,
+  credentials: CredentialStoreState,
+  credentialStore: CredentialStore,
   backend: IntakeBackend,
   now: () => string
 ): Promise<void> {
   const sourceSelection = parseSourceSelectionUpdate(input);
 
   if (sourceSelection !== null) {
-    const providerIds = sourceSelection.category === "local"
+    const providerIds = sourceSelection.category === "localContext"
       ? null
-      : (sourceSelection.category === "scholarly"
-        ? parseLiteratureProviderSelection(sourceSelection.value)
-        : parseProviderSelection(sourceSelection.value, "background"));
+      : parseProviderSelection(sourceSelection.value, sourceSelection.category);
     saveUserMessage(session, input, now(), "command");
 
-    if (sourceSelection.category === "local") {
+    if (sourceSelection.category === "localContext") {
       const localSetting = parseLocalToggle(sourceSelection.value);
 
       if (localSetting === null) {
@@ -1808,11 +1925,11 @@ export async function handleUserInput(
         return;
       }
 
-      projectConfig.sources.local.projectFilesEnabled = localSetting;
+      projectConfig.sources.localContext.projectFilesEnabled = localSetting;
       projectConfig.sources.explicitlyConfigured = true;
       await projectConfigStore.save(projectConfig);
 
-      const response = `Updated local project files for this project: ${localSetting ? "on" : "off"}.`;
+      const response = `Updated local context for this project: ${localSetting ? "on" : "off"}.`;
       renderTaggedBlock(writer, "system", response);
       saveAssistantMessage(session, response, now(), "command");
       await store.save(session);
@@ -1820,43 +1937,39 @@ export async function handleUserInput(
     }
 
     if (providerIds === null) {
-      const response = sourceSelection.category === "scholarly"
-        ? "I couldn't parse that scholarly-provider selection. Use names like `scholarly: openalex, arxiv`, `sources: openalex, crossref`, `sources: none`, or `sources: all`."
-        : "I couldn't parse that background-provider selection. Use names like `background: wikipedia` or `background: none`.";
+      const response = invalidProviderSelectionMessage(sourceSelection.category);
       renderTaggedBlock(writer, "system", response);
       saveAssistantMessage(session, response, now(), "command");
       await store.save(session);
       return;
     }
 
-    if (sourceSelection.category === "scholarly") {
-      projectConfig.sources.scholarly.selectedProviderIds = providerIds;
-      const authPrompted = await promptProviderAuthRefs(
+    projectConfig.sources[sourceSelection.category].selectedProviderIds = providerIds;
+
+    if (sourceSelection.category !== "generalWeb") {
+      const authPrompted = await promptProviderCredentials(
         io,
         transcript,
         writer,
-        projectConfig,
+        credentials,
         providerIds
       );
 
       if (!authPrompted) {
-        const response = "Input closed while configuring provider auth refs. Session saved.";
+        const response = "Input closed while configuring provider credentials. Session saved.";
         renderTaggedBlock(writer, "system", response);
         saveAssistantMessage(session, response, now(), "command");
         await store.save(session);
         return;
       }
-    } else {
-      projectConfig.sources.background.selectedProviderIds = providerIds;
     }
 
     projectConfig.sources.explicitlyConfigured = true;
     await projectConfigStore.save(projectConfig);
+    await credentialStore.save(credentials);
 
     const responseLines = [
-      sourceSelection.category === "scholarly"
-        ? `Updated scholarly providers for this project: ${formatSelectedLiteratureProviders(providerIds)}.`
-        : `Updated background providers for this project: ${formatSelectedLiteratureProviders(providerIds)}.`,
+      updatedProviderSelectionMessage(sourceSelection.category, providerIds),
       `Config saved to ${relativeProjectPath(session.projectRoot, projectConfigPath(session.projectRoot))}.`
     ];
 
@@ -1888,6 +2001,8 @@ async function handleCommand(
   literatureStore: LiteratureStore,
   projectConfig: ProjectConfigState,
   projectConfigStore: ProjectConfigStore,
+  credentials: CredentialStoreState,
+  credentialStore: CredentialStore,
   backend: IntakeBackend,
   runController: RunController,
   now: () => string,
@@ -1909,17 +2024,23 @@ async function handleCommand(
       const run = await reconcileRelevantRun(session, store, runStore, runController, now);
       const memory = await memoryStore.load();
       const currentProjectConfig = await projectConfigStore.load();
+      const currentCredentials = await credentialStore.load();
+      applyCredentialsToEnvironment(currentCredentials);
       projectConfig.sources = currentProjectConfig.sources;
+      credentials.providers = currentCredentials.providers;
       const literature = await literatureStore.load();
-      renderStatus(writer, session, run, transcriptPath, memory, currentProjectConfig, literature);
+      renderStatus(writer, session, run, transcriptPath, memory, currentProjectConfig, literature, currentCredentials);
       saveAssistantMessage(session, "Displayed the current research brief.", now(), "command");
       await store.save(session);
       return "continue";
     }
     case "/sources": {
       const currentProjectConfig = await projectConfigStore.load();
+      const currentCredentials = await credentialStore.load();
+      applyCredentialsToEnvironment(currentCredentials);
       projectConfig.sources = currentProjectConfig.sources;
-      renderSources(writer, session, currentProjectConfig);
+      credentials.providers = currentCredentials.providers;
+      renderSources(writer, session, currentProjectConfig, currentCredentials);
       saveAssistantMessage(session, "Displayed the configured literature providers.", now(), "command");
       await store.save(session);
       return "continue";
@@ -1964,7 +2085,10 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
   const memoryStore = new MemoryStore(options.projectRoot, now);
   const literatureStore = new LiteratureStore(options.projectRoot, now);
   const projectConfigStore = new ProjectConfigStore(options.projectRoot, now);
+  const credentialStore = new CredentialStore(options.projectRoot, now);
   const projectConfig = await projectConfigStore.load();
+  const credentials = await credentialStore.load();
+  applyCredentialsToEnvironment(credentials);
   const runController = options.runController ?? createDefaultRunController();
   const transcript = new ConsoleTranscript(options.projectRoot);
   const writer = createLoggedWriter(io.writer, transcript);
@@ -1983,7 +2107,9 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
     writer,
     session,
     projectConfig,
-    projectConfigStore
+    projectConfigStore,
+    credentialStore,
+    credentials
   );
 
   if (!setupCompleted) {
@@ -2035,6 +2161,8 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
         literatureStore,
         projectConfig,
         projectConfigStore,
+        credentials,
+        credentialStore,
         backend,
         runController,
         now,
@@ -2050,7 +2178,7 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
       continue;
     }
 
-    await handleUserInput(input, io, transcript, writer, session, store, projectConfig, projectConfigStore, backend, now);
+    await handleUserInput(input, io, transcript, writer, session, store, projectConfig, projectConfigStore, credentials, credentialStore, backend, now);
   }
 
   io.close?.();

@@ -102,7 +102,7 @@ test("source gathering honors grouped provider selection when only background re
       },
       memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: [],
-      backgroundProviderIds: ["wikipedia"],
+      generalWebProviderIds: ["wikipedia"],
       projectFilesEnabled: false
     });
 
@@ -111,7 +111,7 @@ test("source gathering honors grouped provider selection when only background re
     assert.ok(sourceKinds.includes("background_article"));
     assert.equal(gathered.canonicalPapers.length, 0);
     assert.match(gathered.notes.join("\n"), /no scholarly discovery providers/i);
-    assert.match(gathered.notes.join("\n"), /Collected 1 background sources from wikipedia/i);
+    assert.match(gathered.notes.join("\n"), /Collected 1 general-web sources from wikipedia/i);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });

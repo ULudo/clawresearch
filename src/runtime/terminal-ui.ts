@@ -25,14 +25,19 @@ import {
   MemoryStore
 } from "./memory-store.js";
 import {
+  applyCredentialsToEnvironment,
+  CredentialStore,
+  setCredentialValue,
+  type CredentialStoreState
+} from "./credential-store.js";
+import {
   authStatesForSelectedProviders,
   ProjectConfigStore,
-  suggestedAuthRefForProvider,
-  setProviderAuthRef,
   type ProjectConfigState
 } from "./project-config-store.js";
 import {
   getSourceProviderDefinition,
+  providerCredentialFields,
   type SourceProviderId
 } from "./provider-registry.js";
 import {
@@ -89,8 +94,10 @@ type SourceOverlayState = {
 };
 
 type AuthOverlayState = {
-  draft: ProjectConfigState;
-  providerIds: SourceProviderId[];
+  fields: Array<{
+    providerId: SourceProviderId;
+    fieldId: string;
+  }>;
   index: number;
   input: string;
   initialSetup: boolean;
@@ -209,7 +216,7 @@ function helpLines(backendLabel: string | null): string[] {
 }
 
 function sourceCommandLike(input: string): boolean {
-  return /^(?:sources?|scholarly|background|local|literature sources?)\s*:/i.test(input);
+  return /^(?:sources?|scholarly|scholarly discovery|publishers?|publisher(?:\/| )full(?:[- ]|)text|fulltext|oa|oa helpers?|helpers?|general web|web|background|local|literature sources?)\s*:/i.test(input);
 }
 
 function footerHint(pendingLabel: string | null): string {
@@ -242,12 +249,14 @@ export class ClawResearchTerminalUi {
   private readonly memoryStore: MemoryStore;
   private readonly literatureStore: LiteratureStore;
   private readonly projectConfigStore: ProjectConfigStore;
+  private readonly credentialStore: CredentialStore;
   private readonly runController: RunController;
   private readonly backend: IntakeBackend;
   private readonly transcript: ConsoleTranscript;
 
   private session!: SessionState;
   private projectConfig!: ProjectConfigState;
+  private credentials!: CredentialStoreState;
   private currentRun: RunRecord | null = null;
   private logEntries: ScreenLogEntry[] = [];
   private composer = "";
@@ -273,6 +282,7 @@ export class ClawResearchTerminalUi {
     this.memoryStore = new MemoryStore(options.projectRoot, this.now);
     this.literatureStore = new LiteratureStore(options.projectRoot, this.now);
     this.projectConfigStore = new ProjectConfigStore(options.projectRoot, this.now);
+    this.credentialStore = new CredentialStore(options.projectRoot, this.now);
     this.runController = options.runController ?? createDefaultRunController();
     this.backend = options.intakeBackend ?? createDefaultIntakeBackend();
     this.transcript = new ConsoleTranscript(options.projectRoot);
@@ -281,6 +291,9 @@ export class ClawResearchTerminalUi {
   async run(): Promise<number> {
     this.session = await this.store.load();
     this.projectConfig = await this.projectConfigStore.load();
+    this.credentials = await this.credentialStore.load();
+    applyCredentialsToEnvironment(this.credentials);
+
     this.session.intake.backendLabel = this.backend.label;
     await this.store.save(this.session);
     this.currentRun = await reconcileRelevantRun(
@@ -420,6 +433,33 @@ export class ClawResearchTerminalUi {
     };
   }
 
+  private authFieldsForSelection(
+    previousConfig: ProjectConfigState,
+    nextConfig: ProjectConfigState,
+    initialSetup: boolean
+  ): Array<{ providerId: SourceProviderId; fieldId: string }> {
+    const previousSelected = initialSetup
+      ? new Set<SourceProviderId>()
+      : new Set(
+        authStatesForSelectedProviders(previousConfig, this.credentials)
+          .map((state) => state.providerId)
+      );
+
+    return authStatesForSelectedProviders(nextConfig, this.credentials).flatMap((state) => {
+      const newlySelected = !previousSelected.has(state.providerId);
+      const shouldPromptAll = initialSetup || newlySelected;
+      const fields = shouldPromptAll
+        ? providerCredentialFields(state.providerId)
+        : providerCredentialFields(state.providerId)
+          .filter((field) => state.missingRequiredFieldIds.includes(field.id));
+
+      return fields.map((field) => ({
+        providerId: state.providerId,
+        fieldId: field.id
+      }));
+    });
+  }
+
   private render(): void {
     if (this.closed) {
       return;
@@ -436,9 +476,11 @@ export class ClawResearchTerminalUi {
         height
       );
     } else if (this.authOverlay !== null) {
-      const providerId = this.authOverlay.providerIds[this.authOverlay.index]!;
-      const authRef = suggestedAuthRefForProvider(this.authOverlay.draft, providerId);
+      const currentField = this.authOverlay.fields[this.authOverlay.index]!;
+      const providerId = currentField.providerId;
       const definition = getSourceProviderDefinition(providerId);
+      const field = providerCredentialFields(providerId)
+        .find((candidate) => candidate.id === currentField.fieldId);
       content = renderAuthPromptFrame({
         width,
         height,
@@ -446,12 +488,12 @@ export class ClawResearchTerminalUi {
         subtitle: `project: ${this.options.projectRoot}  backend: ${this.session.intake.backendLabel ?? "unknown"}  auth setup`,
         providerLabel: definition.label,
         providerDescription: definition.description,
-        guidanceLines: authPromptGuidance(providerId),
-        inputLabel: authPromptLabel(providerId, authRef),
+        guidanceLines: authPromptGuidance(providerId, currentField.fieldId),
+        inputLabel: authPromptLabel(providerId, currentField.fieldId),
         inputValue: `${this.authOverlay.input}_`,
-        footerHint: definition.authMode === "optional_api_key"
-          ? "Enter saves this provider, blank input leaves it unset"
-          : "Enter saves this provider, blank input keeps it unavailable"
+        footerHint: field?.required === true
+          ? "Enter saves this value, blank keeps the provider unavailable"
+          : "Enter saves this value, blank leaves it unset"
       });
     } else {
       content = renderChatFrame({
@@ -580,18 +622,17 @@ export class ClawResearchTerminalUi {
   }
 
   private async commitSourceSelection(draft: ProjectConfigState, initialSetup: boolean): Promise<void> {
+    const previousConfig = this.projectConfig;
     const committed = cloneConfig(draft);
     committed.sources.explicitlyConfigured = true;
     this.projectConfig = await this.projectConfigStore.save(committed);
     this.sourceOverlay = null;
 
-    const authProviderIds = authStatesForSelectedProviders(this.projectConfig)
-      .map((state) => state.providerId);
+    const authFields = this.authFieldsForSelection(previousConfig, this.projectConfig, initialSetup);
 
-    if (authProviderIds.length > 0) {
+    if (authFields.length > 0) {
       this.authOverlay = {
-        draft: cloneConfig(this.projectConfig),
-        providerIds: authProviderIds,
+        fields: authFields,
         index: 0,
         input: "",
         initialSetup
@@ -631,15 +672,16 @@ export class ClawResearchTerminalUi {
     }
 
     if (isSubmitKey(key)) {
-      const providerId = overlay.providerIds[overlay.index]!;
-      const definition = getSourceProviderDefinition(providerId);
+      const currentField = overlay.fields[overlay.index]!;
       const trimmed = overlay.input.trim();
 
-      if (trimmed.length === 0) {
-        setProviderAuthRef(overlay.draft, providerId, null);
-      } else {
-        setProviderAuthRef(overlay.draft, providerId, trimmed);
-      }
+      setCredentialValue(
+        this.credentials,
+        currentField.providerId,
+        currentField.fieldId,
+        trimmed.length === 0 ? null : trimmed
+      );
+      applyCredentialsToEnvironment(this.credentials);
 
       await this.advanceAuthOverlay();
       return;
@@ -658,24 +700,19 @@ export class ClawResearchTerminalUi {
       return;
     }
 
-    if (overlay.index + 1 < overlay.providerIds.length) {
+    if (overlay.index + 1 < overlay.fields.length) {
       overlay.index += 1;
       overlay.input = "";
       this.render();
       return;
     }
 
-    this.projectConfig = await this.projectConfigStore.save({
-      ...overlay.draft,
-      sources: {
-        ...overlay.draft.sources,
-        explicitlyConfigured: true
-      }
-    });
+    this.credentials = await this.credentialStore.save(this.credentials);
+    applyCredentialsToEnvironment(this.credentials);
     this.authOverlay = null;
     this.appendActivityEntries([{
       tag: "system",
-      text: "Saved provider auth env-var references for this project."
+      text: "Saved provider credentials for this project."
     }]);
 
     if (overlay.initialSetup) {
@@ -843,11 +880,15 @@ export class ClawResearchTerminalUi {
       this.store,
       this.projectConfig,
       this.projectConfigStore,
+      this.credentials,
+      this.credentialStore,
       this.backend,
       this.now
     );
 
     this.projectConfig = await this.projectConfigStore.load();
+    this.credentials = await this.credentialStore.load();
+    applyCredentialsToEnvironment(this.credentials);
     this.syncConversationDiff(previousLength);
     this.pendingLabel = null;
     this.render();
@@ -857,7 +898,10 @@ export class ClawResearchTerminalUi {
     const memory = await this.memoryStore.load();
     const literature = await this.literatureStore.load();
     const currentProjectConfig = await this.projectConfigStore.load();
+    const currentCredentials = await this.credentialStore.load();
+    applyCredentialsToEnvironment(currentCredentials);
     this.projectConfig = currentProjectConfig;
+    this.credentials = currentCredentials;
     this.currentRun = await reconcileRelevantRun(
       this.session,
       this.store,
@@ -874,7 +918,8 @@ export class ClawResearchTerminalUi {
       this.transcript.filePath,
       memory,
       currentProjectConfig,
-      literature
+      literature,
+      currentCredentials
     );
 
     return {

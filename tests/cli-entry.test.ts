@@ -36,6 +36,8 @@ function createScriptedIo(lines: string[]): ConsoleIo & { output: string } {
     "",
     "",
     "",
+    "",
+    "",
     ...lines
   ];
 

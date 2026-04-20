@@ -10,15 +10,16 @@ export type SourceProviderId =
   | "unpaywall"
   | "wikipedia"
   | "ieee_xplore"
-  | "scopus"
-  | "sciencedirect"
+  | "elsevier"
   | "springer_nature"
   | "acm_digital_library";
 
 export type SourceProviderCategory =
-  | "scholarly"
-  | "background"
-  | "local";
+  | "scholarlyDiscovery"
+  | "publisherFullText"
+  | "oaRetrievalHelpers"
+  | "generalWeb"
+  | "localContext";
 
 export type SourceProviderRole =
   | "discovery"
@@ -28,7 +29,9 @@ export type SourceProviderRole =
 export type SourceProviderDomain =
   | "general"
   | "cs_ai"
-  | "biomedical";
+  | "biomedical"
+  | "mathematics"
+  | "social_science";
 
 export type SourceProviderAuthMode =
   | "none"
@@ -42,6 +45,18 @@ export type ProviderAuthStatus =
   | "missing_optional"
   | "missing_required";
 
+export type ProviderCredentialFieldKind =
+  | "api_key"
+  | "institution_token"
+  | "email";
+
+export type SourceProviderCredentialField = {
+  id: string;
+  label: string;
+  kind: ProviderCredentialFieldKind;
+  required: boolean;
+};
+
 export type SourceProviderDefinition = {
   id: SourceProviderId;
   label: string;
@@ -53,6 +68,7 @@ export type SourceProviderDefinition = {
   implemented: boolean;
   defaultEnabled: boolean;
   defaultEnvVarName: string | null;
+  credentialFields: SourceProviderCredentialField[];
 };
 
 const providerDefinitions: SourceProviderDefinition[] = [
@@ -60,181 +76,245 @@ const providerDefinitions: SourceProviderDefinition[] = [
     id: "project_files",
     label: "project-files",
     description: "Read markdown and text notes from the current project directory.",
-    category: "local",
+    category: "localContext",
     roles: ["discovery", "acquisition"],
-    domains: ["general", "cs_ai", "biomedical"],
+    domains: ["general", "cs_ai", "biomedical", "mathematics", "social_science"],
     authMode: "none",
     implemented: true,
     defaultEnabled: true,
-    defaultEnvVarName: null
+    defaultEnvVarName: null,
+    credentialFields: []
   },
   {
     id: "openalex",
     label: "openalex",
     description: "Broad scholarly discovery with metadata, identifiers, and OA hints.",
-    category: "scholarly",
+    category: "scholarlyDiscovery",
     roles: ["discovery", "resolver"],
-    domains: ["general", "cs_ai", "biomedical"],
+    domains: ["general", "cs_ai", "biomedical", "mathematics", "social_science"],
     authMode: "optional_api_key",
     implemented: true,
     defaultEnabled: true,
-    defaultEnvVarName: "OPENALEX_API_KEY"
+    defaultEnvVarName: "OPENALEX_API_KEY",
+    credentialFields: [
+      {
+        id: "api_key",
+        label: "API key",
+        kind: "api_key",
+        required: false
+      }
+    ]
   },
   {
     id: "crossref",
     label: "crossref",
     description: "DOI normalization and metadata resolution with light discovery fallback.",
-    category: "scholarly",
+    category: "scholarlyDiscovery",
     roles: ["discovery", "resolver"],
-    domains: ["general", "cs_ai", "biomedical"],
+    domains: ["general", "cs_ai", "biomedical", "mathematics", "social_science"],
     authMode: "none",
     implemented: true,
     defaultEnabled: true,
-    defaultEnvVarName: null
+    defaultEnvVarName: null,
+    credentialFields: []
   },
   {
     id: "arxiv",
     label: "arxiv",
     description: "Preprint discovery and direct access for arXiv-hosted papers.",
-    category: "scholarly",
+    category: "publisherFullText",
     roles: ["discovery", "acquisition"],
-    domains: ["general", "cs_ai"],
+    domains: ["general", "cs_ai", "mathematics"],
     authMode: "none",
     implemented: true,
     defaultEnabled: true,
-    defaultEnvVarName: null
+    defaultEnvVarName: null,
+    credentialFields: []
   },
   {
     id: "dblp",
     label: "dblp",
     description: "Computer-science bibliographic discovery and venue grounding.",
-    category: "scholarly",
+    category: "scholarlyDiscovery",
     roles: ["discovery"],
     domains: ["cs_ai"],
     authMode: "none",
     implemented: true,
     defaultEnabled: true,
-    defaultEnvVarName: null
+    defaultEnvVarName: null,
+    credentialFields: []
   },
   {
     id: "pubmed",
     label: "pubmed",
     description: "Biomedical discovery through NCBI PubMed and E-utilities.",
-    category: "scholarly",
+    category: "scholarlyDiscovery",
     roles: ["discovery"],
     domains: ["biomedical"],
     authMode: "optional_api_key",
     implemented: true,
     defaultEnabled: true,
-    defaultEnvVarName: "NCBI_API_KEY"
+    defaultEnvVarName: "NCBI_API_KEY",
+    credentialFields: [
+      {
+        id: "api_key",
+        label: "NCBI API key",
+        kind: "api_key",
+        required: false
+      }
+    ]
   },
   {
     id: "europe_pmc",
     label: "europe-pmc",
     description: "Biomedical discovery with abstract and OA/full-text resolution.",
-    category: "scholarly",
+    category: "publisherFullText",
     roles: ["discovery", "resolver", "acquisition"],
     domains: ["biomedical"],
     authMode: "none",
     implemented: true,
     defaultEnabled: true,
-    defaultEnvVarName: null
+    defaultEnvVarName: null,
+    credentialFields: []
   },
   {
     id: "core",
     label: "core",
     description: "OA full-text resolution and acquisition from repository aggregations.",
-    category: "scholarly",
+    category: "oaRetrievalHelpers",
     roles: ["resolver", "acquisition"],
-    domains: ["general", "cs_ai", "biomedical"],
+    domains: ["general", "cs_ai", "biomedical", "mathematics", "social_science"],
     authMode: "optional_api_key",
     implemented: true,
     defaultEnabled: true,
-    defaultEnvVarName: "CORE_API_KEY"
+    defaultEnvVarName: "CORE_API_KEY",
+    credentialFields: [
+      {
+        id: "api_key",
+        label: "CORE API key",
+        kind: "api_key",
+        required: false
+      }
+    ]
   },
   {
     id: "unpaywall",
     label: "unpaywall",
     description: "DOI-based legal OA resolution and best open copy lookup.",
-    category: "scholarly",
+    category: "oaRetrievalHelpers",
     roles: ["resolver"],
-    domains: ["general", "cs_ai", "biomedical"],
+    domains: ["general", "cs_ai", "biomedical", "mathematics", "social_science"],
     authMode: "required_api_key",
     implemented: true,
     defaultEnabled: true,
-    defaultEnvVarName: "UNPAYWALL_EMAIL"
+    defaultEnvVarName: "UNPAYWALL_EMAIL",
+    credentialFields: [
+      {
+        id: "email",
+        label: "Unpaywall email",
+        kind: "email",
+        required: true
+      }
+    ]
   },
   {
     id: "wikipedia",
     label: "wikipedia",
     description: "Optional non-scholarly background fallback when scholarly retrieval is sparse.",
-    category: "background",
+    category: "generalWeb",
     roles: ["discovery", "acquisition"],
-    domains: ["general", "cs_ai", "biomedical"],
+    domains: ["general", "cs_ai", "biomedical", "mathematics", "social_science"],
     authMode: "none",
     implemented: true,
     defaultEnabled: false,
-    defaultEnvVarName: null
+    defaultEnvVarName: null,
+    credentialFields: []
   },
   {
     id: "ieee_xplore",
     label: "ieee-xplore",
-    description: "Licensed engineering and applied-science metadata/full-text APIs.",
-    category: "scholarly",
+    description: "IEEE engineering metadata search with open-access and licensed full-text hints.",
+    category: "publisherFullText",
     roles: ["discovery", "acquisition"],
     domains: ["cs_ai", "general"],
     authMode: "required_api_key",
-    implemented: false,
+    implemented: true,
     defaultEnabled: false,
-    defaultEnvVarName: "IEEE_XPLORE_API_KEY"
+    defaultEnvVarName: "IEEE_XPLORE_API_KEY",
+    credentialFields: [
+      {
+        id: "api_key",
+        label: "IEEE Xplore API key",
+        kind: "api_key",
+        required: true
+      }
+    ]
   },
   {
-    id: "scopus",
-    label: "scopus",
-    description: "Broad scholarly index through Elsevier APIs and institutional access.",
-    category: "scholarly",
-    roles: ["discovery", "resolver"],
-    domains: ["general", "cs_ai", "biomedical"],
+    id: "elsevier",
+    label: "elsevier",
+    description: "Elsevier discovery via Scopus plus ScienceDirect full-text routing when entitlement is available.",
+    category: "scholarlyDiscovery",
+    roles: ["discovery", "resolver", "acquisition"],
+    domains: ["general", "cs_ai", "biomedical", "mathematics", "social_science"],
     authMode: "required_api_key",
-    implemented: false,
+    implemented: true,
     defaultEnabled: false,
-    defaultEnvVarName: "SCOPUS_API_KEY"
-  },
-  {
-    id: "sciencedirect",
-    label: "sciencedirect",
-    description: "Licensed full-text retrieval through Elsevier publisher APIs.",
-    category: "scholarly",
-    roles: ["acquisition"],
-    domains: ["general", "cs_ai", "biomedical"],
-    authMode: "institution_token",
-    implemented: false,
-    defaultEnabled: false,
-    defaultEnvVarName: "SCIENCEDIRECT_INSTITUTION_TOKEN"
+    defaultEnvVarName: "ELSEVIER_API_KEY",
+    credentialFields: [
+      {
+        id: "api_key",
+        label: "Elsevier API key",
+        kind: "api_key",
+        required: true
+      },
+      {
+        id: "institution_token",
+        label: "Elsevier institution token",
+        kind: "institution_token",
+        required: false
+      }
+    ]
   },
   {
     id: "springer_nature",
     label: "springer-nature",
-    description: "Publisher metadata and TDM/full-text APIs for Springer Nature content.",
-    category: "scholarly",
-    roles: ["acquisition", "resolver"],
-    domains: ["general", "cs_ai", "biomedical"],
+    description: "Springer Nature metadata, OA lookup, and publisher-route resolution.",
+    category: "publisherFullText",
+    roles: ["discovery", "resolver", "acquisition"],
+    domains: ["general", "cs_ai", "biomedical", "mathematics", "social_science"],
     authMode: "required_api_key",
-    implemented: false,
+    implemented: true,
     defaultEnabled: false,
-    defaultEnvVarName: "SPRINGER_NATURE_API_KEY"
+    defaultEnvVarName: "SPRINGER_NATURE_API_KEY",
+    credentialFields: [
+      {
+        id: "api_key",
+        label: "Springer Nature API key",
+        kind: "api_key",
+        required: true
+      }
+    ]
   },
   {
     id: "acm_digital_library",
     label: "acm-dl",
     description: "Future ACM Digital Library integration for CS publisher access.",
-    category: "scholarly",
+    category: "publisherFullText",
     roles: ["acquisition"],
     domains: ["cs_ai"],
     authMode: "institution_token",
     implemented: false,
     defaultEnabled: false,
-    defaultEnvVarName: "ACM_DL_TOKEN"
+    defaultEnvVarName: "ACM_DL_TOKEN",
+    credentialFields: [
+      {
+        id: "institution_token",
+        label: "ACM DL institution token",
+        kind: "institution_token",
+        required: true
+      }
+    ]
   }
 ];
 
@@ -267,10 +347,11 @@ const providerAliases = new Map<string, SourceProviderId>([
   ["ieee-xplore", "ieee_xplore"],
   ["ieee_xplore", "ieee_xplore"],
   ["ieee xplore", "ieee_xplore"],
-  ["scopus", "scopus"],
-  ["sciencedirect", "sciencedirect"],
-  ["science-direct", "sciencedirect"],
-  ["science direct", "sciencedirect"],
+  ["elsevier", "elsevier"],
+  ["scopus", "elsevier"],
+  ["science direct", "elsevier"],
+  ["science-direct", "elsevier"],
+  ["sciencedirect", "elsevier"],
   ["springer", "springer_nature"],
   ["springer-nature", "springer_nature"],
   ["springer_nature", "springer_nature"],
@@ -280,6 +361,12 @@ const providerAliases = new Map<string, SourceProviderId>([
   ["acm dl", "acm_digital_library"],
   ["acm_digital_library", "acm_digital_library"],
   ["acm digital library", "acm_digital_library"]
+]);
+
+const scholarlyProviderCategories = new Set<SourceProviderCategory>([
+  "scholarlyDiscovery",
+  "publisherFullText",
+  "oaRetrievalHelpers"
 ]);
 
 function normalizeWhitespace(text: string): string {
@@ -314,6 +401,10 @@ export function getSourceProviderDefinition(providerId: SourceProviderId): Sourc
   return provider;
 }
 
+export function providerCredentialFields(providerId: SourceProviderId): SourceProviderCredentialField[] {
+  return getSourceProviderDefinition(providerId).credentialFields.map((field) => ({ ...field }));
+}
+
 export function defaultSourceProviderIds(
   category: SourceProviderCategory,
   options: { includeUnimplemented?: boolean } = {}
@@ -323,12 +414,20 @@ export function defaultSourceProviderIds(
     .map((provider) => provider.id);
 }
 
-export function defaultScholarlyProviderIds(): SourceProviderId[] {
-  return defaultSourceProviderIds("scholarly");
+export function defaultScholarlyDiscoveryProviderIds(): SourceProviderId[] {
+  return defaultSourceProviderIds("scholarlyDiscovery");
 }
 
-export function defaultBackgroundProviderIds(): SourceProviderId[] {
-  return defaultSourceProviderIds("background");
+export function defaultPublisherFullTextProviderIds(): SourceProviderId[] {
+  return defaultSourceProviderIds("publisherFullText");
+}
+
+export function defaultOaRetrievalHelperProviderIds(): SourceProviderId[] {
+  return defaultSourceProviderIds("oaRetrievalHelpers");
+}
+
+export function defaultGeneralWebProviderIds(): SourceProviderId[] {
+  return defaultSourceProviderIds("generalWeb");
 }
 
 export function dedupeProviderIds(providerIds: SourceProviderId[]): SourceProviderId[] {
@@ -345,6 +444,30 @@ export function dedupeProviderIds(providerIds: SourceProviderId[]): SourceProvid
   }
 
   return normalized;
+}
+
+export function isScholarlyProviderCategory(category: SourceProviderCategory): boolean {
+  return scholarlyProviderCategories.has(category);
+}
+
+export function isGeneralWebProviderCategory(category: SourceProviderCategory): boolean {
+  return category === "generalWeb";
+}
+
+export function isLocalContextProviderCategory(category: SourceProviderCategory): boolean {
+  return category === "localContext";
+}
+
+export function defaultScholarlyProviderIds(): SourceProviderId[] {
+  return dedupeProviderIds([
+    ...defaultScholarlyDiscoveryProviderIds(),
+    ...defaultPublisherFullTextProviderIds(),
+    ...defaultOaRetrievalHelperProviderIds()
+  ]);
+}
+
+export function defaultBackgroundProviderIds(): SourceProviderId[] {
+  return defaultGeneralWebProviderIds();
 }
 
 export function parseProviderSelection(
@@ -441,7 +564,7 @@ export function normalizeProviderId(value: unknown): SourceProviderId | null {
 
 export function providerAuthStatus(
   providerId: SourceProviderId,
-  authRef: string | null | undefined
+  configuredFieldIds: string[] | undefined
 ): ProviderAuthStatus {
   const provider = getSourceProviderDefinition(providerId);
 
@@ -449,19 +572,23 @@ export function providerAuthStatus(
     return "not_needed";
   }
 
-  const envVarName = authRef === undefined
-    ? provider.defaultEnvVarName
-    : authRef;
-  const configured = typeof envVarName === "string"
-    && envVarName.trim().length > 0
-    && typeof process.env[envVarName] === "string"
-    && process.env[envVarName]!.trim().length > 0;
+  const configured = new Set(configuredFieldIds ?? []);
+  const fields = provider.credentialFields;
+  const requiredFields = fields.filter((field) => field.required);
+  const optionalFields = fields.filter((field) => !field.required);
 
-  if (configured) {
+  if (fields.length === 0) {
+    return "not_needed";
+  }
+
+  const hasAllRequired = requiredFields.every((field) => configured.has(field.id));
+  const hasAnyOptional = optionalFields.some((field) => configured.has(field.id));
+
+  if (hasAllRequired && (requiredFields.length > 0 || hasAnyOptional)) {
     return "configured";
   }
 
-  return provider.authMode === "optional_api_key"
+  return requiredFields.length === 0
     ? "missing_optional"
     : "missing_required";
 }

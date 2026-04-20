@@ -1,39 +1,51 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
-  defaultBackgroundProviderIds,
-  defaultScholarlyProviderIds,
+  authStateForProvider as authStateFromCredentials,
+  type CredentialStoreState,
+  type ProviderCredentialAuthState
+} from "./credential-store.js";
+import {
   dedupeProviderIds,
+  defaultGeneralWebProviderIds,
+  defaultOaRetrievalHelperProviderIds,
+  defaultPublisherFullTextProviderIds,
+  defaultScholarlyDiscoveryProviderIds,
   getSourceProviderDefinition,
   listSourceProvidersByCategory,
-  normalizeProviderId,
   parseProviderSelection,
-  providerAuthStatus,
-  type ProviderAuthStatus,
-  type SourceProviderCategory,
-  type SourceProviderDefinition,
   type SourceProviderId
 } from "./provider-registry.js";
 import { runtimeDirectoryPath } from "./session-store.js";
 
-const projectConfigSchemaVersion = 2;
+const projectConfigSchemaVersion = 5;
 const projectConfigFileName = "project-config.json";
+const selectableProviderCategories = [
+  "scholarlyDiscovery",
+  "publisherFullText",
+  "oaRetrievalHelpers",
+  "generalWeb"
+] as const;
 
 export type LiteratureProviderId = SourceProviderId;
-
-export type SourceProviderAuthRefs = Partial<Record<SourceProviderId, string | null>>;
+export type ConfigurableProviderCategory = typeof selectableProviderCategories[number];
 
 export type ProjectConfigSourcesState = {
-  scholarly: {
+  scholarlyDiscovery: {
     selectedProviderIds: SourceProviderId[];
   };
-  background: {
+  publisherFullText: {
     selectedProviderIds: SourceProviderId[];
   };
-  local: {
+  oaRetrievalHelpers: {
+    selectedProviderIds: SourceProviderId[];
+  };
+  generalWeb: {
+    selectedProviderIds: SourceProviderId[];
+  };
+  localContext: {
     projectFilesEnabled: boolean;
   };
-  authRefs: SourceProviderAuthRefs;
   explicitlyConfigured: boolean;
 };
 
@@ -46,20 +58,7 @@ export type ProjectConfigState = {
   sources: ProjectConfigSourcesState;
 };
 
-export type ProjectConfigProviderAuthState = {
-  providerId: SourceProviderId;
-  definition: SourceProviderDefinition;
-  authRef: string | null;
-  envValuePresent: boolean;
-  status: ProviderAuthStatus;
-};
-
-type LegacyProjectConfig = {
-  literature?: {
-    selectedProviderIds?: string[];
-    explicitlyConfigured?: boolean;
-  };
-};
+export type ProjectConfigProviderAuthState = ProviderCredentialAuthState;
 
 function asObject(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null
@@ -89,43 +88,16 @@ function readStringArray(value: unknown): string[] {
 }
 
 function normalizeProviderIds(
-  rawProviderIds: string[],
-  category: SourceProviderCategory
+  rawProviderIds: unknown,
+  category: ConfigurableProviderCategory,
+  fallback: SourceProviderId[]
 ): SourceProviderId[] {
-  return (parseProviderSelection(rawProviderIds.join(", "), category) ?? [])
-    .filter((providerId) => getSourceProviderDefinition(providerId).implemented);
-}
-
-function normalizeAuthRefs(value: unknown): SourceProviderAuthRefs {
-  const record = asObject(value);
-  const authRefs: SourceProviderAuthRefs = {};
-
-  for (const [rawProviderId, rawEnvVarName] of Object.entries(record)) {
-    const providerId = normalizeProviderId(rawProviderId);
-    const envVarName = readString(rawEnvVarName);
-
-    if (providerId === null) {
-      continue;
-    }
-
-    if (rawEnvVarName === null) {
-      authRefs[providerId] = null;
-      continue;
-    }
-
-    if (envVarName !== null) {
-      authRefs[providerId] = envVarName;
-    }
+  if (!Array.isArray(rawProviderIds)) {
+    return [...fallback];
   }
 
-  return authRefs;
-}
-
-function hasExplicitAuthRef(
-  config: ProjectConfigState,
-  providerId: SourceProviderId
-): boolean {
-  return Object.prototype.hasOwnProperty.call(config.sources.authRefs, providerId);
+  return (parseProviderSelection(readStringArray(rawProviderIds).join(", "), category) ?? [])
+    .filter((providerId) => getSourceProviderDefinition(providerId).implemented);
 }
 
 function emptyConfig(projectRoot: string, timestamp: string): ProjectConfigState {
@@ -136,68 +108,23 @@ function emptyConfig(projectRoot: string, timestamp: string): ProjectConfigState
     createdAt: timestamp,
     updatedAt: timestamp,
     sources: {
-      scholarly: {
-        selectedProviderIds: defaultScholarlyProviderIds()
+      scholarlyDiscovery: {
+        selectedProviderIds: defaultScholarlyDiscoveryProviderIds()
       },
-      background: {
-        selectedProviderIds: defaultBackgroundProviderIds()
+      publisherFullText: {
+        selectedProviderIds: defaultPublisherFullTextProviderIds()
       },
-      local: {
+      oaRetrievalHelpers: {
+        selectedProviderIds: defaultOaRetrievalHelperProviderIds()
+      },
+      generalWeb: {
+        selectedProviderIds: defaultGeneralWebProviderIds()
+      },
+      localContext: {
         projectFilesEnabled: true
       },
-      authRefs: {},
       explicitlyConfigured: false
     }
-  };
-}
-
-function migrateLegacySelectedProviders(
-  selectedProviderIds: string[] | undefined,
-  base: ProjectConfigState
-): ProjectConfigSourcesState {
-  if (selectedProviderIds === undefined) {
-    return base.sources;
-  }
-
-  const scholarly = new Set<SourceProviderId>();
-  const background = new Set<SourceProviderId>();
-  let projectFilesEnabled = base.sources.local.projectFilesEnabled;
-
-  for (const providerId of selectedProviderIds) {
-    switch (providerId) {
-      case "local_files":
-      case "project_files":
-      case "project-files":
-        projectFilesEnabled = true;
-        break;
-      case "wikipedia":
-        background.add("wikipedia");
-        break;
-      default: {
-        const scholarlyIds = parseProviderSelection(providerId, "scholarly");
-
-        if (scholarlyIds !== null && scholarlyIds.length > 0) {
-          scholarly.add(scholarlyIds[0]!);
-        }
-        break;
-      }
-    }
-  }
-
-  return {
-    scholarly: {
-      selectedProviderIds: scholarly.size > 0
-        ? [...scholarly]
-        : base.sources.scholarly.selectedProviderIds
-    },
-    background: {
-      selectedProviderIds: [...background]
-    },
-    local: {
-      projectFilesEnabled
-    },
-    authRefs: {},
-    explicitlyConfigured: true
   };
 }
 
@@ -208,50 +135,45 @@ function mergeProjectConfig(
 ): ProjectConfigState {
   const record = asObject(raw);
   const sources = asObject(record.sources);
-  const scholarly = asObject(sources.scholarly);
-  const background = asObject(sources.background);
-  const local = asObject(sources.local);
   const base = emptyConfig(projectRoot, timestamp);
-  const legacy = record as LegacyProjectConfig;
-  const hasGroupedSources = Object.keys(sources).length > 0;
-
-  if (!hasGroupedSources && legacy.literature !== undefined) {
-    const migratedSources = migrateLegacySelectedProviders(
-      legacy.literature.selectedProviderIds,
-      base
-    );
-
-    return {
-      ...base,
-      createdAt: readString(record.createdAt) ?? base.createdAt,
-      updatedAt: readString(record.updatedAt) ?? base.updatedAt,
-      sources: {
-        ...migratedSources,
-        explicitlyConfigured: legacy.literature.explicitlyConfigured ?? true
-      }
-    };
-  }
 
   return {
     ...base,
     createdAt: readString(record.createdAt) ?? base.createdAt,
     updatedAt: readString(record.updatedAt) ?? base.updatedAt,
     sources: {
-      scholarly: {
-        selectedProviderIds: Array.isArray(scholarly.selectedProviderIds)
-          ? normalizeProviderIds(readStringArray(scholarly.selectedProviderIds), "scholarly")
-          : base.sources.scholarly.selectedProviderIds
+      scholarlyDiscovery: {
+        selectedProviderIds: normalizeProviderIds(
+          asObject(sources.scholarlyDiscovery).selectedProviderIds,
+          "scholarlyDiscovery",
+          base.sources.scholarlyDiscovery.selectedProviderIds
+        )
       },
-      background: {
-        selectedProviderIds: Array.isArray(background.selectedProviderIds)
-          ? normalizeProviderIds(readStringArray(background.selectedProviderIds), "background")
-          : base.sources.background.selectedProviderIds
+      publisherFullText: {
+        selectedProviderIds: normalizeProviderIds(
+          asObject(sources.publisherFullText).selectedProviderIds,
+          "publisherFullText",
+          base.sources.publisherFullText.selectedProviderIds
+        )
       },
-      local: {
-        projectFilesEnabled: readBoolean(local.projectFilesEnabled)
-          ?? base.sources.local.projectFilesEnabled
+      oaRetrievalHelpers: {
+        selectedProviderIds: normalizeProviderIds(
+          asObject(sources.oaRetrievalHelpers).selectedProviderIds,
+          "oaRetrievalHelpers",
+          base.sources.oaRetrievalHelpers.selectedProviderIds
+        )
       },
-      authRefs: normalizeAuthRefs(sources.authRefs),
+      generalWeb: {
+        selectedProviderIds: normalizeProviderIds(
+          asObject(sources.generalWeb).selectedProviderIds,
+          "generalWeb",
+          base.sources.generalWeb.selectedProviderIds
+        )
+      },
+      localContext: {
+        projectFilesEnabled: readBoolean(asObject(sources.localContext).projectFilesEnabled)
+          ?? base.sources.localContext.projectFilesEnabled
+      },
       explicitlyConfigured: readBoolean(sources.explicitlyConfigured)
         ?? base.sources.explicitlyConfigured
     }
@@ -262,86 +184,49 @@ export function projectConfigPath(projectRoot: string): string {
   return path.join(runtimeDirectoryPath(projectRoot), projectConfigFileName);
 }
 
-export function selectedSourceProviders(config: ProjectConfigState): SourceProviderId[] {
+export function selectedProviderIdsForCategory(
+  config: ProjectConfigState,
+  category: ConfigurableProviderCategory
+): SourceProviderId[] {
+  return [...config.sources[category].selectedProviderIds];
+}
+
+export function selectedScholarlySourceProviders(config: ProjectConfigState): SourceProviderId[] {
   return dedupeProviderIds([
-    ...(config.sources.local.projectFilesEnabled ? ["project_files" as const] : []),
-    ...config.sources.scholarly.selectedProviderIds,
-    ...config.sources.background.selectedProviderIds
+    ...config.sources.scholarlyDiscovery.selectedProviderIds,
+    ...config.sources.publisherFullText.selectedProviderIds,
+    ...config.sources.oaRetrievalHelpers.selectedProviderIds
   ]);
 }
 
-export function defaultAuthRefForProvider(
-  config: ProjectConfigState,
-  providerId: SourceProviderId
-): string | null {
-  if (hasExplicitAuthRef(config, providerId)) {
-    return config.sources.authRefs[providerId] ?? null;
-  }
-
-  return getSourceProviderDefinition(providerId).defaultEnvVarName
-    ?? null;
+export function selectedGeneralWebProviders(config: ProjectConfigState): SourceProviderId[] {
+  return [...config.sources.generalWeb.selectedProviderIds];
 }
 
-export function suggestedAuthRefForProvider(
-  config: ProjectConfigState,
-  providerId: SourceProviderId
-): string | null {
-  const explicit = config.sources.authRefs[providerId];
-
-  if (typeof explicit === "string" && explicit.trim().length > 0) {
-    return explicit;
-  }
-
-  return getSourceProviderDefinition(providerId).defaultEnvVarName ?? null;
+export function selectedSourceProviders(config: ProjectConfigState): SourceProviderId[] {
+  return dedupeProviderIds([
+    ...(config.sources.localContext.projectFilesEnabled ? ["project_files" as const] : []),
+    ...selectedScholarlySourceProviders(config),
+    ...selectedGeneralWebProviders(config)
+  ]);
 }
 
 export function authStateForProvider(
   config: ProjectConfigState,
+  credentials: CredentialStoreState,
   providerId: SourceProviderId
 ): ProjectConfigProviderAuthState {
-  const definition = getSourceProviderDefinition(providerId);
-  const explicitAuthRef = hasExplicitAuthRef(config, providerId)
-    ? (config.sources.authRefs[providerId] ?? null)
-    : undefined;
-  const authRef = explicitAuthRef === undefined
-    ? (definition.defaultEnvVarName ?? null)
-    : explicitAuthRef;
-  const envValuePresent = authRef !== null
-    && typeof process.env[authRef] === "string"
-    && process.env[authRef]!.trim().length > 0;
-  const status = providerAuthStatus(
-    providerId,
-    envValuePresent
-      ? authRef
-      : (explicitAuthRef === undefined ? undefined : explicitAuthRef)
-  );
-
-  return {
-    providerId,
-    definition,
-    authRef,
-    envValuePresent,
-    status
-  };
+  void config;
+  return authStateFromCredentials(credentials, providerId);
 }
 
-export function authStatesForSelectedProviders(config: ProjectConfigState): ProjectConfigProviderAuthState[] {
-  return selectedSourceProviders(config)
-    .map((providerId) => authStateForProvider(config, providerId))
-    .filter((state) => state.definition.authMode !== "none");
-}
-
-export function setProviderAuthRef(
+export function authStatesForSelectedProviders(
   config: ProjectConfigState,
-  providerId: SourceProviderId,
-  authRef: string | null
-): void {
-  if (authRef === null || authRef.trim().length === 0) {
-    config.sources.authRefs[providerId] = null;
-    return;
-  }
-
-  config.sources.authRefs[providerId] = authRef.trim();
+  credentials: CredentialStoreState
+): ProjectConfigProviderAuthState[] {
+  return selectedSourceProviders(config)
+    .map((providerId) => authStateForProvider(config, credentials, providerId))
+    .filter((state) => state.definition.authMode !== "none");
 }
 
 export function formatSelectedLiteratureProviders(providerIds: SourceProviderId[]): string {
@@ -357,19 +242,27 @@ export function formatSelectedLiteratureProviders(providerIds: SourceProviderId[
 export function createLiteratureProviderLines(providerIds: SourceProviderId[]): string[] {
   const selected = new Set(providerIds);
 
-  return listSourceProvidersByCategory("scholarly")
+  return listSourceProvidersByCategory("scholarlyDiscovery")
     .filter((provider) => provider.implemented)
     .map((provider, index) => `[${selected.has(provider.id) ? "x" : " "}] ${index + 1}. ${provider.label} - ${provider.description}`);
 }
 
 export function parseLiteratureProviderSelection(input: string): SourceProviderId[] | null {
-  return parseProviderSelection(input, "scholarly");
+  return parseProviderSelection(input, "scholarlyDiscovery");
 }
 
-export function providerSelectionLines(category: SourceProviderCategory): string[] {
+export function providerSelectionLines(category: ConfigurableProviderCategory): string[] {
   return listSourceProvidersByCategory(category)
     .filter((provider) => provider.implemented)
     .map((provider) => `${provider.label} - ${provider.description}`);
+}
+
+function normalizeCategorySelectionForSave(
+  providerIds: SourceProviderId[],
+  category: ConfigurableProviderCategory
+): SourceProviderId[] {
+  return dedupeProviderIds(providerIds)
+    .filter((providerId) => getSourceProviderDefinition(providerId).category === category);
 }
 
 export class ProjectConfigStore {
@@ -409,19 +302,33 @@ export class ProjectConfigStore {
       createdAt: config.createdAt,
       updatedAt: timestamp,
       sources: {
-        ...config.sources,
-        scholarly: {
-          selectedProviderIds: dedupeProviderIds(config.sources.scholarly.selectedProviderIds)
-            .filter((providerId) => getSourceProviderDefinition(providerId).category === "scholarly")
+        scholarlyDiscovery: {
+          selectedProviderIds: normalizeCategorySelectionForSave(
+            config.sources.scholarlyDiscovery.selectedProviderIds,
+            "scholarlyDiscovery"
+          )
         },
-        background: {
-          selectedProviderIds: dedupeProviderIds(config.sources.background.selectedProviderIds)
-            .filter((providerId) => getSourceProviderDefinition(providerId).category === "background")
+        publisherFullText: {
+          selectedProviderIds: normalizeCategorySelectionForSave(
+            config.sources.publisherFullText.selectedProviderIds,
+            "publisherFullText"
+          )
         },
-        local: {
-          projectFilesEnabled: config.sources.local.projectFilesEnabled
+        oaRetrievalHelpers: {
+          selectedProviderIds: normalizeCategorySelectionForSave(
+            config.sources.oaRetrievalHelpers.selectedProviderIds,
+            "oaRetrievalHelpers"
+          )
         },
-        authRefs: normalizeAuthRefs(config.sources.authRefs),
+        generalWeb: {
+          selectedProviderIds: normalizeCategorySelectionForSave(
+            config.sources.generalWeb.selectedProviderIds,
+            "generalWeb"
+          )
+        },
+        localContext: {
+          projectFilesEnabled: config.sources.localContext.projectFilesEnabled
+        },
         explicitlyConfigured: config.sources.explicitlyConfigured
       }
     };

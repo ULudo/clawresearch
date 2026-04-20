@@ -32,6 +32,8 @@ function createScriptedIo(lines: string[]): CapturedIo {
     "",
     "",
     "",
+    "",
+    "",
     ...lines
   ];
 

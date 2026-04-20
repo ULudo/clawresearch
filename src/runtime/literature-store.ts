@@ -263,23 +263,6 @@ export type LiteratureContext = {
   queryHints: string[];
 };
 
-type LegacyPaperCard = {
-  key?: string;
-  title?: string;
-  citation?: string;
-  locator?: string | null;
-  providerId?: unknown;
-  excerpt?: string;
-  stage?: string;
-  relevance?: string;
-  screeningRationale?: string | null;
-  linkedThemeIds?: string[];
-  linkedClaimIds?: string[];
-  runIds?: string[];
-  createdAt?: string;
-  updatedAt?: string;
-};
-
 function normalizeWhitespace(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
@@ -684,98 +667,12 @@ function normalizeNotebook(raw: unknown): LiteratureReviewNotebook | null {
   };
 }
 
-function migrateLegacyPaper(raw: LegacyPaperCard): CanonicalPaper | null {
-  const key = readString(raw.key);
-  const title = readString(raw.title);
-  const citation = readString(raw.citation);
-
-  if (key === null || title === null || citation === null) {
-    return null;
-  }
-
-  const providerId = normalizeProviderId(raw.providerId);
-  const screeningDecision = raw.relevance === "rejected"
-    ? "exclude"
-    : raw.relevance === "background"
-      ? "background"
-      : "include";
-  const screeningStage = raw.stage === "selected"
-    ? "abstract"
-    : raw.stage === "rejected"
-      ? "title"
-      : "title";
-  const abstract = readString(raw.excerpt);
-  const locator = readString(raw.locator);
-
-  return {
-    id: createLiteratureEntityId("paper", key),
-    key,
-    title,
-    citation,
-    abstract,
-    year: null,
-    authors: [],
-    venue: null,
-    discoveredVia: providerId === null ? [] : [providerId],
-    identifiers: {
-      doi: null,
-      pmid: null,
-      pmcid: null,
-      arxivId: null
-    },
-    discoveryRecords: providerId === null ? [] : [{
-      providerId,
-      sourceId: key,
-      title,
-      locator,
-      citation,
-      year: null
-    }],
-    accessCandidates: providerId === null ? [] : [{
-      providerId,
-      url: locator,
-      accessMode: "metadata_only",
-      fulltextFormat: "none",
-      license: null,
-      tdmAllowed: null,
-      note: "Migrated from a pre-canonical literature card."
-    }],
-    bestAccessUrl: locator,
-    bestAccessProvider: providerId,
-    accessMode: "metadata_only",
-    fulltextFormat: "none",
-    license: null,
-    tdmAllowed: null,
-    contentStatus: {
-      abstractAvailable: abstract !== null,
-      fulltextAvailable: false,
-      fulltextFetched: false,
-      fulltextExtracted: false
-    },
-    screeningStage,
-    screeningDecision,
-    screeningRationale: readString(raw.screeningRationale),
-    accessErrors: [],
-    tags: [],
-    runIds: readStringArray(raw.runIds),
-    linkedThemeIds: readStringArray(raw.linkedThemeIds),
-    linkedClaimIds: readStringArray(raw.linkedClaimIds),
-    createdAt: readString(raw.createdAt) ?? new Date().toISOString(),
-    updatedAt: readString(raw.updatedAt) ?? new Date().toISOString()
-  };
-}
-
 function mergeLiteratureState(raw: unknown, projectRoot: string, timestamp: string): LiteratureState {
   const record = asObject(raw);
   const base = emptyLiteratureState(projectRoot, timestamp);
-  const legacySchema = (readInteger(record.schemaVersion) ?? 0) > 0
-    && (readInteger(record.schemaVersion) ?? 0) < literatureSchemaVersion;
-  const hasCanonicalPapers = !legacySchema;
   const papers = Array.isArray(record.papers)
     ? record.papers.flatMap((entry) => {
-      const normalized = hasCanonicalPapers
-        ? normalizeCanonicalPaper(entry)
-        : migrateLegacyPaper(entry as LegacyPaperCard);
+      const normalized = normalizeCanonicalPaper(entry);
       return normalized === null ? [] : [normalized];
     })
     : [];

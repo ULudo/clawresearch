@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -106,44 +106,6 @@ test("literature store persists canonical papers, access state, theme boards, an
     );
     assert.match(serializedStore, /"paperCount": 1/);
     assert.match(serializedStore, /"fulltext_open"/);
-  } finally {
-    await rm(projectRoot, { recursive: true, force: true });
-  }
-});
-
-test("literature store migrates legacy paper cards into canonical papers with explicit metadata-only access state", async () => {
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-literature-migration-"));
-
-  try {
-    const legacyPath = literatureStoreFilePath(projectRoot);
-    await mkdir(path.dirname(legacyPath), { recursive: true });
-    await writeFile(legacyPath, JSON.stringify({
-      schemaVersion: 1,
-      papers: [
-        {
-          key: "openalex_work:https://example.org/legacy",
-          title: "Legacy Riemann paper",
-          citation: "Legacy Author (2024). Legacy Riemann paper.",
-          locator: "https://example.org/legacy",
-          providerId: "openalex",
-          excerpt: "Legacy excerpt",
-          stage: "selected",
-          relevance: "core",
-          runIds: ["run-legacy"]
-        }
-      ],
-      themes: [],
-      notebooks: []
-    }, null, 2));
-
-    const store = new LiteratureStore(projectRoot, createNow());
-    const state = await store.load();
-
-    assert.equal(state.paperCount, 1);
-    assert.equal(state.papers[0]?.accessMode, "metadata_only");
-    assert.equal(state.papers[0]?.fulltextFormat, "none");
-    assert.equal(state.papers[0]?.bestAccessProvider, "openalex");
-    assert.equal(state.papers[0]?.bestAccessUrl, "https://example.org/legacy");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
