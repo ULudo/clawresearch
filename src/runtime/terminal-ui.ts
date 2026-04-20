@@ -63,6 +63,7 @@ import {
   renderChatFrame,
   renderSourceChecklist,
   toggleSourceChecklistEntry,
+  type CommandSuggestion,
   type ScreenLogEntry,
   type SourceChecklistEntry
 } from "./terminal-ui-model.js";
@@ -114,6 +115,21 @@ type RunCursor = {
   trailingBuffer: string;
   terminalNoticeShown: boolean;
 };
+
+type SlashCommandDefinition = {
+  command: string;
+  description: string;
+};
+
+const slashCommands: SlashCommandDefinition[] = [
+  { command: "/go", description: "Start the detached research run" },
+  { command: "/status", description: "Show the current brief and run state" },
+  { command: "/sources", description: "Inspect or change active literature sources" },
+  { command: "/help", description: "Show slash commands and input hints" },
+  { command: "/pause", description: "Pause the current run" },
+  { command: "/resume", description: "Resume the current paused run" },
+  { command: "/quit", description: "Save the session and close ClawResearch" }
+];
 
 function cloneConfig(config: ProjectConfigState): ProjectConfigState {
   return JSON.parse(JSON.stringify(config)) as ProjectConfigState;
@@ -242,6 +258,119 @@ function eventTag(kind: RunEventKind): string {
   return kind === "literature" ? "lit" : kind;
 }
 
+function isConversationTag(tag: string): boolean {
+  return tag === "consultant"
+    || tag === "you";
+}
+
+function isActivityTag(tag: string): boolean {
+  return !isConversationTag(tag);
+}
+
+function activeSpinnerText(step: number): string {
+  const frames = ["   ", ".  ", ".. ", "..."];
+  return frames[step % frames.length] ?? "...";
+}
+
+function supportsColor(output: TerminalOutput): boolean {
+  return output.isTTY === true && process.env.NO_COLOR !== "1";
+}
+
+function styleAnsi(text: string, code: string, enabled: boolean): string {
+  return enabled ? `\u001b[${code}m${text}\u001b[0m` : text;
+}
+
+function colorizeFrame(content: string, enabled: boolean): string {
+  if (!enabled) {
+    return content;
+  }
+
+  return content
+    .split("\n")
+    .map((line, index) => {
+      if (index === 0) {
+        return styleAnsi(line, "1;97", true);
+      }
+
+      if (index === 1) {
+        return styleAnsi(line, "2;37", true);
+      }
+
+      if (/^[A-Z][A-Za-z ]+ -+$/.test(line)) {
+        return styleAnsi(line, "1;36", true);
+      }
+
+      if (/^status: /i.test(line)) {
+        return styleAnsi(line, "1;33", true);
+      }
+
+      if (/^latest: /i.test(line)) {
+        return styleAnsi(line, "36", true);
+      }
+
+      if (/^ClawResearch: /i.test(line)) {
+        return styleAnsi(line, "1;34", true);
+      }
+
+      if (/^You: /i.test(line)) {
+        return styleAnsi(line, "1;96", true);
+      }
+
+      if (/^Run: /i.test(line)) {
+        return styleAnsi(line, "1;35", true);
+      }
+
+      if (/^Plan: /i.test(line)) {
+        return styleAnsi(line, "35", true);
+      }
+
+      if (/^Literature: /i.test(line)) {
+        return styleAnsi(line, "33", true);
+      }
+
+      if (/^Memory: /i.test(line)) {
+        return styleAnsi(line, "93", true);
+      }
+
+      if (/^Next: /i.test(line)) {
+        return styleAnsi(line, "1;32", true);
+      }
+
+      if (/^Paper: /i.test(line)) {
+        return styleAnsi(line, "33", true);
+      }
+
+      if (/^Done: /i.test(line)) {
+        return styleAnsi(line, "1;32", true);
+      }
+
+      if (/^Error: /i.test(line)) {
+        return styleAnsi(line, "1;31", true);
+      }
+
+      if (/^Command: /i.test(line)) {
+        return styleAnsi(line, "2;37", true);
+      }
+
+      if (/^System: /i.test(line)) {
+        return styleAnsi(line, "2;37", true);
+      }
+
+      if (/^[ >] \/[-a-z]+/.test(line)) {
+        return line.startsWith(">")
+          ? styleAnsi(line, "1;30;47", true)
+          : styleAnsi(line, "36", true);
+      }
+
+      if (/^Chat > /i.test(line)) {
+        return styleAnsi(line, "1;97", true);
+      }
+
+      return line;
+    })
+    .join("\n");
+}
+
 export class ClawResearchTerminalUi {
   private readonly now: () => string;
   private readonly store: SessionStore;
@@ -260,6 +389,7 @@ export class ClawResearchTerminalUi {
   private currentRun: RunRecord | null = null;
   private logEntries: ScreenLogEntry[] = [];
   private composer = "";
+  private commandSuggestionIndex = 0;
   private modal: ModalState | null = null;
   private sourceOverlay: SourceOverlayState | null = null;
   private authOverlay: AuthOverlayState | null = null;
@@ -366,13 +496,114 @@ export class ClawResearchTerminalUi {
     this.render();
   };
 
+  private commandSuggestions(): CommandSuggestion[] {
+    const input = this.composer.trim();
+
+    if (!input.startsWith("/")) {
+      return [];
+    }
+
+    const matches = slashCommands.filter((entry) => input === "/" || entry.command.startsWith(input));
+
+    if (matches.length === 0) {
+      return [];
+    }
+
+    if (this.commandSuggestionIndex >= matches.length) {
+      this.commandSuggestionIndex = 0;
+    }
+
+    return matches.map((entry, index) => ({
+      command: entry.command,
+      description: entry.description,
+      selected: index === this.commandSuggestionIndex
+    }));
+  }
+
+  private currentActivityLabel(): string {
+    const spinner = this.isAnimatedActivity() ? activeSpinnerText(this.spinnerStep).trim() : "";
+    const suffix = spinner.length === 0 ? "" : ` ${spinner}`;
+
+    if (this.pendingLabel !== null) {
+      return `${this.pendingLabel}${suffix}`;
+    }
+
+    if (this.currentRun?.status === "queued" || this.currentRun?.status === "running" || this.currentRun?.status === "paused") {
+      return `${this.currentRun.statusMessage ?? `run ${this.currentRun.status}`}${suffix}`;
+    }
+
+    if (this.currentRun?.status === "completed") {
+      return "run completed";
+    }
+
+    if (this.currentRun?.status === "failed") {
+      return "run failed";
+    }
+
+    return "idle";
+  }
+
+  private latestReplyEntry(): ScreenLogEntry | null {
+    const latestAssistant = [...this.session.conversation]
+      .reverse()
+      .find((entry) => entry.role === "assistant" && entry.kind === "chat");
+
+    return latestAssistant === undefined ? null : mapConversationEntry(latestAssistant);
+  }
+
+  private recentConversationEntries(): ScreenLogEntry[] {
+    const latestReply = this.latestReplyEntry();
+    const conversationEntries = this.logEntries.filter((entry) => isConversationTag(entry.tag));
+
+    if (latestReply === null) {
+      return conversationEntries;
+    }
+
+    for (let index = conversationEntries.length - 1; index >= 0; index -= 1) {
+      const entry = conversationEntries[index];
+
+      if (entry?.tag === latestReply.tag && entry.text === latestReply.text) {
+        return conversationEntries.slice(0, index);
+      }
+    }
+
+    return conversationEntries;
+  }
+
+  private recentActivityEntries(): ScreenLogEntry[] {
+    return this.logEntries.filter((entry) => isActivityTag(entry.tag)).slice(-6);
+  }
+
+  private isAnimatedActivity(): boolean {
+    return this.pendingLabel !== null
+      || this.currentRun?.status === "queued"
+      || this.currentRun?.status === "running";
+  }
+
+  private autocompleteSelectedCommand(): boolean {
+    const suggestions = this.commandSuggestions();
+    const selected = suggestions[this.commandSuggestionIndex] ?? suggestions[0];
+
+    if (selected === undefined) {
+      return false;
+    }
+
+    this.composer = selected.command;
+    this.render();
+    return true;
+  }
+
+  private isExactSlashCommand(input: string): boolean {
+    return slashCommands.some((entry) => entry.command === input);
+  }
+
   private startWatchers(): void {
     this.watchTimer = setInterval(() => {
       void this.pollRunProgress();
     }, this.options.watchPollMs ?? 200);
 
     this.spinnerTimer = setInterval(() => {
-      if (this.pendingLabel !== null) {
+      if (this.isAnimatedActivity()) {
         this.spinnerStep = (this.spinnerStep + 1) % 4;
         this.render();
       }
@@ -496,6 +727,7 @@ export class ClawResearchTerminalUi {
           : "Enter saves this value, blank leaves it unset"
       });
     } else {
+      const pendingSubtitle = this.pendingLabel === null ? null : `${this.pendingLabel}${activeSpinnerText(this.spinnerStep).trim().length === 0 ? "" : ` ${activeSpinnerText(this.spinnerStep).trim()}`}`;
       content = renderChatFrame({
         width,
         height,
@@ -504,19 +736,25 @@ export class ClawResearchTerminalUi {
           this.session,
           this.currentRun,
           this.options.projectRoot,
-          this.pendingLabel === null ? null : `${this.pendingLabel}${". ".repeat(this.spinnerStep).slice(0, this.spinnerStep)}`
+          pendingSubtitle
         ),
         brief: this.session.brief,
-        logs: this.logEntries,
+        conversationLogs: this.recentConversationEntries(),
+        activityLogs: this.recentActivityEntries(),
+        latestReply: this.latestReplyEntry(),
+        activityLabel: this.currentActivityLabel(),
+        commandSuggestions: this.commandSuggestions(),
         inputLabel: "Chat >",
         inputValue: `${this.composer}${this.pendingLabel === null ? "_" : ""}`,
-        footerHint: footerHint(this.pendingLabel),
+        footerHint: this.commandSuggestions().length > 0
+          ? "Up/Down choose  Tab complete  Enter accept/send  Esc clear"
+          : footerHint(this.pendingLabel),
         modalTitle: this.modal?.title ?? null,
         modalLines: this.modal?.lines ?? []
       });
     }
 
-    this.output.write(`\u001b[2J\u001b[H${content}\n`);
+    this.output.write(`\u001b[2J\u001b[H${colorizeFrame(content, supportsColor(this.output))}\n`);
   }
 
   private readonly onKeypress = (value: string, key: readline.Key): void => {
@@ -551,25 +789,47 @@ export class ClawResearchTerminalUi {
       return;
     }
 
+    const commandSuggestions = this.commandSuggestions();
+
+    if (commandSuggestions.length > 0 && (key.name === "up" || key.name === "down")) {
+      const direction = key.name === "up" ? -1 : 1;
+      this.commandSuggestionIndex = (this.commandSuggestionIndex + direction + commandSuggestions.length) % commandSuggestions.length;
+      this.render();
+      return;
+    }
+
+    if (commandSuggestions.length > 0 && (key.name === "tab" || key.name === "right")) {
+      this.autocompleteSelectedCommand();
+      return;
+    }
+
     if (key.name === "backspace") {
       this.composer = Array.from(this.composer).slice(0, -1).join("");
+      this.commandSuggestionIndex = 0;
       this.render();
       return;
     }
 
     if (isSubmitKey(key)) {
+      if (commandSuggestions.length > 0 && !this.isExactSlashCommand(this.composer.trim())) {
+        this.autocompleteSelectedCommand();
+        return;
+      }
+
       void this.submitComposer();
       return;
     }
 
     if (key.name === "escape") {
       this.composer = "";
+      this.commandSuggestionIndex = 0;
       this.render();
       return;
     }
 
     if (typeof value === "string" && value.length > 0 && !key.ctrl && !key.meta) {
       this.composer += value;
+      this.commandSuggestionIndex = 0;
       this.render();
     }
   };
@@ -725,6 +985,7 @@ export class ClawResearchTerminalUi {
   private async submitComposer(): Promise<void> {
     const input = this.composer.trim();
     this.composer = "";
+    this.commandSuggestionIndex = 0;
 
     if (input.length === 0) {
       this.render();

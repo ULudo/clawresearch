@@ -73,7 +73,7 @@ test("source checklist render shows checkboxes and a focused row", () => {
 test("chat frame keeps the latest conversation visible and shows a chat field", () => {
   const output = renderChatFrame({
     width: 96,
-    height: 20,
+    height: 24,
     title: "ClawResearch",
     subtitle: "project: test-project  backend: ollama:qwen  run: queued",
     brief: {
@@ -82,22 +82,38 @@ test("chat frame keeps the latest conversation visible and shows a chat field", 
       researchDirection: "compare retrieval and synthesis architectures",
       successCriterion: "produce concrete design recommendations"
     },
-    logs: [
+    conversationLogs: [
       { tag: "consultant", text: "Hello, tell me what you want to research." },
-      { tag: "you", text: "I want to study autonomous research agents." },
+      { tag: "you", text: "I want to study autonomous research agents." }
+    ],
+    activityLogs: [
       { tag: "run", text: "Research run started." },
       { tag: "plan", text: "Plan the first literature pass." },
       { tag: "next", text: "Read the most relevant canonical papers next." }
     ],
+    latestReply: { tag: "consultant", text: "Great, I can help narrow that into a strong first-pass review brief." },
+    activityLabel: "Gather provider-aware scholarly sources...",
+    commandSuggestions: [
+      { command: "/go", description: "Start the detached research run", selected: true },
+      { command: "/status", description: "Show the current brief and run state", selected: false }
+    ],
     inputLabel: "Chat >",
     inputValue: "Focus on literature review workflows_",
-    footerHint: "/help  /sources  /status  /go  /quit"
+    footerHint: "Up/Down choose  Tab complete  Enter accept/send  Esc clear"
   });
 
-  assert.match(output, /Chat ------------------------------------------------/);
-  assert.match(output, /\[next\] Read the most relevant canonical papers next\./);
   assert.match(output, /Brief -----------------------------------------------/);
   assert.match(output, /topic: autonomous research agents/);
+  assert.match(output, /Activity --------------------------------------------/);
+  assert.match(output, /status: Gather provider-aware scholarly sources/);
+  assert.match(output, /latest: Next - Read the most relevant canonical papers next\./);
+  assert.match(output, /Recent Chat -----------------------------------------/);
+  assert.match(output, /ClawResearch: Hello, tell me what you want to research\./);
+  assert.match(output, /You: I want to study autonomous research agents\./);
+  assert.match(output, /Latest Reply ----------------------------------------/);
+  assert.match(output, /Great, I can help narrow that into a strong first-pass review brief\./);
+  assert.match(output, /Commands --------------------------------------------/);
+  assert.match(output, /> \/go\s+Start the detached research run/);
   assert.match(output, /Input -----------------------------------------------/);
   assert.match(output, /Chat > Focus on literature review workflows_/);
 });

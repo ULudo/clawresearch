@@ -23,13 +23,23 @@ export type ScreenLogEntry = {
   text: string;
 };
 
+export type CommandSuggestion = {
+  command: string;
+  description: string;
+  selected: boolean;
+};
+
 type ChatFrameOptions = {
   width: number;
   height: number;
   title: string;
   subtitle: string;
   brief: ResearchBrief;
-  logs: ScreenLogEntry[];
+  conversationLogs: ScreenLogEntry[];
+  activityLogs: ScreenLogEntry[];
+  latestReply: ScreenLogEntry | null;
+  activityLabel: string | null;
+  commandSuggestions: CommandSuggestion[];
   inputLabel: string;
   inputValue: string;
   footerHint: string;
@@ -133,6 +143,68 @@ function sectionHeader(title: string, width: number): string {
   return `${title} ${"-".repeat(ruleWidth)}`;
 }
 
+function labelForTag(tag: string): string {
+  switch (tag) {
+    case "consultant":
+      return "ClawResearch";
+    case "you":
+      return "You";
+    case "cmd":
+      return "Command";
+    case "system":
+      return "System";
+    case "run":
+      return "Run";
+    case "plan":
+      return "Plan";
+    case "lit":
+    case "literature":
+      return "Literature";
+    case "memory":
+      return "Memory";
+    case "verify":
+      return "Verify";
+    case "next":
+      return "Next";
+    case "source":
+      return "Paper";
+    case "claim":
+      return "Claim";
+    case "exec":
+      return "Exec";
+    case "done":
+      return "Done";
+    case "error":
+      return "Error";
+    case "stdout":
+      return "Stdout";
+    case "stderr":
+      return "Stderr";
+    default:
+      return tag.length === 0
+        ? "Log"
+        : `${tag.slice(0, 1).toUpperCase()}${tag.slice(1)}`;
+  }
+}
+
+function wrapLabeledLine(label: string, text: string, width: number): string[] {
+  const prefix = `${label}: `;
+  const wrapped = wrapText(`${prefix}${text}`, width);
+
+  if (wrapped.length <= 1) {
+    return wrapped;
+  }
+
+  const continuationPrefix = " ".repeat(prefix.length);
+  return wrapped.map((line, index) => {
+    if (index === 0 || line.length === 0) {
+      return line;
+    }
+
+    return `${continuationPrefix}${line}`;
+  });
+}
+
 function briefLines(brief: ResearchBrief, width: number): string[] {
   const compactWidth = Math.max(20, width - 2);
   const entries: Array<[label: string, value: string | null]> = [
@@ -146,7 +218,44 @@ function briefLines(brief: ResearchBrief, width: number): string[] {
 }
 
 function flattenLogs(logs: ScreenLogEntry[], width: number): string[] {
-  return logs.flatMap((entry) => wrapText(`[${entry.tag}] ${entry.text}`, width));
+  return logs.flatMap((entry) => wrapLabeledLine(labelForTag(entry.tag), entry.text, width));
+}
+
+function latestReplyLines(entry: ScreenLogEntry | null, width: number): string[] {
+  if (entry === null) {
+    return wrapText("ClawResearch: Waiting for the next consultant response.", width);
+  }
+
+  return wrapLabeledLine(labelForTag(entry.tag), entry.text, width);
+}
+
+function activitySectionLines(
+  activityLabel: string | null,
+  activityLogs: ScreenLogEntry[],
+  width: number
+): string[] {
+  const lines: string[] = [
+    ...wrapText(`status: ${activityLabel ?? "idle"}`, width)
+  ];
+  const latestActivity = activityLogs[activityLogs.length - 1] ?? null;
+
+  if (latestActivity !== null) {
+    lines.push(...wrapLabeledLine("latest", `${labelForTag(latestActivity.tag)} - ${latestActivity.text}`, width));
+  } else {
+    lines.push(...wrapText("latest: No live run activity yet.", width));
+  }
+
+  return lines;
+}
+
+function commandSuggestionLines(
+  suggestions: CommandSuggestion[],
+  width: number
+): string[] {
+  return suggestions.flatMap((suggestion) => wrapText(
+    `${suggestion.selected ? ">" : " "} ${suggestion.command.padEnd(9)} ${suggestion.description}`,
+    width
+  ));
 }
 
 export function buildSourceChecklistEntries(config: ProjectConfigState): SourceChecklistEntry[] {
@@ -469,52 +578,82 @@ export function renderChatFrame(options: ChatFrameOptions): string {
   const innerWidth = width - 2;
   const header = [
     truncate(options.title, innerWidth),
-    truncate(options.subtitle, innerWidth),
-    ""
+    truncate(options.subtitle, innerWidth)
   ];
 
   const modalLines = options.modalTitle === undefined || options.modalTitle === null
     ? []
     : [
       sectionHeader(options.modalTitle, innerWidth),
-      ...options.modalLines!.flatMap((line) => wrapText(line, innerWidth)),
-      ""
+      ...options.modalLines!.flatMap((line) => wrapText(line, innerWidth))
     ];
 
-  const transcriptHeader = [sectionHeader("Chat", innerWidth)];
-  const transcriptBody = flattenLogs(options.logs, innerWidth);
-
-  const brief = [
-    sectionHeader("Brief", innerWidth),
-    ...briefLines(options.brief, innerWidth),
-    ""
-  ];
-
+  const briefBody = briefLines(options.brief, innerWidth).slice(0, 4);
+  const activityBody = activitySectionLines(options.activityLabel, options.activityLogs, innerWidth).slice(0, 2);
+  const latestReplyBody = latestReplyLines(options.latestReply, innerWidth);
+  const commandSuggestionBody = commandSuggestionLines(options.commandSuggestions, innerWidth);
+  const transcriptBody = flattenLogs(options.conversationLogs, innerWidth);
   const composer = [
     sectionHeader("Input", innerWidth),
     ...wrapText(`${options.inputLabel} ${options.inputValue}`, innerWidth),
-    "",
     truncate(options.footerHint, innerWidth)
   ];
-
-  const reserved = header.length
+  const minimumLatestReplyLines = Math.min(2, latestReplyBody.length);
+  const baseReserved = header.length
     + modalLines.length
-    + transcriptHeader.length
-    + 1
-    + brief.length
+    + 1 + briefBody.length
+    + 1 + activityBody.length
+    + 1 + minimumLatestReplyLines
     + composer.length;
-  const transcriptSpace = Math.max(3, height - 1 - reserved);
-  const transcript = [
-    ...transcriptHeader,
-    ...transcriptBody.slice(-transcriptSpace),
-    ""
+
+  let remaining = Math.max(0, height - 1 - baseReserved);
+  const commandBodyLimit = Math.min(commandSuggestionBody.length, remaining >= 5 ? 3 : remaining >= 3 ? 2 : remaining >= 2 ? 1 : 0);
+  remaining -= commandBodyLimit > 0 ? commandBodyLimit + 1 : 0;
+  const transcriptBodyLimit = Math.min(transcriptBody.length, remaining >= 4 ? remaining - 1 : 0);
+  remaining -= transcriptBodyLimit > 0 ? transcriptBodyLimit + 1 : 0;
+  const extraReplyLines = Math.min(
+    Math.max(0, latestReplyBody.length - minimumLatestReplyLines),
+    Math.max(0, remaining)
+  );
+  const latestReplyLimit = minimumLatestReplyLines + extraReplyLines;
+
+  const brief = [
+    sectionHeader("Brief", innerWidth),
+    ...briefBody
   ];
+
+  const activity = [
+    sectionHeader("Activity", innerWidth),
+    ...activityBody
+  ];
+
+  const transcript = transcriptBodyLimit === 0
+    ? []
+    : [
+      sectionHeader("Recent Chat", innerWidth),
+      ...transcriptBody.slice(-transcriptBodyLimit)
+    ];
+
+  const latestReply = [
+    sectionHeader("Latest Reply", innerWidth),
+    ...latestReplyBody.slice(0, latestReplyLimit)
+  ];
+
+  const commandSuggestions = commandBodyLimit === 0
+    ? []
+    : [
+      sectionHeader("Commands", innerWidth),
+      ...commandSuggestionBody.slice(0, commandBodyLimit)
+    ];
 
   const lines = [
     ...header,
     ...modalLines,
-    ...transcript,
     ...brief,
+    ...activity,
+    ...transcript,
+    ...latestReply,
+    ...commandSuggestions,
     ...composer
   ];
 
