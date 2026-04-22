@@ -1,4 +1,4 @@
-import { appendFile, mkdir, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   buildLiteratureContext,
@@ -14,9 +14,21 @@ import {
   buildProjectMemoryContext,
   createMemoryRecordId,
   MemoryStore,
+  type MemoryLink,
   type MemoryRecordInput
 } from "./memory-store.js";
 import { applyCredentialsToEnvironment, CredentialStore } from "./credential-store.js";
+import {
+  agendaHasActionableWorkPackage,
+  autoRunnableMode,
+  isWorkPackageAutoContinuable,
+  workPackageAutoContinueBlockers,
+  type ExecutionChecklist,
+  type ExecutionChecklistItem,
+  type MethodPlan,
+  type WorkPackageDecisionRecord,
+  type WorkPackageFinding
+} from "./research-agenda.js";
 import {
   authStatesForSelectedProviders,
   formatSelectedLiteratureProviders,
@@ -26,11 +38,14 @@ import {
   selectedScholarlySourceProviders
 } from "./project-config-store.js";
 import type {
+  ResearchAgenda,
   ResearchBackend,
   ResearchClaim,
   ResearchPlan,
   ResearchSynthesis,
-  ResearchTheme
+  ResearchTheme,
+  ResearchDirectionCandidate,
+  WorkPackage
 } from "./research-backend.js";
 import { createDefaultResearchBackend } from "./research-backend.js";
 import {
@@ -40,6 +55,10 @@ import {
   type ResearchSourceGatherer,
   type ResearchSourceGatherResult
 } from "./research-sources.js";
+import {
+  createDefaultRunController,
+  type RunController
+} from "./run-controller.js";
 import { appendRunEvent, type RunEventKind } from "./run-events.js";
 import { RunStore, type RunRecord } from "./run-store.js";
 import type { ResearchBrief } from "./session-store.js";
@@ -56,6 +75,7 @@ type WorkerOptions = {
   now?: () => string;
   researchBackend?: ResearchBackend;
   sourceGatherer?: ResearchSourceGatherer;
+  runController?: RunController;
 };
 
 type JsonValue = boolean | number | string | null | JsonValue[] | { [key: string]: JsonValue };
@@ -129,6 +149,15 @@ async function writeRunArtifacts(run: RunRecord): Promise<void> {
   await writeFile(run.artifacts.claimsPath, "", "utf8");
   await writeFile(run.artifacts.verificationPath, "", "utf8");
   await writeFile(run.artifacts.nextQuestionsPath, "", "utf8");
+  await writeFile(run.artifacts.agendaPath, "", "utf8");
+  await writeFile(run.artifacts.agendaMarkdownPath, "", "utf8");
+  await writeFile(run.artifacts.workPackagePath, "", "utf8");
+  if (run.stage === "work_package") {
+    await writeFile(run.artifacts.methodPlanPath, "", "utf8");
+    await writeFile(run.artifacts.executionChecklistPath, "", "utf8");
+    await writeFile(run.artifacts.findingsPath, "", "utf8");
+    await writeFile(run.artifacts.decisionPath, "", "utf8");
+  }
   await writeFile(run.artifacts.summaryPath, "", "utf8");
   await writeFile(run.artifacts.memoryPath, "", "utf8");
 }
@@ -343,12 +372,382 @@ function synthesisMarkdown(
   return lines.join("\n");
 }
 
-function paperRecordKey(paper: CanonicalPaper): string {
-  return `paper:${paper.id}`;
+function createWorkPackageRunCommand(workPackage: WorkPackage): string[] {
+  return [
+    "clawresearch",
+    "research-loop",
+    "--mode",
+    "work-package",
+    "--work-package-id",
+    workPackage.id
+  ];
 }
 
-function paperRecordId(paper: CanonicalPaper): string {
-  return createMemoryRecordId("source", paperRecordKey(paper));
+async function readJsonArtifactOrNull<T>(filePath: string): Promise<T | null> {
+  try {
+    const contents = await readFile(filePath, "utf8");
+    return JSON.parse(contents) as T;
+  } catch {
+    return null;
+  }
+}
+
+function selectedDirection(
+  agenda: ResearchAgenda
+): ResearchDirectionCandidate | null {
+  if (agenda.selectedDirectionId === null) {
+    return null;
+  }
+
+  return agenda.candidateDirections.find((direction) => direction.id === agenda.selectedDirectionId) ?? null;
+}
+
+function agendaMarkdown(
+  run: RunRecord,
+  plan: ResearchPlan,
+  agenda: ResearchAgenda
+): string {
+  const direction = selectedDirection(agenda);
+  const lines = [
+    "# Research Agenda",
+    "",
+    `- Run id: ${run.id}`,
+    `- Stage: ${run.stage}`,
+    `- Research mode: ${plan.researchMode}`,
+    `- Objective: ${plan.objective}`,
+    "",
+    "## Executive Summary",
+    "",
+    agenda.executiveSummary,
+    "",
+    "## Gaps",
+    ""
+  ];
+
+  if (agenda.gaps.length === 0) {
+    lines.push("- No explicit gaps were extracted from the current reviewed evidence.");
+  } else {
+    for (const gap of agenda.gaps) {
+      const evidence = gap.sourceIds.length > 0
+        ? ` Sources: ${gap.sourceIds.join(", ")}.`
+        : "";
+      const claims = gap.claimIds.length > 0
+        ? ` Claims: ${gap.claimIds.join(", ")}.`
+        : "";
+      lines.push(`- ${gap.title} [${gap.gapKind}; ${gap.severity}]: ${gap.summary}${evidence}${claims}`);
+    }
+  }
+
+  lines.push("", "## Candidate Directions", "");
+
+  if (agenda.candidateDirections.length === 0) {
+    lines.push("- No candidate directions were selected from the current evidence.");
+  } else {
+    for (const candidate of agenda.candidateDirections) {
+      const marker = candidate.id === agenda.selectedDirectionId ? " (selected)" : "";
+      lines.push(`- ${candidate.title}${marker}`);
+      lines.push(`  Mode: ${candidate.mode}`);
+      lines.push(`  Summary: ${candidate.summary}`);
+      lines.push(`  Why now: ${candidate.whyNow}`);
+      lines.push(`  Scores: evidence ${candidate.scores.evidenceBase}/5, novelty ${candidate.scores.novelty}/5, tractability ${candidate.scores.tractability}/5, cost ${candidate.scores.expectedCost}/5, risk ${candidate.scores.risk}/5, overall ${candidate.scores.overall}/5`);
+    }
+  }
+
+  lines.push("", "## Selected Work Package", "");
+
+  if (agenda.selectedWorkPackage === null || direction === null) {
+    lines.push("- No executable work package was selected yet.");
+  } else {
+    lines.push(`- Direction: ${direction.title}`);
+    lines.push(`- Title: ${agenda.selectedWorkPackage.title}`);
+    lines.push(`- Objective: ${agenda.selectedWorkPackage.objective}`);
+    lines.push(`- Hypothesis / question: ${agenda.selectedWorkPackage.hypothesisOrQuestion}`);
+    lines.push(`- Method sketch: ${agenda.selectedWorkPackage.methodSketch}`);
+    lines.push(`- Baselines: ${agenda.selectedWorkPackage.baselines.join(" | ") || "<none>"}`);
+    lines.push(`- Controls: ${agenda.selectedWorkPackage.controls.join(" | ") || "<none>"}`);
+    lines.push(`- Decisive experiment: ${agenda.selectedWorkPackage.decisiveExperiment}`);
+    lines.push(`- Stop criterion: ${agenda.selectedWorkPackage.stopCriterion}`);
+    lines.push(`- Expected artifact: ${agenda.selectedWorkPackage.expectedArtifact}`);
+    lines.push(`- Required inputs: ${agenda.selectedWorkPackage.requiredInputs.join(" | ") || "<none>"}`);
+    lines.push(`- Blocked by: ${agenda.selectedWorkPackage.blockedBy.join(" | ") || "<none>"}`);
+  }
+
+  if (agenda.holdReasons.length > 0) {
+    lines.push("", "## Hold Reasons", "");
+    for (const reason of agenda.holdReasons) {
+      lines.push(`- ${reason}`);
+    }
+  }
+
+  lines.push("", "## Recommended Human Decision", "", agenda.recommendedHumanDecision);
+  return lines.join("\n");
+}
+
+function workPackageDirectionRecordId(direction: ResearchDirectionCandidate): string {
+  return createMemoryRecordId("direction", `${direction.mode}:${direction.title}`);
+}
+
+function workPackageHypothesisRecordId(workPackage: WorkPackage): string {
+  return createMemoryRecordId("hypothesis", `${workPackage.title}:${workPackage.hypothesisOrQuestion}`);
+}
+
+function workPackageMethodPlanRecordId(runId: string, title: string): string {
+  return createMemoryRecordId("method_plan", `run:${runId}:${title}`);
+}
+
+function deriveMethodPlan(
+  workPackage: WorkPackage,
+  brief: ResearchBrief
+): MethodPlan {
+  const baselines = workPackage.baselines.length > 0
+    ? workPackage.baselines
+    : ["Establish the strongest comparable prior approach from the reviewed literature."];
+  const controls = workPackage.controls.length > 0
+    ? workPackage.controls
+    : ["Hold evaluation conditions constant while isolating the claimed intervention."];
+  const ablations = workPackage.mode === "ablation"
+    ? ["Disable or remove one major component at a time and compare against the intact baseline."]
+    : workPackage.mode === "method_improvement"
+      ? ["Compare the improved method against the unchanged baseline and one minimal variant."]
+      : ["No dedicated ablation is required for the first bounded pass unless a confounder emerges."];
+
+  return {
+    assumptions: [
+      `The work package remains scoped to ${brief.topic ?? "the current topic"}.`,
+      ...workPackage.requiredInputs.map((input) => `Input available: ${input}`),
+      workPackage.blockedBy.length > 0
+        ? `Potential blocker: ${workPackage.blockedBy.join(" | ")}`
+        : "No explicit blocker was declared in the selected work package."
+    ],
+    evaluationDesign: `${workPackage.decisiveExperiment} Success is bounded by: ${workPackage.stopCriterion}`,
+    baselines,
+    controls,
+    ablations,
+    decisiveChecks: [
+      workPackage.decisiveExperiment,
+      `Produce the expected artifact: ${workPackage.expectedArtifact}`,
+      `Stop when this criterion is satisfied or clearly unreachable: ${workPackage.stopCriterion}`
+    ]
+  };
+}
+
+function comparableText(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function matchingLocalFiles(localFiles: string[], requirement: string): string[] {
+  const tokens = comparableText(requirement)
+    .split(" ")
+    .filter((token) => token.length >= 4);
+
+  if (tokens.length === 0) {
+    return [];
+  }
+
+  return localFiles.filter((filePath) => {
+    const comparablePath = comparableText(filePath);
+    return tokens.some((token) => comparablePath.includes(token));
+  });
+}
+
+function deriveExecutionChecklist(
+  run: RunRecord,
+  workPackage: WorkPackage,
+  methodPlan: MethodPlan,
+  localFiles: string[]
+): ExecutionChecklist {
+  const requirementSummary = workPackage.requiredInputs.length === 0
+    ? "No explicit required inputs were listed."
+    : workPackage.requiredInputs.map((input) => {
+      const matches = matchingLocalFiles(localFiles, input);
+      return `${input}: ${matches.length > 0 ? `candidate files ${matches.slice(0, 3).join(", ")}` : "not yet found in local context"}`;
+    }).join(" | ");
+  const items: ExecutionChecklistItem[] = [
+    {
+      id: "inspect-context",
+      title: "Inspect local project context",
+      kind: "inspection",
+      intent: "Confirm what code, data, notes, and scripts are already available in the current project root.",
+      expectedOutput: `${localFiles.length} candidate local files or directories, with a shortlist of likely relevant paths.`,
+      failureInterpretation: "If almost no project context exists, the work package may need to stay at planning level first.",
+      status: "completed",
+      notes: localFiles.slice(0, 8).join(" | ") || "No local files were discovered."
+    },
+    {
+      id: "check-inputs",
+      title: "Check required inputs",
+      kind: "inspection",
+      intent: "Verify whether the work package's required inputs appear to exist in the project context.",
+      expectedOutput: requirementSummary,
+      failureInterpretation: "Missing inputs mean the package should be revised or blocked rather than executed blindly.",
+      status: "completed",
+      notes: requirementSummary
+    },
+    {
+      id: "baseline-plan",
+      title: "Restate baselines and controls",
+      kind: "inspection",
+      intent: "Make the comparison frame explicit before continuing into implementation or experimentation.",
+      expectedOutput: `Baselines: ${methodPlan.baselines.join(" | ")} | Controls: ${methodPlan.controls.join(" | ")}`,
+      failureInterpretation: "If baselines or controls remain ambiguous, the work package is not ready for automatic continuation.",
+      status: "completed"
+    },
+    {
+      id: "decisive-check",
+      title: "Prepare the decisive check",
+      kind: "inspection",
+      intent: "Restate the specific decisive experiment or bounded check that will validate or reject the package direction.",
+      expectedOutput: workPackage.decisiveExperiment,
+      failureInterpretation: "If the decisive check is vague, the package should return to agenda refinement.",
+      status: "completed"
+    },
+    {
+      id: "record-next-step",
+      title: "Record the next executable step",
+      kind: "inspection",
+      intent: "Name the concrete next step that should happen after this bounded planning pass.",
+      expectedOutput: `Proceed toward: ${workPackage.expectedArtifact}`,
+      failureInterpretation: "If no concrete next step is visible, stop at planning rather than pretending execution happened.",
+      status: "completed",
+      notes: `Run ${run.id} stayed bounded at planning/inspection level.`
+    }
+  ];
+
+  return {
+    items
+  };
+}
+
+function deriveWorkPackageFindings(
+  workPackage: WorkPackage,
+  localFiles: string[],
+  checklist: ExecutionChecklist
+): WorkPackageFinding[] {
+  const missingInputs = workPackage.requiredInputs.filter((input) => matchingLocalFiles(localFiles, input).length === 0);
+
+  return [
+    {
+      id: "finding-context",
+      title: "Local context inspection",
+      summary: localFiles.length > 0
+        ? `The project root already contains ${localFiles.length} locally discoverable paths that can guide the next step.`
+        : "The project root currently exposes very little local context for this work package.",
+      evidence: localFiles.slice(0, 8),
+      status: localFiles.length > 0 ? "observed" : "missing"
+    },
+    {
+      id: "finding-inputs",
+      title: "Required input availability",
+      summary: missingInputs.length === 0
+        ? "All explicitly listed required inputs have at least one plausible local match."
+        : `Some required inputs are still missing or ambiguous: ${missingInputs.join(" | ")}`,
+      evidence: checklist.items
+        .filter((item) => item.id === "check-inputs")
+        .flatMap((item) => item.notes === undefined ? [] : [item.notes]),
+      status: missingInputs.length === 0 ? "observed" : "blocked"
+    },
+    {
+      id: "finding-eval",
+      title: "Evaluation frame",
+      summary: `The decisive check is currently framed as: ${workPackage.decisiveExperiment}`,
+      evidence: [
+        `Expected artifact: ${workPackage.expectedArtifact}`,
+        `Stop criterion: ${workPackage.stopCriterion}`
+      ],
+      status: "observed"
+    }
+  ];
+}
+
+function decideWorkPackageOutcome(
+  agenda: ResearchAgenda,
+  workPackage: WorkPackage,
+  localFiles: string[],
+  findings: WorkPackageFinding[]
+): WorkPackageDecisionRecord {
+  const blockedBy = [
+    ...workPackage.blockedBy,
+    ...findings
+      .filter((finding) => finding.status === "blocked")
+      .map((finding) => finding.summary)
+  ];
+
+  if (!autoRunnableMode(workPackage)) {
+    return {
+      outcome: "return_to_agenda",
+      rationale: "The selected work package is valuable, but its mode is not in the bounded auto-runnable set for this phase.",
+      nextActions: [
+        "Review the agenda and either confirm a bounded empirical direction or keep the current package human-guided."
+      ],
+      blockedBy,
+      status: "returned"
+    };
+  }
+
+  if (blockedBy.length > 0) {
+    return {
+      outcome: "revise",
+      rationale: "The work package is promising but still blocked by missing inputs or explicit blockers.",
+      nextActions: [
+        "Resolve or replace the blocked inputs before attempting a broader execution loop.",
+        "If the blocker is fundamental, return to agenda generation and pick a more actionable direction."
+      ],
+      blockedBy,
+      status: "blocked"
+    };
+  }
+
+  if (localFiles.length === 0) {
+    return {
+      outcome: "return_to_agenda",
+      rationale: "No meaningful local project context was available, so the package should stay at agenda level.",
+      nextActions: [
+        "Add or identify the relevant local implementation, data, or notes before continuing.",
+        "Alternatively, reframe the work package as pure literature synthesis."
+      ],
+      blockedBy: ["No relevant local project context was detected."],
+      status: "returned"
+    };
+  }
+
+  return {
+    outcome: "continue",
+    rationale: "The work package has a bounded scope, an operational artifact, and enough local context for the next step.",
+    nextActions: [
+      `Use the method plan to work toward the expected artifact: ${workPackage.expectedArtifact}.`,
+      `Evaluate progress using the decisive check: ${workPackage.decisiveExperiment}.`
+    ],
+    blockedBy: [],
+    status: "active"
+  };
+}
+
+function paperEntityId(paper: CanonicalPaper): string {
+  return createLiteratureEntityId("paper", paper.key);
+}
+
+function targetKindForId(targetId: string): MemoryLink["targetKind"] {
+  if (targetId.startsWith("paper-")) {
+    return "paper";
+  }
+
+  if (targetId.startsWith("theme-")) {
+    return "theme";
+  }
+
+  if (targetId.startsWith("notebook-")) {
+    return "notebook";
+  }
+
+  return "memory";
+}
+
+function link(type: MemoryLink["type"], targetId: string): MemoryLink {
+  return {
+    type,
+    targetKind: targetKindForId(targetId),
+    targetId
+  };
 }
 
 function claimRecordId(claim: ResearchClaim): string {
@@ -408,10 +807,7 @@ function buildIdeaRecords(
       title: "Broaden literature retrieval",
       text: `Refine the query plan, provider routing, or access configuration before the next research pass on ${run.brief.topic ?? "this project"}.`,
       runId: run.id,
-      links: questionIds.map((targetId) => ({
-        type: "suggests" as const,
-        targetId
-      })),
+      links: questionIds.map((targetId) => link("refines", targetId)),
       data: {
         researchMode: plan.researchMode,
         objective: plan.objective
@@ -425,10 +821,7 @@ function buildIdeaRecords(
     title: "Follow-up direction",
     text: `Use the canonical paper set from this run to continue the bounded ${plan.researchMode} program around ${plan.objective}.`,
     runId: run.id,
-    links: questionIds.slice(0, 2).map((targetId) => ({
-      type: "suggests" as const,
-      targetId
-    })),
+    links: questionIds.slice(0, 2).map((targetId) => link("refines", targetId)),
     data: {
       researchMode: plan.researchMode,
       objective: plan.objective
@@ -494,6 +887,18 @@ function buildArtifactRecords(
       linkIds: questionIds
     },
     {
+      path: run.artifacts.agendaPath,
+      title: "Research agenda artifact",
+      text: `Saved the ranked research agenda for ${run.id}.`,
+      linkIds: ideaIds.length > 0 ? ideaIds : [summaryId]
+    },
+    {
+      path: run.artifacts.workPackagePath,
+      title: "Selected work package artifact",
+      text: `Saved the selected work package for ${run.id}.`,
+      linkIds: ideaIds.length > 0 ? ideaIds : [summaryId]
+    },
+    {
       path: run.artifacts.summaryPath,
       title: "Run summary artifact",
       text: `Saved run summary for ${run.id}.`,
@@ -513,10 +918,7 @@ function buildArtifactRecords(
     title: artifact.title,
     text: artifact.text,
     runId: run.id,
-    links: artifact.linkIds.map((targetId) => ({
-      type: "contains" as const,
-      targetId
-    })),
+    links: artifact.linkIds.map((targetId) => link("contains", targetId)),
     data: {
       path: relativeArtifactPath(run.projectRoot, artifact.path)
     }
@@ -538,23 +940,8 @@ function buildMemoryInputs(
     ? themes
     : [fallbackFinding(gathered, summaryText, failureMessage)];
   const summaryId = summaryRecordId(run.id);
-
-  const sourceRecords: MemoryRecordInput[] = gathered.canonicalPapers.map((paper) => ({
-    type: "source",
-    key: paperRecordKey(paper),
-    title: paper.title,
-    text: paper.abstract ?? `${paper.citation} [${paper.accessMode}]`,
-    runId: run.id,
-    links: [],
-    data: {
-      citation: paper.citation,
-      locator: paper.bestAccessUrl,
-      sourceKind: "canonical_paper",
-      accessMode: paper.accessMode,
-      providerIds: paper.discoveredVia.join(", ")
-    }
-  }));
-  const sourceIds = gathered.canonicalPapers.map(paperRecordId);
+  const paperByRunId = new Map(gathered.canonicalPapers.map((paper) => [paper.id, paper]));
+  const paperIds = gathered.canonicalPapers.map(paperEntityId);
 
   const verificationByClaimId = new Map(
     verification.verifiedClaims.map((claim) => [claim.claimId, claim])
@@ -569,16 +956,14 @@ function buildMemoryInputs(
       text: claim.evidence,
       runId: run.id,
       links: claim.sourceIds.flatMap((sourceId) => {
-        const paper = gathered.canonicalPapers.find((candidate) => candidate.id === sourceId);
-        return paper === undefined
-          ? []
-          : [{
-            type: "supports" as const,
-            targetId: paperRecordId(paper)
-          }];
+        const paper = paperByRunId.get(sourceId);
+        return paper === undefined ? [] : [link("supported_by", paperEntityId(paper))];
       }),
       data: {
-        sourceIds: claim.sourceIds,
+        paperIds: claim.sourceIds.flatMap((sourceId) => {
+          const paper = paperByRunId.get(sourceId);
+          return paper === undefined ? [] : [paperEntityId(paper)];
+        }),
         supportStatus: verifiedClaim?.supportStatus ?? "unverified",
         confidence: verifiedClaim?.confidence ?? "unknown",
         verificationNotes: verifiedClaim?.verificationNotes ?? []
@@ -595,21 +980,16 @@ function buildMemoryInputs(
     runId: run.id,
     links: [
       ...theme.sourceIds.flatMap((sourceId) => {
-        const paper = gathered.canonicalPapers.find((candidate) => candidate.id === sourceId);
-        return paper === undefined
-          ? []
-          : [{
-            type: "derived_from" as const,
-            targetId: paperRecordId(paper)
-          }];
+        const paper = paperByRunId.get(sourceId);
+        return paper === undefined ? [] : [link("supported_by", paperEntityId(paper))];
       }),
-      ...relatedClaimIdsForTheme(theme, claims).map((targetId) => ({
-        type: "related_to" as const,
-        targetId
-      }))
+      ...relatedClaimIdsForTheme(theme, claims).map((targetId) => link("derived_from", targetId))
     ],
     data: {
-      sourceIds: theme.sourceIds
+      paperIds: theme.sourceIds.flatMap((sourceId) => {
+        const paper = paperByRunId.get(sourceId);
+        return paper === undefined ? [] : [paperEntityId(paper)];
+      })
     }
   }));
   const findingIds = effectiveThemes.map(findingRecordId);
@@ -620,10 +1000,7 @@ function buildMemoryInputs(
     title: question,
     text: question,
     runId: run.id,
-    links: findingIds.slice(0, 3).map((targetId) => ({
-      type: "raises" as const,
-      targetId
-    })),
+    links: findingIds.slice(0, 3).map((targetId) => link("derived_from", targetId)),
     data: {
       researchMode: plan.researchMode
     }
@@ -640,22 +1017,10 @@ function buildMemoryInputs(
     text: summaryText,
     runId: run.id,
     links: [
-      ...findingIds.map((targetId) => ({
-        type: "summarizes" as const,
-        targetId
-      })),
-      ...claimIds.map((targetId) => ({
-        type: "summarizes" as const,
-        targetId
-      })),
-      ...questionIds.map((targetId) => ({
-        type: "summarizes" as const,
-        targetId
-      })),
-      ...ideaIds.map((targetId) => ({
-        type: "summarizes" as const,
-        targetId
-      }))
+      ...findingIds.map((targetId) => link("summarizes", targetId)),
+      ...claimIds.map((targetId) => link("summarizes", targetId)),
+      ...questionIds.map((targetId) => link("summarizes", targetId)),
+      ...ideaIds.map((targetId) => link("summarizes", targetId))
     ],
     data: {
       researchMode: plan.researchMode,
@@ -667,7 +1032,7 @@ function buildMemoryInputs(
 
   const artifactRecords = buildArtifactRecords(
     run,
-    sourceIds,
+    paperIds,
     claimIds,
     findingIds,
     questionIds,
@@ -676,13 +1041,227 @@ function buildMemoryInputs(
   );
 
   return [
-    ...sourceRecords,
     ...claimRecords,
     ...findingRecords,
     ...questionRecords,
     ...ideaRecords,
     summaryRecord,
     ...artifactRecords
+  ];
+}
+
+function buildAgendaMemoryInputs(
+  run: RunRecord,
+  agenda: ResearchAgenda
+): MemoryRecordInput[] {
+  const directionRecords: MemoryRecordInput[] = agenda.candidateDirections.map((direction) => ({
+    type: "direction",
+    key: `${direction.mode}:${direction.title}`,
+    title: direction.title,
+    text: direction.summary,
+    runId: run.id,
+    links: direction.claimIds.map((targetId) => link("derived_from", targetId)),
+    data: {
+      status: direction.id === agenda.selectedDirectionId ? "selected" : "candidate",
+      mode: direction.mode,
+      whyNow: direction.whyNow,
+      overallScore: String(direction.scores.overall),
+      sourceIds: direction.sourceIds,
+      gapIds: direction.gapIds
+    }
+  }));
+
+  const workPackage = agenda.selectedWorkPackage;
+
+  if (workPackage === null) {
+    return directionRecords;
+  }
+
+  const selectedDirection = agenda.candidateDirections.find((direction) => direction.id === agenda.selectedDirectionId) ?? null;
+
+  return [
+    ...directionRecords,
+    {
+      type: "hypothesis",
+      key: `${workPackage.title}:${workPackage.hypothesisOrQuestion}`,
+      title: workPackage.title,
+      text: workPackage.hypothesisOrQuestion,
+      runId: run.id,
+      links: selectedDirection === null
+        ? []
+        : [link("derived_from", workPackageDirectionRecordId(selectedDirection))],
+      data: {
+        status: "selected",
+        mode: workPackage.mode,
+        expectedArtifact: workPackage.expectedArtifact
+      }
+    }
+  ];
+}
+
+function buildWorkPackageArtifactRecords(
+  run: RunRecord,
+  summaryId: string,
+  directionId: string | null,
+  hypothesisId: string | null,
+  methodPlanId: string | null
+): MemoryRecordInput[] {
+  const baseLinks = [
+    summaryId,
+    ...(directionId === null ? [] : [directionId]),
+    ...(hypothesisId === null ? [] : [hypothesisId]),
+    ...(methodPlanId === null ? [] : [methodPlanId])
+  ];
+
+  const artifactSpecs = [
+    {
+      path: run.artifacts.methodPlanPath,
+      title: "Method plan artifact",
+      text: `Saved the bounded method plan for ${run.id}.`
+    },
+    {
+      path: run.artifacts.executionChecklistPath,
+      title: "Execution checklist artifact",
+      text: `Saved the execution checklist for ${run.id}.`
+    },
+    {
+      path: run.artifacts.findingsPath,
+      title: "Work-package findings artifact",
+      text: `Saved bounded findings for ${run.id}.`
+    },
+    {
+      path: run.artifacts.decisionPath,
+      title: "Work-package decision artifact",
+      text: `Saved the work-package decision for ${run.id}.`
+    }
+  ];
+
+  return artifactSpecs.map((artifact) => ({
+    type: "artifact",
+    key: relativeArtifactPath(run.projectRoot, artifact.path),
+    title: artifact.title,
+    text: artifact.text,
+    runId: run.id,
+    links: baseLinks.map((targetId) => link("contains", targetId)),
+    data: {
+      path: relativeArtifactPath(run.projectRoot, artifact.path)
+    }
+  }));
+}
+
+function buildWorkPackageMemoryInputs(
+  run: RunRecord,
+  agenda: ResearchAgenda,
+  workPackage: WorkPackage,
+  methodPlan: MethodPlan,
+  findings: WorkPackageFinding[],
+  decision: WorkPackageDecisionRecord
+): MemoryRecordInput[] {
+  const workPackageSummaryId = createMemoryRecordId("summary", `run:${run.id}:work-package-summary`);
+  const direction = selectedDirection(agenda);
+  const directionId = direction === null ? null : workPackageDirectionRecordId(direction);
+  const hypothesisId = workPackageHypothesisRecordId(workPackage);
+  const methodPlanId = workPackageMethodPlanRecordId(run.id, workPackage.title);
+
+  const hypothesisRecord: MemoryRecordInput = {
+    type: "hypothesis",
+    key: `${workPackage.title}:${workPackage.hypothesisOrQuestion}`,
+    title: workPackage.title,
+    text: workPackage.hypothesisOrQuestion,
+    runId: run.id,
+    links: directionId === null
+      ? []
+      : [link("derived_from", directionId)],
+    data: {
+      status: decision.status === "failed" ? "failed" : decision.status === "blocked" ? "blocked" : "implemented",
+      mode: workPackage.mode
+    }
+  };
+
+  const directionStatusRecord: MemoryRecordInput[] = direction === null
+    ? []
+    : [{
+      type: "direction",
+      key: `${direction.mode}:${direction.title}`,
+      title: direction.title,
+      text: direction.summary,
+      runId: run.id,
+      links: direction.claimIds.map((targetId) => link("derived_from", targetId)),
+      data: {
+        status: decision.status === "failed"
+          ? "failed"
+          : decision.status === "blocked"
+            ? "blocked"
+            : decision.outcome === "continue"
+              ? "implemented"
+              : "selected",
+        mode: direction.mode,
+        whyNow: direction.whyNow,
+        overallScore: String(direction.scores.overall),
+        sourceIds: direction.sourceIds,
+        gapIds: direction.gapIds
+      }
+    }];
+
+  const methodPlanRecord: MemoryRecordInput = {
+    type: "method_plan",
+    key: `run:${run.id}:${workPackage.title}`,
+    title: `Method plan for ${workPackage.title}`,
+    text: methodPlan.evaluationDesign,
+    runId: run.id,
+    links: [
+      link("depends_on", hypothesisId)
+    ],
+    data: {
+      assumptions: methodPlan.assumptions,
+      baselines: methodPlan.baselines,
+      controls: methodPlan.controls,
+      ablations: methodPlan.ablations,
+      decisiveChecks: methodPlan.decisiveChecks,
+      status: decision.outcome === "continue" ? "implemented" : decision.status
+    }
+  };
+
+  const findingRecords: MemoryRecordInput[] = findings.map((finding) => ({
+    type: "finding",
+    key: `${workPackage.title}:${finding.id}`,
+    title: finding.title,
+    text: finding.summary,
+    runId: run.id,
+    links: [
+      link("derived_from", methodPlanId)
+    ],
+    data: {
+      evidence: finding.evidence,
+      status: finding.status
+    }
+  }));
+
+  const summaryRecord: MemoryRecordInput = {
+    type: "summary",
+    key: `run:${run.id}:work-package-summary`,
+    title: `Run ${run.id} work-package summary`,
+    text: decision.rationale,
+    runId: run.id,
+    links: [
+      link("summarizes", hypothesisId),
+      link("summarizes", methodPlanId),
+      ...findingRecords.map((record) => link("summarizes", createMemoryRecordId(record.type, record.key)))
+    ],
+    data: {
+      outcome: decision.outcome,
+      blockedBy: decision.blockedBy
+    }
+  };
+
+  return [
+    ...buildAgendaMemoryInputs(run, agenda),
+    ...directionStatusRecord,
+    hypothesisRecord,
+    methodPlanRecord,
+    ...findingRecords,
+    summaryRecord,
+    ...buildWorkPackageArtifactRecords(run, workPackageSummaryId, directionId, hypothesisId, methodPlanId)
   ];
 }
 
@@ -822,6 +1401,34 @@ function insufficientEvidenceNextQuestions(plan: ResearchPlan): string[] {
   ];
 }
 
+function insufficientEvidenceAgenda(
+  run: RunRecord,
+  plan: ResearchPlan,
+  nextQuestions: string[],
+  failureMessage: string
+): ResearchAgenda {
+  return {
+    executiveSummary: failureMessage,
+    gaps: [{
+      id: `gap-${run.id}-evidence`,
+      title: "Evidence base too thin",
+      summary: failureMessage,
+      sourceIds: [],
+      claimIds: [],
+      severity: "high",
+      gapKind: "coverage_gap"
+    }],
+    candidateDirections: [],
+    selectedDirectionId: null,
+    selectedWorkPackage: null,
+    holdReasons: [
+      failureMessage,
+      ...nextQuestions.slice(0, 2)
+    ],
+    recommendedHumanDecision: `Refine the literature pass before continuing. Start with: ${nextQuestions[0] ?? "inspect retrieval settings and rerun the review."}`
+  };
+}
+
 function insufficientEvidenceSynthesisMarkdown(
   run: RunRecord,
   plan: ResearchPlan,
@@ -860,10 +1467,186 @@ function insufficientEvidenceSynthesisMarkdown(
   ].join("\n");
 }
 
+function workPackageSummaryMarkdown(
+  run: RunRecord,
+  workPackage: WorkPackage,
+  methodPlan: MethodPlan,
+  findings: WorkPackageFinding[],
+  decision: WorkPackageDecisionRecord
+): string {
+  return [
+    "# Work Package Summary",
+    "",
+    `- Run id: ${run.id}`,
+    `- Parent run id: ${run.parentRunId ?? "<none>"}`,
+    `- Work package id: ${workPackage.id}`,
+    `- Title: ${workPackage.title}`,
+    `- Mode: ${workPackage.mode}`,
+    "",
+    "## Objective",
+    "",
+    `- Objective: ${workPackage.objective}`,
+    `- Hypothesis / question: ${workPackage.hypothesisOrQuestion}`,
+    `- Expected artifact: ${workPackage.expectedArtifact}`,
+    "",
+    "## Method Plan",
+    "",
+    `- Evaluation design: ${methodPlan.evaluationDesign}`,
+    `- Baselines: ${methodPlan.baselines.join(" | ") || "<none>"}`,
+    `- Controls: ${methodPlan.controls.join(" | ") || "<none>"}`,
+    `- Ablations: ${methodPlan.ablations.join(" | ") || "<none>"}`,
+    "",
+    "## Findings",
+    "",
+    ...findings.map((finding) => `- ${finding.title} [${finding.status}]: ${finding.summary}`),
+    "",
+    "## Decision",
+    "",
+    `- Outcome: ${decision.outcome}`,
+    `- Status: ${decision.status}`,
+    `- Rationale: ${decision.rationale}`,
+    `- Blocked by: ${decision.blockedBy.join(" | ") || "<none>"}`,
+    "",
+    "## Next Actions",
+    "",
+    ...decision.nextActions.map((action) => `- ${action}`)
+  ].join("\n");
+}
+
+async function runWorkPackageLoop(
+  run: RunRecord,
+  store: RunStore,
+  now: () => string,
+  memoryStore: MemoryStore,
+  literatureStore: LiteratureStore,
+  researchBackend: ResearchBackend
+): Promise<number> {
+  if (run.parentRunId === null || run.derivedFromWorkPackageId === null) {
+    throw new Error("Work-package runs require parentRunId and derivedFromWorkPackageId.");
+  }
+
+  const parentRun = await store.load(run.parentRunId);
+  const parentAgenda = await readJsonArtifactOrNull<ResearchAgenda>(parentRun.artifacts.agendaPath);
+  const parentWorkPackage = await readJsonArtifactOrNull<WorkPackage>(parentRun.artifacts.workPackagePath);
+  const selectedWorkPackage = parentWorkPackage?.id === run.derivedFromWorkPackageId
+    ? parentWorkPackage
+    : parentAgenda?.selectedWorkPackage?.id === run.derivedFromWorkPackageId
+      ? parentAgenda.selectedWorkPackage
+      : null;
+
+  if (parentAgenda === null || selectedWorkPackage === null) {
+    throw new Error("Could not load the selected work package from the parent literature-review run.");
+  }
+
+  const localFiles = await collectResearchLocalFileHints(run.projectRoot, run.brief);
+  const methodPlan = deriveMethodPlan(selectedWorkPackage, run.brief);
+  const checklist = deriveExecutionChecklist(run, selectedWorkPackage, methodPlan, localFiles);
+  const findings = deriveWorkPackageFindings(selectedWorkPackage, localFiles, checklist);
+  const decision = decideWorkPackageOutcome(parentAgenda, selectedWorkPackage, localFiles, findings);
+  const literature = await literatureStore.load();
+  const memoryInputs = buildWorkPackageMemoryInputs(
+    run,
+    parentAgenda,
+    selectedWorkPackage,
+    methodPlan,
+    findings,
+    decision
+  );
+  const memoryResult = await writeMemorySnapshot(run, memoryStore, memoryInputs);
+
+  await writeJsonArtifact(run.artifacts.planPath, {
+    stage: run.stage,
+    parentRunId: run.parentRunId,
+    derivedFromWorkPackageId: run.derivedFromWorkPackageId,
+    workPackage: selectedWorkPackage
+  });
+  await writeJsonArtifact(run.artifacts.agendaPath, parentAgenda);
+  await writeFile(run.artifacts.agendaMarkdownPath, `${agendaMarkdown(parentRun, { researchMode: selectedWorkPackage.mode, objective: selectedWorkPackage.objective, rationale: "Derived from the parent agenda.", searchQueries: [], localFocus: [] }, parentAgenda)}\n`, "utf8");
+  await writeJsonArtifact(run.artifacts.workPackagePath, selectedWorkPackage);
+  await writeJsonArtifact(run.artifacts.methodPlanPath, methodPlan);
+  await writeJsonArtifact(run.artifacts.executionChecklistPath, checklist);
+  await writeJsonArtifact(run.artifacts.findingsPath, findings);
+  await writeJsonArtifact(run.artifacts.decisionPath, decision);
+  await writeJsonArtifact(run.artifacts.literaturePath, {
+    parentRunId: parentRun.id,
+    reusedLiteratureStore: relativeArtifactPath(run.projectRoot, literatureStore.filePath),
+    paperCount: literature.paperCount,
+    themeCount: literature.themeCount,
+    notebookCount: literature.notebookCount
+  });
+  await writeFile(
+    run.artifacts.summaryPath,
+    `${workPackageSummaryMarkdown(run, selectedWorkPackage, methodPlan, findings, decision)}\n`,
+    "utf8"
+  );
+
+  await appendTrace(run, now, `Executing bounded work package ${selectedWorkPackage.id}.`);
+  await appendEvent(run, now, "plan", `Restated objective: ${selectedWorkPackage.objective}`);
+  await appendEvent(run, now, "next", "Inspect local repo/runtime context.");
+  await appendEvent(run, now, "next", "Produce the method plan and bounded execution checklist.");
+  await appendStdout(run, `Research backend: ${researchBackend.label}`);
+  await appendStdout(run, `Work package: ${selectedWorkPackage.title} (${selectedWorkPackage.mode})`);
+  await appendStdout(run, `Local context candidates: ${localFiles.length}`);
+
+  for (const item of checklist.items) {
+    await appendEvent(run, now, item.kind === "command" ? "exec" : "plan", `${item.title}: ${item.intent}`);
+    if (item.notes !== undefined) {
+      await appendStdout(run, `${item.title}: ${item.notes}`);
+    }
+  }
+
+  for (const finding of findings) {
+    await appendEvent(run, now, finding.status === "blocked" ? "stderr" : "summary", `${finding.title}: ${finding.summary}`);
+  }
+
+  await appendEvent(run, now, "memory", `Recorded ${memoryResult.recordCount} structured memory records (${memoryResult.inserted} new, ${memoryResult.updated} updated).`);
+  await appendStdout(run, `Structured memory updated: ${memoryResult.recordCount} records (${memoryResult.inserted} new, ${memoryResult.updated} updated).`);
+  await appendEvent(run, now, "run", `${decision.outcome}: ${decision.rationale}`);
+
+  run.job.finishedAt = now();
+  run.finishedAt = now();
+  run.job.exitCode = 0;
+  run.job.signal = null;
+  run.workerPid = null;
+  run.status = "completed";
+  run.statusMessage = `Work-package run completed with decision ${decision.outcome}.`;
+  await store.save(run);
+  await appendEvent(run, now, "run", run.statusMessage);
+  return 0;
+}
+
+async function launchDerivedWorkPackageRun(
+  store: RunStore,
+  runController: RunController,
+  parentRun: RunRecord,
+  agenda: ResearchAgenda
+): Promise<RunRecord | null> {
+  if (!isWorkPackageAutoContinuable(agenda) || agenda.selectedWorkPackage === null) {
+    return null;
+  }
+
+  const childRun = await store.createWithOptions(
+    parentRun.brief,
+    createWorkPackageRunCommand(agenda.selectedWorkPackage),
+    {
+      stage: "work_package",
+      parentRunId: parentRun.id,
+      derivedFromWorkPackageId: agenda.selectedWorkPackage.id
+    }
+  );
+  const workerPid = await runController.launch(childRun);
+  childRun.workerPid = workerPid;
+  childRun.status = "queued";
+  childRun.statusMessage = "Derived work-package run launched automatically. Waiting for the run worker to start.";
+  await store.save(childRun);
+  return childRun;
+}
+
 export async function runDetachedJobWorker(options: WorkerOptions): Promise<number> {
   const now = options.now ?? (() => new Date().toISOString());
   const store = new RunStore(options.projectRoot, options.version, now);
   const run = await store.load(options.runId);
+  const runController = options.runController ?? createDefaultRunController();
   const researchBackend = options.researchBackend ?? createDefaultResearchBackend();
   const sourceGatherer = options.sourceGatherer ?? createDefaultResearchSourceGatherer();
   const projectConfigStore = new ProjectConfigStore(options.projectRoot, now);
@@ -889,8 +1672,28 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     run.workerPid = process.pid;
     run.status = "running";
     run.startedAt = run.startedAt ?? now();
-    run.statusMessage = "Run worker started and is preparing the provider-aware research loop.";
-    run.job.command = runLoopCommand(run.id);
+    run.statusMessage = run.stage === "work_package"
+      ? "Run worker started and is preparing the bounded work-package loop."
+      : "Run worker started and is preparing the provider-aware research loop.";
+    if (run.job.command.length === 0) {
+      run.job.command = run.stage === "work_package" && run.derivedFromWorkPackageId !== null
+        ? createWorkPackageRunCommand({
+          id: run.derivedFromWorkPackageId,
+          title: "selected-work-package",
+          mode: "method_improvement",
+          objective: "continue the selected work package",
+          hypothesisOrQuestion: "continue the selected work package",
+          methodSketch: "",
+          baselines: [],
+          controls: [],
+          decisiveExperiment: "",
+          stopCriterion: "",
+          expectedArtifact: "",
+          requiredInputs: [],
+          blockedBy: []
+        })
+        : runLoopCommand(run.id);
+    }
     run.job.cwd = run.projectRoot;
     run.job.pid = process.pid;
     run.job.startedAt = now();
@@ -917,7 +1720,6 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         ? `Loaded ${literatureContext.paperCount} prior canonical papers, ${literatureContext.themeCount} theme boards, and ${literatureContext.notebookCount} review notebooks.`
         : "No prior literature memory was available for this run."
     );
-    await appendEvent(run, now, "plan", "Plan the research mode and generate initial retrieval queries.");
     await appendStdout(run, `Research backend: ${researchBackend.label}`);
     await appendStdout(run, `Run loop command: ${run.job.command.join(" ")}`);
     await appendStdout(run, `Selected scholarly-discovery providers: ${formatSelectedLiteratureProviders(scholarlyDiscoveryProviders)}`);
@@ -932,6 +1734,19 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         `Provider auth: ${authState.definition.label} -> ${authState.status}`
       );
     }
+
+    if (run.stage === "work_package") {
+      return runWorkPackageLoop(
+        run,
+        store,
+        now,
+        memoryStore,
+        literatureStore,
+        researchBackend
+      );
+    }
+
+    await appendEvent(run, now, "plan", "Plan the research mode and generate initial retrieval queries.");
 
     const localFiles = await collectResearchLocalFileHints(run.projectRoot, run.brief);
 
@@ -1022,6 +1837,10 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       await writeJsonArtifact(run.artifacts.claimsPath, []);
       await writeJsonArtifact(run.artifacts.verificationPath, verification);
       await writeJsonArtifact(run.artifacts.nextQuestionsPath, nextQuestions);
+      const agenda = insufficientEvidenceAgenda(run, plan, nextQuestions, failureMessage);
+      await writeJsonArtifact(run.artifacts.agendaPath, agenda);
+      await writeFile(run.artifacts.agendaMarkdownPath, `${agendaMarkdown(run, plan, agenda)}\n`, "utf8");
+      await writeJsonArtifact(run.artifacts.workPackagePath, null);
       await writeFile(
         run.artifacts.synthesisPath,
         `${insufficientEvidenceSynthesisMarkdown(run, plan, gathered, nextQuestions, failureMessage)}\n`,
@@ -1043,17 +1862,20 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       const memoryResult = await writeMemorySnapshot(
         run,
         memoryStore,
-        buildMemoryInputs(
-          run,
-          plan,
-          gathered,
-          failureMessage,
-          [],
-          [],
-          verification,
-          nextQuestions,
-          failureMessage
-        )
+        [
+          ...buildMemoryInputs(
+            run,
+            plan,
+            gathered,
+            failureMessage,
+            [],
+            [],
+            verification,
+            nextQuestions,
+            failureMessage
+          ),
+          ...buildAgendaMemoryInputs(run, agenda)
+        ]
       );
       const literatureResult = await literatureStore.upsert(
         buildLiteratureInputs(
@@ -1098,16 +1920,19 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         await appendEvent(run, now, "next", question);
       }
 
+      await appendEvent(run, now, "plan", "Agenda generation completed with a hold because the evidence base remained too thin.");
+      await appendStdout(run, `Agenda hold: ${agenda.recommendedHumanDecision}`);
+
       run.job.finishedAt = now();
       run.finishedAt = now();
-      run.job.exitCode = 1;
+      run.job.exitCode = 0;
       run.job.signal = null;
       run.workerPid = null;
-      run.status = "failed";
-      run.statusMessage = failureMessage;
+      run.status = "completed";
+      run.statusMessage = "Literature review completed, but the agenda is on hold because the evidence base was too thin.";
       await store.save(run);
-      await appendEvent(run, now, "run", failureMessage);
-      return 1;
+      await appendEvent(run, now, "run", run.statusMessage);
+      return 0;
     }
 
     await appendEvent(run, now, "next", "Synthesize themes, claims, and next-step questions from the reviewed paper set.");
@@ -1124,26 +1949,42 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       papers: gathered.reviewedPapers,
       claims: synthesis.claims
     });
+    const agenda = await researchBackend.developResearchAgenda({
+      projectRoot: run.projectRoot,
+      brief: run.brief,
+      plan,
+      papers: gathered.reviewedPapers,
+      synthesis,
+      verification,
+      memoryContext,
+      literatureContext
+    });
 
     await writeJsonArtifact(run.artifacts.claimsPath, synthesis.claims);
     await writeJsonArtifact(run.artifacts.nextQuestionsPath, synthesis.nextQuestions);
     await writeJsonArtifact(run.artifacts.verificationPath, verification);
+    await writeJsonArtifact(run.artifacts.agendaPath, agenda);
+    await writeFile(run.artifacts.agendaMarkdownPath, `${agendaMarkdown(run, plan, agenda)}\n`, "utf8");
+    await writeJsonArtifact(run.artifacts.workPackagePath, agenda.selectedWorkPackage);
     await writeFile(run.artifacts.synthesisPath, `${synthesisMarkdown(run, plan, gathered, synthesis, verification)}\n`, "utf8");
     await writeFile(run.artifacts.summaryPath, `${researchSummaryMarkdown(run, plan, gathered, synthesis, verification)}\n`, "utf8");
     const memoryResult = await writeMemorySnapshot(
       run,
       memoryStore,
-      buildMemoryInputs(
-        run,
-        plan,
-        gathered,
-        synthesis.executiveSummary,
-        synthesis.themes,
-        synthesis.claims,
-        verification,
-        synthesis.nextQuestions,
-        null
-      )
+      [
+        ...buildMemoryInputs(
+          run,
+          plan,
+          gathered,
+          synthesis.executiveSummary,
+          synthesis.themes,
+          synthesis.claims,
+          verification,
+          synthesis.nextQuestions,
+          null
+        ),
+        ...buildAgendaMemoryInputs(run, agenda)
+      ]
     );
     const literatureResult = await literatureStore.upsert(
       buildLiteratureInputs(
@@ -1195,13 +2036,49 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       await appendEvent(run, now, "next", question);
     }
 
+    await appendEvent(run, now, "plan", `Agenda generated with ${agenda.candidateDirections.length} candidate directions.`);
+
+    if (agenda.selectedWorkPackage !== null) {
+      await appendEvent(
+        run,
+        now,
+        "next",
+        `Selected work package: ${agenda.selectedWorkPackage.title}`
+      );
+      await appendStdout(run, `Selected work package: ${agenda.selectedWorkPackage.title}`);
+    }
+
+    let derivedRun: RunRecord | null = null;
+
+    if (projectConfig.runtime.postReviewBehavior === "auto_continue") {
+      derivedRun = await launchDerivedWorkPackageRun(store, runController, run, agenda);
+
+      if (derivedRun === null && agendaHasActionableWorkPackage(agenda)) {
+        const blockers = workPackageAutoContinueBlockers(agenda);
+        await appendEvent(
+          run,
+          now,
+          "next",
+          blockers.length > 0
+            ? `Auto-continue skipped: ${blockers.join(" | ")}`
+            : "Auto-continue was configured, but the selected work package did not satisfy the bounded safety gate."
+        );
+      }
+    }
+
     run.job.finishedAt = now();
     run.finishedAt = now();
     run.job.exitCode = 0;
     run.job.signal = null;
     run.workerPid = null;
     run.status = "completed";
-    run.statusMessage = "Provider-aware literature run completed successfully.";
+    run.statusMessage = derivedRun !== null
+      ? `Provider-aware literature run completed and auto-launched derived work-package run ${derivedRun.id}.`
+      : !agendaHasActionableWorkPackage(agenda)
+        ? "Provider-aware literature run completed, but the agenda remains on hold for human review."
+        : projectConfig.runtime.postReviewBehavior === "confirm"
+          ? "Provider-aware literature run completed and is waiting for `/continue` on the selected work package."
+          : "Provider-aware literature run completed successfully.";
     await store.save(run);
     await appendEvent(run, now, "run", run.statusMessage);
     return 0;

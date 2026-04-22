@@ -33,21 +33,25 @@ function emptyMemoryContext(overrides: Partial<ProjectMemoryContext> = {}): Proj
     available: false,
     recordCount: 0,
     countsByType: {
-      source: 0,
       claim: 0,
       finding: 0,
       question: 0,
       idea: 0,
       summary: 0,
-      artifact: 0
+      artifact: 0,
+      direction: 0,
+      hypothesis: 0,
+      method_plan: 0
     },
-    sources: [],
     claims: [],
     findings: [],
     questions: [],
     ideas: [],
     summaries: [],
     artifacts: [],
+    directions: [],
+    hypotheses: [],
+    methodPlans: [],
     queryHints: [],
     localFileHints: [],
     ...overrides
@@ -618,13 +622,15 @@ test("literature and memory hints influence the next retrieval pass", async () =
         available: true,
         recordCount: 1,
         countsByType: {
-          source: 0,
           claim: 0,
           finding: 0,
           question: 1,
           idea: 0,
           summary: 0,
-          artifact: 0
+          artifact: 0,
+          direction: 0,
+          hypothesis: 0,
+          method_plan: 0
         },
         questions: [
           {
@@ -632,10 +638,13 @@ test("literature and memory hints influence the next retrieval pass", async () =
             title: "Which obstacles limit mollifier methods for the Riemann Hypothesis?",
             text: "Which obstacles limit mollifier methods for the Riemann Hypothesis?",
             runId: "run-prior",
-            linkedRecordIds: [],
+            links: [],
             data: {}
           }
         ],
+        directions: [],
+        hypotheses: [],
+        methodPlans: [],
         queryHints: [
           "mollifier methods"
         ]

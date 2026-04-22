@@ -28,16 +28,6 @@ test("memory store upserts typed records, preserves stable ids, and merges links
 
     const firstUpsert = await store.upsert([
       {
-        type: "source",
-        key: "openalex:https://example.org/paper-1",
-        title: "Example paper",
-        text: "An example source excerpt.",
-        runId: "run-1",
-        data: {
-          citation: "Example Author (2025). Example paper."
-        }
-      },
-      {
         type: "claim",
         key: "Example claim",
         title: "Example claim",
@@ -45,17 +35,18 @@ test("memory store upserts typed records, preserves stable ids, and merges links
         runId: "run-1",
         links: [
           {
-            type: "supports",
-            targetId: createMemoryRecordId("source", "openalex:https://example.org/paper-1")
+            type: "supported_by",
+            targetKind: "paper",
+            targetId: "paper-example-1"
           }
         ],
         data: {
-          sourceIds: ["web-1"]
+          paperIds: ["paper-example-1"]
         }
       }
     ]);
 
-    assert.equal(firstUpsert.inserted, 2);
+    assert.equal(firstUpsert.inserted, 1);
     assert.equal(firstUpsert.updated, 0);
 
     const secondUpsert = await store.upsert([
@@ -67,16 +58,18 @@ test("memory store upserts typed records, preserves stable ids, and merges links
         runId: "run-2",
         links: [
           {
-            type: "supports",
-            targetId: createMemoryRecordId("source", "openalex:https://example.org/paper-1")
+            type: "supported_by",
+            targetKind: "paper",
+            targetId: "paper-example-1"
           },
           {
             type: "related_to",
+            targetKind: "memory",
             targetId: createMemoryRecordId("question", "What should be tested next?")
           }
         ],
         data: {
-          sourceIds: ["web-1", "web-2"],
+          paperIds: ["paper-example-1", "paper-example-2"],
           note: "updated"
         }
       },
@@ -96,15 +89,14 @@ test("memory store upserts typed records, preserves stable ids, and merges links
     const counts = countMemoryRecordsByType(memory);
     const claimRecord = memory.records.find((record) => record.type === "claim");
 
-    assert.equal(memory.recordCount, 3);
-    assert.equal(counts.source, 1);
+    assert.equal(memory.recordCount, 2);
     assert.equal(counts.claim, 1);
     assert.equal(counts.question, 1);
     assert.ok(claimRecord);
     assert.equal(claimRecord?.runId, "run-2");
     assert.equal(claimRecord?.text, "Refined evidence for the example claim.");
     assert.equal(claimRecord?.links.length, 2);
-    assert.deepEqual(claimRecord?.data.sourceIds, ["web-1", "web-2"]);
+    assert.deepEqual(claimRecord?.data.paperIds, ["paper-example-1", "paper-example-2"]);
     assert.equal(claimRecord?.data.note, "updated");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });

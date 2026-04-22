@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import {
@@ -16,6 +17,12 @@ import {
   type IntakeResponse
 } from "./intake-backend.js";
 import {
+  createDefaultProjectAssistantBackend,
+  type ProjectAssistantBackend,
+  type ProjectAssistantRequest,
+  type ProjectAssistantRunContext
+} from "./project-assistant-backend.js";
+import {
   createDefaultRunController,
   type RunController
 } from "./run-controller.js";
@@ -23,6 +30,14 @@ import {
   RunStore,
   type RunRecord
 } from "./run-store.js";
+import {
+  agendaHasActionableWorkPackage,
+  isWorkPackageAutoContinuable,
+  type WorkPackageDecisionRecord,
+  type WorkPackageFinding,
+  workPackageContinueBlockers,
+  workPackageAutoContinueBlockers
+} from "./research-agenda.js";
 import {
   ConsoleTranscript
 } from "./console-transcript.js";
@@ -68,6 +83,10 @@ import {
   type RunEventKind,
   type RunEventRecord
 } from "./run-events.js";
+import type {
+  ResearchAgenda,
+  WorkPackage
+} from "./research-backend.js";
 
 export type OutputWriter = {
   write: (chunk: string) => void;
@@ -84,6 +103,7 @@ export type RunOptions = {
   version: string;
   now?: () => string;
   intakeBackend?: IntakeBackend;
+  projectAssistantBackend?: ProjectAssistantBackend;
   runController?: RunController;
   watchRuns?: boolean;
   watchPollMs?: number;
@@ -176,6 +196,50 @@ function renderTaggedLines(writer: OutputWriter, tag: string, lines: string[]): 
   }
 }
 
+export type AgendaSnapshot = {
+  run: RunRecord;
+  agenda: ResearchAgenda;
+  workPackage: WorkPackage | null;
+};
+
+async function readJsonFileOrNull<T>(filePath: string): Promise<T | null> {
+  try {
+    const contents = await readFile(filePath, "utf8");
+    return JSON.parse(contents) as T;
+  } catch {
+    return null;
+  }
+}
+
+async function loadAgendaSnapshotForRun(run: RunRecord): Promise<AgendaSnapshot | null> {
+  const agenda = await readJsonFileOrNull<ResearchAgenda>(run.artifacts.agendaPath);
+
+  if (agenda === null) {
+    return null;
+  }
+
+  const workPackage = await readJsonFileOrNull<WorkPackage | null>(run.artifacts.workPackagePath);
+  return {
+    run,
+    agenda,
+    workPackage: workPackage ?? agenda.selectedWorkPackage ?? null
+  };
+}
+
+export async function latestAgendaSnapshot(runStore: RunStore): Promise<AgendaSnapshot | null> {
+  const runs = await runStore.list();
+
+  for (const run of runs) {
+    const snapshot = await loadAgendaSnapshotForRun(run);
+
+    if (snapshot !== null) {
+      return snapshot;
+    }
+  }
+
+  return null;
+}
+
 export function relativeProjectPath(projectRoot: string, targetPath: string): string {
   const relativePath = path.relative(projectRoot, targetPath);
   return relativePath.length === 0 ? "." : relativePath;
@@ -199,7 +263,7 @@ function renderWelcome(writer: OutputWriter, session: SessionState): void {
   }
 
   writeLine(writer, "The current directory is treated as the project root automatically.");
-  writeLine(writer, "Use `/help` for commands, `/status` for the current brief and run state, `/sources` to inspect literature providers, `/go` to start a detached run when the brief is ready, and `/quit` to leave.");
+  writeLine(writer, "Use `/help` for commands, `/status` for the current brief, agenda, and run state, `/sources` to inspect literature providers, `/go` to start the literature review, `/agenda` to inspect the latest research agenda, `/continue` to launch the selected work package, and `/quit` to leave.");
   writeLine(writer);
 }
 
@@ -284,7 +348,9 @@ export function renderHelp(writer: OutputWriter, session: SessionState): void {
   writeLine(writer, "  /help   Show the command list and input hints");
   writeLine(writer, "  /status Show the current research brief, run state, and backend");
   writeLine(writer, "  /sources Show the current literature providers for this project");
-  writeLine(writer, "  /go     Start a detached run from the current research brief");
+  writeLine(writer, "  /go     Start the initial detached literature-review run");
+  writeLine(writer, "  /agenda Show the latest saved research agenda and selected work package");
+  writeLine(writer, "  /continue Start the selected work package when the latest agenda is actionable");
   writeLine(writer, "  /pause  Pause the active detached run");
   writeLine(writer, "  /resume Resume the active detached run");
   writeLine(writer, "  /quit   Save and exit");
@@ -298,6 +364,35 @@ export function renderHelp(writer: OutputWriter, session: SessionState): void {
   writeLine(writer, `  Local intake backend: ${session.intake.backendLabel ?? "not configured"}`);
 }
 
+export function renderAgenda(
+  writer: OutputWriter,
+  snapshot: AgendaSnapshot | null,
+  projectRoot: string
+): void {
+  if (snapshot === null) {
+    writeLine(writer, "Agenda:");
+    writeLine(writer, "  none yet");
+    return;
+  }
+
+  writeLine(writer, "Agenda:");
+  writeLine(writer, `  run: ${snapshot.run.id}`);
+  writeLine(writer, `  artifact: ${relativeProjectPath(projectRoot, snapshot.run.artifacts.agendaPath)}`);
+  writeLine(writer, `  summary: ${snapshot.agenda.executiveSummary}`);
+  writeLine(writer, `  candidate directions: ${snapshot.agenda.candidateDirections.length}`);
+  writeLine(writer, `  selected direction: ${snapshot.agenda.selectedDirectionId ?? "<none>"}`);
+  writeLine(writer, `  selected work package: ${snapshot.workPackage?.title ?? "<none>"}`);
+  writeLine(writer, `  recommended decision: ${snapshot.agenda.recommendedHumanDecision}`);
+
+  if (snapshot.agenda.holdReasons.length > 0) {
+    writeLine(writer, "  hold reasons:");
+
+    for (const reason of snapshot.agenda.holdReasons) {
+      writeLine(writer, `    - ${reason}`);
+    }
+  }
+}
+
 export function renderStatus(
   writer: OutputWriter,
   session: SessionState,
@@ -306,7 +401,8 @@ export function renderStatus(
   memory: MemoryState,
   projectConfig: ProjectConfigState,
   literature: LiteratureState,
-  credentials: CredentialStoreState
+  credentials: CredentialStoreState,
+  agendaSnapshot: AgendaSnapshot | null = null
 ): void {
   writeLine(writer, "Current brief:");
   writeLine(writer, `  topic: ${session.brief.topic ?? "<missing>"}`);
@@ -343,6 +439,7 @@ export function renderStatus(
     writeLine(writer, "  none yet");
   } else {
     writeLine(writer, `  id: ${run.id}`);
+    writeLine(writer, `  stage: ${run.stage}`);
     writeLine(writer, `  status: ${run.status}`);
 
     if (run.statusMessage !== null) {
@@ -360,6 +457,15 @@ export function renderStatus(
     writeLine(writer, `  claims: ${relativeProjectPath(session.projectRoot, run.artifacts.claimsPath)}`);
     writeLine(writer, `  verification: ${relativeProjectPath(session.projectRoot, run.artifacts.verificationPath)}`);
     writeLine(writer, `  next questions: ${relativeProjectPath(session.projectRoot, run.artifacts.nextQuestionsPath)}`);
+    writeLine(writer, `  agenda: ${relativeProjectPath(session.projectRoot, run.artifacts.agendaPath)}`);
+    writeLine(writer, `  agenda summary: ${relativeProjectPath(session.projectRoot, run.artifacts.agendaMarkdownPath)}`);
+    writeLine(writer, `  work package: ${relativeProjectPath(session.projectRoot, run.artifacts.workPackagePath)}`);
+    if (run.stage === "work_package") {
+      writeLine(writer, `  method plan: ${relativeProjectPath(session.projectRoot, run.artifacts.methodPlanPath)}`);
+      writeLine(writer, `  execution checklist: ${relativeProjectPath(session.projectRoot, run.artifacts.executionChecklistPath)}`);
+      writeLine(writer, `  findings: ${relativeProjectPath(session.projectRoot, run.artifacts.findingsPath)}`);
+      writeLine(writer, `  decision: ${relativeProjectPath(session.projectRoot, run.artifacts.decisionPath)}`);
+    }
     writeLine(writer, `  memory snapshot: ${relativeProjectPath(session.projectRoot, run.artifacts.memoryPath)}`);
   }
 
@@ -369,6 +475,27 @@ export function renderStatus(
   writeLine(writer, `Messages saved: ${session.conversation.length}`);
   writeLine(writer, `Backend: ${session.intake.backendLabel ?? "<unknown>"}`);
   writeLine(writer, `Debug log: ${relativeProjectPath(session.projectRoot, transcriptPath)}`);
+  writeLine(writer, `Post-review behavior: ${projectConfig.runtime.postReviewBehavior}`);
+  if (agendaSnapshot === null) {
+    writeLine(writer, "Agenda available: no");
+  } else {
+    writeLine(writer, "Agenda available: yes");
+    writeLine(writer, `Selected direction: ${agendaSnapshot.agenda.selectedDirectionId ?? "<none>"}`);
+    writeLine(writer, `Selected work package: ${agendaSnapshot.workPackage?.title ?? "<none>"}`);
+    writeLine(writer, `Waiting for confirmation: ${projectConfig.runtime.postReviewBehavior === "confirm" && agendaHasActionableWorkPackage(agendaSnapshot.agenda) ? "yes" : "no"}`);
+    const continueBlockers = workPackageContinueBlockers(agendaSnapshot.agenda);
+    if (continueBlockers.length > 0 && agendaSnapshot.workPackage !== null) {
+      writeLine(writer, `Continue blockers: ${continueBlockers.join(" | ")}`);
+    }
+    const autoContinueEligible = isWorkPackageAutoContinuable(agendaSnapshot.agenda);
+    writeLine(writer, `Auto-continue eligible: ${autoContinueEligible ? "yes" : "no"}`);
+    if (!autoContinueEligible && agendaHasActionableWorkPackage(agendaSnapshot.agenda)) {
+      const blockers = workPackageAutoContinueBlockers(agendaSnapshot.agenda);
+      if (blockers.length > 0) {
+        writeLine(writer, `Auto-continue blockers: ${blockers.join(" | ")}`);
+      }
+    }
+  }
   writeLine(writer);
   writeLine(writer, "Memory:");
   writeLine(writer, `  store: ${relativeProjectPath(session.projectRoot, memory.runtimeDirectory)}/${"memory.json"}`);
@@ -377,7 +504,7 @@ export function renderStatus(
   const counts = countMemoryRecordsByType(memory);
   writeLine(
     writer,
-    `  by type: source ${counts.source}, claim ${counts.claim}, finding ${counts.finding}, question ${counts.question}, idea ${counts.idea}, summary ${counts.summary}, artifact ${counts.artifact}`
+    `  by type: claim ${counts.claim}, finding ${counts.finding}, question ${counts.question}, idea ${counts.idea}, summary ${counts.summary}, artifact ${counts.artifact}, direction ${counts.direction}, hypothesis ${counts.hypothesis}, method_plan ${counts.method_plan}`
   );
   writeLine(writer);
   writeLine(writer, "Literature:");
@@ -1281,6 +1408,17 @@ function createInitialRunCommand(): string[] {
   return ["clawresearch", "research-loop", "--mode", "plan-gather-synthesize"];
 }
 
+function createContinuationRunCommand(workPackage: WorkPackage): string[] {
+  return [
+    "clawresearch",
+    "research-loop",
+    "--mode",
+    "work-package",
+    "--work-package-id",
+    workPackage.id
+  ];
+}
+
 async function loadRunIfPresent(
   runStore: RunStore,
   runId: string | null
@@ -1336,8 +1474,23 @@ export async function reconcileRelevantRun(
     await store.save(session);
   }
 
-  if (run !== null) {
-    return run;
+  const fallbackRun = run ?? await loadRunIfPresent(runStore, session.lastRunId);
+  const latestRun = await runStore.latest();
+  const preferredRun = latestRun !== null
+    && (fallbackRun === null || latestRun.createdAt >= fallbackRun.createdAt)
+    ? latestRun
+    : fallbackRun;
+
+  if (preferredRun !== null) {
+    if (!isTerminalRun(preferredRun)) {
+      session.activeRunId = preferredRun.id;
+    } else {
+      session.activeRunId = null;
+      session.lastRunId = preferredRun.id;
+    }
+
+    await store.save(session);
+    return preferredRun;
   }
 
   if (session.activeRunId !== null) {
@@ -1345,7 +1498,204 @@ export async function reconcileRelevantRun(
     await store.save(session);
   }
 
-  return loadRunIfPresent(runStore, session.lastRunId);
+  return null;
+}
+
+function normalizedFieldValue(value: string | null): string {
+  return value?.trim().toLowerCase() ?? "";
+}
+
+function briefsMatch(left: ResearchBrief, right: ResearchBrief): boolean {
+  return normalizedFieldValue(left.topic) === normalizedFieldValue(right.topic)
+    && normalizedFieldValue(left.researchQuestion) === normalizedFieldValue(right.researchQuestion)
+    && normalizedFieldValue(left.researchDirection) === normalizedFieldValue(right.researchDirection)
+    && normalizedFieldValue(left.successCriterion) === normalizedFieldValue(right.successCriterion);
+}
+
+async function readTextFileOrNull(filePath: string): Promise<string | null> {
+  try {
+    const contents = await readFile(filePath, "utf8");
+    const trimmed = contents.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readRecentRunEvents(run: RunRecord, limit = 8): Promise<string[]> {
+  const raw = await readTextFileOrNull(run.artifacts.eventsPath);
+
+  if (raw === null) {
+    return [];
+  }
+
+  const parsed = parseRunEventLines(`${raw}\n`);
+  return parsed.events
+    .slice(-limit)
+    .map((event) => `${event.kind}: ${event.message}`);
+}
+
+type ProjectAssistantContextSnapshot = {
+  run: RunRecord;
+  currentRun: ProjectAssistantRunContext;
+  agenda: ResearchAgenda | null;
+  workPackage: WorkPackage | null;
+  decision: WorkPackageDecisionRecord | null;
+  findings: WorkPackageFinding[];
+};
+
+async function loadProjectAssistantContext(
+  session: SessionState,
+  runStore: RunStore
+): Promise<ProjectAssistantContextSnapshot | null> {
+  const preferredRun = await loadRunIfPresent(runStore, session.activeRunId)
+    ?? await loadRunIfPresent(runStore, session.lastRunId)
+    ?? await runStore.latest();
+
+  if (preferredRun === null) {
+    return null;
+  }
+
+  const agendaSnapshot = await loadAgendaSnapshotForRun(preferredRun)
+    ?? await latestAgendaSnapshot(runStore);
+  const decision = await readJsonFileOrNull<WorkPackageDecisionRecord>(preferredRun.artifacts.decisionPath);
+  const findings = await readJsonFileOrNull<WorkPackageFinding[]>(preferredRun.artifacts.findingsPath) ?? [];
+  const summaryMarkdown = await readTextFileOrNull(preferredRun.artifacts.summaryPath);
+  const recentEvents = await readRecentRunEvents(preferredRun);
+
+  return {
+    run: preferredRun,
+    currentRun: {
+      id: preferredRun.id,
+      stage: preferredRun.stage,
+      status: preferredRun.status,
+      statusMessage: preferredRun.statusMessage,
+      briefMatchesCurrent: briefsMatch(preferredRun.brief, session.brief),
+      recentEvents,
+      summaryMarkdown
+    },
+    agenda: agendaSnapshot?.agenda ?? null,
+    workPackage: agendaSnapshot?.workPackage ?? null,
+    decision,
+    findings
+  };
+}
+
+async function requestProjectAssistantTurn(
+  session: SessionState,
+  runStore: RunStore,
+  backend: ProjectAssistantBackend,
+  mode: ProjectAssistantRequest["mode"]
+): Promise<IntakeResponse> {
+  const context = await loadProjectAssistantContext(session, runStore);
+
+  if (context === null) {
+    throw new Error("No run-aware project context is available yet.");
+  }
+
+  return backend.respond({
+    mode,
+    projectRoot: session.projectRoot,
+    brief: session.brief,
+    openQuestions: session.intake.openQuestions,
+    conversation: session.conversation
+      .filter((entry) => entry.kind === "chat")
+      .slice(-16)
+      .map((entry) => ({
+        role: entry.role,
+        content: entry.text
+      })),
+    currentRun: context.currentRun,
+    latestAgenda: context.agenda,
+    latestWorkPackage: context.workPackage,
+    latestDecision: context.decision,
+    latestFindings: context.findings
+  });
+}
+
+function truncateSentence(text: string, limit = 280): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+
+  if (normalized.length <= limit) {
+    return normalized;
+  }
+
+  const boundary = normalized.lastIndexOf(".", limit);
+
+  if (boundary >= Math.floor(limit * 0.4)) {
+    return normalized.slice(0, boundary + 1);
+  }
+
+  return `${normalized.slice(0, limit - 3)}...`;
+}
+
+async function buildCompletedRunSummary(run: RunRecord): Promise<string> {
+  if (run.stage === "work_package") {
+    const workPackage = await readJsonFileOrNull<WorkPackage>(run.artifacts.workPackagePath);
+    const decision = await readJsonFileOrNull<WorkPackageDecisionRecord>(run.artifacts.decisionPath);
+    const findings = await readJsonFileOrNull<WorkPackageFinding[]>(run.artifacts.findingsPath) ?? [];
+    const topFinding = findings.find((finding) => finding.status === "blocked")
+      ?? findings.find((finding) => finding.status === "observed")
+      ?? findings[0]
+      ?? null;
+
+    if (decision !== null) {
+      const nextStep = decision.nextActions[0] ?? "Review the decision artifact and choose the next step.";
+      const packageTitle = workPackage?.title ?? run.derivedFromWorkPackageId ?? "selected work package";
+      const findingText = topFinding === null ? "" : ` Main point: ${topFinding.summary}`;
+
+      return `Work package complete for ${packageTitle}. Outcome: ${decision.outcome}. ${decision.rationale}${findingText} Next step: ${nextStep}`;
+    }
+
+    return run.statusMessage ?? `Work-package run ${run.id} completed.`;
+  }
+
+  const agendaSnapshot = await loadAgendaSnapshotForRun(run);
+
+  if (agendaSnapshot !== null) {
+    const summary = truncateSentence(agendaSnapshot.agenda.executiveSummary);
+
+    if (agendaSnapshot.agenda.holdReasons.length > 0) {
+      return `Literature review complete. ${summary} The agenda is on hold: ${agendaSnapshot.agenda.holdReasons.join(" | ")}`;
+    }
+
+    if (agendaSnapshot.workPackage !== null) {
+      return `Literature review complete. ${summary} Selected next work package: ${agendaSnapshot.workPackage.title}. Next step: use /continue to launch it.`;
+    }
+  }
+
+  const summaryMarkdown = await readTextFileOrNull(run.artifacts.summaryPath);
+
+  if (summaryMarkdown !== null) {
+    const lines = summaryMarkdown
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith("#") && !line.startsWith("- "));
+    const firstLine = lines[0];
+
+    if (firstLine !== undefined) {
+      return `Literature review complete. ${truncateSentence(firstLine)}`;
+    }
+  }
+
+  return run.statusMessage ?? `Research run ${run.id} completed.`;
+}
+
+export async function summarizeCompletedRunIfNeeded(
+  session: SessionState,
+  store: SessionStore,
+  run: RunRecord,
+  now: () => string
+): Promise<string | null> {
+  if (!isTerminalRun(run) || session.lastSummarizedRunId === run.id) {
+    return null;
+  }
+
+  const summary = await buildCompletedRunSummary(run);
+  saveAssistantMessage(session, summary, now());
+  session.lastSummarizedRunId = run.id;
+  await store.save(session);
+  return summary;
 }
 
 function goReadinessFailures(session: SessionState): string[] {
@@ -1512,10 +1862,48 @@ export async function emitAssistantTurn(
   writer: OutputWriter,
   session: SessionState,
   store: SessionStore,
+  runStore: RunStore,
   backend: IntakeBackend,
+  projectAssistantBackend: ProjectAssistantBackend,
   mode: "start" | "resume" | "continue",
   now: () => string
 ): Promise<void> {
+  const projectContext = await loadProjectAssistantContext(session, runStore);
+
+  if (projectContext !== null) {
+    try {
+      const previousBrief: ResearchBrief = { ...session.brief };
+      const response = stabilizeIntakeResponse(
+        session,
+        await requestProjectAssistantTurn(session, runStore, projectAssistantBackend, mode)
+      );
+      applyIntakeResponse(session, response);
+      let assistantMessage = response.assistantMessage;
+      const briefChangedThisTurn = !briefsMatch(previousBrief, session.brief);
+      const divergesFromLatestRun = !briefsMatch(projectContext.run.brief, session.brief);
+
+      if (
+        briefChangedThisTurn
+        && divergesFromLatestRun
+        && !/\/go\b/i.test(assistantMessage)
+      ) {
+        assistantMessage = `${assistantMessage} The brief now differs from the latest saved run. Use \`/go\` when you're ready to refresh the research for the updated direction.`;
+      }
+
+      renderTaggedBlock(writer, "consultant", assistantMessage);
+      saveAssistantMessage(session, assistantMessage, now());
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown backend failure";
+      session.intake.lastError = message;
+      const fallback = "The local research assistant is unavailable right now. You can inspect `/status`, `/agenda`, or ask again once Ollama is responding.";
+      renderTaggedBlock(writer, "system", fallback);
+      saveAssistantMessage(session, fallback, now(), "system");
+    }
+
+    await store.save(session);
+    return;
+  }
+
   try {
     const initialResponse = stabilizeIntakeResponse(
       session,
@@ -1600,6 +1988,7 @@ async function watchRunProgress(
   watchPollMs: number
 ): Promise<RunRecord | null> {
   const cursor = {
+    runId: run.id,
     offset: 0,
     trailingBuffer: ""
   };
@@ -1633,6 +2022,17 @@ async function watchRunProgress(
       run = currentRun;
     }
 
+    if (cursor.runId !== run.id) {
+      cursor.runId = run.id;
+      cursor.offset = 0;
+      cursor.trailingBuffer = "";
+      renderTaggedBlock(
+        writer,
+        "watch",
+        `Switching live run activity to ${relativeProjectPath(session.projectRoot, run.artifacts.eventsPath)}.`
+      );
+    }
+
     if (isTerminalRun(run)) {
       const trailingEvents = await readNewRunEvents(run, cursor);
 
@@ -1647,6 +2047,18 @@ async function watchRunProgress(
           ? `Run ${run.id} completed.`
           : `Run ${run.id} failed.`
       );
+
+      const completionSummary = await summarizeCompletedRunIfNeeded(
+        session,
+        store,
+        run,
+        now
+      );
+
+      if (completionSummary !== null) {
+        renderTaggedBlock(writer, "consultant", completionSummary);
+      }
+
       return run;
     }
 
@@ -1786,6 +2198,114 @@ export async function handleGoCommand(
   }
 }
 
+export async function handleContinueCommand(
+  writer: OutputWriter,
+  session: SessionState,
+  store: SessionStore,
+  runStore: RunStore,
+  runController: RunController,
+  projectConfig: ProjectConfigState,
+  now: () => string,
+  watchRuns: boolean,
+  watchPollMs: number
+): Promise<void> {
+  const reconciledRun = await reconcileRelevantRun(session, store, runStore, runController, now);
+
+  if (reconciledRun !== null && !isTerminalRun(reconciledRun)) {
+    const lines = [
+      "A detached research run is already active for this project.",
+      `Run id: ${reconciledRun.id}`,
+      `Status: ${reconciledRun.status}`,
+      `Trace: ${relativeProjectPath(session.projectRoot, reconciledRun.artifacts.tracePath)}`,
+      "Wait for it to finish or pause it before launching another work-package run."
+    ];
+
+    renderTaggedLines(writer, "run", lines);
+    saveAssistantMessage(session, lines.join(" "), now(), "command");
+    await store.save(session);
+    return;
+  }
+
+  if (projectConfig.runtime.postReviewBehavior !== "confirm") {
+    const response = "This project is configured for `auto_continue`, so bounded work packages should launch automatically when the agenda is actionable.";
+    renderTaggedBlock(writer, "system", response);
+    saveAssistantMessage(session, response, now(), "command");
+    await store.save(session);
+    return;
+  }
+
+  const snapshot = await latestAgendaSnapshot(runStore);
+
+  if (snapshot === null) {
+    const response = "No saved research agenda is available yet. Run `/go` first to produce a literature review and agenda.";
+    renderTaggedBlock(writer, "system", response);
+    saveAssistantMessage(session, response, now(), "command");
+    await store.save(session);
+    return;
+  }
+
+  if (!agendaHasActionableWorkPackage(snapshot.agenda) || snapshot.workPackage === null) {
+    const blockers = workPackageContinueBlockers(snapshot.agenda);
+    const response = blockers.length > 0
+      ? `The latest agenda is not ready for /continue yet: ${blockers.join(" | ")}`
+      : "The latest agenda does not contain an actionable selected work package yet.";
+    renderTaggedBlock(writer, "consultant", response);
+    saveAssistantMessage(session, response, now(), "command");
+    await store.save(session);
+    return;
+  }
+
+  const childRun = await runStore.createWithOptions(
+    session.brief,
+    createContinuationRunCommand(snapshot.workPackage),
+    {
+      stage: "work_package",
+      parentRunId: snapshot.run.id,
+      derivedFromWorkPackageId: snapshot.workPackage.id
+    }
+  );
+  const workerPid = await runController.launch(childRun);
+  childRun.workerPid = workerPid;
+  childRun.status = "queued";
+  childRun.statusMessage = "Detached work-package run launched. Waiting for the run worker to start.";
+  await runStore.save(childRun);
+
+  session.activeRunId = childRun.id;
+  session.lastRunId = childRun.id;
+  await store.save(session);
+
+  const responseLines = [
+    "Work-package run started.",
+    `Parent run id: ${snapshot.run.id}`,
+    `Work package: ${snapshot.workPackage.title}`,
+    `Run id: ${childRun.id}`,
+    `Status: ${childRun.status}`,
+    `Trace: ${relativeProjectPath(session.projectRoot, childRun.artifacts.tracePath)}`,
+    `Stdout: ${relativeProjectPath(session.projectRoot, childRun.artifacts.stdoutPath)}`,
+    `Decision artifact: ${relativeProjectPath(session.projectRoot, childRun.artifacts.decisionPath)}`,
+    watchRuns
+      ? "The console will stream live progress until the work-package run reaches a terminal state."
+      : "Use `/status` to inspect it, `/pause` to stop it temporarily, or `/resume` to continue a paused run."
+  ];
+
+  renderTaggedLines(writer, "run", responseLines);
+  saveAssistantMessage(session, responseLines.join(" "), now(), "command");
+  await store.save(session);
+
+  if (watchRuns) {
+    await watchRunProgress(
+      writer,
+      session,
+      store,
+      runStore,
+      runController,
+      childRun,
+      now,
+      watchPollMs
+    );
+  }
+}
+
 export async function handlePauseCommand(
   writer: OutputWriter,
   session: SessionState,
@@ -1899,11 +2419,13 @@ export async function handleUserInput(
   writer: OutputWriter,
   session: SessionState,
   store: SessionStore,
+  runStore: RunStore,
   projectConfig: ProjectConfigState,
   projectConfigStore: ProjectConfigStore,
   credentials: CredentialStoreState,
   credentialStore: CredentialStore,
   backend: IntakeBackend,
+  projectAssistantBackend: ProjectAssistantBackend,
   now: () => string
 ): Promise<void> {
   const sourceSelection = parseSourceSelectionUpdate(input);
@@ -1988,7 +2510,7 @@ export async function handleUserInput(
     applyExplicitFieldUpdate(session, explicitUpdate);
   }
 
-  await emitAssistantTurn(writer, session, store, backend, "continue", now);
+  await emitAssistantTurn(writer, session, store, runStore, backend, projectAssistantBackend, "continue", now);
 }
 
 async function handleCommand(
@@ -2029,8 +2551,16 @@ async function handleCommand(
       projectConfig.sources = currentProjectConfig.sources;
       credentials.providers = currentCredentials.providers;
       const literature = await literatureStore.load();
-      renderStatus(writer, session, run, transcriptPath, memory, currentProjectConfig, literature, currentCredentials);
+      const agendaSnapshot = await latestAgendaSnapshot(runStore);
+      renderStatus(writer, session, run, transcriptPath, memory, currentProjectConfig, literature, currentCredentials, agendaSnapshot);
       saveAssistantMessage(session, "Displayed the current research brief.", now(), "command");
+      await store.save(session);
+      return "continue";
+    }
+    case "/agenda": {
+      const snapshot = await latestAgendaSnapshot(runStore);
+      renderAgenda(writer, snapshot, session.projectRoot);
+      saveAssistantMessage(session, "Displayed the latest research agenda.", now(), "command");
       await store.save(session);
       return "continue";
     }
@@ -2047,6 +2577,12 @@ async function handleCommand(
     }
     case "/go": {
       await handleGoCommand(writer, session, store, runStore, backend, runController, now, watchRuns, watchPollMs);
+      await store.save(session);
+      return "continue";
+    }
+    case "/continue": {
+      const currentProjectConfig = await projectConfigStore.load();
+      await handleContinueCommand(writer, session, store, runStore, runController, currentProjectConfig, now, watchRuns, watchPollMs);
       await store.save(session);
       return "continue";
     }
@@ -2081,6 +2617,7 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
   const store = new SessionStore(options.projectRoot, options.version, now);
   const session = await store.load();
   const backend = options.intakeBackend ?? createDefaultIntakeBackend();
+  const projectAssistantBackend = options.projectAssistantBackend ?? createDefaultProjectAssistantBackend();
   const runStore = new RunStore(options.projectRoot, options.version, now);
   const memoryStore = new MemoryStore(options.projectRoot, now);
   const literatureStore = new LiteratureStore(options.projectRoot, now);
@@ -2097,7 +2634,7 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
 
   session.intake.backendLabel = backend.label;
   await store.save(session);
-  await reconcileRelevantRun(session, store, runStore, runController, now);
+  const reconciledRun = await reconcileRelevantRun(session, store, runStore, runController, now);
 
   renderBanner(writer, session, transcript.filePath);
   renderWelcome(writer, session);
@@ -2119,12 +2656,25 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
 
   renderLiteratureSetup(writer, session, projectConfig);
 
+  if (reconciledRun !== null) {
+    const completionSummary = await summarizeCompletedRunIfNeeded(
+      session,
+      store,
+      reconciledRun,
+      now
+    );
+
+    if (completionSummary !== null) {
+      renderTaggedBlock(writer, "consultant", completionSummary);
+    }
+  }
+
   const initialChatEntry = latestChatEntry(session);
 
   if (initialChatEntry === null) {
-    await emitAssistantTurn(writer, session, store, backend, "start", now);
+    await emitAssistantTurn(writer, session, store, runStore, backend, projectAssistantBackend, "start", now);
   } else if (initialChatEntry.role === "user") {
-    await emitAssistantTurn(writer, session, store, backend, "resume", now);
+    await emitAssistantTurn(writer, session, store, runStore, backend, projectAssistantBackend, "resume", now);
   }
 
   while (true) {
@@ -2178,7 +2728,22 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
       continue;
     }
 
-    await handleUserInput(input, io, transcript, writer, session, store, projectConfig, projectConfigStore, credentials, credentialStore, backend, now);
+    await handleUserInput(
+      input,
+      io,
+      transcript,
+      writer,
+      session,
+      store,
+      runStore,
+      projectConfig,
+      projectConfigStore,
+      credentials,
+      credentialStore,
+      backend,
+      projectAssistantBackend,
+      now
+    );
   }
 
   io.close?.();

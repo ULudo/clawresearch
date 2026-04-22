@@ -25,7 +25,7 @@ test("project config store loads the current grouped source model and drops inva
   try {
     await mkdir(path.dirname(projectConfigPath(projectRoot)), { recursive: true });
     await writeFile(projectConfigPath(projectRoot), `${JSON.stringify({
-      schemaVersion: 5,
+      schemaVersion: 6,
       projectRoot,
       runtimeDirectory: `${projectRoot}/.clawresearch`,
       createdAt: "2026-01-01T00:00:00.000Z",
@@ -47,19 +47,23 @@ test("project config store loads the current grouped source model and drops inva
           projectFilesEnabled: false
         },
         explicitlyConfigured: true
+      },
+      runtime: {
+        postReviewBehavior: "confirm"
       }
     }, null, 2)}\n`, "utf8");
 
     const store = new ProjectConfigStore(projectRoot, now);
     const config = await store.load();
 
-    assert.equal(config.schemaVersion, 5);
+    assert.equal(config.schemaVersion, 6);
     assert.deepEqual(config.sources.scholarlyDiscovery.selectedProviderIds, ["openalex", "elsevier"]);
     assert.deepEqual(config.sources.publisherFullText.selectedProviderIds, ["arxiv", "springer_nature"]);
     assert.deepEqual(config.sources.oaRetrievalHelpers.selectedProviderIds, ["core", "unpaywall"]);
     assert.deepEqual(config.sources.generalWeb.selectedProviderIds, ["wikipedia"]);
     assert.equal(config.sources.localContext.projectFilesEnabled, false);
     assert.equal(config.sources.explicitlyConfigured, true);
+    assert.equal(config.runtime.postReviewBehavior, "confirm");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -72,7 +76,7 @@ test("project config store saves only providers that belong to each category", a
   try {
     const store = new ProjectConfigStore(projectRoot, now);
     const config = await store.save({
-      schemaVersion: 5,
+      schemaVersion: 6,
       projectRoot,
       runtimeDirectory: `${projectRoot}/.clawresearch`,
       createdAt: "2026-01-01T00:00:00.000Z",
@@ -94,14 +98,18 @@ test("project config store saves only providers that belong to each category", a
           projectFilesEnabled: true
         },
         explicitlyConfigured: true
+      },
+      runtime: {
+        postReviewBehavior: "auto_continue"
       }
     });
 
-    assert.equal(config.schemaVersion, 5);
+    assert.equal(config.schemaVersion, 6);
     assert.deepEqual(config.sources.scholarlyDiscovery.selectedProviderIds, ["openalex", "elsevier"]);
     assert.deepEqual(config.sources.publisherFullText.selectedProviderIds, ["arxiv", "springer_nature"]);
     assert.deepEqual(config.sources.oaRetrievalHelpers.selectedProviderIds, ["core", "unpaywall"]);
     assert.deepEqual(config.sources.generalWeb.selectedProviderIds, ["wikipedia"]);
+    assert.equal(config.runtime.postReviewBehavior, "auto_continue");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

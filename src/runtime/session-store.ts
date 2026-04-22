@@ -3,7 +3,7 @@ import path from "node:path";
 
 export const runtimeDirectoryName = ".clawresearch";
 export const sessionFileName = "session.json";
-const schemaVersion = 3;
+const schemaVersion = 4;
 const placeholderValuePattern = /^(?:string(?:\s+or\s+null)?|null|n\/a|tbd|unknown)$/i;
 
 export type ResearchBriefField =
@@ -52,6 +52,7 @@ export type SessionState = {
   lastGoRequestedAt: string | null;
   activeRunId: string | null;
   lastRunId: string | null;
+  lastSummarizedRunId: string | null;
   brief: ResearchBrief;
   intake: IntakeState;
   conversation: ConversationEntry[];
@@ -91,6 +92,7 @@ function createSessionState(projectRoot: string, version: string, timestamp: str
     lastGoRequestedAt: null,
     activeRunId: null,
     lastRunId: null,
+    lastSummarizedRunId: null,
     brief: createEmptyBrief(),
     intake: {
       backendLabel: null,
@@ -142,6 +144,7 @@ function mergeSession(raw: unknown, projectRoot: string, version: string, timest
     lastGoRequestedAt: readString(session.lastGoRequestedAt),
     activeRunId: readString(session.activeRunId),
     lastRunId: readString(session.lastRunId),
+    lastSummarizedRunId: readString(session.lastSummarizedRunId),
     brief: {
       topic: readString(brief.topic),
       researchQuestion: readString(brief.researchQuestion),

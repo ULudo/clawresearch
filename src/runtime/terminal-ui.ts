@@ -4,13 +4,17 @@ import {
 } from "./console-transcript.js";
 import {
   emitAssistantTurn,
+  handleContinueCommand,
   handleGoCommand,
   handlePauseCommand,
   handleResumeCommand,
   handleUserInput,
+  latestAgendaSnapshot,
   reconcileRelevantRun,
+  renderAgenda,
   renderHelp,
   renderStatus,
+  summarizeCompletedRunIfNeeded,
   type OutputWriter,
   type RunOptions
 } from "./console-app.js";
@@ -18,6 +22,10 @@ import {
   createDefaultIntakeBackend,
   type IntakeBackend
 } from "./intake-backend.js";
+import {
+  createDefaultProjectAssistantBackend,
+  type ProjectAssistantBackend
+} from "./project-assistant-backend.js";
 import {
   LiteratureStore
 } from "./literature-store.js";
@@ -85,6 +93,7 @@ type TerminalUiOptions = RunOptions & {
   input?: TerminalInput;
   output?: TerminalOutput;
   intakeBackend?: IntakeBackend;
+  projectAssistantBackend?: ProjectAssistantBackend;
 };
 
 type SourceOverlayState = {
@@ -123,6 +132,8 @@ type SlashCommandDefinition = {
 
 const slashCommands: SlashCommandDefinition[] = [
   { command: "/go", description: "Start the detached research run" },
+  { command: "/continue", description: "Start the selected work package" },
+  { command: "/agenda", description: "Show the latest research agenda" },
   { command: "/status", description: "Show the current brief and run state" },
   { command: "/sources", description: "Inspect or change active literature sources" },
   { command: "/help", description: "Show slash commands and input hints" },
@@ -236,7 +247,7 @@ function sourceCommandLike(input: string): boolean {
 }
 
 function footerHint(pendingLabel: string | null): string {
-  return pendingLabel ?? "/help  /sources  /status  /go  /pause  /resume  /quit";
+  return pendingLabel ?? "/help  /sources  /status  /agenda  /go  /continue  /pause  /resume  /quit";
 }
 
 function isSubmitKey(key: readline.Key): boolean {
@@ -381,6 +392,7 @@ export class ClawResearchTerminalUi {
   private readonly credentialStore: CredentialStore;
   private readonly runController: RunController;
   private readonly backend: IntakeBackend;
+  private readonly projectAssistantBackend: ProjectAssistantBackend;
   private readonly transcript: ConsoleTranscript;
 
   private session!: SessionState;
@@ -415,6 +427,7 @@ export class ClawResearchTerminalUi {
     this.credentialStore = new CredentialStore(options.projectRoot, this.now);
     this.runController = options.runController ?? createDefaultRunController();
     this.backend = options.intakeBackend ?? createDefaultIntakeBackend();
+    this.projectAssistantBackend = options.projectAssistantBackend ?? createDefaultProjectAssistantBackend();
     this.transcript = new ConsoleTranscript(options.projectRoot);
   }
 
@@ -433,6 +446,16 @@ export class ClawResearchTerminalUi {
       this.runController,
       this.now
     );
+
+    if (this.currentRun !== null) {
+      await summarizeCompletedRunIfNeeded(
+        this.session,
+        this.store,
+        this.currentRun,
+        this.now
+      );
+    }
+
     this.logEntries = this.session.conversation.map(mapConversationEntry);
 
     if (!this.projectConfig.sources.explicitlyConfigured) {
@@ -633,7 +656,9 @@ export class ClawResearchTerminalUi {
       capture.writer,
       this.session,
       this.store,
+      this.runStore,
       this.backend,
+      this.projectAssistantBackend,
       mode,
       this.now
     );
@@ -1039,6 +1064,12 @@ export class ClawResearchTerminalUi {
       return;
     }
 
+    if (input === "/agenda") {
+      this.modal = await this.buildAgendaModal();
+      this.render();
+      return;
+    }
+
     if (input === "/go") {
       await this.runCommandAction("starting detached run", async (writer) => {
         await handleGoCommand(
@@ -1048,6 +1079,23 @@ export class ClawResearchTerminalUi {
           this.runStore,
           this.backend,
           this.runController,
+          this.now,
+          false,
+          this.options.watchPollMs ?? 200
+        );
+      });
+      return;
+    }
+
+    if (input === "/continue") {
+      await this.runCommandAction("starting work package", async (writer) => {
+        await handleContinueCommand(
+          writer,
+          this.session,
+          this.store,
+          this.runStore,
+          this.runController,
+          this.projectConfig,
           this.now,
           false,
           this.options.watchPollMs ?? 200
@@ -1139,11 +1187,13 @@ export class ClawResearchTerminalUi {
       capture.writer,
       this.session,
       this.store,
+      this.runStore,
       this.projectConfig,
       this.projectConfigStore,
       this.credentials,
       this.credentialStore,
       this.backend,
+      this.projectAssistantBackend,
       this.now
     );
 
@@ -1170,6 +1220,7 @@ export class ClawResearchTerminalUi {
       this.runController,
       this.now
     );
+    const agendaSnapshot = await latestAgendaSnapshot(this.runStore);
     const capture = createBufferWriter();
 
     renderStatus(
@@ -1180,11 +1231,24 @@ export class ClawResearchTerminalUi {
       memory,
       currentProjectConfig,
       literature,
-      currentCredentials
+      currentCredentials,
+      agendaSnapshot
     );
 
     return {
       title: "Status",
+      lines: capture.readText().trimEnd().split("\n")
+    };
+  }
+
+  private async buildAgendaModal(): Promise<ModalState> {
+    const snapshot = await latestAgendaSnapshot(this.runStore);
+    const capture = createBufferWriter();
+
+    renderAgenda(capture.writer, snapshot, this.session.projectRoot);
+
+    return {
+      title: "Agenda",
       lines: capture.readText().trimEnd().split("\n")
     };
   }
@@ -1238,6 +1302,14 @@ export class ClawResearchTerminalUi {
         tag: run.status === "completed" ? "done" : "error",
         text: `Run ${run.id} ${run.status}.`
       }]);
+      const previousLength = this.session.conversation.length;
+      await summarizeCompletedRunIfNeeded(
+        this.session,
+        this.store,
+        run,
+        this.now
+      );
+      this.syncConversationDiff(previousLength);
       this.render();
     }
   }

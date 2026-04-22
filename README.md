@@ -105,14 +105,18 @@ The intake chat gradually clarifies and captures:
 - research direction
 - success criterion
 
-If the consultant proposes a concrete first-pass brief, `/go` can accept that draft directly, start a detached local run, stream live progress in the terminal, and persist the run artifacts under the project runtime directory.
+If the consultant proposes a concrete first-pass brief, `/go` can accept that draft directly, start a detached literature-review run, stream live progress in the terminal, and persist the run artifacts under the project runtime directory. A successful literature run now also writes a ranked research agenda and, when possible, a selected next work package. By default ClawResearch stops after agenda generation and waits for `/continue` before launching that next bounded work package.
+
+After a run exists, the chat shifts from pure intake into a project-aware research assistant. It can summarize the latest run, explain the current blocker or next step, answer questions about the active project state, and react to requested changes in the research direction. When you materially change the brief after a saved run, ClawResearch will keep the updated brief and nudge you to run `/go` again so the artifacts catch up with the new direction.
 
 Useful slash commands inside the console:
 
 - `/help`
 - `/status`
+- `/agenda`
 - `/sources`
 - `/go`
+- `/continue`
 - `/pause`
 - `/resume`
 - `/quit`
@@ -153,6 +157,16 @@ Minimal runtime state is persisted locally in:
 ```text
 .clawresearch/session.json
 ```
+
+Run artifacts now include:
+
+- `agenda.json`
+- `agenda.md`
+- `work-package.json`
+- `method-plan.json`
+- `execution-checklist.json`
+- `findings.json`
+- `decision.json`
 
 Project-level literature configuration is persisted in:
 
@@ -212,15 +226,17 @@ Each run keeps a small set of debuggable local artifacts, including:
 
 The project-level memory is intentionally simple rather than graph-heavy. It stores typed records such as:
 
-- `source`
 - `claim`
 - `finding`
 - `question`
 - `idea`
 - `summary`
 - `artifact`
+- `direction`
+- `hypothesis`
+- `method_plan`
 
-Each record has a stable id, lightweight links to related records, and enough metadata to debug how a run's outputs connect without introducing a large orchestration system.
+Each record has a stable id, lightweight links to related records, and enough metadata to debug how a run's outputs connect without introducing a large orchestration system. The memory is now focused on agent-derived working knowledge rather than duplicating canonical papers.
 
 That memory is now also used actively by later runs. The planner and source gatherer receive a summarized project memory context so the next pass can build on prior findings, questions, ideas, and artifacts instead of starting cold each time.
 
@@ -229,6 +245,11 @@ ClawResearch now also keeps a separate literature-oriented store instead of flat
 - canonical paper cards
 - theme boards
 - review notebooks
+
+In practice:
+
+- `memory.json` stores the agent's derived notes, questions, directions, and plans
+- `literature/library.json` stores the canonical paper graph and literature review structure
 
 This keeps the literature review path easier to inspect and easier for an LLM to reuse as a compact working context on later runs.
 

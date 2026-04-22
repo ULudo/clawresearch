@@ -1,9 +1,7 @@
 import { createMemoryRecordId } from "./memory-store.js";
 import type { ResearchClaim } from "./research-backend.js";
-import type {
-  CanonicalPaper,
-  PaperAccessMode
-} from "./literature-store.js";
+import { createLiteratureEntityId } from "./literature-store.js";
+import type { CanonicalPaper, PaperAccessMode } from "./literature-store.js";
 import type { ResearchBrief } from "./session-store.js";
 
 const verificationSchemaVersion = 2;
@@ -86,7 +84,7 @@ export type VerificationRequest = {
 };
 
 function sourceRecordId(source: CanonicalPaper): string {
-  return createMemoryRecordId("source", `paper:${source.id}`);
+  return createLiteratureEntityId("paper", source.key);
 }
 
 function claimRecordId(claim: ResearchClaim): string {

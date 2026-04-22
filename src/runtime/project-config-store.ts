@@ -18,7 +18,7 @@ import {
 } from "./provider-registry.js";
 import { runtimeDirectoryPath } from "./session-store.js";
 
-const projectConfigSchemaVersion = 5;
+const projectConfigSchemaVersion = 6;
 const projectConfigFileName = "project-config.json";
 const selectableProviderCategories = [
   "scholarlyDiscovery",
@@ -56,6 +56,9 @@ export type ProjectConfigState = {
   createdAt: string;
   updatedAt: string;
   sources: ProjectConfigSourcesState;
+  runtime: {
+    postReviewBehavior: "confirm" | "auto_continue";
+  };
 };
 
 export type ProjectConfigProviderAuthState = ProviderCredentialAuthState;
@@ -124,6 +127,9 @@ function emptyConfig(projectRoot: string, timestamp: string): ProjectConfigState
         projectFilesEnabled: true
       },
       explicitlyConfigured: false
+    },
+    runtime: {
+      postReviewBehavior: "confirm"
     }
   };
 }
@@ -176,6 +182,11 @@ function mergeProjectConfig(
       },
       explicitlyConfigured: readBoolean(sources.explicitlyConfigured)
         ?? base.sources.explicitlyConfigured
+    },
+    runtime: {
+      postReviewBehavior: readString(asObject(record.runtime).postReviewBehavior) === "auto_continue"
+        ? "auto_continue"
+        : "confirm"
     }
   };
 }
@@ -330,6 +341,11 @@ export class ProjectConfigStore {
           projectFilesEnabled: config.sources.localContext.projectFilesEnabled
         },
         explicitlyConfigured: config.sources.explicitlyConfigured
+      },
+      runtime: {
+        postReviewBehavior: config.runtime.postReviewBehavior === "auto_continue"
+          ? "auto_continue"
+          : "confirm"
       }
     };
 

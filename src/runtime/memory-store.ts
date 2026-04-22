@@ -3,29 +3,39 @@ import path from "node:path";
 import type { ResearchBrief } from "./session-store.js";
 import { runtimeDirectoryPath } from "./session-store.js";
 
-const memorySchemaVersion = 1;
+const memorySchemaVersion = 2;
 const memoryFileName = "memory.json";
 
 export type MemoryRecordType =
-  | "source"
   | "claim"
   | "finding"
   | "question"
   | "idea"
   | "summary"
-  | "artifact";
+  | "artifact"
+  | "direction"
+  | "hypothesis"
+  | "method_plan";
 
 export type MemoryLinkType =
-  | "supports"
+  | "supported_by"
   | "derived_from"
   | "raises"
-  | "suggests"
+  | "refines"
   | "summarizes"
   | "contains"
-  | "related_to";
+  | "related_to"
+  | "depends_on";
+
+export type MemoryLinkTargetKind =
+  | "memory"
+  | "paper"
+  | "theme"
+  | "notebook";
 
 export type MemoryLink = {
   type: MemoryLinkType;
+  targetKind: MemoryLinkTargetKind;
   targetId: string;
 };
 
@@ -77,7 +87,7 @@ export type ProjectMemoryContextEntry = {
   title: string;
   text: string;
   runId: string | null;
-  linkedRecordIds: string[];
+  links: MemoryLink[];
   data: MemoryData;
 };
 
@@ -85,13 +95,15 @@ export type ProjectMemoryContext = {
   available: boolean;
   recordCount: number;
   countsByType: Record<MemoryRecordType, number>;
-  sources: ProjectMemoryContextEntry[];
   claims: ProjectMemoryContextEntry[];
   findings: ProjectMemoryContextEntry[];
   questions: ProjectMemoryContextEntry[];
   ideas: ProjectMemoryContextEntry[];
   summaries: ProjectMemoryContextEntry[];
   artifacts: ProjectMemoryContextEntry[];
+  directions: ProjectMemoryContextEntry[];
+  hypotheses: ProjectMemoryContextEntry[];
+  methodPlans: ProjectMemoryContextEntry[];
   queryHints: string[];
   localFileHints: string[];
 };
@@ -151,24 +163,35 @@ function normalizeData(value: unknown): MemoryData {
 function normalizeLink(raw: unknown): MemoryLink | null {
   const link = asObject(raw);
   const type = readString(link.type);
+  const targetKind = readString(link.targetKind);
   const targetId = readString(link.targetId);
 
-  if (type === null || targetId === null) {
+  if (type === null || targetKind === null || targetId === null) {
     return null;
   }
 
   switch (type) {
-    case "supports":
+    case "supported_by":
     case "derived_from":
     case "raises":
-    case "suggests":
+    case "refines":
     case "summarizes":
     case "contains":
     case "related_to":
-      return {
-        type,
-        targetId
-      };
+    case "depends_on":
+      switch (targetKind) {
+        case "memory":
+        case "paper":
+        case "theme":
+        case "notebook":
+          return {
+            type,
+            targetKind,
+            targetId
+          };
+        default:
+          return null;
+      }
     default:
       return null;
   }
@@ -183,6 +206,15 @@ function normalizeLinks(value: unknown): MemoryLink[] {
     value.flatMap((entry) => {
       const link = normalizeLink(entry);
       return link === null ? [] : [link];
+    })
+  );
+}
+
+function normalizeInputLinks(links: MemoryLink[]): MemoryLink[] {
+  return dedupeLinks(
+    links.flatMap((link) => {
+      const normalized = normalizeLink(link);
+      return normalized === null ? [] : [normalized];
     })
   );
 }
@@ -268,13 +300,15 @@ function normalizeRecord(raw: unknown): MemoryRecord | null {
   }
 
   switch (type) {
-    case "source":
     case "claim":
     case "finding":
     case "question":
     case "idea":
     case "summary":
     case "artifact":
+    case "direction":
+    case "hypothesis":
+    case "method_plan":
       return {
         id: readString(record.id) ?? createMemoryRecordId(type, key),
         type,
@@ -327,7 +361,7 @@ function normalizeRecordInput(record: MemoryRecordInput): MemoryRecordInput | nu
     title,
     text,
     runId: record.runId,
-    links: dedupeLinks((record.links ?? []).filter((link) => link.targetId.trim().length > 0)),
+    links: normalizeInputLinks(record.links ?? []),
     data: normalizeData(record.data ?? {})
   };
 }
@@ -351,13 +385,15 @@ async function writeMemoryFile(projectRoot: string, memory: MemoryState): Promis
 
 export function countMemoryRecordsByType(memory: MemoryState): Record<MemoryRecordType, number> {
   const counts: Record<MemoryRecordType, number> = {
-    source: 0,
     claim: 0,
     finding: 0,
     question: 0,
     idea: 0,
     summary: 0,
-    artifact: 0
+    artifact: 0,
+    direction: 0,
+    hypothesis: 0,
+    method_plan: 0
   };
 
   for (const record of memory.records) {
@@ -404,7 +440,7 @@ function contextEntry(record: MemoryRecord): ProjectMemoryContextEntry {
     title: record.title,
     text: record.text,
     runId: record.runId,
-    linkedRecordIds: record.links.map((link) => link.targetId),
+    links: record.links,
     data: record.data
   };
 }
@@ -443,16 +479,21 @@ export function buildProjectMemoryContext(
     ...tokenize(brief.successCriterion ?? "")
   ]);
   const countsByType = countMemoryRecordsByType(memory);
-  const sources = selectRelevantEntries(memory.records, "source", briefTokens, perTypeLimit);
   const claims = selectRelevantEntries(memory.records, "claim", briefTokens, perTypeLimit);
   const findings = selectRelevantEntries(memory.records, "finding", briefTokens, perTypeLimit);
   const questions = selectRelevantEntries(memory.records, "question", briefTokens, perTypeLimit);
   const ideas = selectRelevantEntries(memory.records, "idea", briefTokens, perTypeLimit);
   const summaries = selectRelevantEntries(memory.records, "summary", briefTokens, Math.max(2, perTypeLimit - 1));
   const artifacts = selectRelevantEntries(memory.records, "artifact", briefTokens, perTypeLimit + 2);
+  const directions = selectRelevantEntries(memory.records, "direction", briefTokens, perTypeLimit);
+  const hypotheses = selectRelevantEntries(memory.records, "hypothesis", briefTokens, perTypeLimit);
+  const methodPlans = selectRelevantEntries(memory.records, "method_plan", briefTokens, perTypeLimit);
   const queryHints = uniqueStrings([
     ...questions.map((entry) => entry.title),
     ...ideas.map((entry) => entry.title),
+    ...directions.map((entry) => entry.title),
+    ...hypotheses.map((entry) => entry.title),
+    ...methodPlans.map((entry) => entry.title),
     ...findings.map((entry) => entry.title),
     ...claims.map((entry) => entry.title),
     ...summaries.map((entry) => entry.text)
@@ -466,16 +507,6 @@ export function buildProjectMemoryContext(
       }
 
       return [];
-    }),
-    ...sources.flatMap((entry) => {
-      const sourceKind = entry.data.sourceKind;
-      const locator = entry.data.locator;
-
-      if (sourceKind === "local_file" && typeof locator === "string") {
-        return [locator];
-      }
-
-      return [];
     })
   ]).slice(0, 8);
 
@@ -483,13 +514,15 @@ export function buildProjectMemoryContext(
     available: memory.recordCount > 0,
     recordCount: memory.recordCount,
     countsByType,
-    sources,
     claims,
     findings,
     questions,
     ideas,
     summaries,
     artifacts,
+    directions,
+    hypotheses,
+    methodPlans,
     queryHints,
     localFileHints
   };

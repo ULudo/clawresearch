@@ -14,6 +14,10 @@ export type RunStatus =
   | "completed"
   | "failed";
 
+export type RunStage =
+  | "literature_review"
+  | "work_package";
+
 export type RunJobRecord = {
   command: string[];
   cwd: string;
@@ -38,6 +42,13 @@ export type RunArtifactRecord = {
   claimsPath: string;
   verificationPath: string;
   nextQuestionsPath: string;
+  agendaPath: string;
+  agendaMarkdownPath: string;
+  workPackagePath: string;
+  methodPlanPath: string;
+  executionChecklistPath: string;
+  findingsPath: string;
+  decisionPath: string;
   summaryPath: string;
   memoryPath: string;
 };
@@ -52,7 +63,10 @@ export type RunRecord = {
   startedAt: string | null;
   finishedAt: string | null;
   status: RunStatus;
+  stage: RunStage;
   statusMessage: string | null;
+  parentRunId: string | null;
+  derivedFromWorkPackageId: string | null;
   brief: ResearchBrief;
   workerPid: number | null;
   job: RunJobRecord;
@@ -89,7 +103,7 @@ function normalizeBrief(raw: unknown): ResearchBrief {
 function sanitizeTimestampForId(timestamp: string): string {
   return timestamp
     .replace(/[:-]/g, "")
-    .replace(/\.\d{3}Z$/, "z")
+    .replace(/\.(\d{3})Z$/, "$1z")
     .replace("T", "-");
 }
 
@@ -122,12 +136,27 @@ function normalizeRunStatus(value: unknown): RunStatus {
   }
 }
 
+function normalizeRunStage(value: unknown): RunStage {
+  switch (value) {
+    case "work_package":
+      return "work_package";
+    case "literature_review":
+    default:
+      return "literature_review";
+  }
+}
+
 function createRunRecord(
   projectRoot: string,
   version: string,
   brief: ResearchBrief,
   command: string[],
-  timestamp: string
+  timestamp: string,
+  options: {
+    stage?: RunStage;
+    parentRunId?: string | null;
+    derivedFromWorkPackageId?: string | null;
+  } = {}
 ): RunRecord {
   const id = createRunId(timestamp);
   const runDirectory = runDirectoryPath(projectRoot, id);
@@ -142,7 +171,10 @@ function createRunRecord(
     startedAt: null,
     finishedAt: null,
     status: "queued",
+    stage: options.stage ?? "literature_review",
     statusMessage: "Detached run launched. Waiting for the run worker to start.",
+    parentRunId: options.parentRunId ?? null,
+    derivedFromWorkPackageId: options.derivedFromWorkPackageId ?? null,
     brief,
     workerPid: null,
     job: {
@@ -168,6 +200,13 @@ function createRunRecord(
       claimsPath: path.join(runDirectory, "claims.json"),
       verificationPath: path.join(runDirectory, "verification.json"),
       nextQuestionsPath: path.join(runDirectory, "next-questions.json"),
+      agendaPath: path.join(runDirectory, "agenda.json"),
+      agendaMarkdownPath: path.join(runDirectory, "agenda.md"),
+      workPackagePath: path.join(runDirectory, "work-package.json"),
+      methodPlanPath: path.join(runDirectory, "method-plan.json"),
+      executionChecklistPath: path.join(runDirectory, "execution-checklist.json"),
+      findingsPath: path.join(runDirectory, "findings.json"),
+      decisionPath: path.join(runDirectory, "decision.json"),
       summaryPath: path.join(runDirectory, "summary.md"),
       memoryPath: path.join(runDirectory, "memory.json")
     }
@@ -196,7 +235,10 @@ function mergeRunRecord(
     startedAt: readString(record.startedAt),
     finishedAt: readString(record.finishedAt),
     status: normalizeRunStatus(record.status),
+    stage: normalizeRunStage(record.stage),
     statusMessage: readString(record.statusMessage),
+    parentRunId: readString(record.parentRunId),
+    derivedFromWorkPackageId: readString(record.derivedFromWorkPackageId),
     brief: normalizeBrief(record.brief),
     workerPid: readInteger(record.workerPid),
     job: {
@@ -224,6 +266,13 @@ function mergeRunRecord(
       claimsPath: readString(artifacts.claimsPath) ?? path.join(runDirectory, "claims.json"),
       verificationPath: readString(artifacts.verificationPath) ?? path.join(runDirectory, "verification.json"),
       nextQuestionsPath: readString(artifacts.nextQuestionsPath) ?? path.join(runDirectory, "next-questions.json"),
+      agendaPath: readString(artifacts.agendaPath) ?? path.join(runDirectory, "agenda.json"),
+      agendaMarkdownPath: readString(artifacts.agendaMarkdownPath) ?? path.join(runDirectory, "agenda.md"),
+      workPackagePath: readString(artifacts.workPackagePath) ?? path.join(runDirectory, "work-package.json"),
+      methodPlanPath: readString(artifacts.methodPlanPath) ?? path.join(runDirectory, "method-plan.json"),
+      executionChecklistPath: readString(artifacts.executionChecklistPath) ?? path.join(runDirectory, "execution-checklist.json"),
+      findingsPath: readString(artifacts.findingsPath) ?? path.join(runDirectory, "findings.json"),
+      decisionPath: readString(artifacts.decisionPath) ?? path.join(runDirectory, "decision.json"),
       summaryPath: readString(artifacts.summaryPath) ?? path.join(runDirectory, "summary.md"),
       memoryPath: readString(artifacts.memoryPath) ?? path.join(runDirectory, "memory.json")
     }
@@ -259,6 +308,28 @@ export class RunStore {
     return run;
   }
 
+  async createWithOptions(
+    brief: ResearchBrief,
+    command: string[],
+    options: {
+      stage?: RunStage;
+      parentRunId?: string | null;
+      derivedFromWorkPackageId?: string | null;
+    }
+  ): Promise<RunRecord> {
+    const run = createRunRecord(
+      this.projectRoot,
+      this.version,
+      brief,
+      command,
+      this.timestampFactory(),
+      options
+    );
+
+    await writeRunFile(this.projectRoot, run);
+    return run;
+  }
+
   async load(runId: string): Promise<RunRecord> {
     const contents = await readFile(runFilePath(this.projectRoot, runId), "utf8");
     return mergeRunRecord(
@@ -285,8 +356,39 @@ export class RunStore {
     run.artifacts.claimsPath = path.join(run.artifacts.runDirectory, "claims.json");
     run.artifacts.verificationPath = path.join(run.artifacts.runDirectory, "verification.json");
     run.artifacts.nextQuestionsPath = path.join(run.artifacts.runDirectory, "next-questions.json");
+    run.artifacts.agendaPath = path.join(run.artifacts.runDirectory, "agenda.json");
+    run.artifacts.agendaMarkdownPath = path.join(run.artifacts.runDirectory, "agenda.md");
+    run.artifacts.workPackagePath = path.join(run.artifacts.runDirectory, "work-package.json");
+    run.artifacts.methodPlanPath = path.join(run.artifacts.runDirectory, "method-plan.json");
+    run.artifacts.executionChecklistPath = path.join(run.artifacts.runDirectory, "execution-checklist.json");
+    run.artifacts.findingsPath = path.join(run.artifacts.runDirectory, "findings.json");
+    run.artifacts.decisionPath = path.join(run.artifacts.runDirectory, "decision.json");
     run.artifacts.summaryPath = path.join(run.artifacts.runDirectory, "summary.md");
     run.artifacts.memoryPath = path.join(run.artifacts.runDirectory, "memory.json");
     await writeRunFile(this.projectRoot, run);
+  }
+
+  async list(): Promise<RunRecord[]> {
+    await mkdir(this.runsDirectory, { recursive: true });
+    const { readdir } = await import("node:fs/promises");
+    const entries = await readdir(this.runsDirectory, { withFileTypes: true });
+    const runs = await Promise.all(entries
+      .filter((entry) => entry.isDirectory())
+      .map(async (entry) => {
+        try {
+          return await this.load(entry.name);
+        } catch {
+          return null;
+        }
+      }));
+
+    return runs
+      .filter((run): run is RunRecord => run !== null)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  }
+
+  async latest(): Promise<RunRecord | null> {
+    const runs = await this.list();
+    return runs[0] ?? null;
   }
 }

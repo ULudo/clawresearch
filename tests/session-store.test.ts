@@ -63,11 +63,12 @@ test("phase one session files are preserved when the schema adds run tracking", 
     const store = new SessionStore(projectRoot, "0.6.0", createNow());
     const session = await store.load();
 
-    assert.equal(session.schemaVersion, 3);
+    assert.equal(session.schemaVersion, 4);
     assert.equal(session.brief.topic, "Riemann Hypothesis");
     assert.equal(session.brief.researchQuestion, "What are the main proof techniques?");
     assert.equal(session.activeRunId, null);
     assert.equal(session.lastRunId, null);
+    assert.equal(session.lastSummarizedRunId, null);
     assert.equal(session.conversation.length, 1);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
@@ -83,7 +84,7 @@ test("placeholder schema strings are sanitized out of saved sessions on load", a
     await writeFile(
       path.join(runtimeDirectory, "session.json"),
       JSON.stringify({
-        schemaVersion: 3,
+        schemaVersion: 4,
         appVersion: "0.6.0",
         projectRoot,
         runtimeDirectory,
@@ -94,6 +95,7 @@ test("placeholder schema strings are sanitized out of saved sessions on load", a
         lastGoRequestedAt: "2026-01-01T00:00:04.000Z",
         activeRunId: null,
         lastRunId: null,
+        lastSummarizedRunId: null,
         brief: {
           topic: "string or null",
           researchQuestion: "string or null",

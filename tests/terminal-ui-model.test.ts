@@ -14,7 +14,7 @@ import {
 function sampleConfig(): ProjectConfigState {
   const store = new ProjectConfigStore("/tmp/clawresearch-ui-model");
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     projectRoot: store.projectRoot,
     runtimeDirectory: `${store.projectRoot}/.clawresearch`,
     createdAt: "2026-01-01T00:00:00.000Z",
@@ -36,6 +36,9 @@ function sampleConfig(): ProjectConfigState {
         projectFilesEnabled: true
       },
       explicitlyConfigured: true
+    },
+    runtime: {
+      postReviewBehavior: "confirm"
     }
   };
 }

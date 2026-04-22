@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -9,12 +9,15 @@ import {
   type CanonicalPaper
 } from "../src/runtime/literature-store.js";
 import type {
+  ResearchAgenda,
   ResearchBackend,
   ResearchPlanningRequest,
   ResearchPlan,
+  ResearchAgendaRequest,
   ResearchSynthesisRequest,
   ResearchSynthesis
 } from "../src/runtime/research-backend.js";
+import type { RunController } from "../src/runtime/run-controller.js";
 import type {
   ResearchSourceGatherRequest,
   ResearchSourceGatherResult,
@@ -169,6 +172,83 @@ class StubResearchBackend implements ResearchBackend {
       ]
     };
   }
+
+  async developResearchAgenda(_request: ResearchAgendaRequest): Promise<ResearchAgenda> {
+    return {
+      executiveSummary: "A bounded next step is available from the reviewed literature.",
+      gaps: [
+        {
+          id: "gap-1",
+          title: "Method comparison remains shallow",
+          summary: "The current literature still needs clearer bounded comparisons across technique families.",
+          sourceIds: ["paper-1"],
+          claimIds: [],
+          severity: "medium",
+          gapKind: "method_gap"
+        }
+      ],
+      candidateDirections: [
+        {
+          id: "direction-1",
+          title: "Benchmark bounded proof-technique families",
+          summary: "Turn the reviewed literature into a more explicit bounded comparison of technique families.",
+          mode: "benchmarking",
+          whyNow: "The evidence base is grounded enough for a small comparative work package.",
+          sourceIds: ["paper-1"],
+          claimIds: [],
+          gapIds: ["gap-1"],
+          scores: {
+            evidenceBase: 4,
+            novelty: 2,
+            tractability: 4,
+            expectedCost: 2,
+            risk: 2,
+            overall: 4
+          }
+        }
+      ],
+      selectedDirectionId: "direction-1",
+      selectedWorkPackage: {
+        id: "wp-1",
+        title: "Benchmark technique-family framing",
+        mode: "benchmarking",
+        objective: "Produce a bounded comparison of the main proof-technique families.",
+        hypothesisOrQuestion: "Which proof-technique family offers the clearest bounded next step?",
+        methodSketch: "Compare the reviewed technique families against explicit limitations and follow-up tractability.",
+        baselines: ["Current survey framing"],
+        controls: ["Hold the reviewed canonical paper set fixed"],
+        decisiveExperiment: "Produce a comparative note that distinguishes at least two technique families with explicit limits.",
+        stopCriterion: "The comparison is either concrete enough to guide a next run or clearly not yet grounded.",
+        expectedArtifact: "comparative research note",
+        requiredInputs: ["reviewed papers", "run summary"],
+        blockedBy: []
+      },
+      holdReasons: [],
+      recommendedHumanDecision: "Inspect the selected work package and continue if it looks suitably bounded."
+    };
+  }
+}
+
+class CapturingRunController implements RunController {
+  launchedRuns: Array<{ id: string; stage: string; parentRunId: string | null }> = [];
+  private nextPid = 9000;
+
+  async launch(run: { id: string; stage: string; parentRunId: string | null }): Promise<number> {
+    this.launchedRuns.push({
+      id: run.id,
+      stage: run.stage,
+      parentRunId: run.parentRunId
+    });
+    const pid = this.nextPid;
+    this.nextPid += 1;
+    return pid;
+  }
+
+  async pause(): Promise<void> {}
+  async resume(): Promise<void> {}
+  isProcessAlive(): boolean {
+    return true;
+  }
 }
 
 class StubSourceGatherer implements ResearchSourceGatherer {
@@ -315,6 +395,18 @@ class LiteratureAwareResearchBackend implements ResearchBackend {
       nextQuestions: []
     };
   }
+
+  async developResearchAgenda(): Promise<ResearchAgenda> {
+    return {
+      executiveSummary: "The mollifier-centered literature suggests another bounded literature pass before execution.",
+      gaps: [],
+      candidateDirections: [],
+      selectedDirectionId: null,
+      selectedWorkPackage: null,
+      holdReasons: ["The reviewed evidence is still too thin for an executable work package."],
+      recommendedHumanDecision: "Refine the literature review before continuing."
+    };
+  }
 }
 
 class LiteratureAwareSourceGatherer implements ResearchSourceGatherer {
@@ -395,6 +487,14 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as Record<string, unknown>;
     const literatureArtifact = JSON.parse(await readFile(completedRun.artifacts.literaturePath, "utf8")) as Record<string, unknown>;
     const verificationArtifact = JSON.parse(await readFile(completedRun.artifacts.verificationPath, "utf8")) as Record<string, unknown>;
+    const agendaArtifact = JSON.parse(await readFile(completedRun.artifacts.agendaPath, "utf8")) as {
+      selectedDirectionId: string | null;
+      selectedWorkPackage: { id: string; title: string } | null;
+    };
+    const workPackageArtifact = JSON.parse(await readFile(completedRun.artifacts.workPackagePath, "utf8")) as {
+      title: string;
+    };
+    const agendaMarkdown = await readFile(completedRun.artifacts.agendaMarkdownPath, "utf8");
     const literatureStoreContents = await readFile(literatureStoreFilePath(projectRoot), "utf8");
     const memoryContents = await readFile(memoryFilePath(projectRoot), "utf8");
 
@@ -407,8 +507,145 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     assert.match(JSON.stringify(literatureArtifact), /paper-1/);
     assert.match(JSON.stringify(literatureArtifact), /fulltext_open/);
     assert.match(JSON.stringify(verificationArtifact), /paper-1/);
+    assert.equal(agendaArtifact.selectedDirectionId, "direction-1");
+    assert.equal(agendaArtifact.selectedWorkPackage?.id, "wp-1");
+    assert.equal(workPackageArtifact.title, "Benchmark technique-family framing");
+    assert.match(agendaMarkdown, /Research Agenda/);
     assert.match(literatureStoreContents, /"paperCount": 1/);
     assert.match(memoryContents, /paper-1/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("run worker auto-continues by creating a derived work-package run when configured", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-auto-continue-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "Riemann Hypothesis",
+      researchQuestion: "What bounded follow-up should we pursue next?",
+      researchDirection: "Review prior proof-technique families.",
+      successCriterion: "Produce a concise technique map."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.explicitlyConfigured = true;
+    projectConfig.runtime.postReviewBehavior = "auto_continue";
+    await projectConfigStore.save(projectConfig);
+
+    const runController = new CapturingRunController();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: new StubResearchBackend(),
+      sourceGatherer: new StubSourceGatherer(),
+      runController
+    });
+
+    const runs = await runStore.list();
+    const parentRun = await runStore.load(run.id);
+    const childRun = runs.find((candidate) => candidate.parentRunId === run.id && candidate.stage === "work_package") ?? null;
+
+    assert.equal(exitCode, 0);
+    assert.equal(parentRun.status, "completed");
+    assert.ok(childRun);
+    assert.equal(childRun?.derivedFromWorkPackageId, "wp-1");
+    assert.equal(childRun?.status, "queued");
+    assert.equal(runController.launchedRuns.length, 1);
+    assert.equal(runController.launchedRuns[0]?.id, childRun?.id);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("work-package runs write bounded execution artifacts and a decision record", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-work-package-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const literatureRun = await runStore.create({
+      topic: "Riemann Hypothesis",
+      researchQuestion: "What bounded follow-up should we pursue next?",
+      researchDirection: "Review prior proof-technique families.",
+      successCriterion: "Produce a concise technique map."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.explicitlyConfigured = true;
+    await projectConfigStore.save(projectConfig);
+
+    await writeFile(path.join(projectRoot, "README.md"), "# Local context\n", "utf8");
+    await writeFile(path.join(projectRoot, "reviewed-papers.md"), "Reviewed paper notes\n", "utf8");
+    await writeFile(path.join(projectRoot, "run-summary.md"), "Run summary notes\n", "utf8");
+
+    const literatureExitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: literatureRun.id,
+      version: "0.7.0",
+      now,
+      researchBackend: new StubResearchBackend(),
+      sourceGatherer: new StubSourceGatherer()
+    });
+
+    assert.equal(literatureExitCode, 0);
+
+    const workPackageRun = await runStore.createWithOptions(
+      literatureRun.brief,
+      ["clawresearch", "research-loop", "--mode", "work-package", "--work-package-id", "wp-1"],
+      {
+        stage: "work_package",
+        parentRunId: literatureRun.id,
+        derivedFromWorkPackageId: "wp-1"
+      }
+    );
+
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: workPackageRun.id,
+      version: "0.7.0",
+      now,
+      researchBackend: new StubResearchBackend(),
+      sourceGatherer: new StubSourceGatherer()
+    });
+
+    const completedRun = await runStore.load(workPackageRun.id);
+    const methodPlan = JSON.parse(await readFile(completedRun.artifacts.methodPlanPath, "utf8")) as {
+      evaluationDesign: string;
+      baselines: string[];
+    };
+    const checklist = JSON.parse(await readFile(completedRun.artifacts.executionChecklistPath, "utf8")) as {
+      items: Array<{ title: string }>;
+    };
+    const findings = JSON.parse(await readFile(completedRun.artifacts.findingsPath, "utf8")) as Array<{ title: string }>;
+    const decision = JSON.parse(await readFile(completedRun.artifacts.decisionPath, "utf8")) as {
+      outcome: string;
+      status: string;
+    };
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.stage, "work_package");
+    assert.equal(completedRun.status, "completed");
+    assert.match(methodPlan.evaluationDesign, /Success is bounded by/i);
+    assert.ok(checklist.items.length >= 3);
+    assert.ok(findings.length >= 2);
+    assert.equal(decision.outcome, "continue");
+    assert.equal(decision.status, "active");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -717,7 +954,7 @@ test("run worker uses prior literature memory to inform planning and retrieval",
   }
 });
 
-test("run worker fails honestly when no canonical papers are retained", async () => {
+test("run worker writes a hold agenda when no canonical papers are retained", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-no-evidence-"));
   const now = createNow();
 
@@ -750,16 +987,24 @@ test("run worker fails honestly when no canonical papers are retained", async ()
 
     const completedRun = await runStore.load(run.id);
     const summary = await readFile(completedRun.artifacts.summaryPath, "utf8");
+    const agenda = JSON.parse(await readFile(completedRun.artifacts.agendaPath, "utf8")) as {
+      selectedDirectionId: string | null;
+      selectedWorkPackage: unknown;
+      holdReasons: string[];
+    };
 
-    assert.equal(exitCode, 1);
-    assert.equal(completedRun.status, "failed");
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
     assert.match(summary, /did not retain any canonical papers/i);
+    assert.equal(agenda.selectedDirectionId, null);
+    assert.equal(agenda.selectedWorkPackage, null);
+    assert.ok(agenda.holdReasons.length > 0);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("run worker fails honestly when retrieval found papers but review retained none for synthesis", async () => {
+test("run worker writes a hold agenda when retrieval found papers but review retained none for synthesis", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-no-reviewed-"));
   const now = createNow();
 
@@ -843,10 +1088,18 @@ test("run worker fails honestly when retrieval found papers but review retained 
 
     const completedRun = await runStore.load(run.id);
     const summary = await readFile(completedRun.artifacts.summaryPath, "utf8");
+    const agenda = JSON.parse(await readFile(completedRun.artifacts.agendaPath, "utf8")) as {
+      selectedDirectionId: string | null;
+      selectedWorkPackage: unknown;
+      holdReasons: string[];
+    };
 
-    assert.equal(exitCode, 1);
-    assert.equal(completedRun.status, "failed");
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
     assert.match(summary, /did not retain any sufficiently reviewed papers/i);
+    assert.equal(agenda.selectedDirectionId, null);
+    assert.equal(agenda.selectedWorkPackage, null);
+    assert.ok(agenda.holdReasons.length > 0);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

@@ -8,15 +8,16 @@ function emptyMemoryContext(): ProjectMemoryContext {
     available: true,
     recordCount: 3,
     countsByType: {
-      source: 0,
       claim: 0,
       finding: 1,
       question: 1,
       idea: 1,
       summary: 0,
-      artifact: 0
+      artifact: 0,
+      direction: 0,
+      hypothesis: 0,
+      method_plan: 0
     },
-    sources: [],
     claims: [],
     findings: [
       {
@@ -24,7 +25,7 @@ function emptyMemoryContext(): ProjectMemoryContext {
         title: "Mollifier limitations remain central",
         text: "Prior work suggests mollifier limitations are the clearest bounded follow-up.",
         runId: "run-prior",
-        linkedRecordIds: [],
+        links: [],
         data: {}
       }
     ],
@@ -34,7 +35,7 @@ function emptyMemoryContext(): ProjectMemoryContext {
         title: "Which obstacles limit mollifier methods for the Riemann Hypothesis?",
         text: "Which obstacles limit mollifier methods for the Riemann Hypothesis?",
         runId: "run-prior",
-        linkedRecordIds: [],
+        links: [],
         data: {}
       }
     ],
@@ -44,12 +45,15 @@ function emptyMemoryContext(): ProjectMemoryContext {
         title: "Follow the mollifier thread",
         text: "Use mollifier limitations as the next bounded literature pass.",
         runId: "run-prior",
-        linkedRecordIds: [],
+        links: [],
         data: {}
       }
     ],
     summaries: [],
     artifacts: [],
+    directions: [],
+    hypotheses: [],
+    methodPlans: [],
     queryHints: [
       "Which obstacles limit mollifier methods for the Riemann Hypothesis?",
       "Follow the mollifier thread"

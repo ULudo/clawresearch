@@ -1,9 +1,13 @@
 import type { ResearchBrief } from "./session-store.js";
-import type { ProjectMemoryContext } from "./memory-store.js";
+import {
+  createMemoryRecordId,
+  type ProjectMemoryContext
+} from "./memory-store.js";
 import type {
   CanonicalPaper,
   LiteratureContext
 } from "./literature-store.js";
+import type { VerificationReport } from "./verifier.js";
 import {
   buildLiteratureSynthesisInstruction,
   shouldUseLiteratureReviewSubsystem
@@ -12,8 +16,16 @@ import {
 const defaultHost = process.env.OLLAMA_HOST ?? "127.0.0.1:11434";
 const defaultModel = process.env.CLAWRESEARCH_OLLAMA_MODEL ?? "qwen3:14b";
 
+export type ResearchMode =
+  | "literature_synthesis"
+  | "replication"
+  | "benchmarking"
+  | "ablation"
+  | "method_improvement"
+  | "new_hypothesis";
+
 export type ResearchPlan = {
-  researchMode: string;
+  researchMode: ResearchMode;
   objective: string;
   rationale: string;
   searchQueries: string[];
@@ -30,6 +42,75 @@ export type ResearchClaim = {
   claim: string;
   evidence: string;
   sourceIds: string[];
+};
+
+export type ResearchGapKind =
+  | "missing_baseline"
+  | "confounder"
+  | "coverage_gap"
+  | "method_gap"
+  | "evidence_conflict";
+
+export type ResearchGapSeverity =
+  | "low"
+  | "medium"
+  | "high";
+
+export type DirectionScores = {
+  evidenceBase: number;
+  novelty: number;
+  tractability: number;
+  expectedCost: number;
+  risk: number;
+  overall: number;
+};
+
+export type ResearchGap = {
+  id: string;
+  title: string;
+  summary: string;
+  sourceIds: string[];
+  claimIds: string[];
+  severity: ResearchGapSeverity;
+  gapKind: ResearchGapKind;
+};
+
+export type ResearchDirectionCandidate = {
+  id: string;
+  title: string;
+  summary: string;
+  mode: ResearchMode;
+  whyNow: string;
+  sourceIds: string[];
+  claimIds: string[];
+  gapIds: string[];
+  scores: DirectionScores;
+};
+
+export type WorkPackage = {
+  id: string;
+  title: string;
+  mode: ResearchMode;
+  objective: string;
+  hypothesisOrQuestion: string;
+  methodSketch: string;
+  baselines: string[];
+  controls: string[];
+  decisiveExperiment: string;
+  stopCriterion: string;
+  expectedArtifact: string;
+  requiredInputs: string[];
+  blockedBy: string[];
+};
+
+export type ResearchAgenda = {
+  executiveSummary: string;
+  gaps: ResearchGap[];
+  candidateDirections: ResearchDirectionCandidate[];
+  selectedDirectionId: string | null;
+  selectedWorkPackage: WorkPackage | null;
+  holdReasons: string[];
+  recommendedHumanDecision: string;
 };
 
 export type ResearchSynthesis = {
@@ -55,10 +136,22 @@ export type ResearchSynthesisRequest = {
   literatureContext?: LiteratureContext;
 };
 
+export type ResearchAgendaRequest = {
+  projectRoot: string;
+  brief: ResearchBrief;
+  plan: ResearchPlan;
+  papers: CanonicalPaper[];
+  synthesis: ResearchSynthesis;
+  verification: VerificationReport;
+  memoryContext: ProjectMemoryContext;
+  literatureContext?: LiteratureContext;
+};
+
 export interface ResearchBackend {
   readonly label: string;
   planResearch(request: ResearchPlanningRequest): Promise<ResearchPlan>;
   synthesizeResearch(request: ResearchSynthesisRequest): Promise<ResearchSynthesis>;
+  developResearchAgenda(request: ResearchAgendaRequest): Promise<ResearchAgenda>;
 }
 
 type OllamaChatResponse = {
@@ -75,6 +168,29 @@ function safeString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0
     ? value.trim()
     : null;
+}
+
+function hashString(text: string): string {
+  let hash = 2166136261;
+
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return (hash >>> 0).toString(36);
+}
+
+function normalizeText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function clampScore(value: unknown, fallback: number): number {
+  if (typeof value !== "number" || Number.isNaN(value)) {
+    return fallback;
+  }
+
+  return Math.max(1, Math.min(5, Math.round(value)));
 }
 
 function safeStringArray(value: unknown, limit = 8): string[] {
@@ -94,6 +210,48 @@ function safeSourceIdArray(value: unknown): string[] {
 
 function uniqueSourceIds(sourceIds: string[]): string[] {
   return [...new Set(sourceIds)];
+}
+
+function uniqueClaimIds(claimIds: string[]): string[] {
+  return [...new Set(claimIds)];
+}
+
+function safeResearchMode(value: unknown): ResearchMode | null {
+  switch (value) {
+    case "literature_synthesis":
+    case "replication":
+    case "benchmarking":
+    case "ablation":
+    case "method_improvement":
+    case "new_hypothesis":
+      return value;
+    default:
+      return null;
+  }
+}
+
+function safeGapKind(value: unknown): ResearchGapKind | null {
+  switch (value) {
+    case "missing_baseline":
+    case "confounder":
+    case "coverage_gap":
+    case "method_gap":
+    case "evidence_conflict":
+      return value;
+    default:
+      return null;
+  }
+}
+
+function safeGapSeverity(value: unknown): ResearchGapSeverity | null {
+  switch (value) {
+    case "low":
+    case "medium":
+    case "high":
+      return value;
+    default:
+      return null;
+  }
 }
 
 function editDistanceAtMostOne(left: string, right: string): boolean {
@@ -175,7 +333,7 @@ function normalizePlan(raw: unknown, brief: ResearchBrief): ResearchPlan {
   const fallbackQuestion = brief.researchQuestion ?? `What is the most useful first-pass research framing for ${fallbackTopic}?`;
 
   return {
-    researchMode: safeString(record.researchMode) ?? "literature_synthesis",
+    researchMode: safeResearchMode(record.researchMode) ?? "literature_synthesis",
     objective: safeString(record.objective) ?? fallbackQuestion,
     rationale: safeString(record.rationale) ?? "Begin with a bounded literature-grounded pass before making stronger claims.",
     searchQueries: safeStringArray(record.searchQueries, 5).length > 0
@@ -247,6 +405,238 @@ function normalizeSynthesis(raw: unknown, brief: ResearchBrief, allowedSourceIds
   };
 }
 
+function claimRecordIdFromClaimText(text: string): string {
+  return createMemoryRecordId("claim", text);
+}
+
+function claimIdsForSynthesis(synthesis: ResearchSynthesis): string[] {
+  return synthesis.claims.map((claim) => claimRecordIdFromClaimText(claim.claim));
+}
+
+function normalizeDirectionScores(
+  value: unknown,
+  claimIds: string[],
+  verification: VerificationReport
+): DirectionScores {
+  const record = typeof value === "object" && value !== null
+    ? value as Record<string, unknown>
+    : {};
+  const relatedClaims = verification.verifiedClaims.filter((claim) => claimIds.includes(claim.claimId));
+  const evidenceSignals = relatedClaims.filter((claim) => claim.supportStatus === "supported").length;
+  const conflictingSignals = relatedClaims.filter((claim) => claim.supportStatus !== "supported").length;
+  let evidenceBase = clampScore(record.evidenceBase, relatedClaims.length > 0 ? 3 : 2);
+
+  if (evidenceSignals >= 2) {
+    evidenceBase = Math.max(evidenceBase, 4);
+  } else if (evidenceSignals === 1) {
+    evidenceBase = Math.max(evidenceBase, 3);
+  } else {
+    evidenceBase = Math.min(evidenceBase, 2);
+  }
+
+  const tractability = clampScore(record.tractability, 3);
+  const expectedCost = clampScore(record.expectedCost, 3);
+  const risk = clampScore(record.risk, 3);
+  let novelty = clampScore(record.novelty, evidenceBase >= 3 ? 3 : 2);
+
+  if (evidenceBase <= 2) {
+    novelty = Math.min(novelty, 3);
+  }
+
+  let overall = Math.round((evidenceBase + novelty + tractability + (6 - expectedCost) + (6 - risk)) / 5);
+
+  if (conflictingSignals > 0) {
+    overall -= 1;
+  }
+
+  overall = Math.max(1, Math.min(5, overall));
+
+  return {
+    evidenceBase,
+    novelty,
+    tractability,
+    expectedCost,
+    risk,
+    overall
+  };
+}
+
+function normalizeGaps(
+  value: unknown,
+  allowedSourceIds: string[],
+  allowedClaimIds: string[]
+): ResearchGap[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((entry) => {
+    const record = typeof entry === "object" && entry !== null
+      ? entry as Record<string, unknown>
+      : {};
+    const title = safeString(record.title);
+    const summary = safeString(record.summary);
+
+    if (title === null || summary === null) {
+      return [];
+    }
+
+    return [{
+      id: safeString(record.id) ?? `gap-${hashString(`${title}:${summary}`)}`,
+      title,
+      summary,
+      sourceIds: reconcileSourceIds(safeSourceIdArray(record.sourceIds), allowedSourceIds),
+      claimIds: uniqueClaimIds(safeStringArray(record.claimIds, 8).filter((claimId) => allowedClaimIds.includes(claimId))),
+      severity: safeGapSeverity(record.severity) ?? "medium",
+      gapKind: safeGapKind(record.gapKind) ?? "coverage_gap"
+    }];
+  }).slice(0, 6);
+}
+
+function normalizeCandidateDirections(
+  value: unknown,
+  allowedSourceIds: string[],
+  allowedClaimIds: string[],
+  allowedGapIds: string[],
+  verification: VerificationReport
+): ResearchDirectionCandidate[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((entry) => {
+    const record = typeof entry === "object" && entry !== null
+      ? entry as Record<string, unknown>
+      : {};
+    const title = safeString(record.title);
+    const summary = safeString(record.summary);
+    const whyNow = safeString(record.whyNow);
+
+    if (title === null || summary === null || whyNow === null) {
+      return [];
+    }
+
+    const claimIds = uniqueClaimIds(
+      safeStringArray(record.claimIds, 8).filter((claimId) => allowedClaimIds.includes(claimId))
+    );
+
+    return [{
+      id: safeString(record.id) ?? `direction-${hashString(`${title}:${summary}`)}`,
+      title,
+      summary,
+      mode: safeResearchMode(record.mode) ?? "literature_synthesis",
+      whyNow,
+      sourceIds: reconcileSourceIds(safeSourceIdArray(record.sourceIds), allowedSourceIds),
+      claimIds,
+      gapIds: uniqueClaimIds(
+        safeStringArray(record.gapIds, 8).filter((gapId) => allowedGapIds.includes(gapId))
+      ),
+      scores: normalizeDirectionScores(record.scores, claimIds, verification)
+    }];
+  }).slice(0, 5);
+}
+
+function normalizeWorkPackage(
+  value: unknown,
+  candidateDirections: ResearchDirectionCandidate[],
+  brief: ResearchBrief
+): WorkPackage | null {
+  if (typeof value !== "object" || value === null) {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const title = safeString(record.title);
+  const objective = safeString(record.objective);
+  const hypothesisOrQuestion = safeString(record.hypothesisOrQuestion);
+  const methodSketch = safeString(record.methodSketch);
+  const decisiveExperiment = safeString(record.decisiveExperiment);
+  const stopCriterion = safeString(record.stopCriterion);
+  const expectedArtifact = safeString(record.expectedArtifact);
+
+  if (
+    title === null
+    || objective === null
+    || hypothesisOrQuestion === null
+    || methodSketch === null
+    || decisiveExperiment === null
+    || stopCriterion === null
+    || expectedArtifact === null
+  ) {
+    return null;
+  }
+
+  const directionId = safeString(record.directionId);
+  const selectedDirection = directionId === null
+    ? null
+    : candidateDirections.find((direction) => direction.id === directionId) ?? null;
+
+  return {
+    id: safeString(record.id) ?? `work-package-${hashString(`${title}:${objective}`)}`,
+    title,
+    mode: safeResearchMode(record.mode) ?? selectedDirection?.mode ?? "literature_synthesis",
+    objective,
+    hypothesisOrQuestion,
+    methodSketch,
+    baselines: safeStringArray(record.baselines, 6),
+    controls: safeStringArray(record.controls, 6),
+    decisiveExperiment,
+    stopCriterion,
+    expectedArtifact,
+    requiredInputs: safeStringArray(record.requiredInputs, 8),
+    blockedBy: safeStringArray(record.blockedBy, 8)
+  };
+}
+
+function normalizeAgenda(raw: unknown, request: ResearchAgendaRequest): ResearchAgenda {
+  const record = typeof raw === "object" && raw !== null
+    ? raw as Record<string, unknown>
+    : {};
+  const allowedSourceIds = request.papers.map((paper) => paper.id);
+  const allowedClaimIds = claimIdsForSynthesis(request.synthesis);
+  const gaps = normalizeGaps(record.gaps, allowedSourceIds, allowedClaimIds);
+  const candidateDirections = normalizeCandidateDirections(
+    record.candidateDirections,
+    allowedSourceIds,
+    allowedClaimIds,
+    gaps.map((gap) => gap.id),
+    request.verification
+  );
+  let selectedDirectionId = safeString(record.selectedDirectionId);
+
+  if (selectedDirectionId !== null && !candidateDirections.some((direction) => direction.id === selectedDirectionId)) {
+    selectedDirectionId = null;
+  }
+
+  const selectedWorkPackage = normalizeWorkPackage(record.selectedWorkPackage, candidateDirections, request.brief);
+  const effectiveSelectedDirectionId = selectedDirectionId
+    ?? (selectedWorkPackage === null
+      ? null
+      : candidateDirections.find((direction) => direction.mode === selectedWorkPackage.mode)?.id ?? candidateDirections[0]?.id ?? null);
+  const holdReasons = safeStringArray(record.holdReasons, 6);
+  const verifiedSignals = request.verification.verifiedClaims.filter((claim) => claim.supportStatus === "supported").length;
+  const evidenceThin = request.papers.length < 3 || verifiedSignals === 0;
+  const missingSelection = effectiveSelectedDirectionId === null || selectedWorkPackage === null;
+
+  return {
+    executiveSummary: safeString(record.executiveSummary)
+      ?? `The reviewed literature suggests ${candidateDirections.length > 0 ? `${candidateDirections.length} candidate research directions` : "further literature work before direction selection"}.`,
+    gaps,
+    candidateDirections,
+    selectedDirectionId: evidenceThin || missingSelection ? null : effectiveSelectedDirectionId,
+    selectedWorkPackage: evidenceThin || missingSelection ? null : selectedWorkPackage,
+    holdReasons: evidenceThin || missingSelection
+      ? holdReasons.length > 0
+        ? holdReasons
+        : ["The reviewed evidence is still too thin or inconclusive to justify an executable next work package."]
+      : holdReasons,
+    recommendedHumanDecision: safeString(record.recommendedHumanDecision)
+      ?? (evidenceThin || missingSelection
+        ? "Review the agenda, refine the brief or retrieval strategy, and run another literature pass before continuing."
+        : "Inspect the selected work package, then confirm `/continue` if the scope and evidence base look acceptable.")
+  };
+}
+
 function planningInstruction(request: ResearchPlanningRequest): string {
   const literatureContext = request.literatureContext ?? {
     available: false,
@@ -272,10 +662,11 @@ function planningInstruction(request: ResearchPlanningRequest): string {
     "",
     "Allowed researchMode values:",
     "- literature_synthesis",
-    "- replication_scoping",
-    "- exploratory_analysis",
-    "- implementation_review",
-    "- mixed",
+    "- replication",
+    "- benchmarking",
+    "- ablation",
+    "- method_improvement",
+    "- new_hypothesis",
     "",
     "Return JSON only with this exact shape:",
     "{",
@@ -372,6 +763,140 @@ function synthesisInstruction(request: ResearchSynthesisRequest): string {
   ].join("\n");
 }
 
+function agendaInstruction(request: ResearchAgendaRequest): string {
+  const literatureContext = request.literatureContext ?? {
+    available: false,
+    paperCount: 0,
+    themeCount: 0,
+    notebookCount: 0,
+    papers: [],
+    themes: [],
+    notebooks: [],
+    queryHints: []
+  };
+  const reviewedPapers = request.papers.map((paper) => ({
+    id: paper.id,
+    title: paper.title,
+    citation: paper.citation,
+    year: paper.year,
+    venue: paper.venue,
+    abstract: paper.abstract,
+    accessMode: paper.accessMode,
+    screeningDecision: paper.screeningDecision,
+    tags: paper.tags
+  }));
+  const claims = request.synthesis.claims.map((claim) => ({
+    id: claimRecordIdFromClaimText(claim.claim),
+    claim: claim.claim,
+    evidence: claim.evidence,
+    sourceIds: claim.sourceIds
+  }));
+
+  return [
+    "You are ClawResearch's research-agenda module for a console-first autonomous research runtime.",
+    "Convert the reviewed literature, verified claims, open questions, and project memory into a bounded research agenda.",
+    "This is proposal ranking, not scientific proof. Do not treat polished text as evidence.",
+    "Use only the reviewed papers and verified-claim context provided here.",
+    "Prefer 2 to 5 concrete candidate directions.",
+    "If the evidence base is weak, conflicting, or too theory-heavy for a bounded next step, leave selectedDirectionId null, selectedWorkPackage null, and explain holdReasons honestly.",
+    "Do not generate manuscript-writing tasks.",
+    "",
+    "Scoring guidance:",
+    "- strong evidence and replicated signals increase evidenceBase",
+    "- conflicting or weakly supported evidence lowers overall",
+    "- thin evidence cannot justify maximum novelty",
+    "- high-cost or unclear-evaluation directions should be penalized",
+    "",
+    "Allowed mode values:",
+    "- literature_synthesis",
+    "- replication",
+    "- benchmarking",
+    "- ablation",
+    "- method_improvement",
+    "- new_hypothesis",
+    "",
+    "Allowed gapKind values:",
+    "- missing_baseline",
+    "- confounder",
+    "- coverage_gap",
+    "- method_gap",
+    "- evidence_conflict",
+    "",
+    "Allowed severity values:",
+    "- low",
+    "- medium",
+    "- high",
+    "",
+    "Score every dimension from 1 to 5.",
+    "",
+    "Return JSON only with this exact shape:",
+    "{",
+    '  "executiveSummary": "string",',
+    '  "gaps": [',
+    '    {',
+    '      "id": "string",',
+    '      "title": "string",',
+    '      "summary": "string",',
+    '      "sourceIds": ["string"],',
+    '      "claimIds": ["string"],',
+    '      "severity": "low|medium|high",',
+    '      "gapKind": "missing_baseline|confounder|coverage_gap|method_gap|evidence_conflict"',
+    "    }",
+    "  ],",
+    '  "candidateDirections": [',
+    '    {',
+    '      "id": "string",',
+    '      "title": "string",',
+    '      "summary": "string",',
+    '      "mode": "literature_synthesis|replication|benchmarking|ablation|method_improvement|new_hypothesis",',
+    '      "whyNow": "string",',
+    '      "sourceIds": ["string"],',
+    '      "claimIds": ["string"],',
+    '      "gapIds": ["string"],',
+    '      "scores": {',
+    '        "evidenceBase": 1,',
+    '        "novelty": 1,',
+    '        "tractability": 1,',
+    '        "expectedCost": 1,',
+    '        "risk": 1,',
+    '        "overall": 1',
+    "      }",
+    "    }",
+    "  ],",
+    '  "selectedDirectionId": "string or null",',
+    '  "selectedWorkPackage": {',
+    '    "id": "string",',
+    '    "directionId": "string",',
+    '    "title": "string",',
+    '    "mode": "literature_synthesis|replication|benchmarking|ablation|method_improvement|new_hypothesis",',
+    '    "objective": "string",',
+    '    "hypothesisOrQuestion": "string",',
+    '    "methodSketch": "string",',
+    '    "baselines": ["string"],',
+    '    "controls": ["string"],',
+    '    "decisiveExperiment": "string",',
+    '    "stopCriterion": "string",',
+    '    "expectedArtifact": "string",',
+    '    "requiredInputs": ["string"],',
+    '    "blockedBy": ["string"]',
+    '  } or null,',
+    '  "holdReasons": ["string"],',
+    '  "recommendedHumanDecision": "string"',
+    "}",
+    "",
+    `Project root: ${request.projectRoot}`,
+    `Brief: ${JSON.stringify(request.brief)}`,
+    `Plan: ${JSON.stringify(request.plan)}`,
+    `Reviewed papers: ${JSON.stringify(reviewedPapers)}`,
+    `Synthesis themes: ${JSON.stringify(request.synthesis.themes)}`,
+    `Claims: ${JSON.stringify(claims)}`,
+    `Next questions: ${JSON.stringify(request.synthesis.nextQuestions)}`,
+    `Verification: ${JSON.stringify(request.verification)}`,
+    `Project memory context: ${JSON.stringify(request.memoryContext)}`,
+    `Literature memory context: ${JSON.stringify(literatureContext)}`
+  ].join("\n");
+}
+
 async function ollamaJsonCall<T>(
   host: string,
   model: string,
@@ -439,6 +964,16 @@ export class OllamaResearchBackend implements ResearchBackend {
     );
 
     return normalizeSynthesis(raw, request.brief, request.papers.map((paper) => paper.id));
+  }
+
+  async developResearchAgenda(request: ResearchAgendaRequest): Promise<ResearchAgenda> {
+    const raw = await ollamaJsonCall<unknown>(
+      this.host,
+      this.model,
+      agendaInstruction(request)
+    );
+
+    return normalizeAgenda(raw, request);
   }
 }
 
