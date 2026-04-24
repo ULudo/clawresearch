@@ -27,7 +27,9 @@ import {
   type RunController
 } from "./run-controller.js";
 import {
+  researchDirectionPath,
   RunStore,
+  type ResearchDirectionState,
   type RunRecord
 } from "./run-store.js";
 import {
@@ -43,11 +45,13 @@ import {
 } from "./console-transcript.js";
 import {
   buildLiteratureContext,
+  literatureStoreFilePath,
   LiteratureStore,
   type LiteratureState
 } from "./literature-store.js";
 import {
   countMemoryRecordsByType,
+  memoryFilePath,
   MemoryStore,
   type MemoryState
 } from "./memory-store.js";
@@ -197,9 +201,13 @@ function renderTaggedLines(writer: OutputWriter, tag: string, lines: string[]): 
 }
 
 export type AgendaSnapshot = {
-  run: RunRecord;
+  run: RunRecord | null;
   agenda: ResearchAgenda;
   workPackage: WorkPackage | null;
+  source: "global" | "run";
+  sourceRunId: string | null;
+  sourceRunAgendaPath: string | null;
+  provenanceKnown: boolean;
 };
 
 async function readJsonFileOrNull<T>(filePath: string): Promise<T | null> {
@@ -222,12 +230,48 @@ async function loadAgendaSnapshotForRun(run: RunRecord): Promise<AgendaSnapshot 
   return {
     run,
     agenda,
-    workPackage: workPackage ?? agenda.selectedWorkPackage ?? null
+    workPackage: workPackage ?? agenda.selectedWorkPackage ?? null,
+    source: "run",
+    sourceRunId: run.id,
+    sourceRunAgendaPath: run.artifacts.agendaPath,
+    provenanceKnown: true
   };
+}
+
+function directionSourceRunId(direction: ResearchDirectionState | ResearchAgenda): string | null {
+  const candidate = direction as Partial<ResearchDirectionState>;
+  return typeof candidate.sourceRunId === "string" && candidate.sourceRunId.trim().length > 0
+    ? candidate.sourceRunId
+    : null;
+}
+
+function directionSourceAgendaPath(direction: ResearchDirectionState | ResearchAgenda): string | null {
+  const candidate = direction as Partial<ResearchDirectionState>;
+  return typeof candidate.sourceRunAgendaPath === "string" && candidate.sourceRunAgendaPath.trim().length > 0
+    ? candidate.sourceRunAgendaPath
+    : null;
 }
 
 export async function latestAgendaSnapshot(runStore: RunStore): Promise<AgendaSnapshot | null> {
   const runs = await runStore.list();
+  const currentAgenda = await readJsonFileOrNull<ResearchDirectionState | ResearchAgenda>(researchDirectionPath(runStore.projectRoot));
+
+  if (currentAgenda !== null) {
+    const sourceRunId = directionSourceRunId(currentAgenda);
+    const sourceRun = sourceRunId === null ? null : await loadRunIfPresent(runStore, sourceRunId);
+    const workPackage = sourceRun === null
+      ? null
+      : await readJsonFileOrNull<WorkPackage | null>(sourceRun.artifacts.workPackagePath);
+    return {
+      run: sourceRun,
+      agenda: currentAgenda,
+      workPackage: workPackage ?? currentAgenda.selectedWorkPackage ?? null,
+      source: "global",
+      sourceRunId,
+      sourceRunAgendaPath: directionSourceAgendaPath(currentAgenda),
+      provenanceKnown: sourceRun !== null
+    };
+  }
 
   for (const run of runs) {
     const snapshot = await loadAgendaSnapshotForRun(run);
@@ -376,8 +420,11 @@ export function renderAgenda(
   }
 
   writeLine(writer, "Agenda:");
-  writeLine(writer, `  run: ${snapshot.run.id}`);
-  writeLine(writer, `  artifact: ${relativeProjectPath(projectRoot, snapshot.run.artifacts.agendaPath)}`);
+  writeLine(writer, `  source: ${snapshot.provenanceKnown && snapshot.sourceRunId !== null ? `run ${snapshot.sourceRunId}` : "global/unknown"}`);
+  writeLine(writer, `  current direction: ${relativeProjectPath(projectRoot, researchDirectionPath(projectRoot))}`);
+  if (snapshot.run !== null) {
+    writeLine(writer, `  run agenda: ${relativeProjectPath(projectRoot, snapshot.run.artifacts.agendaPath)}`);
+  }
   writeLine(writer, `  summary: ${snapshot.agenda.executiveSummary}`);
   writeLine(writer, `  candidate directions: ${snapshot.agenda.candidateDirections.length}`);
   writeLine(writer, `  selected direction: ${snapshot.agenda.selectedDirectionId ?? "<none>"}`);
@@ -446,6 +493,10 @@ export function renderStatus(
       writeLine(writer, `  detail: ${run.statusMessage}`);
     }
 
+    if (run.job.launchCommand !== null) {
+      writeLine(writer, `  launch command: ${run.job.launchCommand.join(" ")}`);
+    }
+
     writeLine(writer, `  trace: ${relativeProjectPath(session.projectRoot, run.artifacts.tracePath)}`);
     writeLine(writer, `  events: ${relativeProjectPath(session.projectRoot, run.artifacts.eventsPath)}`);
     writeLine(writer, `  stdout: ${relativeProjectPath(session.projectRoot, run.artifacts.stdoutPath)}`);
@@ -466,7 +517,7 @@ export function renderStatus(
       writeLine(writer, `  findings: ${relativeProjectPath(session.projectRoot, run.artifacts.findingsPath)}`);
       writeLine(writer, `  decision: ${relativeProjectPath(session.projectRoot, run.artifacts.decisionPath)}`);
     }
-    writeLine(writer, `  memory snapshot: ${relativeProjectPath(session.projectRoot, run.artifacts.memoryPath)}`);
+    writeLine(writer, `  research journal snapshot: ${relativeProjectPath(session.projectRoot, run.artifacts.memoryPath)}`);
   }
 
   writeLine(writer);
@@ -480,6 +531,7 @@ export function renderStatus(
     writeLine(writer, "Agenda available: no");
   } else {
     writeLine(writer, "Agenda available: yes");
+    writeLine(writer, `Agenda source: ${agendaSnapshot.provenanceKnown && agendaSnapshot.sourceRunId !== null ? `run ${agendaSnapshot.sourceRunId}` : "global/unknown"}`);
     writeLine(writer, `Selected direction: ${agendaSnapshot.agenda.selectedDirectionId ?? "<none>"}`);
     writeLine(writer, `Selected work package: ${agendaSnapshot.workPackage?.title ?? "<none>"}`);
     writeLine(writer, `Waiting for confirmation: ${projectConfig.runtime.postReviewBehavior === "confirm" && agendaHasActionableWorkPackage(agendaSnapshot.agenda) ? "yes" : "no"}`);
@@ -497,8 +549,8 @@ export function renderStatus(
     }
   }
   writeLine(writer);
-  writeLine(writer, "Memory:");
-  writeLine(writer, `  store: ${relativeProjectPath(session.projectRoot, memory.runtimeDirectory)}/${"memory.json"}`);
+  writeLine(writer, "Research journal:");
+  writeLine(writer, `  store: ${relativeProjectPath(session.projectRoot, memoryFilePath(session.projectRoot))}`);
   writeLine(writer, `  records: ${memory.recordCount}`);
 
   const counts = countMemoryRecordsByType(memory);
@@ -510,7 +562,7 @@ export function renderStatus(
   writeLine(writer, "Literature:");
   writeLine(writer, `  config: ${relativeProjectPath(session.projectRoot, projectConfigPath(session.projectRoot))}`);
   writeConfiguredSourceSummary(writer, projectConfig);
-  writeLine(writer, `  store: ${relativeProjectPath(session.projectRoot, literature.runtimeDirectory)}/${"literature/library.json"}`);
+  writeLine(writer, `  store: ${relativeProjectPath(session.projectRoot, literatureStoreFilePath(session.projectRoot))}`);
   writeLine(writer, `  canonical papers: ${literature.paperCount}`);
   writeLine(writer, `  theme boards: ${literature.themeCount}`);
   writeLine(writer, `  review notebooks: ${literature.notebookCount}`);
@@ -2141,6 +2193,8 @@ export async function handleGoCommand(
 
   try {
     run = await runStore.create(session.brief, createInitialRunCommand());
+    run.job.launchCommand = runController.launchCommand(run);
+    await runStore.save(run);
     const workerPid = await runController.launch(run);
     run.workerPid = workerPid;
     run.status = "queued";
@@ -2165,16 +2219,17 @@ export async function handleGoCommand(
     "Research run started.",
     `Run id: ${run.id}`,
     `Status: ${run.status}`,
+    `Launch command: ${run.job.launchCommand?.join(" ") ?? "<unknown>"}`,
     `Trace: ${relativeProjectPath(session.projectRoot, run.artifacts.tracePath)}`,
     `Events: ${relativeProjectPath(session.projectRoot, run.artifacts.eventsPath)}`,
     `Stdout: ${relativeProjectPath(session.projectRoot, run.artifacts.stdoutPath)}`,
     `Stderr: ${relativeProjectPath(session.projectRoot, run.artifacts.stderrPath)}`,
     `Plan: ${relativeProjectPath(session.projectRoot, run.artifacts.planPath)}`,
     `Sources: ${relativeProjectPath(session.projectRoot, run.artifacts.sourcesPath)}`,
-    `Literature: ${relativeProjectPath(session.projectRoot, run.artifacts.literaturePath)}`,
+    `Literature review: ${relativeProjectPath(session.projectRoot, run.artifacts.literaturePath)}`,
     `Synthesis: ${relativeProjectPath(session.projectRoot, run.artifacts.synthesisPath)}`,
     `Verification: ${relativeProjectPath(session.projectRoot, run.artifacts.verificationPath)}`,
-    `Memory: ${relativeProjectPath(session.projectRoot, run.artifacts.memoryPath)}`,
+    `Research journal snapshot: ${relativeProjectPath(session.projectRoot, run.artifacts.memoryPath)}`,
     watchRuns
       ? "The detached run is working in the current project directory, and the console will stream live progress until the current run reaches a terminal state."
       : "The detached run is working in the current project directory. Use `/status` to inspect it, `/pause` to stop it temporarily, or `/resume` to continue a paused run."
@@ -2260,10 +2315,12 @@ export async function handleContinueCommand(
     createContinuationRunCommand(snapshot.workPackage),
     {
       stage: "work_package",
-      parentRunId: snapshot.run.id,
+      parentRunId: snapshot.run?.id ?? null,
       derivedFromWorkPackageId: snapshot.workPackage.id
     }
   );
+  childRun.job.launchCommand = runController.launchCommand(childRun);
+  await runStore.save(childRun);
   const workerPid = await runController.launch(childRun);
   childRun.workerPid = workerPid;
   childRun.status = "queued";
@@ -2276,9 +2333,10 @@ export async function handleContinueCommand(
 
   const responseLines = [
     "Work-package run started.",
-    `Parent run id: ${snapshot.run.id}`,
+    `Parent run id: ${snapshot.run?.id ?? "<unknown>"}`,
     `Work package: ${snapshot.workPackage.title}`,
     `Run id: ${childRun.id}`,
+    `Launch command: ${childRun.job.launchCommand?.join(" ") ?? "<unknown>"}`,
     `Status: ${childRun.status}`,
     `Trace: ${relativeProjectPath(session.projectRoot, childRun.artifacts.tracePath)}`,
     `Stdout: ${relativeProjectPath(session.projectRoot, childRun.artifacts.stdoutPath)}`,

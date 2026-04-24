@@ -49,6 +49,13 @@ import type {
 } from "./research-backend.js";
 import { createDefaultResearchBackend } from "./research-backend.js";
 import {
+  buildEvidenceMatrix,
+  briefFingerprint,
+  type EvidenceMatrix,
+  type EvidenceMatrixInsight,
+  type PaperExtraction
+} from "./research-evidence.js";
+import {
   collectResearchLocalFileHints,
   createDefaultResearchSourceGatherer,
   type ResearchSource,
@@ -60,7 +67,12 @@ import {
   type RunController
 } from "./run-controller.js";
 import { appendRunEvent, type RunEventKind } from "./run-events.js";
-import { RunStore, type RunRecord } from "./run-store.js";
+import {
+  createResearchDirectionState,
+  researchDirectionPath,
+  RunStore,
+  type RunRecord
+} from "./run-store.js";
 import type { ResearchBrief } from "./session-store.js";
 import {
   verifyResearchClaims,
@@ -79,6 +91,23 @@ type WorkerOptions = {
 };
 
 type JsonValue = boolean | number | string | null | JsonValue[] | { [key: string]: JsonValue };
+
+type PaperExtractionsArtifact = {
+  schemaVersion: number;
+  runId: string;
+  briefFingerprint: string;
+  paperCount: number;
+  extractionCount: number;
+  extractions: PaperExtraction[];
+};
+
+type ClaimsArtifact = {
+  schemaVersion: number;
+  runId: string;
+  briefFingerprint: string;
+  claimCount: number;
+  claims: ResearchClaim[];
+};
 
 function markdownBrief(brief: ResearchBrief): string {
   return [
@@ -135,6 +164,43 @@ async function writeJsonArtifact(filePath: string, value: JsonValue | Record<str
   await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
+function paperExtractionsArtifact(
+  run: RunRecord,
+  paperCount: number,
+  extractions: PaperExtraction[]
+): PaperExtractionsArtifact {
+  return {
+    schemaVersion: 1,
+    runId: run.id,
+    briefFingerprint: briefFingerprint(run.brief),
+    paperCount,
+    extractionCount: extractions.length,
+    extractions
+  };
+}
+
+function claimsArtifact(run: RunRecord, claims: ResearchClaim[]): ClaimsArtifact {
+  return {
+    schemaVersion: 1,
+    runId: run.id,
+    briefFingerprint: briefFingerprint(run.brief),
+    claimCount: claims.length,
+    claims
+  };
+}
+
+async function writeResearchDirection(
+  run: RunRecord,
+  agenda: ResearchAgenda,
+  acceptedAt: string,
+  sourceRun: RunRecord | null = run
+): Promise<void> {
+  await writeJsonArtifact(
+    researchDirectionPath(run.projectRoot),
+    createResearchDirectionState(agenda, run, acceptedAt, { sourceRun })
+  );
+}
+
 async function writeRunArtifacts(run: RunRecord): Promise<void> {
   await mkdir(run.artifacts.runDirectory, { recursive: true });
   await writeJsonArtifact(run.artifacts.briefPath, run.brief);
@@ -145,6 +211,8 @@ async function writeRunArtifacts(run: RunRecord): Promise<void> {
   await writeFile(run.artifacts.planPath, "", "utf8");
   await writeFile(run.artifacts.sourcesPath, "", "utf8");
   await writeFile(run.artifacts.literaturePath, "", "utf8");
+  await writeFile(run.artifacts.paperExtractionsPath, "", "utf8");
+  await writeFile(run.artifacts.evidenceMatrixPath, "", "utf8");
   await writeFile(run.artifacts.synthesisPath, "", "utf8");
   await writeFile(run.artifacts.claimsPath, "", "utf8");
   await writeFile(run.artifacts.verificationPath, "", "utf8");
@@ -174,7 +242,7 @@ function summarizeSource(source: ResearchSource): string {
 
 function summarizeReviewedPaper(paper: CanonicalPaper): string {
   const venue = paper.venue ?? "unknown venue";
-  return `${paper.id}: ${paper.title} (${venue}; ${paper.accessMode}; ${paper.screeningDecision})`;
+  return `${paperEntityId(paper)}: ${paper.title} (${venue}; ${paper.accessMode}; ${paper.screeningDecision})`;
 }
 
 function summarizeClaim(claim: ResearchClaim): string {
@@ -204,6 +272,8 @@ function researchSummaryMarkdown(
   run: RunRecord,
   plan: ResearchPlan,
   gathered: ResearchSourceGatherResult,
+  paperExtractions: PaperExtraction[],
+  evidenceMatrix: EvidenceMatrix,
   synthesis: ResearchSynthesis,
   verification: VerificationReport
 ): string {
@@ -216,6 +286,8 @@ function researchSummaryMarkdown(
     `- Raw sources gathered: ${gathered.sources.length}`,
     `- Canonical papers retained: ${gathered.canonicalPapers.length}`,
     `- Reviewed papers selected for synthesis: ${gathered.reviewedPapers.length}`,
+    `- Paper extractions written: ${paperExtractions.length}`,
+    `- Evidence matrix rows: ${evidenceMatrix.rowCount}`,
     "",
     "## Executive Summary",
     "",
@@ -241,6 +313,16 @@ function researchSummaryMarkdown(
     }
   }
 
+  lines.push("", "## Evidence Highlights", "");
+
+  if (evidenceMatrix.derivedInsights.length === 0) {
+    lines.push("- No stable cross-paper evidence insights were derived.");
+  } else {
+    for (const insight of evidenceMatrix.derivedInsights.slice(0, 6)) {
+      lines.push(`- ${insight.kind}: ${insight.title} (${insight.paperIds.join(", ") || "no linked papers"})`);
+    }
+  }
+
   lines.push("", "## Next-Step Questions", "");
 
   if (synthesis.nextQuestions.length === 0) {
@@ -258,6 +340,8 @@ function synthesisMarkdown(
   run: RunRecord,
   plan: ResearchPlan,
   gathered: ResearchSourceGatherResult,
+  paperExtractions: PaperExtraction[],
+  evidenceMatrix: EvidenceMatrix,
   synthesis: ResearchSynthesis,
   verification: VerificationReport
 ): string {
@@ -285,6 +369,8 @@ function synthesisMarkdown(
     `- Raw sources gathered: ${gathered.sources.length}`,
     `- Canonical papers retained: ${gathered.canonicalPapers.length}`,
     `- Reviewed papers selected for synthesis: ${gathered.reviewedPapers.length}`,
+    `- Paper extractions written: ${paperExtractions.length}`,
+    `- Evidence matrix rows: ${evidenceMatrix.rowCount}`,
     "",
     "## Review Workflow",
     "",
@@ -332,13 +418,33 @@ function synthesisMarkdown(
     }
   }
 
+  lines.push("", "## Evidence Matrix Insights", "");
+
+  if (evidenceMatrix.derivedInsights.length === 0) {
+    lines.push("- No evidence-matrix insights were derived.");
+  } else {
+    for (const insight of evidenceMatrix.derivedInsights) {
+      lines.push(`- ${insight.kind}: ${insight.title} - ${insight.summary}`);
+    }
+  }
+
+  lines.push("", "## Paper Extractions", "");
+
+  if (paperExtractions.length === 0) {
+    lines.push("- No paper-by-paper extraction records were produced.");
+  } else {
+    for (const extraction of paperExtractions.slice(0, 12)) {
+      lines.push(`- ${extraction.paperId}: confidence ${extraction.confidence}; system type "${extraction.systemType || "<unspecified>"}"; planning "${extraction.planningStyle || "<unspecified>"}"`);
+    }
+  }
+
   lines.push("", "## Reviewed Papers", "");
 
   if (gathered.reviewedPapers.length === 0) {
     lines.push("- No reviewed papers were selected for synthesis.");
   } else {
     for (const paper of gathered.reviewedPapers) {
-      lines.push(`- ${paper.id}: ${paper.citation} [${paper.accessMode}]`);
+      lines.push(`- ${paperEntityId(paper)}: ${paper.citation} [${paper.accessMode}]`);
     }
   }
 
@@ -726,6 +832,124 @@ function paperEntityId(paper: CanonicalPaper): string {
   return createLiteratureEntityId("paper", paper.key);
 }
 
+function canonicalPaperIdMap(papers: CanonicalPaper[]): Map<string, string> {
+  const mapping = new Map<string, string>();
+
+  for (const paper of papers) {
+    const canonicalId = paperEntityId(paper);
+    mapping.set(paper.id, canonicalId);
+    mapping.set(canonicalId, canonicalId);
+  }
+
+  return mapping;
+}
+
+function paperLookupByAnyId(papers: CanonicalPaper[]): Map<string, CanonicalPaper> {
+  const lookup = new Map<string, CanonicalPaper>();
+
+  for (const paper of papers) {
+    const canonicalId = paperEntityId(paper);
+    lookup.set(paper.id, paper);
+    lookup.set(canonicalId, paper);
+  }
+
+  return lookup;
+}
+
+function remapPaperIds(sourceIds: string[], canonicalIdByAnyId: Map<string, string>): string[] {
+  return [...new Set(sourceIds.map((sourceId) => canonicalIdByAnyId.get(sourceId) ?? sourceId))];
+}
+
+function canonicalizePaper(paper: CanonicalPaper): CanonicalPaper {
+  return {
+    ...paper,
+    id: paperEntityId(paper)
+  };
+}
+
+function canonicalizePapers(papers: CanonicalPaper[]): CanonicalPaper[] {
+  return papers.map((paper) => canonicalizePaper(paper));
+}
+
+function remapPaperExtractions(
+  paperExtractions: PaperExtraction[],
+  canonicalIdByAnyId: Map<string, string>
+): PaperExtraction[] {
+  return paperExtractions.map((extraction) => ({
+    ...extraction,
+    paperId: canonicalIdByAnyId.get(extraction.paperId) ?? extraction.paperId
+  }));
+}
+
+function remapEvidenceMatrix(
+  evidenceMatrix: EvidenceMatrix,
+  canonicalIdByAnyId: Map<string, string>
+): EvidenceMatrix {
+  return {
+    ...evidenceMatrix,
+    rows: evidenceMatrix.rows.map((row) => ({
+      ...row,
+      paperId: canonicalIdByAnyId.get(row.paperId) ?? row.paperId
+    })),
+    derivedInsights: evidenceMatrix.derivedInsights.map((insight) => ({
+      ...insight,
+      paperIds: remapPaperIds(insight.paperIds, canonicalIdByAnyId)
+    }))
+  };
+}
+
+function remapSynthesisSourceIds(
+  synthesis: ResearchSynthesis,
+  canonicalIdByAnyId: Map<string, string>
+): ResearchSynthesis {
+  return {
+    ...synthesis,
+    themes: synthesis.themes.map((theme) => ({
+      ...theme,
+      sourceIds: remapPaperIds(theme.sourceIds, canonicalIdByAnyId)
+    })),
+    claims: synthesis.claims.map((claim) => ({
+      ...claim,
+      sourceIds: remapPaperIds(claim.sourceIds, canonicalIdByAnyId)
+    }))
+  };
+}
+
+function remapAgendaSourceIds(
+  agenda: ResearchAgenda,
+  canonicalIdByAnyId: Map<string, string>
+): ResearchAgenda {
+  return {
+    ...agenda,
+    gaps: agenda.gaps.map((gap) => ({
+      ...gap,
+      sourceIds: remapPaperIds(gap.sourceIds, canonicalIdByAnyId)
+    })),
+    candidateDirections: agenda.candidateDirections.map((direction) => ({
+      ...direction,
+      sourceIds: remapPaperIds(direction.sourceIds, canonicalIdByAnyId)
+    }))
+  };
+}
+
+function remapReviewWorkflow(
+  reviewWorkflow: ResearchSourceGatherResult["reviewWorkflow"],
+  canonicalIdByAnyId: Map<string, string>
+): ResearchSourceGatherResult["reviewWorkflow"] {
+  return {
+    ...reviewWorkflow,
+    titleScreenedPaperIds: remapPaperIds(reviewWorkflow.titleScreenedPaperIds, canonicalIdByAnyId),
+    abstractScreenedPaperIds: remapPaperIds(reviewWorkflow.abstractScreenedPaperIds, canonicalIdByAnyId),
+    fulltextScreenedPaperIds: remapPaperIds(reviewWorkflow.fulltextScreenedPaperIds, canonicalIdByAnyId),
+    includedPaperIds: remapPaperIds(reviewWorkflow.includedPaperIds, canonicalIdByAnyId),
+    excludedPaperIds: remapPaperIds(reviewWorkflow.excludedPaperIds, canonicalIdByAnyId),
+    uncertainPaperIds: remapPaperIds(reviewWorkflow.uncertainPaperIds, canonicalIdByAnyId),
+    blockedPaperIds: remapPaperIds(reviewWorkflow.blockedPaperIds, canonicalIdByAnyId),
+    synthesisPaperIds: remapPaperIds(reviewWorkflow.synthesisPaperIds, canonicalIdByAnyId),
+    deferredPaperIds: remapPaperIds(reviewWorkflow.deferredPaperIds, canonicalIdByAnyId)
+  };
+}
+
 function targetKindForId(targetId: string): MemoryLink["targetKind"] {
   if (targetId.startsWith("paper-")) {
     return "paper";
@@ -790,7 +1014,7 @@ function fallbackFinding(
   return {
     title: failureMessage === null ? "Provisional finding" : "Evidence gap",
     summary: failureMessage ?? summaryText,
-    sourceIds: gathered.canonicalPapers.slice(0, 3).map((paper) => paper.id)
+    sourceIds: gathered.canonicalPapers.slice(0, 3).map((paper) => paperEntityId(paper))
   };
 }
 
@@ -853,8 +1077,20 @@ function buildArtifactRecords(
     },
     {
       path: run.artifacts.literaturePath,
-      title: "Canonical literature artifact",
-      text: `Saved canonical paper cards and access state for ${run.id}.`,
+      title: "Literature review artifact",
+      text: `Saved the run-level literature review snapshot for ${run.id}.`,
+      linkIds: sourceIds
+    },
+    {
+      path: run.artifacts.paperExtractionsPath,
+      title: "Paper extractions artifact",
+      text: `Saved paper-by-paper extraction records for ${run.id}.`,
+      linkIds: sourceIds
+    },
+    {
+      path: run.artifacts.evidenceMatrixPath,
+      title: "Evidence matrix artifact",
+      text: `Saved the structured evidence matrix for ${run.id}.`,
       linkIds: sourceIds
     },
     {
@@ -906,8 +1142,8 @@ function buildArtifactRecords(
     },
     {
       path: run.artifacts.memoryPath,
-      title: "Memory snapshot artifact",
-      text: `Saved structured memory snapshot for ${run.id}.`,
+      title: "Research journal snapshot artifact",
+      text: `Saved structured research journal snapshot for ${run.id}.`,
       linkIds: [summaryId]
     }
   ];
@@ -925,10 +1161,61 @@ function buildArtifactRecords(
   }));
 }
 
+function themeFromInsight(insight: EvidenceMatrixInsight): ResearchTheme {
+  return {
+    title: insight.title,
+    summary: insight.summary,
+    sourceIds: insight.paperIds
+  };
+}
+
+function questionFromInsight(insight: EvidenceMatrixInsight): string {
+  return insight.kind === "gap"
+    ? `Which bounded follow-up would best close this evidence gap: ${insight.title.toLowerCase()}?`
+    : `What evidence or comparison would best resolve this conflict: ${insight.title.toLowerCase()}?`;
+}
+
+function completePaperExtractions(
+  run: RunRecord,
+  reviewedPapers: CanonicalPaper[],
+  paperExtractions: PaperExtraction[]
+): PaperExtraction[] {
+  const byPaperId = new Map(paperExtractions.map((extraction) => [extraction.paperId, extraction]));
+
+  for (const paper of reviewedPapers) {
+    if (byPaperId.has(paper.id)) {
+      continue;
+    }
+
+    byPaperId.set(paper.id, {
+      id: `extraction-${paper.id}`,
+      paperId: paper.id,
+      runId: run.id,
+      problemSetting: "",
+      systemType: "",
+      architecture: "",
+      toolsAndMemory: "",
+      planningStyle: "",
+      evaluationSetup: "",
+      successSignals: [],
+      failureModes: [],
+      limitations: [],
+      supportedClaims: [],
+      confidence: "low",
+      evidenceNotes: ["No structured extraction was recovered for this reviewed paper; the record remains intentionally sparse."]
+    });
+  }
+
+  return reviewedPapers
+    .map((paper) => byPaperId.get(paper.id))
+    .filter((extraction): extraction is PaperExtraction => extraction !== undefined);
+}
+
 function buildMemoryInputs(
   run: RunRecord,
   plan: ResearchPlan,
   gathered: ResearchSourceGatherResult,
+  evidenceMatrix: EvidenceMatrix,
   summaryText: string,
   themes: ResearchTheme[],
   claims: ResearchClaim[],
@@ -936,41 +1223,59 @@ function buildMemoryInputs(
   nextQuestions: string[],
   failureMessage: string | null
 ): MemoryRecordInput[] {
-  const effectiveThemes = themes.length > 0
-    ? themes
-    : [fallbackFinding(gathered, summaryText, failureMessage)];
+  const matrixThemes = evidenceMatrix.derivedInsights
+    .filter((insight) => insight.kind === "pattern" || insight.kind === "anti_pattern" || insight.kind === "conflict")
+    .map((insight) => themeFromInsight(insight));
+  const effectiveThemes = matrixThemes.length > 0
+    ? matrixThemes
+    : themes.length > 0
+      ? themes
+      : [fallbackFinding(gathered, summaryText, failureMessage)];
+  const effectiveQuestions = nextQuestions.length > 0
+    ? nextQuestions
+    : evidenceMatrix.derivedInsights
+      .filter((insight) => insight.kind === "gap" || insight.kind === "conflict")
+      .map((insight) => questionFromInsight(insight))
+      .slice(0, 6);
   const summaryId = summaryRecordId(run.id);
-  const paperByRunId = new Map(gathered.canonicalPapers.map((paper) => [paper.id, paper]));
+  const paperByAnyId = paperLookupByAnyId(gathered.canonicalPapers);
   const paperIds = gathered.canonicalPapers.map(paperEntityId);
 
   const verificationByClaimId = new Map(
     verification.verifiedClaims.map((claim) => [claim.claimId, claim])
   );
-  const claimRecords: MemoryRecordInput[] = claims.map((claim) => {
+  const claimRecords: MemoryRecordInput[] = claims.flatMap((claim) => {
     const verifiedClaim = verificationByClaimId.get(claimRecordId(claim));
+    const supportStatus = verifiedClaim?.supportStatus ?? "unverified";
+    const linkedPaperIds = claim.sourceIds.flatMap((sourceId) => {
+      const paper = paperByAnyId.get(sourceId);
+      return paper === undefined ? [] : [paperEntityId(paper)];
+    });
 
-    return {
+    if (
+      linkedPaperIds.length === 0
+      || (supportStatus !== "supported" && supportStatus !== "partially_supported")
+    ) {
+      return [];
+    }
+
+    return [{
       type: "claim",
       key: claim.claim,
       title: claim.claim,
       text: claim.evidence,
       runId: run.id,
-      links: claim.sourceIds.flatMap((sourceId) => {
-        const paper = paperByRunId.get(sourceId);
-        return paper === undefined ? [] : [link("supported_by", paperEntityId(paper))];
-      }),
+      links: linkedPaperIds.map((paperId) => link("supported_by", paperId)),
       data: {
-        paperIds: claim.sourceIds.flatMap((sourceId) => {
-          const paper = paperByRunId.get(sourceId);
-          return paper === undefined ? [] : [paperEntityId(paper)];
-        }),
-        supportStatus: verifiedClaim?.supportStatus ?? "unverified",
+        paperIds: linkedPaperIds,
+        supportStatus,
         confidence: verifiedClaim?.confidence ?? "unknown",
         verificationNotes: verifiedClaim?.verificationNotes ?? []
       }
-    };
+    }];
   });
-  const claimIds = claims.map(claimRecordId);
+  const claimIds = claimRecords.map((record) => createMemoryRecordId(record.type, record.key));
+  const claimIdSet = new Set(claimIds);
 
   const findingRecords: MemoryRecordInput[] = effectiveThemes.map((theme) => ({
     type: "finding",
@@ -978,23 +1283,25 @@ function buildMemoryInputs(
     title: theme.title,
     text: theme.summary,
     runId: run.id,
-    links: [
+      links: [
       ...theme.sourceIds.flatMap((sourceId) => {
-        const paper = paperByRunId.get(sourceId);
+        const paper = paperByAnyId.get(sourceId);
         return paper === undefined ? [] : [link("supported_by", paperEntityId(paper))];
       }),
-      ...relatedClaimIdsForTheme(theme, claims).map((targetId) => link("derived_from", targetId))
+      ...relatedClaimIdsForTheme(theme, claims)
+        .filter((targetId) => claimIdSet.has(targetId))
+        .map((targetId) => link("derived_from", targetId))
     ],
     data: {
       paperIds: theme.sourceIds.flatMap((sourceId) => {
-        const paper = paperByRunId.get(sourceId);
+        const paper = paperByAnyId.get(sourceId);
         return paper === undefined ? [] : [paperEntityId(paper)];
       })
     }
   }));
   const findingIds = effectiveThemes.map(findingRecordId);
 
-  const questionRecords: MemoryRecordInput[] = nextQuestions.map((question) => ({
+  const questionRecords: MemoryRecordInput[] = effectiveQuestions.map((question) => ({
     type: "question",
     key: question,
     title: question,
@@ -1005,7 +1312,7 @@ function buildMemoryInputs(
       researchMode: plan.researchMode
     }
   }));
-  const questionIds = nextQuestions.map(questionRecordId);
+  const questionIds = effectiveQuestions.map(questionRecordId);
 
   const ideaRecords = buildIdeaRecords(run, plan, questionIds, failureMessage);
   const ideaIds = ideaRecords.map((record) => ideaRecordId(record.key));
@@ -1278,16 +1585,14 @@ function buildLiteratureInputs(
   themes: LiteratureThemeInput[];
   notebooks: LiteratureNotebookInput[];
 } {
-  const storePaperIdByRunPaperId = new Map(
-    gathered.canonicalPapers.map((paper) => [paper.id, createLiteratureEntityId("paper", paper.key)])
-  );
+  const storePaperIdByAnyPaperId = canonicalPaperIdMap(gathered.canonicalPapers);
   const themeInputs: LiteratureThemeInput[] = themes.map((theme) => ({
     key: theme.title,
     title: theme.title,
     summary: theme.summary,
     runId: run.id,
     paperIds: theme.sourceIds.flatMap((sourceId) => {
-      const storePaperId = storePaperIdByRunPaperId.get(sourceId);
+      const storePaperId = storePaperIdByAnyPaperId.get(sourceId);
       return storePaperId === undefined ? [] : [storePaperId];
     }),
     claimIds: relatedClaimIdsForTheme(theme, claims),
@@ -1313,15 +1618,16 @@ function buildLiteratureInputs(
     license: paper.license,
     tdmAllowed: paper.tdmAllowed,
     contentStatus: paper.contentStatus,
+    screeningHistory: paper.screeningHistory,
     screeningStage: paper.screeningStage,
     screeningDecision: paper.screeningDecision,
     screeningRationale: paper.screeningRationale,
     accessErrors: paper.accessErrors,
     runId: run.id,
     linkedThemeIds: themeInputs
-      .filter((theme) => theme.paperIds.includes(storePaperIdByRunPaperId.get(paper.id) ?? paper.id))
+      .filter((theme) => theme.paperIds.includes(storePaperIdByAnyPaperId.get(paper.id) ?? paperEntityId(paper)))
       .map((theme) => createLiteratureEntityId("theme", theme.key)),
-    linkedClaimIds: claims.flatMap((claim) => claim.sourceIds.includes(paper.id)
+    linkedClaimIds: claims.flatMap((claim) => claim.sourceIds.includes(storePaperIdByAnyPaperId.get(paper.id) ?? paperEntityId(paper))
       ? [claimRecordId(claim)]
       : [])
   }));
@@ -1331,7 +1637,7 @@ function buildLiteratureInputs(
     runId: run.id,
     objective: plan.objective,
     summary: summaryText,
-    paperIds: gathered.canonicalPapers.map((paper) => storePaperIdByRunPaperId.get(paper.id) ?? paper.id),
+    paperIds: gathered.canonicalPapers.map((paper) => storePaperIdByAnyPaperId.get(paper.id) ?? paperEntityId(paper)),
     themeIds,
     claimIds: claims.map(claimRecordId),
     nextQuestions,
@@ -1351,15 +1657,18 @@ async function writeLiteratureSnapshot(
   result: LiteratureUpsertResult,
   gathered: ResearchSourceGatherResult
 ): Promise<void> {
+  const canonicalIdByAnyId = canonicalPaperIdMap(gathered.canonicalPapers);
   await writeJsonArtifact(run.artifacts.literaturePath, {
     storePath: relativeArtifactPath(run.projectRoot, literatureStore.filePath),
     paperCount: gathered.canonicalPapers.length,
     reviewedPaperCount: gathered.reviewedPapers.length,
-    papers: gathered.canonicalPapers,
-    reviewedPapers: gathered.reviewedPapers,
-    reviewWorkflow: gathered.reviewWorkflow,
+    papers: canonicalizePapers(gathered.canonicalPapers),
+    reviewedPapers: canonicalizePapers(gathered.reviewedPapers),
+    reviewWorkflow: remapReviewWorkflow(gathered.reviewWorkflow, canonicalIdByAnyId),
+    selectionQuality: gathered.selectionQuality ?? null,
     mergeDiagnostics: gathered.mergeDiagnostics,
     authStatus: gathered.authStatus,
+    retrievalDiagnostics: gathered.retrievalDiagnostics ?? null,
     inserted: result.inserted,
     updated: result.updated,
     stateCounts: {
@@ -1393,12 +1702,32 @@ async function writeMemorySnapshot(
   };
 }
 
-function insufficientEvidenceNextQuestions(plan: ResearchPlan): string[] {
+function insufficientEvidenceNextQuestions(plan: ResearchPlan, gathered?: ResearchSourceGatherResult): string[] {
+  const diagnostics = gathered?.retrievalDiagnostics;
+  const suggestedQueries = diagnostics?.suggestedNextQueries.slice(0, 3) ?? [];
+  const providerErrors = diagnostics?.providerAttempts
+    .filter((attempt) => attempt.error !== null)
+    .map((attempt) => `${attempt.providerId}: ${attempt.error}`)
+    .slice(0, 2) ?? [];
+  const accessLimitations = diagnostics?.accessLimitations.slice(0, 2) ?? [];
+  const diagnosticQuestions = [
+    suggestedQueries.length > 0
+      ? `Which of these recovery queries should be tried next: ${suggestedQueries.join(" | ")}?`
+      : null,
+    providerErrors.length > 0
+      ? `Which provider failure should be addressed first: ${providerErrors.join(" | ")}?`
+      : null,
+    accessLimitations.length > 0
+      ? `Which access limitation should be configured first: ${accessLimitations.join(" | ")}?`
+      : null
+  ].filter((question): question is string => question !== null);
+
   return [
+    ...diagnosticQuestions,
     "Which terminology, entity names, or domain cues should be refined to improve scholarly retrieval quality?",
     "Which provider configuration or credentials are still limiting access to relevant papers?",
     `Which of these planned queries should be refined first: ${plan.searchQueries.slice(0, 3).join(" | ") || "no queries were generated"}?`
-  ];
+  ].slice(0, 5);
 }
 
 function insufficientEvidenceAgenda(
@@ -1426,6 +1755,83 @@ function insufficientEvidenceAgenda(
       ...nextQuestions.slice(0, 2)
     ],
     recommendedHumanDecision: `Refine the literature pass before continuing. Start with: ${nextQuestions[0] ?? "inspect retrieval settings and rerun the review."}`
+  };
+}
+
+function retrievalDiagnosticHoldReasons(gathered: ResearchSourceGatherResult): string[] {
+  const diagnostics = gathered.retrievalDiagnostics;
+
+  if (diagnostics === undefined) {
+    return [];
+  }
+
+  const providerFailures = diagnostics.providerAttempts
+    .filter((attempt) => attempt.error !== null)
+    .map((attempt) => `${attempt.providerId} failed: ${attempt.error}`)
+    .slice(0, 2);
+  const recoverySummary = diagnostics.recoveryPasses > 0
+    ? [`One recovery retrieval pass ran, but only ${gathered.reviewedPapers.length} reviewed papers were selected for synthesis.`]
+    : [];
+  const accessLimitations = diagnostics.accessLimitations.slice(0, 2);
+  const suggestedQueries = diagnostics.suggestedNextQueries.length > 0
+    ? [`Potential next retrieval queries: ${diagnostics.suggestedNextQueries.slice(0, 3).join(" | ")}.`]
+    : [];
+
+  return [
+    ...recoverySummary,
+    ...providerFailures,
+    ...accessLimitations,
+    ...suggestedQueries
+  ];
+}
+
+function selectionQualityHoldReasons(gathered: ResearchSourceGatherResult): string[] {
+  const selectionQuality = gathered.selectionQuality;
+
+  if (selectionQuality === undefined || selectionQuality === null || selectionQuality.adequacy === "strong") {
+    return [];
+  }
+
+  const missing = selectionQuality.missingRequiredFacets.map((facet) => facet.label).slice(0, 5);
+  const backgroundOnly = selectionQuality.backgroundOnlyFacets.map((facet) => facet.label).slice(0, 3);
+  const reasons = [
+    missing.length > 0
+      ? `The reviewed set does not cover required success-criterion facets: ${missing.join(", ")}.`
+      : `The reviewed set has only ${selectionQuality.adequacy} coverage of the required review facets.`,
+    backgroundOnly.length > 0
+      ? `Some required facets appeared only in unselected/background candidates: ${backgroundOnly.join(", ")}.`
+      : null
+  ].filter((reason): reason is string => reason !== null);
+
+  return reasons;
+}
+
+function agendaWithRetrievalHoldReasons(
+  agenda: ResearchAgenda,
+  gathered: ResearchSourceGatherResult,
+  evidenceMatrix: EvidenceMatrix
+): ResearchAgenda {
+  const selectionReasons = selectionQualityHoldReasons(gathered);
+
+  if (evidenceMatrix.rowCount >= 3 && selectionReasons.length === 0) {
+    return agenda;
+  }
+
+  const extraReasons = [
+    ...selectionReasons,
+    ...(evidenceMatrix.rowCount < 3 ? retrievalDiagnosticHoldReasons(gathered) : [])
+  ];
+
+  if (extraReasons.length === 0) {
+    return agenda;
+  }
+
+  return {
+    ...agenda,
+    holdReasons: [...new Set([...agenda.holdReasons, ...extraReasons])].slice(0, 6),
+    recommendedHumanDecision: agenda.recommendedHumanDecision.length > 0
+      ? agenda.recommendedHumanDecision
+      : "Inspect retrieval diagnostics, refine the query plan or provider setup, and rerun the literature pass before continuing."
   };
 }
 
@@ -1521,13 +1927,17 @@ async function runWorkPackageLoop(
   literatureStore: LiteratureStore,
   researchBackend: ResearchBackend
 ): Promise<number> {
-  if (run.parentRunId === null || run.derivedFromWorkPackageId === null) {
-    throw new Error("Work-package runs require parentRunId and derivedFromWorkPackageId.");
+  if (run.derivedFromWorkPackageId === null) {
+    throw new Error("Work-package runs require derivedFromWorkPackageId.");
   }
 
-  const parentRun = await store.load(run.parentRunId);
-  const parentAgenda = await readJsonArtifactOrNull<ResearchAgenda>(parentRun.artifacts.agendaPath);
-  const parentWorkPackage = await readJsonArtifactOrNull<WorkPackage>(parentRun.artifacts.workPackagePath);
+  const parentRun = run.parentRunId === null ? null : await store.load(run.parentRunId);
+  const parentAgenda = parentRun === null
+    ? await readJsonArtifactOrNull<ResearchAgenda>(researchDirectionPath(run.projectRoot))
+    : await readJsonArtifactOrNull<ResearchAgenda>(parentRun.artifacts.agendaPath);
+  const parentWorkPackage = parentRun === null
+    ? null
+    : await readJsonArtifactOrNull<WorkPackage>(parentRun.artifacts.workPackagePath);
   const selectedWorkPackage = parentWorkPackage?.id === run.derivedFromWorkPackageId
     ? parentWorkPackage
     : parentAgenda?.selectedWorkPackage?.id === run.derivedFromWorkPackageId
@@ -1561,14 +1971,15 @@ async function runWorkPackageLoop(
     workPackage: selectedWorkPackage
   });
   await writeJsonArtifact(run.artifacts.agendaPath, parentAgenda);
-  await writeFile(run.artifacts.agendaMarkdownPath, `${agendaMarkdown(parentRun, { researchMode: selectedWorkPackage.mode, objective: selectedWorkPackage.objective, rationale: "Derived from the parent agenda.", searchQueries: [], localFocus: [] }, parentAgenda)}\n`, "utf8");
+  await writeResearchDirection(run, parentAgenda, now(), parentRun ?? run);
+  await writeFile(run.artifacts.agendaMarkdownPath, `${agendaMarkdown(parentRun ?? run, { researchMode: selectedWorkPackage.mode, objective: selectedWorkPackage.objective, rationale: "Derived from the parent agenda.", searchQueries: [], localFocus: [] }, parentAgenda)}\n`, "utf8");
   await writeJsonArtifact(run.artifacts.workPackagePath, selectedWorkPackage);
   await writeJsonArtifact(run.artifacts.methodPlanPath, methodPlan);
   await writeJsonArtifact(run.artifacts.executionChecklistPath, checklist);
   await writeJsonArtifact(run.artifacts.findingsPath, findings);
   await writeJsonArtifact(run.artifacts.decisionPath, decision);
   await writeJsonArtifact(run.artifacts.literaturePath, {
-    parentRunId: parentRun.id,
+    parentRunId: parentRun?.id ?? null,
     reusedLiteratureStore: relativeArtifactPath(run.projectRoot, literatureStore.filePath),
     paperCount: literature.paperCount,
     themeCount: literature.themeCount,
@@ -1599,8 +2010,8 @@ async function runWorkPackageLoop(
     await appendEvent(run, now, finding.status === "blocked" ? "stderr" : "summary", `${finding.title}: ${finding.summary}`);
   }
 
-  await appendEvent(run, now, "memory", `Recorded ${memoryResult.recordCount} structured memory records (${memoryResult.inserted} new, ${memoryResult.updated} updated).`);
-  await appendStdout(run, `Structured memory updated: ${memoryResult.recordCount} records (${memoryResult.inserted} new, ${memoryResult.updated} updated).`);
+  await appendEvent(run, now, "memory", `Recorded ${memoryResult.recordCount} research journal records (${memoryResult.inserted} new, ${memoryResult.updated} updated).`);
+  await appendStdout(run, `Research journal updated: ${memoryResult.recordCount} records (${memoryResult.inserted} new, ${memoryResult.updated} updated).`);
   await appendEvent(run, now, "run", `${decision.outcome}: ${decision.rationale}`);
 
   run.job.finishedAt = now();
@@ -1634,6 +2045,8 @@ async function launchDerivedWorkPackageRun(
       derivedFromWorkPackageId: agenda.selectedWorkPackage.id
     }
   );
+  childRun.job.launchCommand = runController.launchCommand(childRun);
+  await store.save(childRun);
   const workerPid = await runController.launch(childRun);
   childRun.workerPid = workerPid;
   childRun.status = "queued";
@@ -1722,6 +2135,9 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     );
     await appendStdout(run, `Research backend: ${researchBackend.label}`);
     await appendStdout(run, `Run loop command: ${run.job.command.join(" ")}`);
+    if (run.job.launchCommand !== null) {
+      await appendStdout(run, `Launch command: ${run.job.launchCommand.join(" ")}`);
+    }
     await appendStdout(run, `Selected scholarly-discovery providers: ${formatSelectedLiteratureProviders(scholarlyDiscoveryProviders)}`);
     await appendStdout(run, `Selected publisher/full-text providers: ${formatSelectedLiteratureProviders(publisherFullTextProviders)}`);
     await appendStdout(run, `Selected OA/retrieval helpers: ${formatSelectedLiteratureProviders(oaRetrievalHelperProviders)}`);
@@ -1776,6 +2192,8 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       projectFilesEnabled: localEnabled,
       credentials
     });
+    const canonicalIdByAnyPaperId = canonicalPaperIdMap(gathered.canonicalPapers);
+    const canonicalReviewedPapers = canonicalizePapers(gathered.reviewedPapers);
 
     await writeJsonArtifact(run.artifacts.sourcesPath, {
       sourceConfig: {
@@ -1795,9 +2213,11 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       generalWebProviders,
       routing: gathered.routing,
       authStatus: gathered.authStatus,
+      retrievalDiagnostics: gathered.retrievalDiagnostics ?? null,
       notes: gathered.notes,
       rawSources: gathered.sources,
       reviewWorkflow: gathered.reviewWorkflow,
+      selectionQuality: gathered.selectionQuality ?? null,
       mergeDiagnostics: gathered.mergeDiagnostics,
       literatureReview: gathered.literatureReview ?? null
     });
@@ -1824,21 +2244,34 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     }
 
     if (gathered.canonicalPapers.length === 0 || gathered.reviewedPapers.length === 0) {
-      const nextQuestions = insufficientEvidenceNextQuestions(plan);
+      const nextQuestions = insufficientEvidenceNextQuestions(plan, gathered);
       const failureMessage = gathered.canonicalPapers.length === 0
         ? "Literature retrieval did not retain any canonical papers that could ground synthesis. The run stopped before unsupported synthesis."
         : "The review workflow did not retain any sufficiently reviewed papers for synthesis. The run stopped before unsupported synthesis.";
+      const paperExtractions: PaperExtraction[] = [];
+      const evidenceMatrix = buildEvidenceMatrix({
+        runId: run.id,
+        brief: run.brief,
+        paperExtractions
+      });
       const verification = verifyResearchClaims({
         brief: run.brief,
         papers: [],
         claims: []
       });
 
-      await writeJsonArtifact(run.artifacts.claimsPath, []);
+      await writeJsonArtifact(run.artifacts.paperExtractionsPath, paperExtractionsArtifact(run, canonicalReviewedPapers.length, paperExtractions));
+      await writeJsonArtifact(run.artifacts.evidenceMatrixPath, evidenceMatrix);
+      await writeJsonArtifact(run.artifacts.claimsPath, claimsArtifact(run, []));
       await writeJsonArtifact(run.artifacts.verificationPath, verification);
       await writeJsonArtifact(run.artifacts.nextQuestionsPath, nextQuestions);
-      const agenda = insufficientEvidenceAgenda(run, plan, nextQuestions, failureMessage);
+      const agenda = agendaWithRetrievalHoldReasons(
+        insufficientEvidenceAgenda(run, plan, nextQuestions, failureMessage),
+        gathered,
+        evidenceMatrix
+      );
       await writeJsonArtifact(run.artifacts.agendaPath, agenda);
+      await writeResearchDirection(run, agenda, now());
       await writeFile(run.artifacts.agendaMarkdownPath, `${agendaMarkdown(run, plan, agenda)}\n`, "utf8");
       await writeJsonArtifact(run.artifacts.workPackagePath, null);
       await writeFile(
@@ -1867,6 +2300,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
             run,
             plan,
             gathered,
+            evidenceMatrix,
             failureMessage,
             [],
             [],
@@ -1899,11 +2333,11 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         run,
         now,
         "memory",
-        `Recorded ${memoryResult.recordCount} structured memory records (${memoryResult.inserted} new, ${memoryResult.updated} updated).`
+        `Recorded ${memoryResult.recordCount} research journal records (${memoryResult.inserted} new, ${memoryResult.updated} updated).`
       );
       await appendStdout(
         run,
-        `Structured memory updated: ${memoryResult.recordCount} records (${memoryResult.inserted} new, ${memoryResult.updated} updated).`
+        `Research journal updated: ${memoryResult.recordCount} records (${memoryResult.inserted} new, ${memoryResult.updated} updated).`
       );
       await appendEvent(
         run,
@@ -1935,39 +2369,84 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       return 0;
     }
 
-    await appendEvent(run, now, "next", "Synthesize themes, claims, and next-step questions from the reviewed paper set.");
+    await appendEvent(run, now, "next", "Extract structured paper records from the reviewed paper set.");
+
+    const extractedPapers = await researchBackend.extractReviewedPapers({
+      projectRoot: run.projectRoot,
+      runId: run.id,
+      brief: run.brief,
+      plan,
+      papers: canonicalReviewedPapers,
+      literatureContext
+    });
+    const paperExtractions = completePaperExtractions(
+      run,
+      canonicalReviewedPapers,
+      remapPaperExtractions(extractedPapers, canonicalIdByAnyPaperId)
+    );
+
+    await writeJsonArtifact(run.artifacts.paperExtractionsPath, paperExtractionsArtifact(run, canonicalReviewedPapers.length, paperExtractions));
+    await appendEvent(run, now, "summary", `Extracted ${paperExtractions.length} paper records from the reviewed set.`);
+    await appendStdout(run, `Paper extractions written: ${paperExtractions.length}`);
+
+    await appendEvent(run, now, "next", "Build the cross-paper evidence matrix from the reviewed extractions.");
+
+    const evidenceMatrix = buildEvidenceMatrix({
+      runId: run.id,
+      brief: run.brief,
+      paperExtractions
+    });
+    const normalizedEvidenceMatrix = remapEvidenceMatrix(evidenceMatrix, canonicalIdByAnyPaperId);
+
+    await writeJsonArtifact(run.artifacts.evidenceMatrixPath, normalizedEvidenceMatrix);
+    await appendStdout(run, `Evidence matrix rows: ${normalizedEvidenceMatrix.rowCount}`);
+
+    await appendEvent(run, now, "next", "Synthesize themes, claims, and next-step questions from the evidence matrix.");
 
     const synthesis = await researchBackend.synthesizeResearch({
       projectRoot: run.projectRoot,
       brief: run.brief,
       plan,
-      papers: gathered.reviewedPapers,
+      papers: canonicalReviewedPapers,
+      paperExtractions,
+      evidenceMatrix: normalizedEvidenceMatrix,
+      selectionQuality: gathered.selectionQuality ?? null,
       literatureContext
     });
+    const normalizedSynthesis = remapSynthesisSourceIds(synthesis, canonicalIdByAnyPaperId);
     const verification = verifyResearchClaims({
       brief: run.brief,
-      papers: gathered.reviewedPapers,
-      claims: synthesis.claims
+      papers: canonicalReviewedPapers,
+      claims: normalizedSynthesis.claims
     });
     const agenda = await researchBackend.developResearchAgenda({
       projectRoot: run.projectRoot,
       brief: run.brief,
       plan,
-      papers: gathered.reviewedPapers,
-      synthesis,
+      papers: canonicalReviewedPapers,
+      paperExtractions,
+      evidenceMatrix: normalizedEvidenceMatrix,
+      synthesis: normalizedSynthesis,
       verification,
+      selectionQuality: gathered.selectionQuality ?? null,
       memoryContext,
       literatureContext
     });
+    const normalizedAgenda = agendaWithRetrievalHoldReasons(
+      remapAgendaSourceIds(agenda, canonicalIdByAnyPaperId),
+      gathered,
+      normalizedEvidenceMatrix
+    );
 
-    await writeJsonArtifact(run.artifacts.claimsPath, synthesis.claims);
-    await writeJsonArtifact(run.artifacts.nextQuestionsPath, synthesis.nextQuestions);
+    await writeJsonArtifact(run.artifacts.claimsPath, claimsArtifact(run, normalizedSynthesis.claims));
+    await writeJsonArtifact(run.artifacts.nextQuestionsPath, normalizedSynthesis.nextQuestions);
     await writeJsonArtifact(run.artifacts.verificationPath, verification);
-    await writeJsonArtifact(run.artifacts.agendaPath, agenda);
-    await writeFile(run.artifacts.agendaMarkdownPath, `${agendaMarkdown(run, plan, agenda)}\n`, "utf8");
-    await writeJsonArtifact(run.artifacts.workPackagePath, agenda.selectedWorkPackage);
-    await writeFile(run.artifacts.synthesisPath, `${synthesisMarkdown(run, plan, gathered, synthesis, verification)}\n`, "utf8");
-    await writeFile(run.artifacts.summaryPath, `${researchSummaryMarkdown(run, plan, gathered, synthesis, verification)}\n`, "utf8");
+    await writeJsonArtifact(run.artifacts.agendaPath, normalizedAgenda);
+    await writeResearchDirection(run, normalizedAgenda, now());
+    await writeFile(run.artifacts.agendaMarkdownPath, `${agendaMarkdown(run, plan, normalizedAgenda)}\n`, "utf8");
+    await writeJsonArtifact(run.artifacts.workPackagePath, normalizedAgenda.selectedWorkPackage);
+    await writeFile(run.artifacts.synthesisPath, `${synthesisMarkdown(run, plan, gathered, paperExtractions, normalizedEvidenceMatrix, normalizedSynthesis, verification)}\n`, "utf8");
+    await writeFile(run.artifacts.summaryPath, `${researchSummaryMarkdown(run, plan, gathered, paperExtractions, normalizedEvidenceMatrix, normalizedSynthesis, verification)}\n`, "utf8");
     const memoryResult = await writeMemorySnapshot(
       run,
       memoryStore,
@@ -1976,14 +2455,15 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
           run,
           plan,
           gathered,
-          synthesis.executiveSummary,
-          synthesis.themes,
-          synthesis.claims,
+          normalizedEvidenceMatrix,
+          normalizedSynthesis.executiveSummary,
+          normalizedSynthesis.themes,
+          normalizedSynthesis.claims,
           verification,
-          synthesis.nextQuestions,
+          normalizedSynthesis.nextQuestions,
           null
         ),
-        ...buildAgendaMemoryInputs(run, agenda)
+        ...buildAgendaMemoryInputs(run, normalizedAgenda)
       ]
     );
     const literatureResult = await literatureStore.upsert(
@@ -1991,16 +2471,16 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         run,
         plan,
         gathered,
-        synthesis.executiveSummary,
-        synthesis.themes,
-        synthesis.claims,
-        synthesis.nextQuestions
+        normalizedSynthesis.executiveSummary,
+        normalizedSynthesis.themes,
+        normalizedSynthesis.claims,
+        normalizedSynthesis.nextQuestions
       )
     );
     await writeLiteratureSnapshot(run, literatureStore, literatureResult, gathered);
 
     await appendTrace(run, now, "Synthesis completed.");
-    await appendEvent(run, now, "summary", synthesis.executiveSummary);
+    await appendEvent(run, now, "summary", normalizedSynthesis.executiveSummary);
     await appendEvent(run, now, "verify", verification.summary);
     await appendStdout(run, `Verification: ${verification.summary}`);
     for (const verifiedClaim of verification.verifiedClaims.slice(0, 4)) {
@@ -2010,11 +2490,11 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       run,
       now,
       "memory",
-      `Recorded ${memoryResult.recordCount} structured memory records (${memoryResult.inserted} new, ${memoryResult.updated} updated).`
+      `Recorded ${memoryResult.recordCount} research journal records (${memoryResult.inserted} new, ${memoryResult.updated} updated).`
     );
     await appendStdout(
       run,
-      `Structured memory updated: ${memoryResult.recordCount} records (${memoryResult.inserted} new, ${memoryResult.updated} updated).`
+      `Research journal updated: ${memoryResult.recordCount} records (${memoryResult.inserted} new, ${memoryResult.updated} updated).`
     );
     await appendEvent(
       run,
@@ -2027,34 +2507,34 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       `Literature store updated: ${literatureResult.state.paperCount} canonical papers, ${literatureResult.state.themeCount} theme boards, ${literatureResult.state.notebookCount} review notebooks.`
     );
 
-    for (const claim of synthesis.claims.slice(0, 4)) {
+    for (const claim of normalizedSynthesis.claims.slice(0, 4)) {
       await appendEvent(run, now, "claim", summarizeClaim(claim));
       await appendStdout(run, `Claim recorded: ${summarizeClaim(claim)}`);
     }
 
-    for (const question of synthesis.nextQuestions) {
+    for (const question of normalizedSynthesis.nextQuestions) {
       await appendEvent(run, now, "next", question);
     }
 
-    await appendEvent(run, now, "plan", `Agenda generated with ${agenda.candidateDirections.length} candidate directions.`);
+    await appendEvent(run, now, "plan", `Agenda generated with ${normalizedAgenda.candidateDirections.length} candidate directions.`);
 
-    if (agenda.selectedWorkPackage !== null) {
+    if (normalizedAgenda.selectedWorkPackage !== null) {
       await appendEvent(
         run,
         now,
         "next",
-        `Selected work package: ${agenda.selectedWorkPackage.title}`
+        `Selected work package: ${normalizedAgenda.selectedWorkPackage.title}`
       );
-      await appendStdout(run, `Selected work package: ${agenda.selectedWorkPackage.title}`);
+      await appendStdout(run, `Selected work package: ${normalizedAgenda.selectedWorkPackage.title}`);
     }
 
     let derivedRun: RunRecord | null = null;
 
     if (projectConfig.runtime.postReviewBehavior === "auto_continue") {
-      derivedRun = await launchDerivedWorkPackageRun(store, runController, run, agenda);
+      derivedRun = await launchDerivedWorkPackageRun(store, runController, run, normalizedAgenda);
 
-      if (derivedRun === null && agendaHasActionableWorkPackage(agenda)) {
-        const blockers = workPackageAutoContinueBlockers(agenda);
+      if (derivedRun === null && agendaHasActionableWorkPackage(normalizedAgenda)) {
+        const blockers = workPackageAutoContinueBlockers(normalizedAgenda);
         await appendEvent(
           run,
           now,
@@ -2074,7 +2554,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     run.status = "completed";
     run.statusMessage = derivedRun !== null
       ? `Provider-aware literature run completed and auto-launched derived work-package run ${derivedRun.id}.`
-      : !agendaHasActionableWorkPackage(agenda)
+      : !agendaHasActionableWorkPackage(normalizedAgenda)
         ? "Provider-aware literature run completed, but the agenda remains on hold for human review."
         : projectConfig.runtime.postReviewBehavior === "confirm"
           ? "Provider-aware literature run completed and is waiting for `/continue` on the selected work package."

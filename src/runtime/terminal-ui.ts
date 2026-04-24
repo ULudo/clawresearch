@@ -335,11 +335,11 @@ function colorizeFrame(content: string, enabled: boolean): string {
         return styleAnsi(line, "35", true);
       }
 
-      if (/^Literature: /i.test(line)) {
+      if (/^Literature(?: review)?: /i.test(line)) {
         return styleAnsi(line, "33", true);
       }
 
-      if (/^Memory: /i.test(line)) {
+      if (/^(?:Notes|Research journal snapshot): /i.test(line)) {
         return styleAnsi(line, "93", true);
       }
 

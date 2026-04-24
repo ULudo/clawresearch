@@ -92,11 +92,58 @@ function readOptionValue(argv: string[], optionName: string): string | null {
 }
 
 function createConsoleIo(input = process.stdin, output = process.stdout): ConsoleIo {
+  const terminal = Boolean(input.isTTY && output.isTTY);
   const rl = readline.createInterface({
     input,
     output,
-    terminal: true
+    terminal
   });
+
+  if (!terminal) {
+    const queuedLines: string[] = [];
+    const pendingPrompts: Array<(line: string | null) => void> = [];
+    let closed = false;
+
+    rl.on("line", (line) => {
+      const resolve = pendingPrompts.shift();
+
+      if (resolve === undefined) {
+        queuedLines.push(line);
+        return;
+      }
+
+      resolve(line);
+    });
+    rl.on("close", () => {
+      closed = true;
+
+      while (pendingPrompts.length > 0) {
+        pendingPrompts.shift()?.(null);
+      }
+    });
+
+    return {
+      writer: output,
+      async prompt(promptText: string): Promise<string | null> {
+        output.write(promptText);
+
+        if (queuedLines.length > 0) {
+          return queuedLines.shift() ?? null;
+        }
+
+        if (closed) {
+          return null;
+        }
+
+        return await new Promise((resolve) => {
+          pendingPrompts.push(resolve);
+        });
+      },
+      close(): void {
+        rl.close();
+      }
+    };
+  }
 
   return {
     writer: output,

@@ -7,11 +7,29 @@ import type {
   CanonicalPaper,
   LiteratureContext
 } from "./literature-store.js";
+import {
+  evidenceMatrixNextQuestions,
+  type EvidenceMatrix,
+  type PaperClaimSupportStrength,
+  type PaperExtraction,
+  type PaperExtractionConfidence
+} from "./research-evidence.js";
 import type { VerificationReport } from "./verifier.js";
 import {
   buildLiteratureSynthesisInstruction,
-  shouldUseLiteratureReviewSubsystem
+  shouldUseLiteratureReviewSubsystem,
+  type ReviewSelectionQuality
 } from "./literature-review.js";
+
+export type {
+  EvidenceMatrix,
+  EvidenceMatrixInsight,
+  EvidenceMatrixInsightKind,
+  EvidenceMatrixRow,
+  PaperClaimSupportStrength,
+  PaperExtraction,
+  PaperExtractionConfidence
+} from "./research-evidence.js";
 
 const defaultHost = process.env.OLLAMA_HOST ?? "127.0.0.1:11434";
 const defaultModel = process.env.CLAWRESEARCH_OLLAMA_MODEL ?? "qwen3:14b";
@@ -133,6 +151,9 @@ export type ResearchSynthesisRequest = {
   brief: ResearchBrief;
   plan: ResearchPlan;
   papers: CanonicalPaper[];
+  paperExtractions: PaperExtraction[];
+  evidenceMatrix: EvidenceMatrix;
+  selectionQuality?: ReviewSelectionQuality | null;
   literatureContext?: LiteratureContext;
 };
 
@@ -141,15 +162,28 @@ export type ResearchAgendaRequest = {
   brief: ResearchBrief;
   plan: ResearchPlan;
   papers: CanonicalPaper[];
+  paperExtractions: PaperExtraction[];
+  evidenceMatrix: EvidenceMatrix;
   synthesis: ResearchSynthesis;
   verification: VerificationReport;
+  selectionQuality?: ReviewSelectionQuality | null;
   memoryContext: ProjectMemoryContext;
+  literatureContext?: LiteratureContext;
+};
+
+export type PaperExtractionRequest = {
+  projectRoot: string;
+  runId: string;
+  brief: ResearchBrief;
+  plan: ResearchPlan;
+  papers: CanonicalPaper[];
   literatureContext?: LiteratureContext;
 };
 
 export interface ResearchBackend {
   readonly label: string;
   planResearch(request: ResearchPlanningRequest): Promise<ResearchPlan>;
+  extractReviewedPapers(request: PaperExtractionRequest): Promise<PaperExtraction[]>;
   synthesizeResearch(request: ResearchSynthesisRequest): Promise<ResearchSynthesis>;
   developResearchAgenda(request: ResearchAgendaRequest): Promise<ResearchAgenda>;
 }
@@ -179,10 +213,6 @@ function hashString(text: string): string {
   }
 
   return (hash >>> 0).toString(36);
-}
-
-function normalizeText(value: string): string {
-  return value.replace(/\s+/g, " ").trim();
 }
 
 function clampScore(value: unknown, fallback: number): number {
@@ -248,6 +278,28 @@ function safeGapSeverity(value: unknown): ResearchGapSeverity | null {
     case "low":
     case "medium":
     case "high":
+      return value;
+    default:
+      return null;
+  }
+}
+
+function safePaperClaimSupportStrength(value: unknown): PaperClaimSupportStrength | null {
+  switch (value) {
+    case "explicit":
+    case "partial":
+    case "implied":
+      return value;
+    default:
+      return null;
+  }
+}
+
+function safePaperExtractionConfidence(value: unknown): PaperExtractionConfidence | null {
+  switch (value) {
+    case "high":
+    case "medium":
+    case "low":
       return value;
     default:
       return null;
@@ -343,6 +395,69 @@ function normalizePlan(raw: unknown, brief: ResearchBrief): ResearchPlan {
   };
 }
 
+function normalizeExtractionClaims(value: unknown): PaperExtraction["supportedClaims"] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.flatMap((entry) => {
+    const record = typeof entry === "object" && entry !== null
+      ? entry as Record<string, unknown>
+      : {};
+    const claim = safeString(record.claim);
+
+    if (claim === null) {
+      return [];
+    }
+
+    return [{
+      claim,
+      support: safePaperClaimSupportStrength(record.support) ?? "implied"
+    }];
+  }).slice(0, 8);
+}
+
+function normalizePaperExtractions(raw: unknown, request: PaperExtractionRequest): PaperExtraction[] {
+  const record = typeof raw === "object" && raw !== null
+    ? raw as Record<string, unknown>
+    : {};
+  const rawExtractions = Array.isArray(record.extractions)
+    ? record.extractions
+    : Array.isArray(raw)
+      ? raw
+      : [];
+  const papersById = new Map(request.papers.map((paper) => [paper.id, paper]));
+
+  return rawExtractions.flatMap((entry, index) => {
+    const extraction = typeof entry === "object" && entry !== null
+      ? entry as Record<string, unknown>
+      : {};
+    const paperId = safeString(extraction.paperId);
+
+    if (paperId === null || !papersById.has(paperId)) {
+      return [];
+    }
+
+    return [{
+      id: safeString(extraction.id) ?? `extraction-${hashString(`${request.runId}:${paperId}:${index}`)}`,
+      paperId,
+      runId: request.runId,
+      problemSetting: safeString(extraction.problemSetting) ?? "",
+      systemType: safeString(extraction.systemType) ?? "",
+      architecture: safeString(extraction.architecture) ?? "",
+      toolsAndMemory: safeString(extraction.toolsAndMemory) ?? "",
+      planningStyle: safeString(extraction.planningStyle) ?? "",
+      evaluationSetup: safeString(extraction.evaluationSetup) ?? "",
+      successSignals: safeStringArray(extraction.successSignals, 8),
+      failureModes: safeStringArray(extraction.failureModes, 8),
+      limitations: safeStringArray(extraction.limitations, 8),
+      supportedClaims: normalizeExtractionClaims(extraction.supportedClaims),
+      confidence: safePaperExtractionConfidence(extraction.confidence) ?? "low",
+      evidenceNotes: safeStringArray(extraction.evidenceNotes, 8)
+    }];
+  });
+}
+
 function normalizeThemes(value: unknown, allowedSourceIds: string[] = []): ResearchTheme[] {
   if (!Array.isArray(value)) {
     return [];
@@ -391,17 +506,19 @@ function normalizeClaims(value: unknown, allowedSourceIds: string[] = []): Resea
   }).slice(0, 8);
 }
 
-function normalizeSynthesis(raw: unknown, brief: ResearchBrief, allowedSourceIds: string[] = []): ResearchSynthesis {
+function normalizeSynthesis(raw: unknown, request: ResearchSynthesisRequest, allowedSourceIds: string[] = []): ResearchSynthesis {
   const record = typeof raw === "object" && raw !== null
     ? raw as Record<string, unknown>
     : {};
+  const nextQuestions = safeStringArray(record.nextQuestions, 6);
+  const matrixBackedQuestions = evidenceMatrixNextQuestions(request.evidenceMatrix);
 
   return {
     executiveSummary: safeString(record.executiveSummary)
-      ?? `This first-pass run synthesized the available sources around ${brief.topic ?? "the requested topic"}.`,
+      ?? `This first-pass run synthesized the available sources around ${request.brief.topic ?? "the requested topic"}.`,
     themes: normalizeThemes(record.themes, allowedSourceIds),
     claims: normalizeClaims(record.claims, allowedSourceIds),
-    nextQuestions: safeStringArray(record.nextQuestions, 6)
+    nextQuestions: nextQuestions.length > 0 ? nextQuestions : matrixBackedQuestions
   };
 }
 
@@ -615,8 +732,12 @@ function normalizeAgenda(raw: unknown, request: ResearchAgendaRequest): Research
       : candidateDirections.find((direction) => direction.mode === selectedWorkPackage.mode)?.id ?? candidateDirections[0]?.id ?? null);
   const holdReasons = safeStringArray(record.holdReasons, 6);
   const verifiedSignals = request.verification.verifiedClaims.filter((claim) => claim.supportStatus === "supported").length;
-  const evidenceThin = request.papers.length < 3 || verifiedSignals === 0;
+  const evidenceThin = request.evidenceMatrix.rowCount < 3 || verifiedSignals === 0;
   const missingSelection = effectiveSelectedDirectionId === null || selectedWorkPackage === null;
+  const matrixHolds = request.evidenceMatrix.derivedInsights
+    .filter((insight) => insight.kind === "gap" || insight.kind === "conflict")
+    .map((insight) => insight.summary)
+    .slice(0, 2);
 
   return {
     executiveSummary: safeString(record.executiveSummary)
@@ -627,8 +748,10 @@ function normalizeAgenda(raw: unknown, request: ResearchAgendaRequest): Research
     selectedWorkPackage: evidenceThin || missingSelection ? null : selectedWorkPackage,
     holdReasons: evidenceThin || missingSelection
       ? holdReasons.length > 0
-        ? holdReasons
-        : ["The reviewed evidence is still too thin or inconclusive to justify an executable next work package."]
+        ? [...holdReasons, ...matrixHolds].slice(0, 6)
+        : matrixHolds.length > 0
+          ? matrixHolds
+          : ["The reviewed evidence is still too thin or inconclusive to justify an executable next work package."]
       : holdReasons,
     recommendedHumanDecision: safeString(record.recommendedHumanDecision)
       ?? (evidenceThin || missingSelection
@@ -685,6 +808,81 @@ function planningInstruction(request: ResearchPlanningRequest): string {
   ].join("\n");
 }
 
+function extractionInstruction(request: PaperExtractionRequest): string {
+  const literatureContext = request.literatureContext ?? {
+    available: false,
+    paperCount: 0,
+    themeCount: 0,
+    notebookCount: 0,
+    papers: [],
+    themes: [],
+    notebooks: [],
+    queryHints: []
+  };
+  const reviewedPapers = request.papers.map((paper) => ({
+    paperId: paper.id,
+    title: paper.title,
+    citation: paper.citation,
+    abstract: paper.abstract,
+    year: paper.year,
+    venue: paper.venue,
+    authors: paper.authors,
+    accessMode: paper.accessMode,
+    screeningStage: paper.screeningStage,
+    screeningDecision: paper.screeningDecision,
+    screeningRationale: paper.screeningRationale,
+    tags: paper.tags
+  }));
+
+  return [
+    "You are ClawResearch's paper-extraction module for a console-first autonomous research runtime.",
+    "Extract paper-by-paper evidence only from the provided reviewed papers.",
+    "Do not fabricate detail. If a field is unclear, leave it as an empty string or empty array and lower confidence.",
+    "Supported claims must be short claim texts grounded in the paper itself.",
+    "",
+    "Allowed confidence values:",
+    "- high",
+    "- medium",
+    "- low",
+    "",
+    "Allowed supportedClaims support values:",
+    "- explicit",
+    "- partial",
+    "- implied",
+    "",
+    "Return JSON only with this exact shape:",
+    "{",
+    '  "extractions": [',
+    "    {",
+    '      "id": "string",',
+    '      "paperId": "string",',
+    '      "problemSetting": "string",',
+    '      "systemType": "string",',
+    '      "architecture": "string",',
+    '      "toolsAndMemory": "string",',
+    '      "planningStyle": "string",',
+    '      "evaluationSetup": "string",',
+    '      "successSignals": ["string"],',
+    '      "failureModes": ["string"],',
+    '      "limitations": ["string"],',
+    '      "supportedClaims": [',
+    '        { "claim": "string", "support": "explicit|partial|implied" }',
+    "      ],",
+    '      "confidence": "high|medium|low",',
+    '      "evidenceNotes": ["string"]',
+    "    }",
+    "  ]",
+    "}",
+    "",
+    `Project root: ${request.projectRoot}`,
+    `Run id: ${request.runId}`,
+    `Brief: ${JSON.stringify(request.brief)}`,
+    `Plan: ${JSON.stringify(request.plan)}`,
+    `Reviewed papers: ${JSON.stringify(reviewedPapers)}`,
+    `Literature memory context: ${JSON.stringify(literatureContext)}`
+  ].join("\n");
+}
+
 function synthesisInstruction(request: ResearchSynthesisRequest): string {
   const literatureContext = request.literatureContext ?? {
     available: false,
@@ -716,23 +914,31 @@ function synthesisInstruction(request: ResearchSynthesisRequest): string {
   }));
 
   if (shouldUseLiteratureReviewSubsystem(request.plan, request.brief)) {
-    return buildLiteratureSynthesisInstruction({
-      projectRoot: request.projectRoot,
-      brief: request.brief,
-      plan: request.plan,
-      sources: condensedPapers.map((paper) => ({
-        id: paper.id,
-        kind: "canonical_paper",
-        title: paper.title,
-        locator: paper.bestAccessUrl,
-        citation: paper.citation,
-        excerpt: paper.abstract ?? `${paper.accessMode} via ${paper.bestAccessProvider ?? "unknown"}`,
-        screeningDecision: paper.screeningDecision,
-        screeningRationale: paper.screeningRationale,
-        tags: paper.tags
-      })),
-      literatureContext
-    });
+    return [
+      buildLiteratureSynthesisInstruction({
+        projectRoot: request.projectRoot,
+        brief: request.brief,
+        plan: request.plan,
+        sources: condensedPapers.map((paper) => ({
+          id: paper.id,
+          kind: "canonical_paper",
+          title: paper.title,
+          locator: paper.bestAccessUrl,
+          citation: paper.citation,
+          excerpt: paper.abstract ?? `${paper.accessMode} via ${paper.bestAccessProvider ?? "unknown"}`,
+          screeningDecision: paper.screeningDecision,
+          screeningRationale: paper.screeningRationale,
+          tags: paper.tags
+        })),
+        literatureContext,
+        selectionQuality: request.selectionQuality ?? null
+      }),
+      "",
+      "Evidence-backed extraction layer:",
+      `Paper extractions: ${JSON.stringify(request.paperExtractions)}`,
+      `Evidence matrix: ${JSON.stringify(request.evidenceMatrix)}`,
+      "Ground themes, claims, and open questions in the evidence matrix derivedInsights and the extraction records, not only the raw paper list."
+    ].join("\n");
   }
 
   return [
@@ -759,6 +965,9 @@ function synthesisInstruction(request: ResearchSynthesisRequest): string {
     `Brief: ${JSON.stringify(request.brief)}`,
     `Plan: ${JSON.stringify(request.plan)}`,
     `Canonical papers: ${JSON.stringify(condensedPapers)}`,
+    `Review selection quality: ${JSON.stringify(request.selectionQuality ?? null)}`,
+    `Paper extractions: ${JSON.stringify(request.paperExtractions)}`,
+    `Evidence matrix: ${JSON.stringify(request.evidenceMatrix)}`,
     `Literature memory context: ${JSON.stringify(literatureContext)}`
   ].join("\n");
 }
@@ -797,6 +1006,8 @@ function agendaInstruction(request: ResearchAgendaRequest): string {
     "Convert the reviewed literature, verified claims, open questions, and project memory into a bounded research agenda.",
     "This is proposal ranking, not scientific proof. Do not treat polished text as evidence.",
     "Use only the reviewed papers and verified-claim context provided here.",
+    "Use review selection quality as a boundary condition: do not select a work package whose core objective depends on missing required facets.",
+    "If selection adequacy is thin or required facets are missing, either choose a literature-retrieval/refinement package or leave the agenda on hold with explicit missing-facet reasons.",
     "Prefer 2 to 5 concrete candidate directions.",
     "If the evidence base is weak, conflicting, or too theory-heavy for a bounded next step, leave selectedDirectionId null, selectedWorkPackage null, and explain holdReasons honestly.",
     "Do not generate manuscript-writing tasks.",
@@ -888,6 +1099,9 @@ function agendaInstruction(request: ResearchAgendaRequest): string {
     `Brief: ${JSON.stringify(request.brief)}`,
     `Plan: ${JSON.stringify(request.plan)}`,
     `Reviewed papers: ${JSON.stringify(reviewedPapers)}`,
+    `Review selection quality: ${JSON.stringify(request.selectionQuality ?? null)}`,
+    `Paper extractions: ${JSON.stringify(request.paperExtractions)}`,
+    `Evidence matrix: ${JSON.stringify(request.evidenceMatrix)}`,
     `Synthesis themes: ${JSON.stringify(request.synthesis.themes)}`,
     `Claims: ${JSON.stringify(claims)}`,
     `Next questions: ${JSON.stringify(request.synthesis.nextQuestions)}`,
@@ -956,6 +1170,16 @@ export class OllamaResearchBackend implements ResearchBackend {
     return normalizePlan(raw, request.brief);
   }
 
+  async extractReviewedPapers(request: PaperExtractionRequest): Promise<PaperExtraction[]> {
+    const raw = await ollamaJsonCall<unknown>(
+      this.host,
+      this.model,
+      extractionInstruction(request)
+    );
+
+    return normalizePaperExtractions(raw, request);
+  }
+
   async synthesizeResearch(request: ResearchSynthesisRequest): Promise<ResearchSynthesis> {
     const raw = await ollamaJsonCall<unknown>(
       this.host,
@@ -963,7 +1187,7 @@ export class OllamaResearchBackend implements ResearchBackend {
       synthesisInstruction(request)
     );
 
-    return normalizeSynthesis(raw, request.brief, request.papers.map((paper) => paper.id));
+    return normalizeSynthesis(raw, request, request.papers.map((paper) => paper.id));
   }
 
   async developResearchAgenda(request: ResearchAgendaRequest): Promise<ResearchAgenda> {

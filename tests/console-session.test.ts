@@ -67,6 +67,10 @@ class FakeRunController implements RunController {
   private nextPid = 4000;
   private readonly alive = new Set<number>();
 
+  launchCommand(run: { id: string; projectRoot: string }): string[] {
+    return ["node", "stub-cli.js", "--run-job", run.id, "--project-root", run.projectRoot];
+  }
+
   async launch(): Promise<number> {
     const pid = this.nextPid;
     this.nextPid += 1;
@@ -99,6 +103,10 @@ class WatchedFakeRunController implements RunController {
     private readonly now: () => string,
     private readonly stepDelayMs = 10
   ) {}
+
+  launchCommand(run: { id: string; projectRoot: string }): string[] {
+    return ["node", "stub-cli.js", "--run-job", run.id, "--project-root", run.projectRoot];
+  }
 
   async launch(run: { id: string; projectRoot: string; appVersion: string }): Promise<number> {
     const pid = this.nextPid;
@@ -205,6 +213,10 @@ class RaceyWatchedRunController implements RunController {
     private readonly now: () => string,
     private readonly stepDelayMs = 10
   ) {}
+
+  launchCommand(run: { id: string; projectRoot: string }): string[] {
+    return ["node", "stub-cli.js", "--run-job", run.id, "--project-root", run.projectRoot];
+  }
 
   async launch(run: { id: string; projectRoot: string; appVersion: string }): Promise<number> {
     const pid = this.nextPid;

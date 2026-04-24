@@ -72,6 +72,150 @@ function emptyLiteratureContext(overrides: Partial<LiteratureContext> = {}): Lit
   };
 }
 
+test("dynamic query expansion preserves plan queries and adds brief entities for unfamiliar topics", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-query-dynamic-"));
+
+  try {
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "ritual soundscapes in medieval Icelandic legal assemblies",
+        researchQuestion: "How did acoustic practices shape legal memory and authority in assembly culture?",
+        researchDirection: "Run a literature synthesis of legal anthropology, sound studies, and saga evidence.",
+        successCriterion: "Identify known evidence, open interpretive gaps, and one grounded next archival task."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review ritual soundscape evidence in medieval Icelandic assemblies.",
+        rationale: "This should work for an unfamiliar humanities-style topic.",
+        searchQueries: ["medieval Icelandic assemblies soundscape legal memory"],
+        localFocus: ["legal anthropology", "sound studies"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: []
+    });
+
+    const queries = gathered.retrievalDiagnostics?.queries ?? [];
+
+    assert.equal(queries[0]?.source, "plan");
+    assert.equal(queries[0]?.query, "medieval Icelandic assemblies soundscape legal memory");
+    assert.ok(queries.some((query) => query.source === "brief_entity"));
+    assert.ok(queries.some((query) => query.source === "brief_task"));
+    assert.ok(gathered.routing.plannedQueries[0]?.includes("medieval Icelandic assemblies"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("dynamic query expansion adds broad mathematical verification vocabulary without topic hardcoding", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-query-math-"));
+
+  try {
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "rigorous numerical verification of Riemann zeta zeros",
+        researchQuestion: "What evidence exists for reliable numerical verification and error control?",
+        researchDirection: "Run a literature synthesis of verification methods and unresolved computational tasks.",
+        successCriterion: "Identify reliability gaps and a bounded computational follow-up."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review rigorous numerical verification methods.",
+        rationale: "Mathematical verification requires search vocabulary beyond the initial phrasing.",
+        searchQueries: ["Riemann zeta zeros numerical verification"],
+        localFocus: ["verification methods", "error control"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: []
+    });
+
+    const domainQueries = (gathered.retrievalDiagnostics?.queries ?? [])
+      .filter((query) => query.source === "domain_vocabulary")
+      .map((query) => query.query.toLowerCase());
+
+    assert.ok(domainQueries.some((query) => query.includes("rigorous computation")));
+    assert.ok(domainQueries.some((query) => query.includes("error bounds")));
+    assert.ok(domainQueries.some((query) => query.includes("interval arithmetic") || query.includes("ball arithmetic")));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("dynamic query expansion adds care-workforce vocabulary from brief intent", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-query-care-"));
+
+  try {
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "AI tools in nursing homes and workforce effects",
+        researchQuestion: "What evidence exists that AI tools change staffing patterns, care quality, and worker displacement risk?",
+        researchDirection: "Run a literature synthesis comparing deployment patterns and workforce impacts.",
+        successCriterion: "Produce a grounded summary and concrete next research task."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review AI in nursing homes and workforce outcomes.",
+        rationale: "Care-delivery evidence uses long-term-care and staffing vocabulary.",
+        searchQueries: ["AI tools nursing homes workforce effects"],
+        localFocus: ["staffing", "care quality"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: []
+    });
+
+    const queries = (gathered.retrievalDiagnostics?.queries ?? []).map((query) => query.query.toLowerCase());
+    const domainQueries = (gathered.retrievalDiagnostics?.queries ?? [])
+      .filter((query) => query.source === "domain_vocabulary")
+      .map((query) => query.query.toLowerCase());
+
+    assert.ok(domainQueries.some((query) => query.includes("long-term care")));
+    assert.ok(queries.some((query) => query.includes("care quality")));
+    assert.ok(queries.some((query) => query.includes("staffing") || query.includes("workforce")));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("dynamic query expansion adds research-agent evaluation vocabulary from brief intent", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-query-agents-"));
+
+  try {
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "autonomous research agents for literature synthesis",
+        researchQuestion: "What architectures synthesize literature and propose next research tasks?",
+        researchDirection: "Compare agent architectures, evaluation practices, memory, and provenance designs.",
+        successCriterion: "Produce a grounded map of gaps and one engineering work package."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review autonomous research-agent architectures.",
+        rationale: "Agent evaluation and tool-use vocabulary should expand the search.",
+        searchQueries: ["autonomous research agents literature synthesis"],
+        localFocus: ["evaluation", "memory", "provenance"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: []
+    });
+
+    const domainQueries = (gathered.retrievalDiagnostics?.queries ?? [])
+      .filter((query) => query.source === "domain_vocabulary")
+      .map((query) => query.query.toLowerCase());
+
+    assert.ok(domainQueries.some((query) => query.includes("agent evaluation")));
+    assert.ok(domainQueries.some((query) => query.includes("literature synthesis agents")));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("provider routing biases openalex, arxiv, and dblp for CS/AI briefs", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-routing-cs-"));
   const originalFetch = globalThis.fetch;
@@ -765,7 +909,7 @@ test("provider fetch retries a transient rate limit before failing the run", asy
         attempts += 1;
 
         if (attempts === 1) {
-          return new Response(JSON.stringify({ error: "rate limited" }), { status: 429, statusText: "Too Many Requests", headers: { "content-type": "application/json" } });
+          return new Response(JSON.stringify({ error: "rate limited" }), { status: 429, statusText: "Too Many Requests", headers: { "content-type": "application/json", "retry-after": "0" } });
         }
 
         return new Response(JSON.stringify({
@@ -817,6 +961,51 @@ test("provider fetch retries a transient rate limit before failing the run", asy
 
     assert.ok(attempts >= 2, `Expected at least one retry, saw ${attempts} attempts.`);
     assert.equal(gathered.canonicalPapers.length, 1);
+    assert.equal(gathered.retrievalDiagnostics?.providerAttempts[0]?.error, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("missing unpaywall email is reported as an access limitation", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-unpaywall-diagnostic-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.openalex.org" && url.pathname === "/works") {
+        return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "autonomous research agents",
+        researchQuestion: "What design patterns recur in the literature?",
+        researchDirection: "Review architectures and evaluation strategies.",
+        successCriterion: "Produce a grounded synthesis of recurring design patterns."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review autonomous research agent architectures.",
+        rationale: "Missing resolver configuration should be explicit.",
+        searchQueries: ["autonomous research agents design patterns"],
+        localFocus: ["architectures", "evaluation strategies"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: ["openalex", "unpaywall"]
+    });
+
+    assert.ok(
+      gathered.retrievalDiagnostics?.accessLimitations.some((limitation) => /Unpaywall resolver unavailable/i.test(limitation))
+    );
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
@@ -900,6 +1089,449 @@ test("literature-review filtering rejects unrelated query noise even when it sha
     assert.deepEqual(gathered.canonicalPapers.map((paper) => paper.title), [
       "On Robin's criterion for the Riemann hypothesis"
     ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("literature-review screening retains strong task and focus matches without exact domain-anchor wording", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-relaxed-screening-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.openalex.org" && url.pathname === "/works") {
+        const page = Number(url.searchParams.get("page") ?? "1");
+
+        if (page > 1) {
+          return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+
+        return new Response(JSON.stringify({
+          results: [
+            {
+              id: "https://openalex.org/W-relaxed",
+              display_name: "Planning-loop evaluation benchmarks for tool-using scientific assistants",
+              publication_year: 2025,
+              authorships: [
+                { author: { display_name: "Relevant Author" } }
+              ],
+              primary_location: {
+                source: {
+                  display_name: "AI Systems Review"
+                },
+                landing_page_url: "https://example.org/scientific-assistants"
+              },
+              doi: "https://doi.org/10.1000/scientific-assistants",
+              abstract_inverted_index: toAbstractIndex(
+                "Evaluation benchmark architecture for planning loops memory provenance and tool use in scientific assistants."
+              )
+            }
+          ]
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "autonomous research agents",
+        researchQuestion: "What architectures synthesize literature and propose next research tasks?",
+        researchDirection: "Compare planning loops, evaluation practices, memory, and provenance designs.",
+        successCriterion: "Produce a grounded map of gaps and one engineering work package."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review autonomous research-agent architectures.",
+        rationale: "Relevant papers may use scientific-assistant terminology instead of exact domain anchors.",
+        searchQueries: ["autonomous research agents literature synthesis"],
+        localFocus: ["planning loops", "evaluation", "memory", "provenance"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: ["openalex"]
+    });
+
+    assert.equal(gathered.canonicalPapers.length, 1);
+    assert.equal(gathered.canonicalPapers[0]?.screeningDecision, "uncertain");
+    assert.equal(gathered.reviewedPapers.length, 1);
+    assert.match(gathered.canonicalPapers[0]?.screeningRationale ?? "", /Retained because the combined topic, task, and focus evidence/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("review workflow promotes high-quality uncertain abstract papers when included evidence is sparse", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-review-promotion-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.openalex.org" && url.pathname === "/works") {
+        const page = Number(url.searchParams.get("page") ?? "1");
+
+        if (page > 1) {
+          return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+
+        return new Response(JSON.stringify({
+          results: [
+            {
+              id: "https://openalex.org/W-include",
+              display_name: "Autonomous research agents for literature synthesis and evaluation",
+              publication_year: 2025,
+              authorships: [
+                { author: { display_name: "Included Author" } }
+              ],
+              primary_location: {
+                source: {
+                  display_name: "AI Systems Review"
+                },
+                landing_page_url: "https://example.org/include"
+              },
+              doi: "https://doi.org/10.1000/include",
+              abstract_inverted_index: toAbstractIndex(
+                "Autonomous research agents literature synthesis evaluation memory provenance and research task generation."
+              )
+            },
+            {
+              id: "https://openalex.org/W-uncertain-1",
+              display_name: "Tool-using scientific assistants for planning-loop evaluation",
+              publication_year: 2024,
+              authorships: [
+                { author: { display_name: "Uncertain Author" } }
+              ],
+              primary_location: {
+                source: {
+                  display_name: "AI Systems Review"
+                },
+                landing_page_url: "https://example.org/uncertain-1"
+              },
+              doi: "https://doi.org/10.1000/uncertain-1",
+              abstract_inverted_index: toAbstractIndex(
+                "Planning-loop evaluation benchmark architecture for memory provenance and tool use in scientific assistants."
+              )
+            },
+            {
+              id: "https://openalex.org/W-uncertain-2",
+              display_name: "Scientific assistant memory architectures for reproducible task generation",
+              publication_year: 2023,
+              authorships: [
+                { author: { display_name: "Another Author" } }
+              ],
+              primary_location: {
+                source: {
+                  display_name: "Proceedings of AI Evaluation"
+                },
+                landing_page_url: "https://example.org/uncertain-2"
+              },
+              doi: "https://doi.org/10.1000/uncertain-2",
+              abstract_inverted_index: toAbstractIndex(
+                "Evaluation architecture memory provenance and reproducible planning for tool using scientific assistants."
+              )
+            }
+          ]
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "autonomous research agents",
+        researchQuestion: "What architectures synthesize literature and propose next research tasks?",
+        researchDirection: "Compare planning loops, evaluation practices, memory, and provenance designs.",
+        successCriterion: "Produce a grounded map of gaps and one engineering work package."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review autonomous research-agent architectures.",
+        rationale: "Sparse included evidence should promote cautious high-quality uncertain papers.",
+        searchQueries: ["autonomous research agents literature synthesis"],
+        localFocus: ["planning loops", "evaluation", "memory", "provenance"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: ["openalex"]
+    });
+
+    assert.equal(gathered.reviewedPapers.length, 3);
+    assert.equal(gathered.reviewWorkflow.counts.included, 1);
+    assert.equal(gathered.reviewWorkflow.counts.selectedForSynthesis, 3);
+    assert.match(gathered.reviewWorkflow.notes.join("\n"), /Promoted 2 high\/medium-quality uncertain papers/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("review selection records success-criterion facet coverage for the selected papers", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-facet-coverage-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.openalex.org" && url.pathname === "/works") {
+        const page = Number(url.searchParams.get("page") ?? "1");
+
+        if (page > 1) {
+          return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+
+        return new Response(JSON.stringify({
+          results: [
+            {
+              id: "https://openalex.org/W-nursing-workforce",
+              display_name: "Artificial intelligence adoption, staffing, and care quality in nursing homes",
+              publication_year: 2025,
+              authorships: [
+                { author: { display_name: "Care Author" } }
+              ],
+              primary_location: {
+                source: {
+                  display_name: "Journal of Long-Term Care"
+                },
+                landing_page_url: "https://example.org/nursing-workforce"
+              },
+              doi: "https://doi.org/10.1000/nursing-workforce",
+              abstract_inverted_index: toAbstractIndex(
+                "Nursing homes artificial intelligence adoption staffing workforce displacement and care quality in long-term care."
+              )
+            },
+            {
+              id: "https://openalex.org/W-healthcare-ai",
+              display_name: "Artificial intelligence in healthcare review",
+              publication_year: 2024,
+              authorships: [
+                { author: { display_name: "Broad Author" } }
+              ],
+              primary_location: {
+                source: {
+                  display_name: "Healthcare Review"
+                },
+                landing_page_url: "https://example.org/healthcare-ai"
+              },
+              doi: "https://doi.org/10.1000/healthcare-ai",
+              abstract_inverted_index: toAbstractIndex(
+                "A broad healthcare review of artificial intelligence systems across clinical settings."
+              )
+            }
+          ]
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "AI adoption in nursing homes",
+        researchQuestion: "How does AI adoption affect staffing, workforce displacement, and care quality in nursing homes?",
+        researchDirection: "Review evidence on nursing-home staffing and quality impacts.",
+        successCriterion: "Produce a research note that distinguishes observed staffing and care-quality effects from speculation."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Synthesize AI adoption evidence in nursing homes.",
+        rationale: "The selected reviewed set should cover the success criterion facets.",
+        searchQueries: ["AI adoption nursing homes staffing care quality"],
+        localFocus: ["staffing", "workforce displacement", "care quality"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: ["openalex"]
+    });
+
+    const selectionQuality = gathered.selectionQuality;
+    const targetedPaper = gathered.reviewedPapers.find((paper) => /staffing, and care quality/i.test(paper.title));
+    const targetedCoverage = selectionQuality?.paperFacetCoverage.find((coverage) => coverage.paperId === targetedPaper?.id);
+    const coveredLabels = selectionQuality?.requiredFacets
+      .filter((facet) => targetedCoverage?.coveredFacetIds.includes(facet.id))
+      .map((facet) => facet.label.toLowerCase()) ?? [];
+
+    assert.ok(selectionQuality !== undefined && selectionQuality !== null);
+    assert.ok(targetedPaper !== undefined);
+    assert.ok(coveredLabels.some((label) => /nursing homes/.test(label)));
+    assert.ok(coveredLabels.some((label) => /staffing|workforce/.test(label)));
+    assert.ok(coveredLabels.some((label) => /care quality/.test(label)));
+    assert.match(gathered.reviewWorkflow.notes.join("\n"), /Review facet adequacy/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("review selection records missing method facets when zeta evidence drifts away from verification", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-facet-missing-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.openalex.org" && url.pathname === "/works") {
+        const page = Number(url.searchParams.get("page") ?? "1");
+
+        if (page > 1) {
+          return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+
+        return new Response(JSON.stringify({
+          results: [
+            {
+              id: "https://openalex.org/W-zeta-differences",
+              display_name: "Distributions of differences of Riemann zeta zeros",
+              publication_year: 2024,
+              authorships: [
+                { author: { display_name: "Zeta Author" } }
+              ],
+              primary_location: {
+                source: {
+                  display_name: "Journal of Number Theory"
+                },
+                landing_page_url: "https://example.org/zeta-differences"
+              },
+              doi: "https://doi.org/10.1000/zeta-differences",
+              abstract_inverted_index: toAbstractIndex(
+                "Riemann zeta zeros zero spacing statistics pair correlation and number theory."
+              )
+            }
+          ]
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "rigorous numerical verification of Riemann zeta zeros",
+        researchQuestion: "What evidence exists for reliable numerical verification and error control?",
+        researchDirection: "Review rigorous computation methods for verifying zeta zeros.",
+        successCriterion: "Identify verification methods with explicit error bounds and implementation constraints."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review rigorous numerical verification methods for zeta zeros.",
+        rationale: "Adjacent zeta statistics papers should not satisfy verification-method facets.",
+        searchQueries: ["Riemann zeta zeros numerical verification error bounds"],
+        localFocus: ["error bounds", "rigorous computation", "implementation constraints"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: ["openalex"]
+    });
+
+    const missingLabels = gathered.selectionQuality?.missingRequiredFacets.map((facet) => facet.label.toLowerCase()) ?? [];
+
+    assert.ok(missingLabels.some((label) => /error bounds|rigorous numerical verification|verification/.test(label)));
+    assert.notEqual(gathered.selectionQuality?.adequacy, "strong");
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("thin evidence triggers one recovery pass and records recovery diagnostics", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-recovery-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.openalex.org" && url.pathname === "/works") {
+        const search = url.searchParams.get("search") ?? "";
+
+        if (!/limitations/i.test(search)) {
+          return new Response(JSON.stringify({
+            results: [
+              {
+                id: "https://openalex.org/W-noise",
+                display_name: "Unrelated survey of aquarium maintenance",
+                publication_year: 2024,
+                authorships: [
+                  { author: { display_name: "Noise Author" } }
+                ],
+                primary_location: {
+                  source: {
+                    display_name: "Maintenance Review"
+                  },
+                  landing_page_url: "https://example.org/noise"
+                },
+                abstract_inverted_index: toAbstractIndex(
+                  "A survey review of aquarium maintenance procedures."
+                )
+              }
+            ]
+          }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+
+        return new Response(JSON.stringify({
+          results: [
+            {
+              id: "https://openalex.org/W-recovery",
+              display_name: "Autonomous research agents limitations and evaluation practices",
+              publication_year: 2025,
+              authorships: [
+                { author: { display_name: "Recovery Author" } }
+              ],
+              primary_location: {
+                source: {
+                  display_name: "AI Systems Review"
+                },
+                landing_page_url: "https://example.org/recovery"
+              },
+              doi: "https://doi.org/10.1000/recovery",
+              abstract_inverted_index: toAbstractIndex(
+                "Autonomous research agents limitations evaluation practices memory provenance and literature synthesis."
+              )
+            }
+          ]
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "autonomous research agents",
+        researchQuestion: "What remains unresolved?",
+        researchDirection: "Review planning and evaluation gaps.",
+        successCriterion: "Find a grounded next task."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review autonomous research-agent evidence.",
+        rationale: "The first pass should be too thin and trigger recovery.",
+        searchQueries: ["autonomous research agents evidence"],
+        localFocus: ["planning", "evaluation"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: ["openalex"]
+    });
+
+    assert.equal(gathered.retrievalDiagnostics?.recoveryPasses, 1);
+    assert.ok(gathered.retrievalDiagnostics?.providerAttempts.some((attempt) => attempt.phase === "recovery"));
+    assert.ok(gathered.retrievalDiagnostics?.queries.some((query) => query.source === "recovery" || query.source === "rejected_candidate"));
+    assert.ok(gathered.canonicalPapers.some((paper) => /limitations and evaluation/i.test(paper.title)));
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });

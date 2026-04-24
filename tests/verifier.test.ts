@@ -41,6 +41,19 @@ test("verifier records provenance, evidence links, and supported claims from can
           fulltextFetched: false,
           fulltextExtracted: false
         },
+        screeningHistory: [{
+          stage: "title",
+          decision: "uncertain",
+          rationale: "Retained after title screening for deeper review."
+        }, {
+          stage: "abstract",
+          decision: "include",
+          rationale: "Abstract-level screening supported deeper review."
+        }, {
+          stage: "fulltext",
+          decision: "include",
+          rationale: "Directly relevant survey."
+        }],
         screeningStage: "fulltext",
         screeningDecision: "include",
         screeningRationale: "Directly relevant survey.",
@@ -110,6 +123,11 @@ test("verifier marks claims linked only to blocked papers as unverified", () => 
           fulltextFetched: false,
           fulltextExtracted: false
         },
+        screeningHistory: [{
+          stage: "title",
+          decision: "uncertain",
+          rationale: "Discovered but not readable."
+        }],
         screeningStage: "title",
         screeningDecision: "uncertain",
         screeningRationale: "Discovered but not readable.",
@@ -176,6 +194,15 @@ test("verifier emits explicit unknown when the claim itself states evidence is l
           fulltextFetched: false,
           fulltextExtracted: false
         },
+        screeningHistory: [{
+          stage: "title",
+          decision: "uncertain",
+          rationale: "Retained after title screening for deeper review."
+        }, {
+          stage: "abstract",
+          decision: "include",
+          rationale: "Abstract-level screening only."
+        }],
         screeningStage: "abstract",
         screeningDecision: "include",
         screeningRationale: "Abstract-level screening only.",

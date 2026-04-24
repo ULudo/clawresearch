@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -44,6 +44,19 @@ test("literature store persists canonical papers, access state, theme boards, an
           bestAccessProvider: "openalex",
           accessMode: "fulltext_open",
           fulltextFormat: "pdf",
+          screeningHistory: [{
+            stage: "title",
+            decision: "uncertain",
+            rationale: "Retained after title screening for deeper review."
+          }, {
+            stage: "abstract",
+            decision: "include",
+            rationale: "Abstract-level screening supported deeper review."
+          }, {
+            stage: "fulltext",
+            decision: "include",
+            rationale: "Directly relevant survey paper with open full text."
+          }],
           screeningStage: "fulltext",
           screeningDecision: "include",
           screeningRationale: "Directly relevant survey paper with open full text.",
@@ -95,6 +108,8 @@ test("literature store persists canonical papers, access state, theme boards, an
     assert.equal(state.papers[0]?.accessMode, "fulltext_open");
     assert.equal(state.papers[0]?.fulltextFormat, "pdf");
     assert.equal(state.papers[0]?.identifiers.doi, "10.1000/rh-proof-techniques");
+    assert.equal(state.papers[0]?.screeningHistory.length, 3);
+    assert.equal(state.papers[0]?.screeningHistory[1]?.stage, "abstract");
     assert.equal(context.available, true);
     assert.match(context.papers[0]?.title ?? "", /Riemann Hypothesis/);
     assert.equal(context.papers[0]?.accessMode, "fulltext_open");
@@ -106,6 +121,37 @@ test("literature store persists canonical papers, access state, theme boards, an
     );
     assert.match(serializedStore, /"paperCount": 1/);
     assert.match(serializedStore, /"fulltext_open"/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("literature store reads legacy nested library before writing the root library", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-literature-store-legacy-"));
+  const now = createNow();
+
+  try {
+    await mkdir(path.join(projectRoot, ".clawresearch", "literature"), { recursive: true });
+    await writeFile(path.join(projectRoot, ".clawresearch", "literature", "library.json"), `${JSON.stringify({
+      schemaVersion: 2,
+      projectRoot,
+      runtimeDirectory: path.join(projectRoot, ".clawresearch"),
+      literatureDirectory: path.join(projectRoot, ".clawresearch", "literature"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      paperCount: 0,
+      themeCount: 0,
+      notebookCount: 0,
+      papers: [],
+      themes: [],
+      notebooks: []
+    }, null, 2)}\n`, "utf8");
+
+    const store = new LiteratureStore(projectRoot, now);
+    const state = await store.load();
+
+    assert.equal(store.filePath, path.join(projectRoot, ".clawresearch", "library.json"));
+    assert.equal(state.paperCount, 0);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

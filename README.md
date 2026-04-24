@@ -180,16 +180,22 @@ Project-level credentials are persisted locally in:
 .clawresearch/credentials.json
 ```
 
-The runtime now also keeps a small structured memory in:
+The runtime now also keeps a structured research journal in:
 
 ```text
-.clawresearch/memory.json
+.clawresearch/research-journal.json
 ```
 
-The dedicated literature store now lives in:
+The canonical paper library now lives in:
 
 ```text
-.clawresearch/literature/library.json
+.clawresearch/library.json
+```
+
+The current accepted research direction lives in:
+
+```text
+.clawresearch/research-direction.json
 ```
 
 The console also keeps a raw debug transcript of the interaction in:
@@ -214,17 +220,20 @@ Each run keeps a small set of debuggable local artifacts, including:
 - `brief.json`
 - `plan.json`
 - `sources.json`
-- `literature.json`
+- `literature-review.json`
+- `paper-extractions.json`
+- `evidence-matrix.json`
 - `synthesis.md`
 - `claims.json`
 - `verification.json`
 - `next-questions.json`
+- `agenda.json`
 - `summary.md`
-- `memory.json`
+- `research-journal.json`
 
 `events.jsonl` is the structured event stream the console watches while a run is active. It currently emits small, readable steps such as `plan`, `source`, `claim`, `next`, `exec`, `summary`, and terminal `run` updates.
 
-The project-level memory is intentionally simple rather than graph-heavy. It stores typed records such as:
+The project-level research journal is intentionally simple rather than graph-heavy. It stores typed records such as:
 
 - `claim`
 - `finding`
@@ -236,9 +245,9 @@ The project-level memory is intentionally simple rather than graph-heavy. It sto
 - `hypothesis`
 - `method_plan`
 
-Each record has a stable id, lightweight links to related records, and enough metadata to debug how a run's outputs connect without introducing a large orchestration system. The memory is now focused on agent-derived working knowledge rather than duplicating canonical papers.
+Each record has a stable id, lightweight links to related records, and enough metadata to debug how a run's outputs connect without introducing a large orchestration system. The journal is focused on agent-derived working knowledge rather than duplicating canonical papers.
 
-That memory is now also used actively by later runs. The planner and source gatherer receive a summarized project memory context so the next pass can build on prior findings, questions, ideas, and artifacts instead of starting cold each time.
+The research journal is now also used actively by later runs. The planner and source gatherer receive a summarized project memory context so the next pass can build on prior findings, questions, ideas, and artifacts instead of starting cold each time.
 
 ClawResearch now also keeps a separate literature-oriented store instead of flattening papers into generic memory only. That store currently maintains:
 
@@ -248,8 +257,10 @@ ClawResearch now also keeps a separate literature-oriented store instead of flat
 
 In practice:
 
-- `memory.json` stores the agent's derived notes, questions, directions, and plans
-- `literature/library.json` stores the canonical paper graph and literature review structure
+- `research-journal.json` stores the agent's derived findings, questions, hypotheses, ideas, directions, and plans
+- `library.json` stores the canonical paper graph and literature review structure
+- `research-direction.json` stores the current accepted research direction / agenda
+- `runs/<run-id>/literature-review.json` stores the literature snapshot for one `/go` run
 
 This keeps the literature review path easier to inspect and easier for an LLM to reuse as a compact working context on later runs.
 
@@ -271,13 +282,13 @@ The detached worker now runs a minimal explicit research loop. It is still inten
 - record claims with explicit evidence references
 - verify claim provenance, support status, and explicit unknown or unverified gaps
 - produce next-step research questions
-- write a small structured memory batch into both the run directory and the project runtime memory store
+- write a small structured research journal batch into both the run directory and the project runtime journal store
 
 It is still not a full autonomous scientist yet. The current loop is best understood as a source-grounded first research pass with inspectable artifacts.
 
 When the run is clearly a literature-review task, ClawResearch now switches to a specialized literature subsystem. That subsystem builds a task-aware literature profile, ranks papers by domain and task fit rather than pure keyword overlap, merges provider duplicates into canonical papers, and uses a literature-specific synthesis prompt that emphasizes thematic comparison, citation grounding, and explicit gap identification.
 
-`sources.json` now keeps raw provider hits, routing notes, and merge diagnostics. `literature.json` keeps the canonical paper set, access state, screening state, and provider-auth status that mattered for the run.
+`sources.json` now keeps raw provider hits, routing notes, and merge diagnostics. `literature-review.json` keeps the canonical paper set, access state, screening state, and provider-auth status that mattered for the run.
 
 After dependencies are installed, the runtime can also be built and run as compiled JavaScript:
 
@@ -317,16 +328,16 @@ run        Trace: .clawresearch/runs/run-.../trace.log
 run        Events: .clawresearch/runs/run-.../events.jsonl
 run        Plan: .clawresearch/runs/run-.../plan.json
 run        Sources: .clawresearch/runs/run-.../sources.json
-run        Literature: .clawresearch/runs/run-.../literature.json
+run        Literature review: .clawresearch/runs/run-.../literature-review.json
 run        Synthesis: .clawresearch/runs/run-.../synthesis.md
 run        Verification: .clawresearch/runs/run-.../verification.json
-run        Memory: .clawresearch/runs/run-.../memory.json
+run        Research journal snapshot: .clawresearch/runs/run-.../research-journal.json
 watch      Streaming live run activity from .clawresearch/runs/run-.../events.jsonl.
 plan       Plan the research mode and generate initial search queries.
 source     web-1: ...
 claim      ...
 verify     Verified 1 claims against 2 sources. 1 supported, 0 partially supported, 0 unverified, 0 explicit unknown.
-memory     Recorded 15 structured memory records (15 new, 0 updated).
+memory     Recorded 15 research journal records (15 new, 0 updated).
 next       ...
 done       Run run-... completed.
 ```

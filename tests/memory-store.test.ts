@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -98,6 +98,44 @@ test("memory store upserts typed records, preserves stable ids, and merges links
     assert.equal(claimRecord?.links.length, 2);
     assert.deepEqual(claimRecord?.data.paperIds, ["paper-example-1", "paper-example-2"]);
     assert.equal(claimRecord?.data.note, "updated");
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("memory store reads legacy notes file before writing the research journal", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-memory-store-legacy-"));
+  const now = createNow();
+
+  try {
+    await mkdir(path.join(projectRoot, ".clawresearch"), { recursive: true });
+    await writeFile(path.join(projectRoot, ".clawresearch", "notes.json"), `${JSON.stringify({
+      schemaVersion: 2,
+      projectRoot,
+      runtimeDirectory: path.join(projectRoot, ".clawresearch"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      recordCount: 1,
+      records: [{
+        id: "finding-legacy",
+        type: "finding",
+        key: "legacy finding",
+        title: "Legacy finding",
+        text: "Loaded from the old notes file.",
+        runId: "run-legacy",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        links: [],
+        data: {}
+      }]
+    }, null, 2)}\n`, "utf8");
+
+    const store = new MemoryStore(projectRoot, now);
+    const memory = await store.load();
+
+    assert.equal(store.filePath, path.join(projectRoot, ".clawresearch", "research-journal.json"));
+    assert.equal(memory.recordCount, 1);
+    assert.equal(memory.records[0]?.title, "Legacy finding");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

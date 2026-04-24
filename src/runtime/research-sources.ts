@@ -6,10 +6,16 @@ import {
 } from "./credential-store.js";
 import {
   assessLiteratureSource,
+  assessPaperFacetCoverage,
+  buildReviewFacets,
+  buildReviewSelectionQuality,
   buildLiteratureReviewProfile,
   shouldUseLiteratureReviewSubsystem,
   type LiteratureReviewProfile,
-  type LiteratureSourceAssessment
+  type LiteratureSourceAssessment,
+  type PaperFacetCoverage,
+  type ReviewFacet,
+  type ReviewSelectionQuality
 } from "./literature-review.js";
 import type {
   CanonicalPaper,
@@ -18,6 +24,7 @@ import type {
   PaperDiscoveryRecord,
   PaperFulltextFormat,
   PaperIdentifiers,
+  PaperScreeningStatus,
   LiteratureContext
 } from "./literature-store.js";
 import { createLiteratureEntityId } from "./literature-store.js";
@@ -183,6 +190,22 @@ export type ProviderAuthSnapshot = {
   status: ProviderAuthStatus;
 };
 
+export type QueryExpansionSource =
+  | "plan"
+  | "brief_entity"
+  | "brief_task"
+  | "memory"
+  | "literature"
+  | "domain_vocabulary"
+  | "rejected_candidate"
+  | "recovery";
+
+export type QueryExpansionCandidate = {
+  query: string;
+  source: QueryExpansionSource;
+  reason: string;
+};
+
 export type RoutingPlan = {
   domain: SourceProviderDomain | "mixed";
   plannedQueries: string[];
@@ -215,6 +238,25 @@ export type ReviewWorkflowSummary = {
   notes: string[];
 };
 
+export type RetrievalDiagnostics = {
+  queries: QueryExpansionCandidate[];
+  providerAttempts: Array<{
+    providerId: SourceProviderId;
+    phase: "initial" | "recovery";
+    rawCandidateCount: number;
+    acceptedSourceCount: number;
+    error: string | null;
+  }>;
+  screeningSummary: {
+    accepted: number;
+    rejected: number;
+    weakMatchSamples: Array<{ title: string; rationale: string }>;
+  };
+  recoveryPasses: number;
+  accessLimitations: string[];
+  suggestedNextQueries: string[];
+};
+
 export type ResearchSourceGatherResult = {
   sources: ResearchSource[];
   canonicalPapers: CanonicalPaper[];
@@ -233,6 +275,8 @@ export type ResearchSourceGatherResult = {
       assessment: LiteratureSourceAssessment;
     }>;
   } | null;
+  retrievalDiagnostics?: RetrievalDiagnostics;
+  selectionQuality?: ReviewSelectionQuality | null;
 };
 
 export type ResearchSourceGatherRequest = {
@@ -289,6 +333,23 @@ type RetrievalBudget = {
   maxPagesPerQuery: number;
   maxCandidatesPerProvider: number;
   targetAcceptedSources: number;
+};
+
+type FilterCandidatesResult = {
+  sources: ResearchSource[];
+  notes: string[];
+  assessments: Array<{ sourceId: string; title: string; assessment: LiteratureSourceAssessment }>;
+  rejectedSamples: Array<{ title: string; excerpt: string; rationale: string }>;
+  acceptedCount: number;
+  rejectedCount: number;
+};
+
+type CanonicalReviewState = {
+  canonicalPapers: CanonicalPaper[];
+  reviewedPapers: CanonicalPaper[];
+  reviewWorkflow: ReviewWorkflowSummary;
+  selectionQuality: ReviewSelectionQuality | null;
+  mergeDiagnostics: string[];
 };
 
 type ProviderPageResult = {
@@ -379,7 +440,15 @@ function normalizeMatchToken(token: string): string {
     return `${token.slice(0, -3)}y`;
   }
 
-  if (token.endsWith("s") && token.length > 4 && !token.endsWith("ss") && !token.endsWith("is")) {
+  if ((token.endsWith("ches") || token.endsWith("shes") || token.endsWith("xes")) && token.length > 5) {
+    return token.slice(0, -2);
+  }
+
+  if (/(ous|ics|ss|is)$/.test(token)) {
+    return token;
+  }
+
+  if (token.endsWith("s") && token.length > 4) {
     return token.slice(0, -1);
   }
 
@@ -408,6 +477,73 @@ function uniqueStrings(values: Array<string | null | undefined>): string[] {
   }
 
   return normalized;
+}
+
+function normalizeQueryKey(value: string): string {
+  return normalizeWhitespace(value.toLowerCase());
+}
+
+function uniqueQueryCandidates(candidates: QueryExpansionCandidate[]): QueryExpansionCandidate[] {
+  const seen = new Set<string>();
+  const result: QueryExpansionCandidate[] = [];
+
+  for (const candidate of candidates) {
+    const query = normalizeWhitespace(candidate.query);
+    const key = normalizeQueryKey(query);
+
+    if (query.length === 0 || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push({
+      ...candidate,
+      query
+    });
+  }
+
+  return result;
+}
+
+function queryCandidate(
+  query: string | null | undefined,
+  source: QueryExpansionSource,
+  reason: string
+): QueryExpansionCandidate[] {
+  const normalized = typeof query === "string" ? normalizeWhitespace(query) : "";
+
+  return normalized.length === 0
+    ? []
+    : [{ query: normalized, source, reason }];
+}
+
+function queryTokenSequence(text: string | null | undefined): string[] {
+  if (typeof text !== "string") {
+    return [];
+  }
+
+  return matchTokens(text)
+    .filter((token) => !stopTokens.has(token))
+    .filter((token) => token.length >= 3 || preservedShortTokens.has(token));
+}
+
+function keyPhrasesFromText(text: string | null | undefined, limit: number): string[] {
+  const tokens = queryTokenSequence(text);
+  const phrases: string[] = [];
+
+  if (tokens.length === 0) {
+    return [];
+  }
+
+  for (const size of [4, 3, 2]) {
+    for (let index = 0; index <= tokens.length - size; index += 1) {
+      phrases.push(tokens.slice(index, index + size).join(" "));
+    }
+  }
+
+  phrases.push(tokens.slice(0, Math.min(6, tokens.length)).join(" "));
+
+  return uniqueStrings(phrases).slice(0, limit);
 }
 
 function overlapScore(text: string, referenceTokens: Set<string>): number {
@@ -830,10 +966,137 @@ function buildRetrievalBudget(
   };
 }
 
-function buildQueryPlan(request: ResearchSourceGatherRequest, budget: RetrievalBudget): string[] {
+function primaryQueryAnchor(request: ResearchSourceGatherRequest): string {
   const primaryTopic = request.brief.topic ?? request.plan.objective;
-  const topicPhrase = compactQueryPhrase(primaryTopic, 8) ?? primaryTopic;
+  return compactQueryPhrase(primaryTopic, 8) ?? primaryTopic;
+}
+
+function combinedResearchText(request: ResearchSourceGatherRequest): string {
+  return [
+    request.brief.topic,
+    request.brief.researchQuestion,
+    request.brief.researchDirection,
+    request.brief.successCriterion,
+    request.plan.objective,
+    request.plan.rationale,
+    ...request.plan.searchQueries,
+    ...request.plan.localFocus
+  ].filter((value): value is string => typeof value === "string").join(" ");
+}
+
+function buildBriefEntityQueryCandidates(request: ResearchSourceGatherRequest): QueryExpansionCandidate[] {
+  const fields = [
+    request.brief.topic,
+    request.brief.researchQuestion,
+    request.brief.researchDirection,
+    request.brief.successCriterion,
+    request.plan.objective,
+    ...request.plan.localFocus
+  ];
+
+  return uniqueStrings(fields.flatMap((field) => keyPhrasesFromText(field, 4)))
+    .slice(0, 18)
+    .flatMap((phrase) => queryCandidate(phrase, "brief_entity", "Extracted from the research brief or local focus."));
+}
+
+function buildBriefTaskQueryCandidates(request: ResearchSourceGatherRequest): QueryExpansionCandidate[] {
+  const text = combinedResearchText(request);
+  const anchor = primaryQueryAnchor(request);
+  const candidates: QueryExpansionCandidate[] = [];
+
+  if (/\b(literature|review|survey|synthesis|mapping|taxonomy|related work|prior work)\b/i.test(text)) {
+    candidates.push(...queryCandidate(`${anchor} literature review`, "brief_task", "The brief asks for literature synthesis or prior-work mapping."));
+    candidates.push(...queryCandidate(`${anchor} survey`, "brief_task", "The brief asks for a review-style evidence base."));
+  }
+
+  if (/\b(compare|comparison|taxonomy|trade-?off|versus|vs\b)\b/i.test(text)) {
+    candidates.push(...queryCandidate(`${anchor} comparison`, "brief_task", "The brief asks for comparison across approaches or evidence."));
+  }
+
+  if (/\b(evaluation|evaluate|benchmark|metric|baseline|evidence|success criteria?)\b/i.test(text)) {
+    candidates.push(...queryCandidate(`${anchor} evaluation`, "brief_task", "The brief asks for evaluation evidence or success criteria."));
+    candidates.push(...queryCandidate(`${anchor} benchmark`, "brief_task", "The brief asks for evaluable or benchmarkable evidence."));
+  }
+
+  if (/\b(implementation|architecture|system|workflow|tooling|runtime)\b/i.test(text)) {
+    candidates.push(...queryCandidate(`${anchor} architecture`, "brief_task", "The brief asks about systems, implementation, or architecture."));
+  }
+
+  if (/\b(workforce|staffing|employment|jobs?|labor|labour|displacement|worker|workers)\b/i.test(text)) {
+    candidates.push(...queryCandidate(`${anchor} workforce`, "brief_task", "The brief asks about workforce or labor effects."));
+    candidates.push(...queryCandidate(`${anchor} staffing`, "brief_task", "The brief asks about staffing patterns."));
+  }
+
+  return uniqueQueryCandidates(candidates);
+}
+
+function buildDomainVocabularyQueryCandidates(
+  request: ResearchSourceGatherRequest,
+  domain: SourceProviderDomain | "mixed"
+): QueryExpansionCandidate[] {
+  const text = combinedResearchText(request);
+  const anchor = primaryQueryAnchor(request);
+  const candidates: QueryExpansionCandidate[] = [];
+  const mathematicalVerification = domain === "mathematics"
+    && /\b(rigorous|numerical|verification|verified|compute|computed|computation|error|bound|bounds|zeros?)\b/i.test(text);
+
+  if (mathematicalVerification) {
+    for (const term of ["rigorous computation", "error bounds", "interval arithmetic", "ball arithmetic", "numerical verification"]) {
+      candidates.push(...queryCandidate(`${anchor} ${term}`, "domain_vocabulary", "Mathematical verification tasks often use this search vocabulary."));
+    }
+  }
+
+  if (domain === "biomedical" && /\b(nursing homes?|long[- ]term care|care homes?|residential care|aged care)\b/i.test(text)) {
+    for (const term of ["long-term care", "residential care", "care quality", "staffing", "workforce"]) {
+      candidates.push(...queryCandidate(`${anchor} ${term}`, "domain_vocabulary", "Care-delivery and workforce questions often use this search vocabulary."));
+    }
+  }
+
+  if ((domain === "cs_ai" || domain === "mixed") && /\b(agent|agents|autonomous|ai scientist|scientific discovery|research automation)\b/i.test(text)) {
+    for (const term of ["agent evaluation", "scientific discovery agents", "literature synthesis agents", "tool-using agents"]) {
+      candidates.push(...queryCandidate(`${anchor} ${term}`, "domain_vocabulary", "Research-agent questions often use this search vocabulary."));
+    }
+  }
+
+  if (domain === "social_science" && /\b(policy|governance|workforce|employment|organization|organisation)\b/i.test(text)) {
+    for (const term of ["policy evidence", "organizational impact", "workforce impact"]) {
+      candidates.push(...queryCandidate(`${anchor} ${term}`, "domain_vocabulary", "Social-science impact questions often use this search vocabulary."));
+    }
+  }
+
+  return uniqueQueryCandidates(candidates);
+}
+
+function buildRecoveryQueryCandidates(
+  request: ResearchSourceGatherRequest,
+  rejectedSamples: Array<{ title: string; excerpt: string; rationale: string }>
+): QueryExpansionCandidate[] {
+  const anchor = primaryQueryAnchor(request);
+  const sampleQueries = rejectedSamples
+    .slice(0, 8)
+    .flatMap((sample) => keyPhrasesFromText(`${sample.title} ${sample.excerpt}`, 2))
+    .slice(0, 8)
+    .flatMap((phrase) => queryCandidate(`${anchor} ${phrase}`, "rejected_candidate", "Recovered from weakly matched candidate metadata."));
+  const broadTaskQueries = [
+    `${anchor} review`,
+    `${anchor} survey`,
+    `${anchor} evaluation`,
+    `${anchor} limitations`
+  ].flatMap((query) => queryCandidate(query, "recovery", "Broad recovery query for a thin evidence base."));
+
+  return uniqueQueryCandidates([
+    ...sampleQueries,
+    ...broadTaskQueries
+  ]);
+}
+
+function buildQueryExpansionCandidates(
+  request: ResearchSourceGatherRequest,
+  domain: SourceProviderDomain | "mixed",
+  recoveryCandidates: QueryExpansionCandidate[] = []
+): QueryExpansionCandidate[] {
   const explicitQueries = uniqueStrings(request.plan.searchQueries);
+  const topicPhrase = primaryQueryAnchor(request);
   const focusQueries = uniqueStrings([
     compactQueryPhrase(request.brief.researchQuestion, 7),
     compactQueryPhrase(request.brief.researchDirection, 7),
@@ -843,15 +1106,84 @@ function buildQueryPlan(request: ResearchSourceGatherRequest, budget: RetrievalB
   ]);
   const literatureHints = request.literatureContext?.queryHints ?? [];
   const memoryHints = request.memoryContext.queryHints ?? [];
-  const buckets = [
-    explicitQueries,
-    focusQueries.map((query) => `${topicPhrase} ${query}`),
-    memoryHints.map((hint) => `${topicPhrase} ${compactQueryPhrase(hint, 6) ?? hint}`),
-    literatureHints.map((hint) => `${topicPhrase} ${compactQueryPhrase(hint, 6) ?? hint}`),
-    [topicPhrase]
-  ];
+  const planCandidates = explicitQueries.flatMap((query) => queryCandidate(query, "plan", "Model-planned retrieval query."));
+  const briefTaskCandidates = [
+    ...focusQueries.map((query) => `${topicPhrase} ${query}`),
+    topicPhrase
+  ].flatMap((query) => queryCandidate(query, "brief_task", "Derived from the scoped brief and research plan."));
+  const memoryCandidates = memoryHints.flatMap((hint) => queryCandidate(
+    `${topicPhrase} ${compactQueryPhrase(hint, 6) ?? hint}`,
+    "memory",
+    "Project research journal query hint."
+  ));
+  const literatureCandidates = literatureHints.flatMap((hint) => queryCandidate(
+    `${topicPhrase} ${compactQueryPhrase(hint, 6) ?? hint}`,
+    "literature",
+    "Canonical paper library query hint."
+  ));
 
-  return interleaveUniqueQueries(buckets, budget.maxQueries);
+  return uniqueQueryCandidates([
+    ...planCandidates,
+    ...buildBriefEntityQueryCandidates(request),
+    ...briefTaskCandidates,
+    ...memoryCandidates,
+    ...literatureCandidates,
+    ...buildDomainVocabularyQueryCandidates(request, domain),
+    ...recoveryCandidates
+  ]);
+}
+
+function interleaveQueryCandidates(candidates: QueryExpansionCandidate[], limit: number): QueryExpansionCandidate[] {
+  const sourceOrder: QueryExpansionSource[] = [
+    "plan",
+    "brief_entity",
+    "brief_task",
+    "memory",
+    "literature",
+    "domain_vocabulary",
+    "rejected_candidate",
+    "recovery"
+  ];
+  const buckets = sourceOrder.map((source) => candidates.filter((candidate) => candidate.source === source));
+  const seen = new Set<string>();
+  const result: QueryExpansionCandidate[] = [];
+  const maxBucketLength = Math.max(0, ...buckets.map((bucket) => bucket.length));
+
+  for (let index = 0; index < maxBucketLength && result.length < limit; index += 1) {
+    for (const bucket of buckets) {
+      const candidate = bucket[index];
+      const key = candidate === undefined ? null : normalizeQueryKey(candidate.query);
+
+      if (candidate === undefined || key === null || seen.has(key)) {
+        continue;
+      }
+
+      seen.add(key);
+      result.push(candidate);
+
+      if (result.length >= limit) {
+        break;
+      }
+    }
+  }
+
+  return result;
+}
+
+function buildQueryPlan(
+  request: ResearchSourceGatherRequest,
+  domain: SourceProviderDomain | "mixed",
+  budget: RetrievalBudget,
+  recoveryCandidates: QueryExpansionCandidate[] = []
+): { candidates: QueryExpansionCandidate[]; selected: QueryExpansionCandidate[]; queries: string[] } {
+  const candidates = buildQueryExpansionCandidates(request, domain, recoveryCandidates);
+  const selected = interleaveQueryCandidates(candidates, budget.maxQueries);
+
+  return {
+    candidates,
+    selected,
+    queries: selected.map((candidate) => candidate.query)
+  };
 }
 
 function interleaveUniqueQueries(buckets: string[][], limit: number): string[] {
@@ -1016,8 +1348,34 @@ function isRetriableFetchError(error: unknown): boolean {
     || error instanceof TypeError;
 }
 
-function retryDelayMs(attempt: number): number {
-  return 100 * attempt;
+function retryAfterDelayMs(value: string | null): number | null {
+  if (value === null || value.trim().length === 0) {
+    return null;
+  }
+
+  const seconds = Number.parseFloat(value);
+  if (Number.isFinite(seconds)) {
+    return Math.max(0, Math.min(5_000, Math.round(seconds * 1_000)));
+  }
+
+  const timestamp = Date.parse(value);
+  if (!Number.isNaN(timestamp)) {
+    return Math.max(0, Math.min(5_000, timestamp - Date.now()));
+  }
+
+  return null;
+}
+
+function retryDelayMs(attempt: number, status: number | null = null, retryAfter: string | null = null): number {
+  const retryAfterMs = retryAfterDelayMs(retryAfter);
+
+  if (retryAfterMs !== null) {
+    return retryAfterMs;
+  }
+
+  return status === 429
+    ? 250 * attempt
+    : 100 * attempt;
 }
 
 async function fetchWithRetry(
@@ -1039,7 +1397,7 @@ async function fetchWithRetry(
         lastError = error;
 
         if (attempt < 3 && isRetriableStatus(response.status)) {
-          await waitFor(retryDelayMs(attempt));
+          await waitFor(retryDelayMs(attempt, response.status, response.headers.get("retry-after")));
           continue;
         }
 
@@ -1170,6 +1528,27 @@ function accessRank(record: PaperAccessRecord): number {
   }
 }
 
+function relaxedLiteratureAssessment(assessment: LiteratureSourceAssessment): LiteratureSourceAssessment {
+  const strongDomainEvidence = assessment.matchedDomainAnchors.length > 0
+    && (assessment.focusScore >= 2 || assessment.taskAttributeScore >= 4 || assessment.topicScore >= 6);
+  const strongTaskFocusEvidence = assessment.focusScore >= 4 && assessment.taskAttributeScore >= 4;
+  const highAggregateEvidence = assessment.totalScore >= 10;
+  const accepted = assessment.accepted
+    || strongDomainEvidence
+    || strongTaskFocusEvidence
+    || highAggregateEvidence;
+
+  if (!accepted || assessment.accepted) {
+    return assessment;
+  }
+
+  return {
+    ...assessment,
+    accepted: true,
+    rationale: `${assessment.rationale} Retained because the combined topic, task, and focus evidence was strong enough for a first-pass literature review.`
+  };
+}
+
 function screeningForSource(
   source: ResearchSource,
   profile: LiteratureReviewProfile | null
@@ -1188,10 +1567,11 @@ function screeningForSource(
     excerpt: source.excerpt,
     citation: source.citation
   });
+  const relaxedAssessment = relaxedLiteratureAssessment(assessment);
 
   return {
-    assessment,
-    accepted: assessment.accepted
+    assessment: relaxedAssessment,
+    accepted: relaxedAssessment.accepted
   };
 }
 
@@ -2500,6 +2880,8 @@ function screeningDecision(
     };
   }
 
+  const relaxedRetained = assessment?.rationale.includes("Retained because the combined topic, task, and focus evidence") ?? false;
+
   if (stage === "fulltext") {
     if (quality.severeConcern) {
       return {
@@ -2512,6 +2894,13 @@ function screeningDecision(
       return {
         decision: "uncertain",
         rationale: `${assessment?.rationale ?? "Directly readable at full text."} The paper remains reviewable, but its venue/title quality is too weak for automatic inclusion.`
+      };
+    }
+
+    if (relaxedRetained) {
+      return {
+        decision: "uncertain",
+        rationale: `${assessment?.rationale ?? "Directly readable at full text."} Retained as a cautious candidate because it did not satisfy the stricter domain-anchor gate.`
       };
     }
 
@@ -2536,6 +2925,13 @@ function screeningDecision(
       };
     }
 
+    if (relaxedRetained) {
+      return {
+        decision: "uncertain",
+        rationale: `${assessment?.rationale ?? "The paper can be screened at the abstract level."} Retained as a cautious candidate because it did not satisfy the stricter domain-anchor gate.`
+      };
+    }
+
     return {
       decision: "include",
       rationale: `${assessment?.rationale ?? "The paper can be screened at the abstract level."} Source quality tier: ${quality.tier}.`
@@ -2555,7 +2951,41 @@ function screeningDecision(
     };
 }
 
-function paperScreeningPriority(paper: CanonicalPaper): number {
+function screeningHistoryForPaper(
+  stage: "title" | "abstract" | "fulltext",
+  decision: "include" | "background" | "exclude" | "uncertain",
+  rationale: string | null
+): PaperScreeningStatus[] {
+  const history: PaperScreeningStatus[] = [{
+    stage: "title",
+    decision: stage === "title" ? decision : "uncertain",
+    rationale: stage === "title"
+      ? rationale
+      : "Retained after title screening for deeper review."
+  }];
+
+  if (stage === "abstract" || stage === "fulltext") {
+    history.push({
+      stage: "abstract",
+      decision: stage === "abstract" ? decision : "include",
+      rationale: stage === "abstract"
+        ? rationale
+        : "Abstract-level screening supported deeper full-text review."
+    });
+  }
+
+  if (stage === "fulltext") {
+    history.push({
+      stage: "fulltext",
+      decision,
+      rationale
+    });
+  }
+
+  return history;
+}
+
+function paperScreeningPriority(paper: CanonicalPaper, coverage: PaperFacetCoverage | null = null): number {
   const quality = sourceQualityAssessmentForPaper(paper);
   const topicAnchorTagCount = paper.tags.filter((tag) => tag.startsWith("topic-anchor:")).length;
   const focusTagCount = paper.tags.filter((tag) => tag.startsWith("focus:")).length;
@@ -2613,14 +3043,20 @@ function paperScreeningPriority(paper: CanonicalPaper): number {
   score += topicAnchorTagCount * 8;
   score += focusTagCount * 10;
   score += taskTagCount * 4;
+  score += (coverage?.coverageScore ?? 0) * 12;
+  score -= (coverage?.missingRequiredFacetIds.length ?? 0) * 3;
   score += Math.min(5, paper.discoveredVia.length) * 3;
   score += Math.max(0, Math.min(10, (paper.year ?? 0) - 2015));
   return score;
 }
 
-function sortPapersForReview(papers: CanonicalPaper[]): CanonicalPaper[] {
+function sortPapersForReview(
+  papers: CanonicalPaper[],
+  coverageByPaperId: Map<string, PaperFacetCoverage> = new Map()
+): CanonicalPaper[] {
   return [...papers].sort((left, right) => {
-    return paperScreeningPriority(right) - paperScreeningPriority(left)
+    return paperScreeningPriority(right, coverageByPaperId.get(right.id) ?? null)
+      - paperScreeningPriority(left, coverageByPaperId.get(left.id) ?? null)
       || (right.year ?? 0) - (left.year ?? 0)
       || left.title.localeCompare(right.title);
   });
@@ -2663,11 +3099,62 @@ function collapseReviewSeries(papers: CanonicalPaper[]): { selected: CanonicalPa
   };
 }
 
-function buildReviewWorkflow(canonicalPapers: CanonicalPaper[]): {
+function selectPapersForFacetCoverage(input: {
+  orderedCandidates: CanonicalPaper[];
+  facets: ReviewFacet[];
+  coverageByPaperId: Map<string, PaperFacetCoverage>;
+  limit: number;
+}): CanonicalPaper[] {
+  const selected: CanonicalPaper[] = [];
+  const selectedIds = new Set<string>();
+  const requiredFacets = input.facets.filter((facet) => facet.required);
+
+  for (const facet of requiredFacets) {
+    const best = input.orderedCandidates
+      .filter((paper) => !selectedIds.has(paper.id))
+      .filter((paper) => input.coverageByPaperId.get(paper.id)?.coveredFacetIds.includes(facet.id) ?? false)
+      .sort((left, right) => {
+        return paperScreeningPriority(right, input.coverageByPaperId.get(right.id) ?? null)
+          - paperScreeningPriority(left, input.coverageByPaperId.get(left.id) ?? null);
+      })[0];
+
+    if (best === undefined) {
+      continue;
+    }
+
+    selected.push(best);
+    selectedIds.add(best.id);
+
+    if (selected.length >= input.limit) {
+      return selected;
+    }
+  }
+
+  for (const paper of input.orderedCandidates) {
+    if (selectedIds.has(paper.id)) {
+      continue;
+    }
+
+    selected.push(paper);
+    selectedIds.add(paper.id);
+
+    if (selected.length >= input.limit) {
+      break;
+    }
+  }
+
+  return selected;
+}
+
+function buildReviewWorkflow(canonicalPapers: CanonicalPaper[], facets: ReviewFacet[]): {
   reviewedPapers: CanonicalPaper[];
   reviewWorkflow: ReviewWorkflowSummary;
+  selectionQuality: ReviewSelectionQuality | null;
 } {
-  const ordered = sortPapersForReview(canonicalPapers);
+  const coverageByPaperId = new Map(
+    canonicalPapers.map((paper) => [paper.id, assessPaperFacetCoverage(facets, paper)])
+  );
+  const ordered = sortPapersForReview(canonicalPapers, coverageByPaperId);
   const qualityCounts = {
     high: ordered.filter((paper) => sourceQualityAssessmentForPaper(paper).tier === "high").length,
     medium: ordered.filter((paper) => sourceQualityAssessmentForPaper(paper).tier === "medium").length,
@@ -2697,23 +3184,82 @@ function buildReviewWorkflow(canonicalPapers: CanonicalPaper[]): {
     .map((paper) => paper.id);
   const includedPapers = ordered.filter((paper) => paper.screeningDecision === "include");
   const qualityEligibleIncludedPapers = includedPapers.filter((paper) => sourceQualityAssessmentForPaper(paper).tier !== "low");
-  const collapsed = collapseReviewSeries(qualityEligibleIncludedPapers);
-  const synthesisPaperIds = collapsed.selected.slice(0, 24).map((paper) => paper.id);
+  const eligibleUncertainPapers = ordered.filter((paper) => {
+    const quality = sourceQualityAssessmentForPaper(paper);
+    return paper.screeningDecision === "uncertain"
+      && (paper.screeningStage === "abstract" || paper.screeningStage === "fulltext")
+      && quality.tier !== "low"
+      && !quality.severeConcern
+      && paper.accessMode !== "needs_credentials"
+      && paper.accessMode !== "fulltext_blocked";
+  });
+  const promotedUncertainPapers = qualityEligibleIncludedPapers.length >= 3
+    ? []
+    : eligibleUncertainPapers.slice(0, Math.max(0, 3 - qualityEligibleIncludedPapers.length));
+  const selectedCandidateIds = new Set([
+    ...qualityEligibleIncludedPapers.map((paper) => paper.id),
+    ...promotedUncertainPapers.map((paper) => paper.id)
+  ]);
+  const uncoveredRequiredFacetIds = facets
+    .filter((facet) => facet.required)
+    .filter((facet) => ![...selectedCandidateIds].some((paperId) => (
+      coverageByPaperId.get(paperId)?.coveredFacetIds.includes(facet.id) ?? false
+    )))
+    .map((facet) => facet.id);
+  const facetRescuePapers = eligibleUncertainPapers.filter((paper) => {
+    if (selectedCandidateIds.has(paper.id)) {
+      return false;
+    }
+
+    const coverage = coverageByPaperId.get(paper.id);
+    return coverage !== undefined && uncoveredRequiredFacetIds.some((facetId) => coverage.coveredFacetIds.includes(facetId));
+  }).slice(0, Math.max(0, 24 - selectedCandidateIds.size));
+  const collapsed = collapseReviewSeries([
+    ...qualityEligibleIncludedPapers,
+    ...promotedUncertainPapers,
+    ...facetRescuePapers
+  ]);
+  const selectedForSynthesis = facets.length === 0
+    ? collapsed.selected.slice(0, 24)
+    : selectPapersForFacetCoverage({
+      orderedCandidates: sortPapersForReview(collapsed.selected, coverageByPaperId),
+      facets,
+      coverageByPaperId,
+      limit: 24
+    });
+  const synthesisPaperIds = selectedForSynthesis.map((paper) => paper.id);
   const deferredPaperIds = includedPaperIds.filter((paperId) => !synthesisPaperIds.includes(paperId));
   const reviewedPapers = ordered.filter((paper) => synthesisPaperIds.includes(paper.id));
+  const selectionQuality = facets.length === 0
+    ? null
+    : buildReviewSelectionQuality({
+      facets,
+      papers: canonicalPapers,
+      selectedPaperIds: synthesisPaperIds
+    });
   const notes = [
     `Title screened ${titleScreenedPaperIds.length} canonical papers.`,
     `Abstract screened ${abstractScreenedPaperIds.length} papers and full-text screened ${fulltextScreenedPaperIds.length}.`,
     `Included ${includedPaperIds.length} papers after screening, with ${blockedPaperIds.length} still blocked or credential-limited.`,
     `Source-quality tiers: ${qualityCounts.high} high, ${qualityCounts.medium} medium, ${qualityCounts.low} low.`,
+    promotedUncertainPapers.length > 0
+      ? `Promoted ${promotedUncertainPapers.length} high/medium-quality uncertain papers into the reviewed set because fewer than 3 included papers were available.`
+      : null,
+    facetRescuePapers.length > 0
+      ? `Added ${facetRescuePapers.length} high/medium-quality uncertain papers because they covered required review facets missing from the included set.`
+      : null,
+    selectionQuality !== null
+      ? `Review facet adequacy is ${selectionQuality.adequacy}; missing required facets: ${selectionQuality.missingRequiredFacets.map((facet) => facet.label).join(", ") || "<none>"}.`
+      : null,
     ...collapsed.notes,
-    synthesisPaperIds.length === includedPaperIds.length
+    promotedUncertainPapers.length === 0 && synthesisPaperIds.length === includedPaperIds.length
       ? `Selected all ${synthesisPaperIds.length} included papers for synthesis.`
-      : `Selected ${synthesisPaperIds.length} included papers for synthesis and deferred ${deferredPaperIds.length} additional included papers for later passes.`
-  ];
+      : `Selected ${synthesisPaperIds.length} papers for synthesis and deferred ${deferredPaperIds.length} additional included papers for later passes.`
+  ].filter((note): note is string => note !== null);
 
   return {
     reviewedPapers,
+    selectionQuality,
     reviewWorkflow: {
       titleScreenedPaperIds,
       abstractScreenedPaperIds,
@@ -2793,6 +3339,7 @@ function canonicalPaperFromSources(
       fulltextFetched: false,
       fulltextExtracted: false
     },
+    screeningHistory: [],
     screeningStage: "title",
     screeningDecision: "uncertain",
     screeningRationale: null,
@@ -2842,6 +3389,7 @@ function canonicalPaperFromSources(
       fulltextFetched: false,
       fulltextExtracted: false
     },
+    screeningHistory: [],
     screeningStage: stage,
     screeningDecision: "uncertain",
     screeningRationale: null,
@@ -2870,6 +3418,7 @@ function canonicalPaperFromSources(
 
   return {
     ...provisionalPaper,
+    screeningHistory: screeningHistoryForPaper(stage, screening.decision, screening.rationale),
     screeningDecision: screening.decision,
     screeningRationale: screening.rationale,
     tags: qualityTags
@@ -2889,9 +3438,10 @@ function filterCandidates(
   rawCandidates: RawCandidate[],
   request: ResearchSourceGatherRequest,
   profile: LiteratureReviewProfile | null
-): { sources: ResearchSource[]; notes: string[]; assessments: Array<{ sourceId: string; title: string; assessment: LiteratureSourceAssessment }> } {
+): FilterCandidatesResult {
   const notes: string[] = [];
   const assessments: Array<{ sourceId: string; title: string; assessment: LiteratureSourceAssessment }> = [];
+  const rejectedSamples: Array<{ title: string; excerpt: string; rationale: string }> = [];
   const acceptedSources: ResearchSource[] = [];
   const referenceTokens = sourceTokensForBrief(request);
   const anchorTokens = topicAnchorTokens(request);
@@ -2919,26 +3469,37 @@ function filterCandidates(
 
     const anchorScore = overlapScore(`${source.title} ${source.excerpt}`, anchorTokens);
     const topicPhraseMatch = containsTopicPhrase(source, request);
+    const assessment = screening.assessment;
     const strongTopicAccepted = topicTokens.size === 0
       || strongTopicScore >= minimumTopicMatches
-      || topicPhraseMatch;
+      || topicPhraseMatch
+      || (assessment !== undefined && assessment.focusScore >= 4 && assessment.taskAttributeScore >= 4)
+      || (assessment !== undefined && assessment.totalScore >= 10);
     const profileAccepted = profile === null
       ? screening.accepted || heuristicScore >= 3
       : (
         screening.accepted
+        || (assessment !== undefined && assessment.focusScore >= 4 && assessment.taskAttributeScore >= 4)
+        || (assessment !== undefined && assessment.totalScore >= 10)
         || (
-          screening.assessment !== undefined
-          && screening.assessment.topicScore >= 6
-          && (screening.assessment.focusScore >= 2 || screening.assessment.taskAttributeScore >= 4)
+          assessment !== undefined
+          && assessment.topicScore >= 6
+          && (assessment.focusScore >= 2 || assessment.taskAttributeScore >= 4)
         )
         || (topicPhraseMatch && heuristicScore >= 3)
       );
-    const accepted = strongTopicAccepted
-      && profileAccepted
-      && (anchorTokens.size === 0 || anchorScore >= 2 || topicPhraseMatch || strongTopicScore >= minimumTopicMatches);
+    const accepted = strongTopicAccepted && profileAccepted;
 
     if (!accepted) {
       filtered += 1;
+      if (rejectedSamples.length < 12) {
+        rejectedSamples.push({
+          title: source.title,
+          excerpt: source.excerpt,
+          rationale: assessment?.rationale
+            ?? `Weak overlap with the scoped brief (anchor score ${anchorScore}, heuristic score ${heuristicScore}).`
+        });
+      }
       continue;
     }
 
@@ -2952,7 +3513,10 @@ function filterCandidates(
   return {
     sources: acceptedSources,
     notes,
-    assessments
+    assessments,
+    rejectedSamples,
+    acceptedCount: acceptedSources.length,
+    rejectedCount: filtered
   };
 }
 
@@ -3173,6 +3737,86 @@ function uniqueAccessCandidates(candidates: PaperAccessRecord[]): PaperAccessRec
   return normalized;
 }
 
+async function buildCanonicalReviewState(
+  scholarlySources: ResearchSource[],
+  routing: RoutingPlan,
+  request: ResearchSourceGatherRequest,
+  reviewFacets: ReviewFacet[]
+): Promise<CanonicalReviewState> {
+  const groupedSources = new Map<string, ResearchSource[]>();
+  const heuristicIndex = new Map<string, string>();
+  const mergeDiagnostics: string[] = [];
+
+  for (const source of scholarlySources) {
+    const key = mergeKeyForSource(source);
+    const heuristicKey = `heuristic:${titleHeuristicKey(source.title, source.year, source.authors)}`;
+    const existingKey = groupedSources.has(key)
+      ? key
+      : heuristicIndex.get(heuristicKey) ?? key;
+    const group = groupedSources.get(existingKey) ?? [];
+    group.push(source);
+    groupedSources.set(existingKey, group);
+    heuristicIndex.set(heuristicKey, existingKey);
+  }
+
+  const canonicalPapers: CanonicalPaper[] = [];
+
+  for (const [key, group] of groupedSources.entries()) {
+    const provisional = canonicalPaperFromSources(key, group, []);
+    const resolved = await resolveCanonicalAccess(provisional, routing, request);
+    const paper = canonicalPaperFromSources(key, group, resolved.candidates).id === provisional.id
+      ? {
+        ...canonicalPaperFromSources(key, group, resolved.candidates),
+        bestAccessUrl: resolved.best.url,
+        bestAccessProvider: resolved.best.providerId,
+        accessMode: resolved.best.accessMode,
+        fulltextFormat: resolved.best.fulltextFormat,
+        license: resolved.best.license,
+        tdmAllowed: resolved.best.tdmAllowed,
+        accessErrors: resolved.accessErrors
+      }
+      : provisional;
+
+    canonicalPapers.push(paper);
+
+    if (group.length > 1) {
+      mergeDiagnostics.push(`Merged ${group.length} provider hits into canonical paper ${paper.id}.`);
+    }
+  }
+
+  const { reviewedPapers, reviewWorkflow, selectionQuality } = buildReviewWorkflow(canonicalPapers, reviewFacets);
+
+  return {
+    canonicalPapers,
+    reviewedPapers,
+    reviewWorkflow,
+    selectionQuality,
+    mergeDiagnostics
+  };
+}
+
+function accessLimitationsFromAuth(authStatus: ProviderAuthSnapshot[]): string[] {
+  return authStatus.flatMap((state) => {
+    if (state.providerId === "unpaywall" && state.missingRequiredFieldIds.includes("email")) {
+      return ["Unpaywall resolver unavailable until an email is configured."];
+    }
+
+    if (state.missingRequiredFieldIds.length > 0) {
+      return [`${getSourceProviderDefinition(state.providerId).label} missing required credentials: ${state.missingRequiredFieldIds.join(", ")}.`];
+    }
+
+    if (state.missingOptionalFieldIds.length > 0 && state.status === "missing_optional") {
+      return [`${getSourceProviderDefinition(state.providerId).label} optional credentials unset: ${state.missingOptionalFieldIds.join(", ")}.`];
+    }
+
+    return [];
+  });
+}
+
+function shouldRunRecoveryPass(state: CanonicalReviewState, literatureReviewActive: boolean): boolean {
+  return literatureReviewActive && (state.canonicalPapers.length === 0 || state.reviewedPapers.length < 3);
+}
+
 export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
   async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
     const scholarlyProviderIds = selectedScholarlyProviderIds(request);
@@ -3185,7 +3829,8 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
     const routing = routeProviders(domain, scholarlyProviderIds);
     const literatureReviewActive = shouldUseLiteratureReviewSubsystem(request.plan, request.brief);
     const budget = buildRetrievalBudget(request, literatureReviewActive);
-    const queries = buildQueryPlan(request, budget);
+    let queryPlan = buildQueryPlan(request, domain, budget);
+    let queries = queryPlan.queries;
     routing.plannedQueries = queries;
     const literatureProfile = literatureReviewActive
       ? buildLiteratureReviewProfile({
@@ -3194,15 +3839,31 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
         memoryContext: request.memoryContext
       })
       : null;
+    const reviewFacets = literatureReviewActive
+      ? buildReviewFacets({
+        brief: request.brief,
+        plan: request.plan,
+        profile: literatureProfile
+      })
+      : [];
     const selectedAssessments: Array<{ sourceId: string; title: string; assessment: LiteratureSourceAssessment }> = [];
+    const providerAttempts: RetrievalDiagnostics["providerAttempts"] = [];
+    const rejectedSamples: Array<{ title: string; excerpt: string; rationale: string }> = [];
     const localSources = await gatherLocalProjectFiles(request);
     const scholarlySources: ResearchSource[] = [];
+    const seenScholarlySourceIds = new Set<string>();
     const backgroundSources: ResearchSource[] = [];
+    let acceptedScreeningCount = 0;
+    let rejectedScreeningCount = 0;
+    let recoveryPasses = 0;
 
     if (literatureProfile !== null) {
       notes.push("Literature review subsystem active.");
       if (literatureProfile.taskAttributes.length > 0) {
         notes.push(`Task-aware paper ranking attributes: ${literatureProfile.taskAttributes.join(", ")}.`);
+      }
+      if (reviewFacets.length > 0) {
+        notes.push(`Review facet selection will track: ${reviewFacets.map((facet) => `${facet.label}${facet.required ? " (required)" : ""}`).join(", ")}.`);
       }
     }
 
@@ -3215,31 +3876,64 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
     const minimumProviderPassesBeforeStop = literatureReviewActive
       ? Math.min(domain === "biomedical" ? 4 : 3, routing.discoveryProviderIds.length)
       : 1;
+    const runScholarlyDiscoveryPass = async (
+      passQueries: string[],
+      passBudget: RetrievalBudget,
+      phase: "initial" | "recovery"
+    ): Promise<void> => {
+      for (const [providerIndex, providerId] of routing.discoveryProviderIds.entries()) {
+        try {
+          const rawCandidates = await queryProvider(providerId, passQueries, request, passBudget);
+          const filtered = filterCandidates(rawCandidates, request, literatureProfile);
+          const newSources = filtered.sources.filter((source) => {
+            if (seenScholarlySourceIds.has(source.id)) {
+              return false;
+            }
 
-    for (const [providerIndex, providerId] of routing.discoveryProviderIds.entries()) {
-      try {
-        const rawCandidates = await queryProvider(providerId, queries, request, budget);
-        const filtered = filterCandidates(rawCandidates, request, literatureProfile);
-        scholarlySources.push(...filtered.sources);
-        notes.push(...filtered.notes);
-        selectedAssessments.push(...filtered.assessments);
-        notes.push(
-          `Collected ${filtered.sources.length} screened scholarly hits from ${getSourceProviderDefinition(providerId).label} after reviewing ${rawCandidates.length} raw candidates.`
-        );
-
-        if (
-          scholarlySources.length >= budget.targetAcceptedSources
-          && providerIndex + 1 >= minimumProviderPassesBeforeStop
-        ) {
+            seenScholarlySourceIds.add(source.id);
+            return true;
+          });
+          scholarlySources.push(...newSources);
+          notes.push(...filtered.notes);
+          selectedAssessments.push(...filtered.assessments);
+          rejectedSamples.push(...filtered.rejectedSamples);
+          acceptedScreeningCount += filtered.acceptedCount;
+          rejectedScreeningCount += filtered.rejectedCount;
+          providerAttempts.push({
+            providerId,
+            phase,
+            rawCandidateCount: rawCandidates.length,
+            acceptedSourceCount: newSources.length,
+            error: null
+          });
           notes.push(
-            `Reached the current screened-source target (${budget.targetAcceptedSources}) after querying ${providerIndex + 1} providers and stopped discovery early.`
+            `Collected ${newSources.length} new screened scholarly hits from ${getSourceProviderDefinition(providerId).label} after reviewing ${rawCandidates.length} raw candidates${phase === "recovery" ? " during recovery" : ""}.`
           );
-          break;
+
+          if (
+            scholarlySources.length >= passBudget.targetAcceptedSources
+            && providerIndex + 1 >= minimumProviderPassesBeforeStop
+          ) {
+            notes.push(
+              `Reached the current screened-source target (${passBudget.targetAcceptedSources}) after querying ${providerIndex + 1} providers and stopped discovery early.`
+            );
+            break;
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          providerAttempts.push({
+            providerId,
+            phase,
+            rawCandidateCount: 0,
+            acceptedSourceCount: 0,
+            error: message
+          });
+          notes.push(`${getSourceProviderDefinition(providerId).label} query failed: ${message}`);
         }
-      } catch (error) {
-        notes.push(`${getSourceProviderDefinition(providerId).label} query failed: ${error instanceof Error ? error.message : String(error)}`);
       }
-    }
+    };
+
+    await runScholarlyDiscoveryPass(queries, budget, "initial");
 
     for (const providerId of generalWebProviderIds) {
       try {
@@ -3258,49 +3952,59 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
       }
     }
 
-    const groupedSources = new Map<string, ResearchSource[]>();
-    const heuristicIndex = new Map<string, string>();
+    let canonicalReview = await buildCanonicalReviewState(scholarlySources, routing, request, reviewFacets);
 
-    for (const source of scholarlySources) {
-      const key = mergeKeyForSource(source);
-      const heuristicKey = `heuristic:${titleHeuristicKey(source.title, source.year, source.authors)}`;
-      const existingKey = groupedSources.has(key)
-        ? key
-        : heuristicIndex.get(heuristicKey) ?? key;
-      const group = groupedSources.get(existingKey) ?? [];
-      group.push(source);
-      groupedSources.set(existingKey, group);
-      heuristicIndex.set(heuristicKey, existingKey);
-    }
+    if (shouldRunRecoveryPass(canonicalReview, literatureReviewActive)) {
+      const initialQueryKeys = new Set(queries.map(normalizeQueryKey));
+      const recoveryCandidates = buildRecoveryQueryCandidates(request, rejectedSamples);
+      queryPlan = buildQueryPlan(request, domain, {
+        ...budget,
+        maxQueries: Math.min(12, budget.maxQueries)
+      }, recoveryCandidates);
+      const recoveryQueries = interleaveQueryCandidates(queryPlan.candidates, 24)
+        .filter((candidate) => !initialQueryKeys.has(normalizeQueryKey(candidate.query)))
+        .slice(0, 12)
+        .map((candidate) => candidate.query);
 
-    const canonicalPapers: CanonicalPaper[] = [];
-
-    for (const [key, group] of groupedSources.entries()) {
-      const provisional = canonicalPaperFromSources(key, group, []);
-      const resolved = await resolveCanonicalAccess(provisional, routing, request);
-      const paper = canonicalPaperFromSources(key, group, resolved.candidates).id === provisional.id
-        ? {
-          ...canonicalPaperFromSources(key, group, resolved.candidates),
-          bestAccessUrl: resolved.best.url,
-          bestAccessProvider: resolved.best.providerId,
-          accessMode: resolved.best.accessMode,
-          fulltextFormat: resolved.best.fulltextFormat,
-          license: resolved.best.license,
-          tdmAllowed: resolved.best.tdmAllowed,
-          accessErrors: resolved.accessErrors
-        }
-        : provisional;
-
-      canonicalPapers.push(paper);
-
-      if (group.length > 1) {
-        mergeDiagnostics.push(`Merged ${group.length} provider hits into canonical paper ${paper.id}.`);
+      if (recoveryQueries.length > 0) {
+        recoveryPasses = 1;
+        queries = uniqueStrings([...queries, ...recoveryQueries]);
+        routing.plannedQueries = queries;
+        notes.push(`Evidence remained thin after the first pass; running one recovery pass with ${recoveryQueries.length} additional queries.`);
+        await runScholarlyDiscoveryPass(recoveryQueries, {
+          ...budget,
+          maxQueries: recoveryQueries.length,
+          maxQueriesPerProvider: Math.min(8, recoveryQueries.length),
+          maxPagesPerQuery: Math.min(2, budget.maxPagesPerQuery),
+          maxCandidatesPerProvider: Math.min(80, budget.maxCandidatesPerProvider),
+          targetAcceptedSources: Math.max(24, Math.floor(budget.targetAcceptedSources / 2))
+        }, "recovery");
+        canonicalReview = await buildCanonicalReviewState(scholarlySources, routing, request, reviewFacets);
       }
     }
 
+    const { canonicalPapers, reviewedPapers, reviewWorkflow, selectionQuality } = canonicalReview;
+    mergeDiagnostics.push(...canonicalReview.mergeDiagnostics);
     notes.push(`Canonical merge produced ${canonicalPapers.length} scholarly papers from ${scholarlySources.length} discovery hits.`);
-    const { reviewedPapers, reviewWorkflow } = buildReviewWorkflow(canonicalPapers);
     notes.push(...reviewWorkflow.notes);
+    const retrievalDiagnostics: RetrievalDiagnostics = {
+      queries: queryPlan.candidates.slice(0, 80),
+      providerAttempts,
+      screeningSummary: {
+        accepted: acceptedScreeningCount,
+        rejected: rejectedScreeningCount,
+        weakMatchSamples: rejectedSamples.slice(0, 12).map((sample) => ({
+          title: sample.title,
+          rationale: sample.rationale
+        }))
+      },
+      recoveryPasses,
+      accessLimitations: accessLimitationsFromAuth(authStatus),
+      suggestedNextQueries: buildRecoveryQueryCandidates(request, rejectedSamples)
+        .map((candidate) => candidate.query)
+        .filter((query) => !queries.map(normalizeQueryKey).includes(normalizeQueryKey(query)))
+        .slice(0, 8)
+    };
 
     const allSources: ResearchSource[] = [
       {
@@ -3343,7 +4047,9 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
           active: true,
           profile: literatureProfile,
           selectedAssessments
-        }
+        },
+      retrievalDiagnostics,
+      selectionQuality
     };
   }
 }

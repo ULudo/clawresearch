@@ -6,16 +6,19 @@ import path from "node:path";
 import {
   handleContinueCommand,
   handleUserInput,
+  latestAgendaSnapshot,
+  renderAgenda,
   summarizeCompletedRunIfNeeded,
   type ConsoleIo
 } from "../src/runtime/console-app.js";
-import { createDefaultRunController } from "../src/runtime/run-controller.js";
+import { createDefaultRunController, type RunController } from "../src/runtime/run-controller.js";
 import { ConsoleTranscript } from "../src/runtime/console-transcript.js";
 import type { IntakeBackend, IntakeResponse } from "../src/runtime/intake-backend.js";
 import type { ProjectAssistantBackend } from "../src/runtime/project-assistant-backend.js";
+import type { ResearchAgenda } from "../src/runtime/research-backend.js";
 import { ProjectConfigStore } from "../src/runtime/project-config-store.js";
 import { CredentialStore } from "../src/runtime/credential-store.js";
-import { RunStore } from "../src/runtime/run-store.js";
+import { researchDirectionPath, RunStore, type RunRecord } from "../src/runtime/run-store.js";
 import { SessionStore } from "../src/runtime/session-store.js";
 
 function createNow(): () => string {
@@ -60,6 +63,71 @@ function readyResponse(message: string): IntakeResponse {
     openQuestions: [],
     summary: "A grounded computational research brief."
   };
+}
+
+function actionableAgenda(overrides: Partial<ResearchAgenda> = {}): ResearchAgenda {
+  return {
+    executiveSummary: "The literature review identified a bounded follow-up.",
+    gaps: [],
+    candidateDirections: [
+      {
+        id: "direction-1",
+        title: "Benchmark technique-family framing",
+        summary: "Compare technique families with explicit limits.",
+        mode: "method_improvement",
+        whyNow: "The reviewed literature supports a bounded follow-up.",
+        sourceIds: [],
+        claimIds: [],
+        gapIds: [],
+        scores: {
+          evidenceBase: 4,
+          novelty: 3,
+          tractability: 4,
+          expectedCost: 2,
+          risk: 2,
+          overall: 4
+        }
+      }
+    ],
+    selectedDirectionId: "direction-1",
+    selectedWorkPackage: {
+      id: "wp-1",
+      title: "Benchmark technique-family framing",
+      mode: "method_improvement",
+      objective: "Produce a bounded benchmark note.",
+      hypothesisOrQuestion: "Can technique-family framing improve follow-up selection?",
+      methodSketch: "Hold the reviewed literature fixed and compare two concrete approaches.",
+      baselines: ["Current agenda"],
+      controls: ["Same reviewed literature"],
+      decisiveExperiment: "Write a comparison with explicit limits.",
+      stopCriterion: "The comparison supports or rejects the follow-up.",
+      expectedArtifact: "A bounded benchmark note.",
+      requiredInputs: [],
+      blockedBy: []
+    },
+    holdReasons: [],
+    recommendedHumanDecision: "Continue with the selected work package.",
+    ...overrides
+  };
+}
+
+class CapturingContinueRunController implements RunController {
+  launchedRunIds: string[] = [];
+
+  launchCommand(run: RunRecord): string[] {
+    return ["node", "dist/src/cli.js", "--run-job", run.id, "--project-root", run.projectRoot];
+  }
+
+  async launch(run: RunRecord): Promise<number> {
+    this.launchedRunIds.push(run.id);
+    return 7700;
+  }
+
+  async pause(): Promise<void> {}
+  async resume(): Promise<void> {}
+  isProcessAlive(): boolean {
+    return false;
+  }
 }
 
 test("handleUserInput uses the project assistant backend once a run exists", async () => {
@@ -406,6 +474,143 @@ test("summarizeCompletedRunIfNeeded records a blocked work-package summary", asy
     assert.match(summary ?? "", /Work package complete/i);
     assert.match(summary ?? "", /Outcome: revise/i);
     assert.match(summary ?? "", /baseline implementation/i);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("latestAgendaSnapshot uses global direction provenance instead of the newest run", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-console-agenda-source-run-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.6.0", now);
+    const agenda = actionableAgenda();
+    const olderRun = await runStore.create({
+      topic: "Riemann Hypothesis",
+      researchQuestion: "What bounded follow-up should we pursue next?",
+      researchDirection: "Literature synthesis.",
+      successCriterion: "Grounded summary."
+    }, ["clawresearch", "research-loop"]);
+    olderRun.status = "completed";
+    olderRun.stage = "literature_review";
+    await runStore.save(olderRun);
+    await writeFile(olderRun.artifacts.agendaPath, `${JSON.stringify(agenda, null, 2)}\n`, "utf8");
+    await writeFile(olderRun.artifacts.workPackagePath, `${JSON.stringify(agenda.selectedWorkPackage, null, 2)}\n`, "utf8");
+
+    const newerRun = await runStore.create({
+      topic: "Riemann Hypothesis",
+      researchQuestion: "What newer run exists without an agenda?",
+      researchDirection: "A newer but unrelated run.",
+      successCriterion: "Do not use this run for agenda provenance."
+    }, ["clawresearch", "research-loop"]);
+    newerRun.status = "completed";
+    newerRun.stage = "literature_review";
+    await runStore.save(newerRun);
+
+    await writeFile(researchDirectionPath(projectRoot), `${JSON.stringify({
+      ...agenda,
+      schemaVersion: 1,
+      sourceRunId: olderRun.id,
+      sourceRunStage: "literature_review",
+      sourceRunAgendaPath: path.relative(projectRoot, olderRun.artifacts.agendaPath),
+      acceptedAt: "2026-04-20T10:00:00.000Z"
+    }, null, 2)}\n`, "utf8");
+
+    const snapshot = await latestAgendaSnapshot(runStore);
+    const sink = captureWriter();
+
+    renderAgenda(sink.writer, snapshot, projectRoot);
+
+    assert.equal(snapshot?.run?.id, olderRun.id);
+    assert.equal(snapshot?.sourceRunId, olderRun.id);
+    assert.equal(snapshot?.provenanceKnown, true);
+    assert.match(sink.readText(), new RegExp(`source: run ${olderRun.id}`));
+    assert.match(sink.readText(), new RegExp(`run agenda: .*${olderRun.id}`));
+    assert.doesNotMatch(sink.readText(), new RegExp(`run agenda: .*${newerRun.id}`));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("latestAgendaSnapshot treats bare global direction as unknown provenance", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-console-agenda-global-unknown-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.6.0", now);
+    const run = await runStore.create({
+      topic: "Riemann Hypothesis",
+      researchQuestion: "What newer run exists without an agenda?",
+      researchDirection: "A newer but unrelated run.",
+      successCriterion: "Do not use this run for agenda provenance."
+    }, ["clawresearch", "research-loop"]);
+    run.status = "completed";
+    await runStore.save(run);
+    await writeFile(researchDirectionPath(projectRoot), `${JSON.stringify(actionableAgenda(), null, 2)}\n`, "utf8");
+
+    const snapshot = await latestAgendaSnapshot(runStore);
+    const sink = captureWriter();
+
+    renderAgenda(sink.writer, snapshot, projectRoot);
+
+    assert.equal(snapshot?.run, null);
+    assert.equal(snapshot?.sourceRunId, null);
+    assert.equal(snapshot?.provenanceKnown, false);
+    assert.equal(snapshot?.workPackage?.id, "wp-1");
+    assert.match(sink.readText(), /source: global\/unknown/);
+    assert.doesNotMatch(sink.readText(), /run agenda:/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("handleContinueCommand launches from unknown global provenance with a null parent run", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-console-continue-global-unknown-"));
+  const now = createNow();
+
+  try {
+    const sessionStore = new SessionStore(projectRoot, "0.6.0", now);
+    const session = await sessionStore.load();
+    session.brief.topic = "Riemann Hypothesis";
+    session.brief.researchQuestion = "How does it influence prime distribution?";
+    session.brief.researchDirection = "Literature synthesis.";
+    session.brief.successCriterion = "Grounded summary.";
+    session.intake.readiness = "ready";
+    await sessionStore.save(session);
+
+    const runStore = new RunStore(projectRoot, "0.6.0", now);
+    await writeFile(researchDirectionPath(projectRoot), `${JSON.stringify(actionableAgenda(), null, 2)}\n`, "utf8");
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    const runController = new CapturingContinueRunController();
+    const sink = captureWriter();
+
+    await handleContinueCommand(
+      sink.writer,
+      session,
+      sessionStore,
+      runStore,
+      runController,
+      projectConfig,
+      now,
+      false,
+      50
+    );
+
+    const runs = await runStore.list();
+    const childRun = runs.find((candidate) => candidate.stage === "work_package") ?? null;
+
+    assert.ok(childRun);
+    assert.equal(childRun.parentRunId, null);
+    assert.equal(childRun.derivedFromWorkPackageId, "wp-1");
+    assert.deepEqual(runController.launchedRunIds, [childRun.id]);
+    assert.ok(childRun.job.launchCommand?.includes("--run-job"));
+    assert.ok(childRun.job.launchCommand?.includes(childRun.id));
+    assert.ok(childRun.job.launchCommand?.includes("--project-root"));
+    assert.ok(childRun.job.launchCommand?.includes(projectRoot));
+    assert.match(sink.readText(), /Parent run id: <unknown>/);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

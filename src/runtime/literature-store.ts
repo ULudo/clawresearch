@@ -8,8 +8,8 @@ import {
 } from "./provider-registry.js";
 
 const literatureSchemaVersion = 2;
-const literatureDirectoryName = "literature";
 const literatureStoreFileName = "library.json";
+const legacyLiteratureStorePathParts = ["literature", "library.json"];
 
 export type PaperAccessMode =
   | "metadata_only"
@@ -95,6 +95,7 @@ export type CanonicalPaper = {
   license: string | null;
   tdmAllowed: boolean | null;
   contentStatus: PaperContentStatus;
+  screeningHistory: PaperScreeningStatus[];
   screeningStage: PaperScreeningStage;
   screeningDecision: PaperScreeningDecision;
   screeningRationale: string | null;
@@ -140,7 +141,6 @@ export type LiteratureState = {
   schemaVersion: number;
   projectRoot: string;
   runtimeDirectory: string;
-  literatureDirectory: string;
   createdAt: string;
   updatedAt: string;
   paperCount: number;
@@ -170,6 +170,7 @@ export type CanonicalPaperInput = {
   license?: string | null;
   tdmAllowed?: boolean | null;
   contentStatus?: Partial<PaperContentStatus>;
+  screeningHistory?: PaperScreeningStatus[];
   screeningStage?: PaperScreeningStage;
   screeningDecision?: PaperScreeningDecision;
   screeningRationale?: string | null;
@@ -349,12 +350,12 @@ export function createLiteratureEntityId(
   return `${kind}-${hashString(`${kind}:${normalizeWhitespace(key)}`)}`;
 }
 
-function literatureDirectoryPath(projectRoot: string): string {
-  return path.join(runtimeDirectoryPath(projectRoot), literatureDirectoryName);
+export function literatureStoreFilePath(projectRoot: string): string {
+  return path.join(runtimeDirectoryPath(projectRoot), literatureStoreFileName);
 }
 
-export function literatureStoreFilePath(projectRoot: string): string {
-  return path.join(literatureDirectoryPath(projectRoot), literatureStoreFileName);
+function legacyLiteratureStoreFilePath(projectRoot: string): string {
+  return path.join(runtimeDirectoryPath(projectRoot), ...legacyLiteratureStorePathParts);
 }
 
 function normalizeIdentifiers(value: unknown): PaperIdentifiers {
@@ -457,6 +458,43 @@ function normalizeAccessRecord(value: unknown): PaperAccessRecord | null {
   };
 }
 
+function normalizeScreeningStatus(value: unknown): PaperScreeningStatus | null {
+  const record = asObject(value);
+  return {
+    stage: normalizeScreeningStage(record.stage),
+    decision: normalizeScreeningDecision(record.decision),
+    rationale: readString(record.rationale)
+  };
+}
+
+function normalizeScreeningHistory(value: unknown): PaperScreeningStatus[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const seen = new Set<string>();
+  const normalized: PaperScreeningStatus[] = [];
+
+  for (const entry of value) {
+    const status = normalizeScreeningStatus(entry);
+
+    if (status === null) {
+      continue;
+    }
+
+    const key = `${status.stage}:${status.decision}:${status.rationale ?? ""}`;
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    normalized.push(status);
+  }
+
+  return normalized;
+}
+
 function normalizeContentStatus(value: unknown, accessMode: PaperAccessMode): PaperContentStatus {
   const record = asObject(value);
   const abstractAvailable = readBoolean(record.abstractAvailable)
@@ -533,7 +571,6 @@ function emptyLiteratureState(projectRoot: string, timestamp: string): Literatur
     schemaVersion: literatureSchemaVersion,
     projectRoot,
     runtimeDirectory: runtimeDirectoryPath(projectRoot),
-    literatureDirectory: literatureDirectoryPath(projectRoot),
     createdAt: timestamp,
     updatedAt: timestamp,
     paperCount: 0,
@@ -593,6 +630,7 @@ function normalizeCanonicalPaper(raw: unknown): CanonicalPaper | null {
     license: readString(record.license),
     tdmAllowed: readBoolean(record.tdmAllowed),
     contentStatus: normalizeContentStatus(record.contentStatus, accessMode),
+    screeningHistory: normalizeScreeningHistory(record.screeningHistory),
     screeningStage: normalizeScreeningStage(record.screeningStage),
     screeningDecision: normalizeScreeningDecision(record.screeningDecision),
     screeningRationale: readString(record.screeningRationale),
@@ -723,8 +761,28 @@ function normalizePaperInput(input: CanonicalPaperInput): CanonicalPaperInput {
     accessErrors: readStringArray(input.accessErrors ?? []),
     tags: readStringArray(input.tags ?? []),
     linkedThemeIds: readStringArray(input.linkedThemeIds ?? []),
-    linkedClaimIds: readStringArray(input.linkedClaimIds ?? [])
+    linkedClaimIds: readStringArray(input.linkedClaimIds ?? []),
+    screeningHistory: normalizeScreeningHistory(input.screeningHistory ?? [])
   };
+}
+
+function mergeScreeningHistory(
+  existing: PaperScreeningStatus[],
+  incoming: PaperScreeningStatus[],
+  effective: PaperScreeningStatus
+): PaperScreeningStatus[] {
+  const history = normalizeScreeningHistory([
+    ...existing,
+    ...incoming,
+    effective
+  ]);
+  const stageOrder: Record<PaperScreeningStage, number> = {
+    title: 0,
+    abstract: 1,
+    fulltext: 2
+  };
+
+  return [...history].sort((left, right) => stageOrder[left.stage] - stageOrder[right.stage]);
 }
 
 function mergeIdentifiers(
@@ -762,6 +820,12 @@ function mergePaper(
   const accessMode = normalized.accessMode ?? existing?.accessMode ?? "metadata_only";
   const screeningStage = normalized.screeningStage ?? existing?.screeningStage ?? "title";
   const screeningDecision = normalized.screeningDecision ?? existing?.screeningDecision ?? "uncertain";
+  const screeningRationale = normalized.screeningRationale ?? existing?.screeningRationale ?? null;
+  const effectiveScreeningStatus: PaperScreeningStatus = {
+    stage: screeningStage,
+    decision: screeningDecision,
+    rationale: screeningRationale
+  };
 
   return {
     id,
@@ -803,9 +867,14 @@ function mergePaper(
       fulltextFetched: false,
       fulltextExtracted: false
     }, normalized.contentStatus, accessMode),
+    screeningHistory: mergeScreeningHistory(
+      existing?.screeningHistory ?? [],
+      normalized.screeningHistory ?? [],
+      effectiveScreeningStatus
+    ),
     screeningStage,
     screeningDecision,
-    screeningRationale: normalized.screeningRationale ?? existing?.screeningRationale ?? null,
+    screeningRationale,
     accessErrors: dedupeStrings([...(existing?.accessErrors ?? []), ...(normalized.accessErrors ?? [])]),
     tags: dedupeStrings([...(existing?.tags ?? []), ...(normalized.tags ?? [])]),
     runIds: dedupeStrings([...(existing?.runIds ?? []), normalized.runId]),
@@ -950,6 +1019,17 @@ export class LiteratureStore {
         throw error;
       }
 
+      try {
+        const contents = await readFile(legacyLiteratureStoreFilePath(this.projectRoot), "utf8");
+        return mergeLiteratureState(JSON.parse(contents) as unknown, this.projectRoot, timestamp);
+      } catch (legacyError) {
+        const missingLegacy = legacyError instanceof Error && "code" in legacyError && legacyError.code === "ENOENT";
+
+        if (!missingLegacy) {
+          throw legacyError;
+        }
+      }
+
       return emptyLiteratureState(this.projectRoot, timestamp);
     }
   }
@@ -962,7 +1042,6 @@ export class LiteratureStore {
       schemaVersion: literatureSchemaVersion,
       projectRoot: this.projectRoot,
       runtimeDirectory: runtimeDirectoryPath(this.projectRoot),
-      literatureDirectory: literatureDirectoryPath(this.projectRoot),
       updatedAt: timestamp,
       paperCount: normalized.papers.length,
       themeCount: normalized.themes.length,
@@ -1034,7 +1113,6 @@ export class LiteratureStore {
       schemaVersion: literatureSchemaVersion,
       projectRoot: this.projectRoot,
       runtimeDirectory: runtimeDirectoryPath(this.projectRoot),
-      literatureDirectory: literatureDirectoryPath(this.projectRoot),
       updatedAt: timestamp,
       paperCount: paperMap.size,
       themeCount: themeMap.size,

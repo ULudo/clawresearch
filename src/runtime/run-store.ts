@@ -4,6 +4,7 @@ import {
   runtimeDirectoryPath,
   type ResearchBrief
 } from "./session-store.js";
+import type { ResearchAgenda } from "./research-backend.js";
 
 const runSchemaVersion = 1;
 
@@ -20,6 +21,7 @@ export type RunStage =
 
 export type RunJobRecord = {
   command: string[];
+  launchCommand: string[] | null;
   cwd: string;
   pid: number | null;
   startedAt: string | null;
@@ -38,6 +40,8 @@ export type RunArtifactRecord = {
   planPath: string;
   sourcesPath: string;
   literaturePath: string;
+  paperExtractionsPath: string;
+  evidenceMatrixPath: string;
   synthesisPath: string;
   claimsPath: string;
   verificationPath: string;
@@ -73,6 +77,14 @@ export type RunRecord = {
   artifacts: RunArtifactRecord;
 };
 
+export type ResearchDirectionState = ResearchAgenda & {
+  schemaVersion: number;
+  sourceRunId: string | null;
+  sourceRunStage: RunStage | null;
+  sourceRunAgendaPath: string | null;
+  acceptedAt: string;
+};
+
 function asObject(value: unknown): Record<string, unknown> {
   if (typeof value === "object" && value !== null) {
     return value as Record<string, unknown>;
@@ -87,6 +99,37 @@ function readString(value: unknown): string | null {
 
 function readInteger(value: unknown): number | null {
   return typeof value === "number" && Number.isInteger(value) ? value : null;
+}
+
+function readStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.flatMap((entry) => typeof entry === "string" ? [entry] : [])
+    : [];
+}
+
+function relativeProjectPath(projectRoot: string, targetPath: string): string {
+  const relativePath = path.relative(projectRoot, targetPath);
+  return relativePath.length === 0 ? "." : relativePath;
+}
+
+export function createResearchDirectionState(
+  agenda: ResearchAgenda,
+  run: RunRecord,
+  acceptedAt: string,
+  options: {
+    sourceRun?: RunRecord | null;
+  } = {}
+): ResearchDirectionState {
+  const sourceRun = options.sourceRun ?? run;
+
+  return {
+    ...agenda,
+    schemaVersion: 1,
+    sourceRunId: sourceRun.id,
+    sourceRunStage: sourceRun.stage,
+    sourceRunAgendaPath: relativeProjectPath(run.projectRoot, sourceRun.artifacts.agendaPath),
+    acceptedAt
+  };
 }
 
 function normalizeBrief(raw: unknown): ResearchBrief {
@@ -121,6 +164,73 @@ export function runDirectoryPath(projectRoot: string, runId: string): string {
 
 export function runFilePath(projectRoot: string, runId: string): string {
   return path.join(runDirectoryPath(projectRoot, runId), "run.json");
+}
+
+export function researchDirectionPath(projectRoot: string): string {
+  return path.join(runtimeDirectoryPath(projectRoot), "research-direction.json");
+}
+
+function createRunArtifacts(projectRoot: string, runId: string): RunArtifactRecord {
+  const runDirectory = runDirectoryPath(projectRoot, runId);
+
+  return {
+    runDirectory,
+    tracePath: path.join(runDirectory, "trace.log"),
+    eventsPath: path.join(runDirectory, "events.jsonl"),
+    stdoutPath: path.join(runDirectory, "stdout.log"),
+    stderrPath: path.join(runDirectory, "stderr.log"),
+    briefPath: path.join(runDirectory, "brief.json"),
+    planPath: path.join(runDirectory, "plan.json"),
+    sourcesPath: path.join(runDirectory, "sources.json"),
+    literaturePath: path.join(runDirectory, "literature-review.json"),
+    paperExtractionsPath: path.join(runDirectory, "paper-extractions.json"),
+    evidenceMatrixPath: path.join(runDirectory, "evidence-matrix.json"),
+    synthesisPath: path.join(runDirectory, "synthesis.md"),
+    claimsPath: path.join(runDirectory, "claims.json"),
+    verificationPath: path.join(runDirectory, "verification.json"),
+    nextQuestionsPath: path.join(runDirectory, "next-questions.json"),
+    agendaPath: path.join(runDirectory, "agenda.json"),
+    agendaMarkdownPath: path.join(runDirectory, "agenda.md"),
+    workPackagePath: path.join(runDirectory, "work-package.json"),
+    methodPlanPath: path.join(runDirectory, "method-plan.json"),
+    executionChecklistPath: path.join(runDirectory, "execution-checklist.json"),
+    findingsPath: path.join(runDirectory, "findings.json"),
+    decisionPath: path.join(runDirectory, "decision.json"),
+    summaryPath: path.join(runDirectory, "summary.md"),
+    memoryPath: path.join(runDirectory, "research-journal.json")
+  };
+}
+
+function mergeRunArtifacts(raw: unknown, projectRoot: string, runId: string): RunArtifactRecord {
+  const artifacts = asObject(raw);
+  const defaults = createRunArtifacts(projectRoot, runId);
+
+  return {
+    runDirectory: readString(artifacts.runDirectory) ?? defaults.runDirectory,
+    tracePath: readString(artifacts.tracePath) ?? defaults.tracePath,
+    eventsPath: readString(artifacts.eventsPath) ?? defaults.eventsPath,
+    stdoutPath: readString(artifacts.stdoutPath) ?? defaults.stdoutPath,
+    stderrPath: readString(artifacts.stderrPath) ?? defaults.stderrPath,
+    briefPath: readString(artifacts.briefPath) ?? defaults.briefPath,
+    planPath: readString(artifacts.planPath) ?? defaults.planPath,
+    sourcesPath: readString(artifacts.sourcesPath) ?? defaults.sourcesPath,
+    literaturePath: readString(artifacts.literaturePath) ?? defaults.literaturePath,
+    paperExtractionsPath: readString(artifacts.paperExtractionsPath) ?? defaults.paperExtractionsPath,
+    evidenceMatrixPath: readString(artifacts.evidenceMatrixPath) ?? defaults.evidenceMatrixPath,
+    synthesisPath: readString(artifacts.synthesisPath) ?? defaults.synthesisPath,
+    claimsPath: readString(artifacts.claimsPath) ?? defaults.claimsPath,
+    verificationPath: readString(artifacts.verificationPath) ?? defaults.verificationPath,
+    nextQuestionsPath: readString(artifacts.nextQuestionsPath) ?? defaults.nextQuestionsPath,
+    agendaPath: readString(artifacts.agendaPath) ?? defaults.agendaPath,
+    agendaMarkdownPath: readString(artifacts.agendaMarkdownPath) ?? defaults.agendaMarkdownPath,
+    workPackagePath: readString(artifacts.workPackagePath) ?? defaults.workPackagePath,
+    methodPlanPath: readString(artifacts.methodPlanPath) ?? defaults.methodPlanPath,
+    executionChecklistPath: readString(artifacts.executionChecklistPath) ?? defaults.executionChecklistPath,
+    findingsPath: readString(artifacts.findingsPath) ?? defaults.findingsPath,
+    decisionPath: readString(artifacts.decisionPath) ?? defaults.decisionPath,
+    summaryPath: readString(artifacts.summaryPath) ?? defaults.summaryPath,
+    memoryPath: readString(artifacts.memoryPath) ?? defaults.memoryPath
+  };
 }
 
 function normalizeRunStatus(value: unknown): RunStatus {
@@ -159,7 +269,6 @@ function createRunRecord(
   } = {}
 ): RunRecord {
   const id = createRunId(timestamp);
-  const runDirectory = runDirectoryPath(projectRoot, id);
 
   return {
     schemaVersion: runSchemaVersion,
@@ -179,6 +288,7 @@ function createRunRecord(
     workerPid: null,
     job: {
       command,
+      launchCommand: null,
       cwd: projectRoot,
       pid: null,
       startedAt: null,
@@ -186,30 +296,7 @@ function createRunRecord(
       exitCode: null,
       signal: null
     },
-    artifacts: {
-      runDirectory,
-      tracePath: path.join(runDirectory, "trace.log"),
-      eventsPath: path.join(runDirectory, "events.jsonl"),
-      stdoutPath: path.join(runDirectory, "stdout.log"),
-      stderrPath: path.join(runDirectory, "stderr.log"),
-      briefPath: path.join(runDirectory, "brief.json"),
-      planPath: path.join(runDirectory, "plan.json"),
-      sourcesPath: path.join(runDirectory, "sources.json"),
-      literaturePath: path.join(runDirectory, "literature.json"),
-      synthesisPath: path.join(runDirectory, "synthesis.md"),
-      claimsPath: path.join(runDirectory, "claims.json"),
-      verificationPath: path.join(runDirectory, "verification.json"),
-      nextQuestionsPath: path.join(runDirectory, "next-questions.json"),
-      agendaPath: path.join(runDirectory, "agenda.json"),
-      agendaMarkdownPath: path.join(runDirectory, "agenda.md"),
-      workPackagePath: path.join(runDirectory, "work-package.json"),
-      methodPlanPath: path.join(runDirectory, "method-plan.json"),
-      executionChecklistPath: path.join(runDirectory, "execution-checklist.json"),
-      findingsPath: path.join(runDirectory, "findings.json"),
-      decisionPath: path.join(runDirectory, "decision.json"),
-      summaryPath: path.join(runDirectory, "summary.md"),
-      memoryPath: path.join(runDirectory, "memory.json")
-    }
+    artifacts: createRunArtifacts(projectRoot, id)
   };
 }
 
@@ -220,10 +307,8 @@ function mergeRunRecord(
   runId: string
 ): RunRecord {
   const record = asObject(raw);
-  const artifacts = asObject(record.artifacts);
   const job = asObject(record.job);
   const resolvedId = readString(record.id) ?? runId;
-  const runDirectory = runDirectoryPath(projectRoot, resolvedId);
 
   return {
     schemaVersion: runSchemaVersion,
@@ -242,9 +327,10 @@ function mergeRunRecord(
     brief: normalizeBrief(record.brief),
     workerPid: readInteger(record.workerPid),
     job: {
-      command: Array.isArray(job.command)
-        ? job.command.flatMap((entry) => typeof entry === "string" ? [entry] : [])
-        : [],
+      command: readStringArray(job.command),
+      launchCommand: readStringArray(job.launchCommand).length > 0
+        ? readStringArray(job.launchCommand)
+        : null,
       cwd: readString(job.cwd) ?? projectRoot,
       pid: readInteger(job.pid),
       startedAt: readString(job.startedAt),
@@ -252,30 +338,7 @@ function mergeRunRecord(
       exitCode: readInteger(job.exitCode),
       signal: readString(job.signal)
     },
-    artifacts: {
-      runDirectory: readString(artifacts.runDirectory) ?? runDirectory,
-      tracePath: readString(artifacts.tracePath) ?? path.join(runDirectory, "trace.log"),
-      eventsPath: readString(artifacts.eventsPath) ?? path.join(runDirectory, "events.jsonl"),
-      stdoutPath: readString(artifacts.stdoutPath) ?? path.join(runDirectory, "stdout.log"),
-      stderrPath: readString(artifacts.stderrPath) ?? path.join(runDirectory, "stderr.log"),
-      briefPath: readString(artifacts.briefPath) ?? path.join(runDirectory, "brief.json"),
-      planPath: readString(artifacts.planPath) ?? path.join(runDirectory, "plan.json"),
-      sourcesPath: readString(artifacts.sourcesPath) ?? path.join(runDirectory, "sources.json"),
-      literaturePath: readString(artifacts.literaturePath) ?? path.join(runDirectory, "literature.json"),
-      synthesisPath: readString(artifacts.synthesisPath) ?? path.join(runDirectory, "synthesis.md"),
-      claimsPath: readString(artifacts.claimsPath) ?? path.join(runDirectory, "claims.json"),
-      verificationPath: readString(artifacts.verificationPath) ?? path.join(runDirectory, "verification.json"),
-      nextQuestionsPath: readString(artifacts.nextQuestionsPath) ?? path.join(runDirectory, "next-questions.json"),
-      agendaPath: readString(artifacts.agendaPath) ?? path.join(runDirectory, "agenda.json"),
-      agendaMarkdownPath: readString(artifacts.agendaMarkdownPath) ?? path.join(runDirectory, "agenda.md"),
-      workPackagePath: readString(artifacts.workPackagePath) ?? path.join(runDirectory, "work-package.json"),
-      methodPlanPath: readString(artifacts.methodPlanPath) ?? path.join(runDirectory, "method-plan.json"),
-      executionChecklistPath: readString(artifacts.executionChecklistPath) ?? path.join(runDirectory, "execution-checklist.json"),
-      findingsPath: readString(artifacts.findingsPath) ?? path.join(runDirectory, "findings.json"),
-      decisionPath: readString(artifacts.decisionPath) ?? path.join(runDirectory, "decision.json"),
-      summaryPath: readString(artifacts.summaryPath) ?? path.join(runDirectory, "summary.md"),
-      memoryPath: readString(artifacts.memoryPath) ?? path.join(runDirectory, "memory.json")
-    }
+    artifacts: mergeRunArtifacts(record.artifacts, projectRoot, resolvedId)
   };
 }
 
@@ -296,16 +359,7 @@ export class RunStore {
   }
 
   async create(brief: ResearchBrief, command: string[]): Promise<RunRecord> {
-    const run = createRunRecord(
-      this.projectRoot,
-      this.version,
-      brief,
-      command,
-      this.timestampFactory()
-    );
-
-    await writeRunFile(this.projectRoot, run);
-    return run;
+    return this.createWithOptions(brief, command, {});
   }
 
   async createWithOptions(
@@ -344,27 +398,7 @@ export class RunStore {
     run.updatedAt = this.timestampFactory();
     run.appVersion = this.version;
     run.projectRoot = this.projectRoot;
-    run.artifacts.runDirectory = runDirectoryPath(this.projectRoot, run.id);
-    run.artifacts.tracePath = path.join(run.artifacts.runDirectory, "trace.log");
-    run.artifacts.eventsPath = path.join(run.artifacts.runDirectory, "events.jsonl");
-    run.artifacts.stdoutPath = path.join(run.artifacts.runDirectory, "stdout.log");
-    run.artifacts.stderrPath = path.join(run.artifacts.runDirectory, "stderr.log");
-    run.artifacts.briefPath = path.join(run.artifacts.runDirectory, "brief.json");
-    run.artifacts.planPath = path.join(run.artifacts.runDirectory, "plan.json");
-    run.artifacts.sourcesPath = path.join(run.artifacts.runDirectory, "sources.json");
-    run.artifacts.synthesisPath = path.join(run.artifacts.runDirectory, "synthesis.md");
-    run.artifacts.claimsPath = path.join(run.artifacts.runDirectory, "claims.json");
-    run.artifacts.verificationPath = path.join(run.artifacts.runDirectory, "verification.json");
-    run.artifacts.nextQuestionsPath = path.join(run.artifacts.runDirectory, "next-questions.json");
-    run.artifacts.agendaPath = path.join(run.artifacts.runDirectory, "agenda.json");
-    run.artifacts.agendaMarkdownPath = path.join(run.artifacts.runDirectory, "agenda.md");
-    run.artifacts.workPackagePath = path.join(run.artifacts.runDirectory, "work-package.json");
-    run.artifacts.methodPlanPath = path.join(run.artifacts.runDirectory, "method-plan.json");
-    run.artifacts.executionChecklistPath = path.join(run.artifacts.runDirectory, "execution-checklist.json");
-    run.artifacts.findingsPath = path.join(run.artifacts.runDirectory, "findings.json");
-    run.artifacts.decisionPath = path.join(run.artifacts.runDirectory, "decision.json");
-    run.artifacts.summaryPath = path.join(run.artifacts.runDirectory, "summary.md");
-    run.artifacts.memoryPath = path.join(run.artifacts.runDirectory, "memory.json");
+    run.artifacts = createRunArtifacts(this.projectRoot, run.id);
     await writeRunFile(this.projectRoot, run);
   }
 

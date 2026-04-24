@@ -6,9 +6,11 @@ import path from "node:path";
 import {
   LiteratureStore,
   literatureStoreFilePath,
+  createLiteratureEntityId,
   type CanonicalPaper
 } from "../src/runtime/literature-store.js";
 import type {
+  PaperExtractionRequest,
   ResearchAgenda,
   ResearchBackend,
   ResearchPlanningRequest,
@@ -17,6 +19,10 @@ import type {
   ResearchSynthesisRequest,
   ResearchSynthesis
 } from "../src/runtime/research-backend.js";
+import type {
+  EvidenceMatrix,
+  PaperExtraction
+} from "../src/runtime/research-evidence.js";
 import type { RunController } from "../src/runtime/run-controller.js";
 import type {
   ResearchSourceGatherRequest,
@@ -25,7 +31,7 @@ import type {
 } from "../src/runtime/research-sources.js";
 import { MemoryStore, memoryFilePath } from "../src/runtime/memory-store.js";
 import { ProjectConfigStore } from "../src/runtime/project-config-store.js";
-import { RunStore } from "../src/runtime/run-store.js";
+import { researchDirectionPath, RunStore } from "../src/runtime/run-store.js";
 import { runDetachedJobWorker } from "../src/runtime/run-worker.js";
 
 function createNow(): () => string {
@@ -69,6 +75,19 @@ function canonicalPaper(overrides: Partial<CanonicalPaper> = {}): CanonicalPaper
       fulltextFetched: false,
       fulltextExtracted: false
     },
+    screeningHistory: [{
+      stage: "title",
+      decision: "uncertain",
+      rationale: "Retained after title screening for deeper review."
+    }, {
+      stage: "abstract",
+      decision: "include",
+      rationale: "Abstract-level screening supported deeper review."
+    }, {
+      stage: "fulltext",
+      decision: "include",
+      rationale: "Directly relevant survey."
+    }],
     screeningStage: "fulltext" as const,
     screeningDecision: "include" as const,
     screeningRationale: "Directly relevant survey.",
@@ -79,6 +98,34 @@ function canonicalPaper(overrides: Partial<CanonicalPaper> = {}): CanonicalPaper
     linkedClaimIds: [],
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
+    ...overrides
+  };
+}
+
+function canonicalPaperId(paper: CanonicalPaper): string {
+  return createLiteratureEntityId("paper", paper.key);
+}
+
+function paperExtraction(overrides: Partial<PaperExtraction> = {}): PaperExtraction {
+  return {
+    id: "extraction-1",
+    paperId: "paper-1",
+    runId: "run-1",
+    problemSetting: "Compare proof-technique families for the Riemann Hypothesis.",
+    systemType: "literature review",
+    architecture: "survey comparison",
+    toolsAndMemory: "canonical paper set plus bounded notes",
+    planningStyle: "comparative synthesis",
+    evaluationSetup: "Compare technique families against explicit limitations.",
+    successSignals: ["clear bounded comparison"],
+    failureModes: ["weak evaluation comparability"],
+    limitations: ["single reviewed survey paper"],
+    supportedClaims: [{
+      claim: "Analytic number theory remains central.",
+      support: "explicit"
+    }],
+    confidence: "high",
+    evidenceNotes: ["Grounded in the reviewed survey paper abstract and metadata."],
     ...overrides
   };
 }
@@ -131,6 +178,8 @@ function reviewWorkflowFor(papers: CanonicalPaper[], reviewedPaperIds?: string[]
 class StubResearchBackend implements ResearchBackend {
   readonly label = "stub:research";
   capturedPaperIds: string[] = [];
+  capturedExtractionPaperIds: string[] = [];
+  capturedMatrixRowCount = 0;
 
   async planResearch(): Promise<ResearchPlan> {
     return {
@@ -148,8 +197,19 @@ class StubResearchBackend implements ResearchBackend {
     };
   }
 
+  async extractReviewedPapers(request: PaperExtractionRequest): Promise<PaperExtraction[]> {
+    this.capturedExtractionPaperIds = request.papers.map((paper) => paper.id);
+    return request.papers.map((paper, index) => paperExtraction({
+      id: `extraction-${index + 1}`,
+      paperId: paper.id,
+      runId: request.runId
+    }));
+  }
+
   async synthesizeResearch(request: ResearchSynthesisRequest): Promise<ResearchSynthesis> {
     this.capturedPaperIds = request.papers.map((paper) => paper.id);
+    this.capturedMatrixRowCount = request.evidenceMatrix.rowCount;
+    const sourceIds = request.evidenceMatrix.rows.map((row) => row.paperId);
 
     return {
       executiveSummary: "The initial paper pass suggests a small number of recurring technique families, each with clear limitations.",
@@ -157,14 +217,14 @@ class StubResearchBackend implements ResearchBackend {
         {
           title: "Analytic number theory dominates",
           summary: "Most approaches cluster around analytic number theory and the zeta function.",
-          sourceIds: ["paper-1"]
+          sourceIds
         }
       ],
       claims: [
         {
           claim: "Current proof attempts repeatedly return to analytic techniques around the zeta function.",
           evidence: "The retained canonical survey paper emphasizes analytic methods and frames them as central to the problem.",
-          sourceIds: ["paper-1"]
+          sourceIds
         }
       ],
       nextQuestions: [
@@ -173,7 +233,9 @@ class StubResearchBackend implements ResearchBackend {
     };
   }
 
-  async developResearchAgenda(_request: ResearchAgendaRequest): Promise<ResearchAgenda> {
+  async developResearchAgenda(request: ResearchAgendaRequest): Promise<ResearchAgenda> {
+    const sourceIds = request.evidenceMatrix.rows.map((row) => row.paperId);
+
     return {
       executiveSummary: "A bounded next step is available from the reviewed literature.",
       gaps: [
@@ -181,7 +243,7 @@ class StubResearchBackend implements ResearchBackend {
           id: "gap-1",
           title: "Method comparison remains shallow",
           summary: "The current literature still needs clearer bounded comparisons across technique families.",
-          sourceIds: ["paper-1"],
+          sourceIds,
           claimIds: [],
           severity: "medium",
           gapKind: "method_gap"
@@ -194,7 +256,7 @@ class StubResearchBackend implements ResearchBackend {
           summary: "Turn the reviewed literature into a more explicit bounded comparison of technique families.",
           mode: "benchmarking",
           whyNow: "The evidence base is grounded enough for a small comparative work package.",
-          sourceIds: ["paper-1"],
+          sourceIds,
           claimIds: [],
           gapIds: ["gap-1"],
           scores: {
@@ -233,6 +295,10 @@ class CapturingRunController implements RunController {
   launchedRuns: Array<{ id: string; stage: string; parentRunId: string | null }> = [];
   private nextPid = 9000;
 
+  launchCommand(run: { id: string; projectRoot: string }): string[] {
+    return ["node", "stub-cli.js", "--run-job", run.id, "--project-root", run.projectRoot];
+  }
+
   async launch(run: { id: string; stage: string; parentRunId: string | null }): Promise<number> {
     this.launchedRuns.push({
       id: run.id,
@@ -256,6 +322,38 @@ class StubSourceGatherer implements ResearchSourceGatherer {
     const papers = [
       canonicalPaper()
     ];
+    const selectionQuality = {
+      schemaVersion: 1 as const,
+      requiredFacets: [{
+        id: "facet-proof-techniques",
+        label: "proof techniques",
+        kind: "method" as const,
+        required: true,
+        terms: ["proof techniques"],
+        source: "success_criterion" as const,
+        rationale: "Extracted from the test success criterion."
+      }],
+      optionalFacets: [],
+      paperFacetCoverage: [{
+        paperId: "paper-1",
+        coveredFacetIds: ["facet-proof-techniques"],
+        missingRequiredFacetIds: [],
+        coverageScore: 4,
+        matchedTerms: ["proof techniques"],
+        rationale: "Covered by the survey metadata."
+      }],
+      selectedSetCoverage: [{
+        facetId: "facet-proof-techniques",
+        label: "proof techniques",
+        required: true,
+        coveredByPaperIds: ["paper-1"],
+        count: 1
+      }],
+      missingRequiredFacets: [],
+      backgroundOnlyFacets: [],
+      adequacy: "strong" as const,
+      selectionRationale: ["Selected set covers the proof-techniques facet."]
+    };
 
     return {
       notes: [
@@ -322,7 +420,8 @@ class StubSourceGatherer implements ResearchSourceGatherer {
           status: "missing_optional"
         }
       ],
-      reviewWorkflow: reviewWorkflowFor(papers)
+      reviewWorkflow: reviewWorkflowFor(papers),
+      selectionQuality
     };
   }
 }
@@ -385,6 +484,16 @@ class LiteratureAwareResearchBackend implements ResearchBackend {
         "limitations"
       ]
     };
+  }
+
+  async extractReviewedPapers(request: PaperExtractionRequest): Promise<PaperExtraction[]> {
+    return request.papers.map((paper, index) => paperExtraction({
+      id: `literature-aware-extraction-${index + 1}`,
+      paperId: paper.id,
+      runId: request.runId,
+      systemType: "literature review",
+      planningStyle: "memory-guided review"
+    }));
   }
 
   async synthesizeResearch(): Promise<ResearchSynthesis> {
@@ -486,6 +595,19 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     const completedRun = await runStore.load(run.id);
     const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as Record<string, unknown>;
     const literatureArtifact = JSON.parse(await readFile(completedRun.artifacts.literaturePath, "utf8")) as Record<string, unknown>;
+    const paperExtractionsArtifact = JSON.parse(await readFile(completedRun.artifacts.paperExtractionsPath, "utf8")) as {
+      schemaVersion: number;
+      runId: string;
+      briefFingerprint: string;
+      paperCount: number;
+      extractionCount: number;
+      extractions: Array<Record<string, unknown>>;
+    };
+    const evidenceMatrixArtifact = JSON.parse(await readFile(completedRun.artifacts.evidenceMatrixPath, "utf8")) as {
+      rowCount: number;
+      rows: unknown[];
+      derivedInsights: Array<{ kind: string }>;
+    };
     const verificationArtifact = JSON.parse(await readFile(completedRun.artifacts.verificationPath, "utf8")) as Record<string, unknown>;
     const agendaArtifact = JSON.parse(await readFile(completedRun.artifacts.agendaPath, "utf8")) as {
       selectedDirectionId: string | null;
@@ -494,25 +616,65 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     const workPackageArtifact = JSON.parse(await readFile(completedRun.artifacts.workPackagePath, "utf8")) as {
       title: string;
     };
+    const claimsArtifact = JSON.parse(await readFile(completedRun.artifacts.claimsPath, "utf8")) as {
+      schemaVersion: number;
+      runId: string;
+      briefFingerprint: string;
+      claimCount: number;
+      claims: Array<Record<string, unknown>>;
+    };
     const agendaMarkdown = await readFile(completedRun.artifacts.agendaMarkdownPath, "utf8");
     const literatureStoreContents = await readFile(literatureStoreFilePath(projectRoot), "utf8");
     const memoryContents = await readFile(memoryFilePath(projectRoot), "utf8");
+    const researchDirectionContents = await readFile(researchDirectionPath(projectRoot), "utf8");
+    const researchDirection = JSON.parse(researchDirectionContents) as {
+      selectedDirectionId: string | null;
+      sourceRunId: string | null;
+      sourceRunStage: string | null;
+      sourceRunAgendaPath: string | null;
+      acceptedAt: string | null;
+    };
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
-    assert.deepEqual(backend.capturedPaperIds, ["paper-1"]);
+    assert.deepEqual(backend.capturedPaperIds, [canonicalPaperId(canonicalPaper())]);
+    assert.deepEqual(backend.capturedExtractionPaperIds, [canonicalPaperId(canonicalPaper())]);
+    assert.equal(backend.capturedMatrixRowCount, 1);
     assert.match(JSON.stringify(sourcesArtifact), /rawSources/);
     assert.match(JSON.stringify(sourcesArtifact), /sourceConfig/);
     assert.match(JSON.stringify(sourcesArtifact), /mergeDiagnostics/);
+    assert.match(JSON.stringify(sourcesArtifact), /selectionQuality/);
     assert.match(JSON.stringify(literatureArtifact), /paper-1/);
     assert.match(JSON.stringify(literatureArtifact), /fulltext_open/);
+    assert.match(JSON.stringify(literatureArtifact), /proof techniques/);
+    assert.match(JSON.stringify(literatureArtifact), /selectionQuality/);
+    assert.equal(paperExtractionsArtifact.schemaVersion, 1);
+    assert.equal(paperExtractionsArtifact.runId, completedRun.id);
+    assert.equal(typeof paperExtractionsArtifact.briefFingerprint, "string");
+    assert.equal(paperExtractionsArtifact.paperCount, 1);
+    assert.equal(paperExtractionsArtifact.extractionCount, 1);
+    assert.equal(paperExtractionsArtifact.extractions[0]?.paperId, canonicalPaperId(canonicalPaper()));
+    assert.equal(claimsArtifact.schemaVersion, 1);
+    assert.equal(claimsArtifact.runId, completedRun.id);
+    assert.equal(typeof claimsArtifact.briefFingerprint, "string");
+    assert.equal(claimsArtifact.claimCount, 1);
+    assert.equal(claimsArtifact.claims.length, 1);
+    assert.equal(evidenceMatrixArtifact.rowCount, 1);
+    assert.equal(evidenceMatrixArtifact.rows.length, 1);
+    assert.ok(evidenceMatrixArtifact.derivedInsights.length > 0);
     assert.match(JSON.stringify(verificationArtifact), /paper-1/);
     assert.equal(agendaArtifact.selectedDirectionId, "direction-1");
     assert.equal(agendaArtifact.selectedWorkPackage?.id, "wp-1");
+    assert.equal(researchDirection.selectedDirectionId, "direction-1");
+    assert.equal(researchDirection.sourceRunId, completedRun.id);
+    assert.equal(researchDirection.sourceRunStage, "literature_review");
+    assert.match(researchDirection.sourceRunAgendaPath ?? "", new RegExp(`${completedRun.id}/agenda\\.json`));
+    assert.equal(typeof researchDirection.acceptedAt, "string");
     assert.equal(workPackageArtifact.title, "Benchmark technique-family framing");
     assert.match(agendaMarkdown, /Research Agenda/);
     assert.match(literatureStoreContents, /"paperCount": 1/);
     assert.match(memoryContents, /paper-1/);
+    assert.doesNotMatch(memoryContents, /"type": "source"/);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -561,6 +723,10 @@ test("run worker auto-continues by creating a derived work-package run when conf
     assert.ok(childRun);
     assert.equal(childRun?.derivedFromWorkPackageId, "wp-1");
     assert.equal(childRun?.status, "queued");
+    assert.ok(childRun?.job.launchCommand?.includes("--run-job"));
+    assert.ok(childRun?.job.launchCommand?.includes(childRun.id));
+    assert.ok(childRun?.job.launchCommand?.includes("--project-root"));
+    assert.ok(childRun?.job.launchCommand?.includes(projectRoot));
     assert.equal(runController.launchedRuns.length, 1);
     assert.equal(runController.launchedRuns[0]?.id, childRun?.id);
   } finally {
@@ -750,7 +916,13 @@ test("run worker synthesizes from the reviewed subset instead of the full canoni
     const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as Record<string, unknown>;
 
     assert.equal(exitCode, 0);
-    assert.deepEqual(backend.capturedPaperIds, ["paper-reviewed"]);
+    assert.deepEqual(
+      backend.capturedPaperIds,
+      [canonicalPaperId(canonicalPaper({
+        id: "paper-reviewed",
+        key: "doi:10.1000/reviewed"
+      }))]
+    );
     assert.match(summary, /Reviewed papers selected for synthesis: 1/);
     assert.match(JSON.stringify(sourcesArtifact), /reviewWorkflow/);
     assert.match(JSON.stringify(sourcesArtifact), /paper-blocked/);
@@ -869,7 +1041,13 @@ test("run worker previews reviewed papers instead of raw-source noise in the liv
     const events = await readFile(completedRun.artifacts.eventsPath, "utf8");
 
     assert.equal(exitCode, 0);
-    assert.match(stdout, /Reviewed paper: paper-reviewed-preview: Reviewed survey of autonomous research agents/);
+    assert.match(
+      stdout,
+      new RegExp(`Reviewed paper: ${canonicalPaperId(canonicalPaper({
+        id: "paper-reviewed-preview",
+        key: "doi:10.1000/reviewed-preview"
+      }))}: Reviewed survey of autonomous research agents`)
+    );
     assert.doesNotMatch(stdout, /Source selected:/);
     assert.doesNotMatch(events, /Irrelevant sewer flooding review/);
   } finally {
@@ -987,6 +1165,23 @@ test("run worker writes a hold agenda when no canonical papers are retained", as
 
     const completedRun = await runStore.load(run.id);
     const summary = await readFile(completedRun.artifacts.summaryPath, "utf8");
+    const paperExtractions = JSON.parse(await readFile(completedRun.artifacts.paperExtractionsPath, "utf8")) as {
+      schemaVersion: number;
+      runId: string;
+      paperCount: number;
+      extractionCount: number;
+      extractions: unknown[];
+    };
+    const claims = JSON.parse(await readFile(completedRun.artifacts.claimsPath, "utf8")) as {
+      schemaVersion: number;
+      runId: string;
+      claimCount: number;
+      claims: unknown[];
+    };
+    const evidenceMatrix = JSON.parse(await readFile(completedRun.artifacts.evidenceMatrixPath, "utf8")) as {
+      rowCount: number;
+      rows: unknown[];
+    };
     const agenda = JSON.parse(await readFile(completedRun.artifacts.agendaPath, "utf8")) as {
       selectedDirectionId: string | null;
       selectedWorkPackage: unknown;
@@ -996,6 +1191,17 @@ test("run worker writes a hold agenda when no canonical papers are retained", as
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
     assert.match(summary, /did not retain any canonical papers/i);
+    assert.equal(paperExtractions.schemaVersion, 1);
+    assert.equal(paperExtractions.runId, completedRun.id);
+    assert.equal(paperExtractions.paperCount, 0);
+    assert.equal(paperExtractions.extractionCount, 0);
+    assert.equal(paperExtractions.extractions.length, 0);
+    assert.equal(claims.schemaVersion, 1);
+    assert.equal(claims.runId, completedRun.id);
+    assert.equal(claims.claimCount, 0);
+    assert.equal(claims.claims.length, 0);
+    assert.equal(evidenceMatrix.rowCount, 0);
+    assert.equal(evidenceMatrix.rows.length, 0);
     assert.equal(agenda.selectedDirectionId, null);
     assert.equal(agenda.selectedWorkPackage, null);
     assert.ok(agenda.holdReasons.length > 0);

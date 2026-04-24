@@ -4,7 +4,8 @@ import type { ResearchBrief } from "./session-store.js";
 import { runtimeDirectoryPath } from "./session-store.js";
 
 const memorySchemaVersion = 2;
-const memoryFileName = "memory.json";
+const memoryFileName = "research-journal.json";
+const legacyMemoryFileNames = ["notes.json", "memory.json"];
 
 export type MemoryRecordType =
   | "claim"
@@ -269,6 +270,10 @@ function memoryStatePath(projectRoot: string): string {
 
 export function memoryFilePath(projectRoot: string): string {
   return memoryStatePath(projectRoot);
+}
+
+function legacyMemoryStatePaths(projectRoot: string): string[] {
+  return legacyMemoryFileNames.map((fileName) => path.join(runtimeDirectoryPath(projectRoot), fileName));
 }
 
 function createEmptyMemoryState(projectRoot: string, timestamp: string): MemoryState {
@@ -549,6 +554,19 @@ export class MemoryStore {
 
       if (!missingFile) {
         throw error;
+      }
+
+      for (const legacyPath of legacyMemoryStatePaths(this.projectRoot)) {
+        try {
+          const contents = await readFile(legacyPath, "utf8");
+          return mergeMemoryState(JSON.parse(contents), this.projectRoot, this.timestampFactory());
+        } catch (legacyError) {
+          const missingLegacyFile = legacyError instanceof Error && "code" in legacyError && legacyError.code === "ENOENT";
+
+          if (!missingLegacyFile) {
+            throw legacyError;
+          }
+        }
       }
 
       const memory = createEmptyMemoryState(this.projectRoot, this.timestampFactory());
