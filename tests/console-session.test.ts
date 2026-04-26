@@ -1456,6 +1456,166 @@ test("phase two console can pause and resume the active detached run", async () 
   }
 });
 
+test("phase one console exposes review-paper status, checks, and draft text", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-console-paper-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "Autonomous research agents",
+      researchQuestion: "How should autonomous research agents be evaluated?",
+      researchDirection: "Review evaluation and literature-agent practices.",
+      successCriterion: "Produce a review-paper draft with explicit checks."
+    }, ["clawresearch", "research-loop"]);
+    run.status = "completed";
+    run.stage = "literature_review";
+    await runStore.save(run);
+    await writeFile(run.artifacts.paperPath, "# Autonomous Research Agents\n\n## Abstract\n\nA draft review paper.\n", "utf8");
+    await writeFile(run.artifacts.paperJsonPath, `${JSON.stringify({
+      schemaVersion: 1,
+      runId: run.id,
+      briefFingerprint: "fingerprint",
+      title: "Autonomous Research Agents: A technical survey",
+      abstract: "A draft review paper.",
+      reviewType: "technical_survey",
+      structureRationale: "The structure follows the research question.",
+      scientificRoles: ["title_and_abstract", "review_method", "limitations", "references"],
+      sections: [],
+      claims: [
+        {
+          claimId: "claim-1",
+          claim: "Evaluation remains a central open issue.",
+          evidence: "The reviewed literature emphasizes evaluation.",
+          sourceIds: ["paper-1"]
+        }
+      ],
+      citationLinks: [],
+      referencedPaperIds: ["paper-1"],
+      evidenceTableIds: [],
+      limitations: ["The reviewed set is small."],
+      readinessStatus: "needs_more_evidence"
+    }, null, 2)}\n`, "utf8");
+    await writeFile(run.artifacts.manuscriptChecksPath, `${JSON.stringify({
+      schemaVersion: 1,
+      runId: run.id,
+      paperPath: run.artifacts.paperPath,
+      readinessStatus: "needs_more_evidence",
+      blockerCount: 0,
+      warningCount: 1,
+      checks: [
+        {
+          id: "references-complete",
+          title: "References cover cited papers",
+          status: "pass",
+          severity: "info",
+          message: "references.json covers the cited canonical paper IDs."
+        }
+      ],
+      blockers: []
+    }, null, 2)}\n`, "utf8");
+
+    const io = createScriptedIo(["/paper", "/paper checks", "/paper open", "/quit"]);
+    const backend: IntakeBackend = {
+      label: "intake:test",
+      async respond(): Promise<IntakeResponse> {
+        return {
+          assistantMessage: "The saved run already has a paper draft.",
+          brief: run.brief,
+          readiness: "ready",
+          readinessRationale: "The brief is complete.",
+          openQuestions: [],
+          summary: "Paper command test."
+        };
+      }
+    };
+
+    const exitCode = await runPhaseOneConsole(io, {
+      projectRoot,
+      version: "0.7.0",
+      now,
+      intakeBackend: backend,
+      runController: new FakeRunController(),
+      watchRuns: false
+    });
+
+    assert.equal(exitCode, 0);
+    assert.match(io.output, /Paper:/);
+    assert.match(io.output, /readiness: needs_more_evidence/);
+    assert.match(io.output, /Paper checks:/);
+    assert.match(io.output, /References cover cited papers/);
+    assert.match(io.output, /# Autonomous Research Agents/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("phase one console explains failed runs before manuscript generation", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-console-paper-failed-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "Autonomous research agents",
+      researchQuestion: "Why did the run fail before paper generation?",
+      researchDirection: "Inspect failure diagnostics.",
+      successCriterion: "Paper commands explain the failed stage."
+    }, ["clawresearch", "research-loop"]);
+    run.status = "failed";
+    run.statusMessage = "Run worker failed: extraction recovery budget exhausted";
+    run.finishedAt = "2026-01-01T00:00:10.000Z";
+    await runStore.save(run);
+    await mkdir(run.artifacts.runDirectory, { recursive: true });
+    await writeFile(run.artifacts.eventsPath, `${JSON.stringify({
+      timestamp: "2026-01-01T00:00:08.000Z",
+      kind: "stderr",
+      message: "Extraction batch failed (timeout): oversized extraction batch"
+    })}\n`, "utf8");
+    const failedStatus = {
+      schemaVersion: 1,
+      runId: run.id,
+      artifactKind: "paper",
+      status: "failed",
+      stage: "literature_review",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:10.000Z",
+      counts: {},
+      error: {
+        message: "extraction recovery budget exhausted",
+        kind: "stage_blocked",
+        operation: "extraction"
+      }
+    };
+    await writeFile(run.artifacts.paperJsonPath, `${JSON.stringify(failedStatus, null, 2)}\n`, "utf8");
+    await writeFile(run.artifacts.manuscriptChecksPath, `${JSON.stringify({
+      ...failedStatus,
+      artifactKind: "manuscript-checks"
+    }, null, 2)}\n`, "utf8");
+
+    const io = createScriptedIo(["/paper", "/paper checks", "/quit"]);
+    const exitCode = await runPhaseOneConsole(io, {
+      projectRoot,
+      version: "0.7.0",
+      now,
+      intakeBackend: new StubIntakeBackend(),
+      runController: new FakeRunController(),
+      watchRuns: false
+    });
+
+    assert.equal(exitCode, 0);
+    assert.match(io.output, /Paper:/);
+    assert.match(io.output, /run status: failed/);
+    assert.match(io.output, /readiness: not_started/);
+    assert.match(io.output, /no draft reason: Run worker failed: extraction recovery budget exhausted/);
+    assert.match(io.output, /Paper checks:/);
+    assert.match(io.output, /diagnostic: stage_blocked during extraction/);
+    assert.match(io.output, /recent events:/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("phase two console streams live run progress and reports completion", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-watch-run-"));
   const now = createNow();

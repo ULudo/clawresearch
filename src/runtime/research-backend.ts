@@ -178,14 +178,44 @@ export type PaperExtractionRequest = {
   plan: ResearchPlan;
   papers: CanonicalPaper[];
   literatureContext?: LiteratureContext;
+  compact?: boolean;
 };
+
+export type ResearchBackendOperation =
+  | "planning"
+  | "extraction"
+  | "synthesis"
+  | "agenda";
+
+export type ResearchBackendCallOptions = {
+  operation: ResearchBackendOperation;
+  timeoutMs: number;
+};
+
+export type ResearchBackendFailureKind =
+  | "timeout"
+  | "malformed_json"
+  | "http"
+  | "unexpected";
+
+export class ResearchBackendError extends Error {
+  constructor(
+    public readonly kind: ResearchBackendFailureKind,
+    public readonly operation: ResearchBackendOperation,
+    message: string,
+    public readonly timeoutMs: number | null = null
+  ) {
+    super(message);
+    this.name = "ResearchBackendError";
+  }
+}
 
 export interface ResearchBackend {
   readonly label: string;
-  planResearch(request: ResearchPlanningRequest): Promise<ResearchPlan>;
-  extractReviewedPapers(request: PaperExtractionRequest): Promise<PaperExtraction[]>;
-  synthesizeResearch(request: ResearchSynthesisRequest): Promise<ResearchSynthesis>;
-  developResearchAgenda(request: ResearchAgendaRequest): Promise<ResearchAgenda>;
+  planResearch(request: ResearchPlanningRequest, options?: ResearchBackendCallOptions): Promise<ResearchPlan>;
+  extractReviewedPapers(request: PaperExtractionRequest, options?: ResearchBackendCallOptions): Promise<PaperExtraction[]>;
+  synthesizeResearch(request: ResearchSynthesisRequest, options?: ResearchBackendCallOptions): Promise<ResearchSynthesis>;
+  developResearchAgenda(request: ResearchAgendaRequest, options?: ResearchBackendCallOptions): Promise<ResearchAgenda>;
 }
 
 type OllamaChatResponse = {
@@ -506,18 +536,77 @@ function normalizeClaims(value: unknown, allowedSourceIds: string[] = []): Resea
   }).slice(0, 8);
 }
 
+function fallbackThemesFromEvidence(
+  request: ResearchSynthesisRequest,
+  allowedSourceIds: string[]
+): ResearchTheme[] {
+  const insightThemes = request.evidenceMatrix.derivedInsights.flatMap((insight) => {
+    const sourceIds = reconcileSourceIds(insight.paperIds, allowedSourceIds);
+
+    if (sourceIds.length === 0) {
+      return [];
+    }
+
+    return [{
+      title: insight.title,
+      summary: insight.summary,
+      sourceIds
+    }];
+  });
+
+  if (insightThemes.length > 0) {
+    return insightThemes.slice(0, 6);
+  }
+
+  const rowsWithClaims = request.evidenceMatrix.rows
+    .filter((row) => row.claimCount > 0)
+    .slice(0, 6);
+
+  if (rowsWithClaims.length === 0) {
+    return [];
+  }
+
+  return [{
+    title: "Reviewed system evidence",
+    summary: `The reviewed set contains ${rowsWithClaims.length} papers with extractable paper-level claims, but the synthesis backend did not return stable cross-paper themes.`,
+    sourceIds: reconcileSourceIds(rowsWithClaims.map((row) => row.paperId), allowedSourceIds)
+  }];
+}
+
+function fallbackClaimsFromPaperExtractions(
+  request: ResearchSynthesisRequest,
+  allowedSourceIds: string[]
+): ResearchClaim[] {
+  return request.paperExtractions.flatMap((extraction) => {
+    if (extraction.confidence === "low" || !allowedSourceIds.includes(extraction.paperId)) {
+      return [];
+    }
+
+    return extraction.supportedClaims
+      .filter((claim) => claim.support === "explicit" || claim.support === "partial")
+      .map((claim) => ({
+        claim: claim.claim,
+        evidence: extraction.evidenceNotes[0]
+          ?? `Extracted from reviewed paper ${extraction.paperId} in the ${extraction.problemSetting} setting.`,
+        sourceIds: [extraction.paperId]
+      }));
+  }).slice(0, 8);
+}
+
 function normalizeSynthesis(raw: unknown, request: ResearchSynthesisRequest, allowedSourceIds: string[] = []): ResearchSynthesis {
   const record = typeof raw === "object" && raw !== null
     ? raw as Record<string, unknown>
     : {};
   const nextQuestions = safeStringArray(record.nextQuestions, 6);
   const matrixBackedQuestions = evidenceMatrixNextQuestions(request.evidenceMatrix);
+  const themes = normalizeThemes(record.themes, allowedSourceIds);
+  const claims = normalizeClaims(record.claims, allowedSourceIds);
 
   return {
     executiveSummary: safeString(record.executiveSummary)
       ?? `This first-pass run synthesized the available sources around ${request.brief.topic ?? "the requested topic"}.`,
-    themes: normalizeThemes(record.themes, allowedSourceIds),
-    claims: normalizeClaims(record.claims, allowedSourceIds),
+    themes: themes.length > 0 ? themes : fallbackThemesFromEvidence(request, allowedSourceIds),
+    claims: claims.length > 0 ? claims : fallbackClaimsFromPaperExtractions(request, allowedSourceIds),
     nextQuestions: nextQuestions.length > 0 ? nextQuestions : matrixBackedQuestions
   };
 }
@@ -823,20 +912,23 @@ function extractionInstruction(request: PaperExtractionRequest): string {
     paperId: paper.id,
     title: paper.title,
     citation: paper.citation,
-    abstract: paper.abstract,
+    abstract: request.compact === true ? paper.abstract?.slice(0, 1_200) ?? null : paper.abstract,
     year: paper.year,
     venue: paper.venue,
-    authors: paper.authors,
+    authors: request.compact === true ? paper.authors.slice(0, 8) : paper.authors,
     accessMode: paper.accessMode,
     screeningStage: paper.screeningStage,
     screeningDecision: paper.screeningDecision,
     screeningRationale: paper.screeningRationale,
-    tags: paper.tags
+    tags: request.compact === true ? paper.tags.slice(0, 8) : paper.tags
   }));
 
   return [
     "You are ClawResearch's paper-extraction module for a console-first autonomous research runtime.",
     "Extract paper-by-paper evidence only from the provided reviewed papers.",
+    request.compact === true
+      ? "Use compact mode: prefer short, conservative fields and return one sparse but valid extraction per paper."
+      : "Use normal mode: retain useful methodological and evidence detail while staying concise.",
     "Do not fabricate detail. If a field is unclear, leave it as an empty string or empty array and lower confidence.",
     "Supported claims must be short claim texts grounded in the paper itself.",
     "",
@@ -1114,40 +1206,84 @@ function agendaInstruction(request: ResearchAgendaRequest): string {
 async function ollamaJsonCall<T>(
   host: string,
   model: string,
-  systemPrompt: string
+  systemPrompt: string,
+  options: ResearchBackendCallOptions
 ): Promise<T> {
-  const response = await fetch(`http://${normalizeHost(host)}/api/chat`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      model,
-      stream: false,
-      think: false,
-      format: "json",
-      messages: [
-        {
-          role: "system",
-          content: systemPrompt
-        }
-      ]
-    }),
-    signal: AbortSignal.timeout(120_000)
-  });
+  let response: Response;
+
+  try {
+    response = await fetch(`http://${normalizeHost(host)}/api/chat`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model,
+        stream: false,
+        think: false,
+        format: "json",
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt
+          }
+        ]
+      }),
+      signal: AbortSignal.timeout(options.timeoutMs)
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const name = error instanceof Error ? error.name : "";
+
+    if (/timeout/i.test(name) || /timeout|aborted/i.test(message)) {
+      throw new ResearchBackendError(
+        "timeout",
+        options.operation,
+        `${options.operation} model call exceeded ${options.timeoutMs} ms`,
+        options.timeoutMs
+      );
+    }
+
+    throw new ResearchBackendError(
+      "unexpected",
+      options.operation,
+      `${options.operation} model call failed: ${message}`,
+      options.timeoutMs
+    );
+  }
 
   if (!response.ok) {
-    throw new Error(`Ollama request failed with ${response.status} ${response.statusText}`);
+    throw new ResearchBackendError(
+      "http",
+      options.operation,
+      `Ollama ${options.operation} request failed with ${response.status} ${response.statusText}`,
+      options.timeoutMs
+    );
   }
 
   const payload = await response.json() as OllamaChatResponse;
   const content = payload.message?.content;
 
   if (typeof content !== "string") {
-    throw new Error("Ollama returned an unexpected response.");
+    throw new ResearchBackendError(
+      "unexpected",
+      options.operation,
+      `Ollama ${options.operation} request returned an unexpected response.`,
+      options.timeoutMs
+    );
   }
 
-  return extractJson(content) as T;
+  try {
+    return extractJson(content) as T;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new ResearchBackendError(
+      "malformed_json",
+      options.operation,
+      `Ollama ${options.operation} response was not valid JSON: ${message}`,
+      options.timeoutMs
+    );
+  }
 }
 
 export class OllamaResearchBackend implements ResearchBackend {
@@ -1160,41 +1296,57 @@ export class OllamaResearchBackend implements ResearchBackend {
     this.label = `ollama:${this.model}`;
   }
 
-  async planResearch(request: ResearchPlanningRequest): Promise<ResearchPlan> {
+  async planResearch(request: ResearchPlanningRequest, options: ResearchBackendCallOptions = {
+    operation: "planning",
+    timeoutMs: 300_000
+  }): Promise<ResearchPlan> {
     const raw = await ollamaJsonCall<unknown>(
       this.host,
       this.model,
-      planningInstruction(request)
+      planningInstruction(request),
+      options
     );
 
     return normalizePlan(raw, request.brief);
   }
 
-  async extractReviewedPapers(request: PaperExtractionRequest): Promise<PaperExtraction[]> {
+  async extractReviewedPapers(request: PaperExtractionRequest, options: ResearchBackendCallOptions = {
+    operation: "extraction",
+    timeoutMs: 300_000
+  }): Promise<PaperExtraction[]> {
     const raw = await ollamaJsonCall<unknown>(
       this.host,
       this.model,
-      extractionInstruction(request)
+      extractionInstruction(request),
+      options
     );
 
     return normalizePaperExtractions(raw, request);
   }
 
-  async synthesizeResearch(request: ResearchSynthesisRequest): Promise<ResearchSynthesis> {
+  async synthesizeResearch(request: ResearchSynthesisRequest, options: ResearchBackendCallOptions = {
+    operation: "synthesis",
+    timeoutMs: 300_000
+  }): Promise<ResearchSynthesis> {
     const raw = await ollamaJsonCall<unknown>(
       this.host,
       this.model,
-      synthesisInstruction(request)
+      synthesisInstruction(request),
+      options
     );
 
     return normalizeSynthesis(raw, request, request.papers.map((paper) => paper.id));
   }
 
-  async developResearchAgenda(request: ResearchAgendaRequest): Promise<ResearchAgenda> {
+  async developResearchAgenda(request: ResearchAgendaRequest, options: ResearchBackendCallOptions = {
+    operation: "agenda",
+    timeoutMs: 300_000
+  }): Promise<ResearchAgenda> {
     const raw = await ollamaJsonCall<unknown>(
       this.host,
       this.model,
-      agendaInstruction(request)
+      agendaInstruction(request),
+      options
     );
 
     return normalizeAgenda(raw, request);

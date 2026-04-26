@@ -58,8 +58,8 @@ function renderDocs(writer: OutputWriter, packageRoot: string, resetDoc: string,
 
 function renderHelp(writer: OutputWriter): void {
   writeLine(writer, "Usage:");
-  writeLine(writer, "  clawresearch");
-  writeLine(writer, "  clawresearch --plain");
+  writeLine(writer, "  clawresearch [--project-root PATH]");
+  writeLine(writer, "  clawresearch --plain [--project-root PATH]");
   writeLine(writer, "  clawresearch --docs");
   writeLine(writer, "  clawresearch --version");
   writeLine(writer, "  clawresearch --help");
@@ -73,6 +73,9 @@ function renderHelp(writer: OutputWriter): void {
   writeLine(writer, "  /status");
   writeLine(writer, "  /agenda");
   writeLine(writer, "  /sources");
+  writeLine(writer, "  /paper");
+  writeLine(writer, "  /paper open");
+  writeLine(writer, "  /paper checks");
   writeLine(writer, "  /go");
   writeLine(writer, "  /continue");
   writeLine(writer, "  /pause");
@@ -89,6 +92,10 @@ function readOptionValue(argv: string[], optionName: string): string | null {
   }
 
   return argv[index + 1] ?? null;
+}
+
+function resolveProjectRoot(candidate: string | null | undefined): string {
+  return path.resolve(candidate ?? process.cwd());
 }
 
 function createConsoleIo(input = process.stdin, output = process.stdout): ConsoleIo {
@@ -174,11 +181,11 @@ export async function main(argv: string[], options: MainOptions = {}): Promise<n
   const docs = await resolveDocs(packageRoot);
   const writer = options.writer ?? process.stdout;
   const runId = readOptionValue(argv, "--run-job");
-  const detachedProjectRoot = readOptionValue(argv, "--project-root");
+  const projectRoot = resolveProjectRoot(readOptionValue(argv, "--project-root") ?? options.projectRoot);
 
   if (runId !== null) {
     return runDetachedJobWorker({
-      projectRoot: detachedProjectRoot ?? process.cwd(),
+      projectRoot,
       runId,
       version
     });
@@ -204,14 +211,14 @@ export async function main(argv: string[], options: MainOptions = {}): Promise<n
 
   if (!forcePlain && options.io === undefined && process.stdin.isTTY && process.stdout.isTTY) {
     return runTerminalUi({
-      projectRoot: options.projectRoot ?? process.cwd(),
+      projectRoot,
       version,
       intakeBackend: options.intakeBackend
     });
   }
 
   return runPhaseOneConsole(io, {
-    projectRoot: options.projectRoot ?? process.cwd(),
+    projectRoot,
     version,
     intakeBackend: options.intakeBackend
   });

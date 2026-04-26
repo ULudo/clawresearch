@@ -450,6 +450,14 @@ function contextEntry(record: MemoryRecord): ProjectMemoryContextEntry {
   };
 }
 
+function isRuntimeArtifactPath(value: MemoryDataValue): boolean {
+  if (typeof value !== "string") {
+    return false;
+  }
+
+  return value.startsWith(".clawresearch/") || value.includes("/.clawresearch/");
+}
+
 function selectRelevantEntries(
   records: MemoryRecord[],
   type: MemoryRecordType,
@@ -489,7 +497,8 @@ export function buildProjectMemoryContext(
   const questions = selectRelevantEntries(memory.records, "question", briefTokens, perTypeLimit);
   const ideas = selectRelevantEntries(memory.records, "idea", briefTokens, perTypeLimit);
   const summaries = selectRelevantEntries(memory.records, "summary", briefTokens, Math.max(2, perTypeLimit - 1));
-  const artifacts = selectRelevantEntries(memory.records, "artifact", briefTokens, perTypeLimit + 2);
+  const artifacts = selectRelevantEntries(memory.records, "artifact", briefTokens, perTypeLimit + 2)
+    .filter((entry) => !isRuntimeArtifactPath(entry.data.path));
   const directions = selectRelevantEntries(memory.records, "direction", briefTokens, perTypeLimit);
   const hypotheses = selectRelevantEntries(memory.records, "hypothesis", briefTokens, perTypeLimit);
   const methodPlans = selectRelevantEntries(memory.records, "method_plan", briefTokens, perTypeLimit);
@@ -507,7 +516,7 @@ export function buildProjectMemoryContext(
     ...artifacts.flatMap((entry) => {
       const dataPath = entry.data.path;
 
-      if (typeof dataPath === "string" && !dataPath.startsWith(".clawresearch/")) {
+      if (typeof dataPath === "string" && !isRuntimeArtifactPath(dataPath)) {
         return [dataPath];
       }
 

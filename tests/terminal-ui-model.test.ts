@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ProjectConfigStore } from "../src/runtime/project-config-store.js";
+import {
+  defaultRuntimeLlmConfig,
+  ProjectConfigStore
+} from "../src/runtime/project-config-store.js";
 import type { ProjectConfigState } from "../src/runtime/project-config-store.js";
 import {
   authPromptGuidance,
@@ -14,7 +17,7 @@ import {
 function sampleConfig(): ProjectConfigState {
   const store = new ProjectConfigStore("/tmp/clawresearch-ui-model");
   return {
-    schemaVersion: 6,
+    schemaVersion: 7,
     projectRoot: store.projectRoot,
     runtimeDirectory: `${store.projectRoot}/.clawresearch`,
     createdAt: "2026-01-01T00:00:00.000Z",
@@ -38,9 +41,14 @@ function sampleConfig(): ProjectConfigState {
       explicitlyConfigured: true
     },
     runtime: {
-      postReviewBehavior: "confirm"
+      postReviewBehavior: "confirm",
+      llm: defaultRuntimeLlmConfig
     }
   };
+}
+
+function maxRenderedLineLength(output: string): number {
+  return Math.max(...output.split("\n").map((line) => line.length));
 }
 
 test("source checklist toggles scholarly providers and local files", () => {
@@ -119,6 +127,7 @@ test("chat frame keeps the latest conversation visible and shows a chat field", 
   assert.match(output, /> \/go\s+Start the detached research run/);
   assert.match(output, /Input -----------------------------------------------/);
   assert.match(output, /Chat > Focus on literature review workflows_/);
+  assert.ok(maxRenderedLineLength(output) <= 92);
 });
 
 test("auth prompt frame stays focused on the credential question", () => {
@@ -143,4 +152,37 @@ test("auth prompt frame stays focused on the credential question", () => {
   assert.match(output, /pubmed ncbi api key \[optional\]/);
   assert.doesNotMatch(output, /Chat --------------------------------/);
   assert.doesNotMatch(output, /Brief --------------------------------/);
+});
+
+test("chat frame keeps narrow terminal lines inside the safety gutter", () => {
+  const width = 64;
+  const output = renderChatFrame({
+    width,
+    height: 22,
+    title: "ClawResearch",
+    subtitle: "project: /tmp/a/very/long/project/path/that/would/otherwise/clip  backend: ollama:qwen3:14b",
+    brief: {
+      topic: "autonomous research agents with unusually long prompt text",
+      researchQuestion: "How should long live run updates avoid clipping at the terminal edge?",
+      researchDirection: "Validate wrapping behavior for narrow TUI terminals.",
+      successCriterion: "No rendered line should use the rightmost unsafe terminal columns."
+    },
+    conversationLogs: [
+      { tag: "you", text: "x".repeat(180) }
+    ],
+    activityLogs: [
+      { tag: "next", text: "Extracting reviewed paper batch with an extremely long canonical path and recovery diagnostic message ".repeat(3) }
+    ],
+    latestReply: { tag: "consultant", text: "I will keep the layout readable even on a narrow terminal." },
+    activityLabel: "Recovering extraction by shrinking the next batch size to 1",
+    commandSuggestions: [
+      { command: "/paper checks", description: "Show manuscript readiness checks and recovery diagnostics", selected: true },
+      { command: "/status", description: "Show the current brief and latest run state", selected: false }
+    ],
+    inputLabel: "Chat >",
+    inputValue: "/paper checks",
+    footerHint: "Enter accept/send  Esc clear"
+  });
+
+  assert.ok(maxRenderedLineLength(output) <= width - 4);
 });

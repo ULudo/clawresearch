@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
+  buildProjectMemoryContext,
   countMemoryRecordsByType,
   createMemoryRecordId,
   MemoryStore
@@ -136,6 +137,51 @@ test("memory store reads legacy notes file before writing the research journal",
     assert.equal(store.filePath, path.join(projectRoot, ".clawresearch", "research-journal.json"));
     assert.equal(memory.recordCount, 1);
     assert.equal(memory.records[0]?.title, "Legacy finding");
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("project memory context does not expose runtime artifact paths as planning hints", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-memory-context-artifacts-"));
+  const now = createNow();
+
+  try {
+    const store = new MemoryStore(projectRoot, now);
+    await store.upsert([
+      {
+        type: "artifact",
+        key: ".clawresearch/runs/run-1/paper.json",
+        title: "Structured review paper artifact",
+        text: "Saved structured paper representation for run-1.",
+        runId: "run-1",
+        data: {
+          path: ".clawresearch/runs/run-1/paper.json"
+        }
+      },
+      {
+        type: "artifact",
+        key: "notes/source-notes.md",
+        title: "Source notes",
+        text: "Useful local notes for autonomous research agents.",
+        runId: "run-1",
+        data: {
+          path: "notes/source-notes.md"
+        }
+      }
+    ]);
+
+    const memory = await store.load();
+    const context = buildProjectMemoryContext(memory, {
+      topic: "autonomous research agents",
+      researchQuestion: "How should retrieval be improved?",
+      researchDirection: "Review source notes.",
+      successCriterion: "Use relevant local context."
+    });
+
+    assert.ok(context.artifacts.some((entry) => entry.data.path === "notes/source-notes.md"));
+    assert.ok(!context.artifacts.some((entry) => String(entry.data.path).includes(".clawresearch/runs")));
+    assert.deepEqual(context.localFileHints, ["notes/source-notes.md"]);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

@@ -10,6 +10,9 @@ import {
   buildReviewFacets,
   buildReviewSelectionQuality,
   buildLiteratureReviewProfile,
+  isCoreTopicReviewFacet,
+  isRetrievalQualityConstraintPhrase,
+  isSubstantiveReviewFacet,
   shouldUseLiteratureReviewSubsystem,
   type LiteratureReviewProfile,
   type LiteratureSourceAssessment,
@@ -257,6 +260,21 @@ export type RetrievalDiagnostics = {
   suggestedNextQueries: string[];
 };
 
+export type LiteratureRelevanceStatus =
+  | "in_scope"
+  | "borderline"
+  | "excluded";
+
+export type LiteratureRelevanceAssessment = {
+  paperId: string;
+  title: string;
+  status: LiteratureRelevanceStatus;
+  reviewer: "hybrid_protocol_gate";
+  matchedCriteria: string[];
+  missingCriteria: string[];
+  reason: string;
+};
+
 export type ResearchSourceGatherResult = {
   sources: ResearchSource[];
   canonicalPapers: CanonicalPaper[];
@@ -274,9 +292,11 @@ export type ResearchSourceGatherResult = {
       title: string;
       assessment: LiteratureSourceAssessment;
     }>;
+    relevanceAssessments?: LiteratureRelevanceAssessment[];
   } | null;
   retrievalDiagnostics?: RetrievalDiagnostics;
   selectionQuality?: ReviewSelectionQuality | null;
+  relevanceAssessments?: LiteratureRelevanceAssessment[];
 };
 
 export type ResearchSourceGatherRequest = {
@@ -285,6 +305,7 @@ export type ResearchSourceGatherRequest = {
   plan: ResearchPlan;
   memoryContext: ProjectMemoryContext;
   literatureContext?: LiteratureContext;
+  recoveryQueries?: string[];
   providerIds?: SourceProviderId[];
   scholarlyProviderIds?: SourceProviderId[];
   generalWebProviderIds?: SourceProviderId[];
@@ -350,6 +371,7 @@ type CanonicalReviewState = {
   reviewWorkflow: ReviewWorkflowSummary;
   selectionQuality: ReviewSelectionQuality | null;
   mergeDiagnostics: string[];
+  relevanceAssessments: LiteratureRelevanceAssessment[];
 };
 
 type ProviderPageResult = {
@@ -945,7 +967,8 @@ function buildRetrievalBudget(
     request.brief.researchQuestion,
     request.brief.researchDirection,
     request.brief.successCriterion,
-    ...request.plan.localFocus
+    ...request.plan.localFocus,
+    ...(request.recoveryQueries ?? [])
   ].filter((value): value is string => typeof value === "string" && value.trim().length > 0).length;
   const broadTopic = tokenize(request.brief.topic ?? request.plan.objective).length <= 4;
   const maxQueries = Math.min(
@@ -1058,6 +1081,12 @@ function buildDomainVocabularyQueryCandidates(
     }
   }
 
+  if ((domain === "cs_ai" || domain === "mixed") && /\b(experiment|experimentation|exploration|evaluation|paper writing|publication|scientific progress|scientific discovery)\b/i.test(text)) {
+    for (const term of ["AI scientist experimentation", "autonomous scientific discovery", "agent benchmark evaluation", "research agent paper writing"]) {
+      candidates.push(...queryCandidate(`${anchor} ${term}`, "domain_vocabulary", "End-to-end research-agent questions often need lifecycle-specific vocabulary."));
+    }
+  }
+
   if (domain === "social_science" && /\b(policy|governance|workforce|employment|organization|organisation)\b/i.test(text)) {
     for (const term of ["policy evidence", "organizational impact", "workforce impact"]) {
       candidates.push(...queryCandidate(`${anchor} ${term}`, "domain_vocabulary", "Social-science impact questions often use this search vocabulary."));
@@ -1069,9 +1098,23 @@ function buildDomainVocabularyQueryCandidates(
 
 function buildRecoveryQueryCandidates(
   request: ResearchSourceGatherRequest,
-  rejectedSamples: Array<{ title: string; excerpt: string; rationale: string }>
+  rejectedSamples: Array<{ title: string; excerpt: string; rationale: string }>,
+  selectionQuality: ReviewSelectionQuality | null = null
 ): QueryExpansionCandidate[] {
   const anchor = primaryQueryAnchor(request);
+  const missingFacetQueries = selectionQuality?.missingRequiredFacets
+    .filter((facet) => isSubstantiveReviewFacet(facet))
+    .slice(0, 6)
+    .flatMap((facet) => uniqueStrings([
+      facet.label,
+      facet.terms.slice(0, 4).join(" ")
+    ])
+      .filter((query) => !isRetrievalQualityConstraintPhrase(query))
+      .flatMap((query) => queryCandidate(
+        `${anchor} ${query}`,
+        "recovery",
+        "Recovered from missing required review-facet coverage."
+      ))) ?? [];
   const sampleQueries = rejectedSamples
     .slice(0, 8)
     .flatMap((sample) => keyPhrasesFromText(`${sample.title} ${sample.excerpt}`, 2))
@@ -1085,6 +1128,7 @@ function buildRecoveryQueryCandidates(
   ].flatMap((query) => queryCandidate(query, "recovery", "Broad recovery query for a thin evidence base."));
 
   return uniqueQueryCandidates([
+    ...missingFacetQueries,
     ...sampleQueries,
     ...broadTaskQueries
   ]);
@@ -1107,6 +1151,8 @@ function buildQueryExpansionCandidates(
   const literatureHints = request.literatureContext?.queryHints ?? [];
   const memoryHints = request.memoryContext.queryHints ?? [];
   const planCandidates = explicitQueries.flatMap((query) => queryCandidate(query, "plan", "Model-planned retrieval query."));
+  const explicitRecoveryCandidates = uniqueStrings(request.recoveryQueries ?? [])
+    .flatMap((query) => queryCandidate(query, "recovery", "Requested by the autonomous evidence-recovery loop."));
   const briefTaskCandidates = [
     ...focusQueries.map((query) => `${topicPhrase} ${query}`),
     topicPhrase
@@ -1129,6 +1175,7 @@ function buildQueryExpansionCandidates(
     ...memoryCandidates,
     ...literatureCandidates,
     ...buildDomainVocabularyQueryCandidates(request, domain),
+    ...explicitRecoveryCandidates,
     ...recoveryCandidates
   ]);
 }
@@ -3099,6 +3146,142 @@ function collapseReviewSeries(papers: CanonicalPaper[]): { selected: CanonicalPa
   };
 }
 
+function paperReviewText(paper: CanonicalPaper): string {
+  return [
+    paper.title,
+    paper.abstract,
+    paper.citation,
+    paper.venue,
+    ...paper.tags
+  ].filter((value): value is string => typeof value === "string").join(" ");
+}
+
+function tokenSetForPaper(paper: CanonicalPaper): Set<string> {
+  return new Set(matchTokens(paperReviewText(paper)));
+}
+
+function termMatchesPaper(term: string, normalizedText: string, tokens: Set<string>): boolean {
+  const normalizedTerm = normalizeWhitespace(term.toLowerCase());
+  const termTokens = matchTokens(normalizedTerm);
+
+  if (termTokens.length === 0) {
+    return false;
+  }
+
+  return normalizedText.includes(normalizedTerm)
+    || termTokens.every((token) => tokens.has(token));
+}
+
+function matchedFacetLabels(
+  paper: CanonicalPaper,
+  facets: ReviewFacet[],
+  predicate: (facet: ReviewFacet) => boolean
+): string[] {
+  const normalizedText = normalizeWhitespace(paperReviewText(paper).toLowerCase());
+  const tokens = tokenSetForPaper(paper);
+
+  return facets
+    .filter(predicate)
+    .filter((facet) => facet.terms.some((term) => termMatchesPaper(term, normalizedText, tokens)))
+    .map((facet) => facet.label);
+}
+
+function reviewRelevanceAssessmentForPaper(
+  paper: CanonicalPaper,
+  facets: ReviewFacet[],
+  coverage: PaperFacetCoverage | null = null
+): LiteratureRelevanceAssessment {
+  if (facets.length === 0) {
+    return {
+      paperId: paper.id,
+      title: paper.title,
+      status: "in_scope",
+      reviewer: "hybrid_protocol_gate",
+      matchedCriteria: ["No protocol criteria were available; source was retained by the ordinary screening workflow."],
+      missingCriteria: [],
+      reason: "No protocol criteria were available, so the relevance gate deferred to screening state."
+    };
+  }
+
+  const requiredCoreFacets = facets.filter((facet) => facet.required && isCoreTopicReviewFacet(facet));
+  const requiredSubstantiveFacets = facets.filter((facet) => facet.required && isSubstantiveReviewFacet(facet));
+  const coreMatched = matchedFacetLabels(paper, requiredCoreFacets, () => true);
+  const substantiveMatched = matchedFacetLabels(paper, requiredSubstantiveFacets, () => true);
+  const coveredFacetIds = new Set(coverage?.coveredFacetIds ?? []);
+  const optionalMatched = facets
+    .filter((facet) => !facet.required && coveredFacetIds.has(facet.id))
+    .map((facet) => facet.label);
+  const coreSatisfied = requiredCoreFacets.length === 0 || coreMatched.length > 0;
+  const substantiveSatisfied = requiredSubstantiveFacets.length === 0 || substantiveMatched.length > 0;
+  const matchedCriteria = uniqueStrings([
+    ...coreMatched.map((label) => `core:${label}`),
+    ...substantiveMatched.map((label) => `evidence:${label}`),
+    ...optionalMatched.map((label) => `hint:${label}`)
+  ]);
+  const missingCriteria = uniqueStrings([
+    ...(coreSatisfied ? [] : requiredCoreFacets.map((facet) => `core:${facet.label}`)),
+    ...(substantiveSatisfied ? [] : requiredSubstantiveFacets.map((facet) => `evidence:${facet.label}`))
+  ]);
+  const status: LiteratureRelevanceStatus = coreSatisfied && substantiveSatisfied
+    ? "in_scope"
+    : coreSatisfied || substantiveSatisfied
+      ? "borderline"
+      : "excluded";
+
+  return {
+    paperId: paper.id,
+    title: paper.title,
+    status,
+    reviewer: "hybrid_protocol_gate",
+    matchedCriteria,
+    missingCriteria,
+    reason: status === "in_scope"
+      ? "The paper matched the protocol core scope and at least one required evidence target."
+      : status === "borderline"
+        ? "The paper matched only part of the protocol scope/evidence gate and was kept out of final synthesis."
+        : "The paper did not match the protocol core scope or required evidence targets closely enough for synthesis."
+  };
+}
+
+function buildLiteratureRelevanceAssessments(
+  papers: CanonicalPaper[],
+  facets: ReviewFacet[],
+  coverageByPaperId: Map<string, PaperFacetCoverage>
+): LiteratureRelevanceAssessment[] {
+  return papers.map((paper) => reviewRelevanceAssessmentForPaper(paper, facets, coverageByPaperId.get(paper.id) ?? null));
+}
+
+function paperPassesSynthesisRelevanceGate(
+  paper: CanonicalPaper,
+  facets: ReviewFacet[],
+  coverage: PaperFacetCoverage | null = null,
+  relevanceAssessment: LiteratureRelevanceAssessment | null = null
+): boolean {
+  if (relevanceAssessment !== null) {
+    return relevanceAssessment.status === "in_scope";
+  }
+
+  if (facets.length === 0) {
+    return true;
+  }
+
+  const coveredFacetIds = new Set(coverage?.coveredFacetIds ?? []);
+  const coreFacetIds = new Set(facets.filter(isCoreTopicReviewFacet).map((facet) => facet.id));
+  const substantiveFacetIds = new Set(facets.filter(isSubstantiveReviewFacet).map((facet) => facet.id));
+  const topicAnchorTagCount = paper.tags.filter((tag) => tag.startsWith("topic-anchor:")).length;
+  const focusTagCount = paper.tags.filter((tag) => tag.startsWith("focus:")).length;
+  const taskTagCount = paper.tags.filter((tag) => tag.startsWith("task:")).length;
+  const coreMatched = coreFacetIds.size === 0
+    || topicAnchorTagCount > 0
+    || [...coreFacetIds].some((facetId) => coveredFacetIds.has(facetId));
+  const substantiveMatched = substantiveFacetIds.size === 0
+    || focusTagCount > 0
+    || taskTagCount > 0
+    || [...substantiveFacetIds].some((facetId) => coveredFacetIds.has(facetId));
+
+  return coreMatched && substantiveMatched;
+}
+
 function selectPapersForFacetCoverage(input: {
   orderedCandidates: CanonicalPaper[];
   facets: ReviewFacet[];
@@ -3150,10 +3333,13 @@ function buildReviewWorkflow(canonicalPapers: CanonicalPaper[], facets: ReviewFa
   reviewedPapers: CanonicalPaper[];
   reviewWorkflow: ReviewWorkflowSummary;
   selectionQuality: ReviewSelectionQuality | null;
+  relevanceAssessments: LiteratureRelevanceAssessment[];
 } {
   const coverageByPaperId = new Map(
     canonicalPapers.map((paper) => [paper.id, assessPaperFacetCoverage(facets, paper)])
   );
+  const relevanceAssessments = buildLiteratureRelevanceAssessments(canonicalPapers, facets, coverageByPaperId);
+  const relevanceByPaperId = new Map(relevanceAssessments.map((assessment) => [assessment.paperId, assessment]));
   const ordered = sortPapersForReview(canonicalPapers, coverageByPaperId);
   const qualityCounts = {
     high: ordered.filter((paper) => sourceQualityAssessmentForPaper(paper).tier === "high").length,
@@ -3183,7 +3369,26 @@ function buildReviewWorkflow(canonicalPapers: CanonicalPaper[], facets: ReviewFa
     ))
     .map((paper) => paper.id);
   const includedPapers = ordered.filter((paper) => paper.screeningDecision === "include");
-  const qualityEligibleIncludedPapers = includedPapers.filter((paper) => sourceQualityAssessmentForPaper(paper).tier !== "low");
+  const synthesisEligiblePapers = ordered.filter((paper) => (
+    paper.screeningDecision !== "exclude"
+    && paper.screeningDecision !== "background"
+    && paperPassesSynthesisRelevanceGate(
+      paper,
+      facets,
+      coverageByPaperId.get(paper.id) ?? null,
+      relevanceByPaperId.get(paper.id) ?? null
+    )
+  ));
+  const synthesisEligiblePaperIds = new Set(synthesisEligiblePapers.map((paper) => paper.id));
+  const heldBackForRelevancePapers = ordered.filter((paper) => (
+    paper.screeningDecision !== "exclude"
+    && paper.screeningDecision !== "background"
+    && !synthesisEligiblePaperIds.has(paper.id)
+  ));
+  const qualityEligibleIncludedPapers = includedPapers.filter((paper) => (
+    sourceQualityAssessmentForPaper(paper).tier !== "low"
+    && synthesisEligiblePaperIds.has(paper.id)
+  ));
   const eligibleUncertainPapers = ordered.filter((paper) => {
     const quality = sourceQualityAssessmentForPaper(paper);
     return paper.screeningDecision === "uncertain"
@@ -3191,7 +3396,8 @@ function buildReviewWorkflow(canonicalPapers: CanonicalPaper[], facets: ReviewFa
       && quality.tier !== "low"
       && !quality.severeConcern
       && paper.accessMode !== "needs_credentials"
-      && paper.accessMode !== "fulltext_blocked";
+      && paper.accessMode !== "fulltext_blocked"
+      && synthesisEligiblePaperIds.has(paper.id);
   });
   const promotedUncertainPapers = qualityEligibleIncludedPapers.length >= 3
     ? []
@@ -3242,6 +3448,12 @@ function buildReviewWorkflow(canonicalPapers: CanonicalPaper[], facets: ReviewFa
     `Abstract screened ${abstractScreenedPaperIds.length} papers and full-text screened ${fulltextScreenedPaperIds.length}.`,
     `Included ${includedPaperIds.length} papers after screening, with ${blockedPaperIds.length} still blocked or credential-limited.`,
     `Source-quality tiers: ${qualityCounts.high} high, ${qualityCounts.medium} medium, ${qualityCounts.low} low.`,
+    heldBackForRelevancePapers.length > 0
+      ? `Held back ${heldBackForRelevancePapers.length} otherwise retained papers because the hybrid protocol relevance gate did not mark them in scope.`
+      : null,
+    relevanceAssessments.some((assessment) => assessment.status !== "in_scope")
+      ? `Hybrid relevance gate: ${relevanceAssessments.filter((assessment) => assessment.status === "in_scope").length} in scope, ${relevanceAssessments.filter((assessment) => assessment.status === "borderline").length} borderline, ${relevanceAssessments.filter((assessment) => assessment.status === "excluded").length} excluded.`
+      : null,
     promotedUncertainPapers.length > 0
       ? `Promoted ${promotedUncertainPapers.length} high/medium-quality uncertain papers into the reviewed set because fewer than 3 included papers were available.`
       : null,
@@ -3260,6 +3472,7 @@ function buildReviewWorkflow(canonicalPapers: CanonicalPaper[], facets: ReviewFa
   return {
     reviewedPapers,
     selectionQuality,
+    relevanceAssessments,
     reviewWorkflow: {
       titleScreenedPaperIds,
       abstractScreenedPaperIds,
@@ -3784,14 +3997,15 @@ async function buildCanonicalReviewState(
     }
   }
 
-  const { reviewedPapers, reviewWorkflow, selectionQuality } = buildReviewWorkflow(canonicalPapers, reviewFacets);
+  const { reviewedPapers, reviewWorkflow, selectionQuality, relevanceAssessments } = buildReviewWorkflow(canonicalPapers, reviewFacets);
 
   return {
     canonicalPapers,
     reviewedPapers,
     reviewWorkflow,
     selectionQuality,
-    mergeDiagnostics
+    mergeDiagnostics,
+    relevanceAssessments
   };
 }
 
@@ -3813,8 +4027,69 @@ function accessLimitationsFromAuth(authStatus: ProviderAuthSnapshot[]): string[]
   });
 }
 
-function shouldRunRecoveryPass(state: CanonicalReviewState, literatureReviewActive: boolean): boolean {
-  return literatureReviewActive && (state.canonicalPapers.length === 0 || state.reviewedPapers.length < 3);
+function selectionQualityNeedsRecovery(selectionQuality: ReviewSelectionQuality | null): boolean {
+  if (selectionQuality === null || selectionQuality.adequacy === "strong") {
+    return false;
+  }
+
+  return selectionQuality.missingRequiredFacets.length > 0
+    || selectionQuality.adequacy === "thin";
+}
+
+function canonicalReviewQualityScore(state: CanonicalReviewState): number {
+  const inScope = state.relevanceAssessments.filter((assessment) => assessment.status === "in_scope").length;
+  const borderline = state.relevanceAssessments.filter((assessment) => assessment.status === "borderline").length;
+  const excluded = state.relevanceAssessments.filter((assessment) => assessment.status === "excluded").length;
+  const missing = state.selectionQuality?.missingRequiredFacets.length ?? 0;
+
+  return inScope * 20
+    + state.reviewedPapers.length * 5
+    + state.reviewWorkflow.counts.included
+    - missing * 12
+    - borderline * 3
+    - excluded;
+}
+
+function canonicalReviewImproved(previous: CanonicalReviewState, next: CanonicalReviewState): boolean {
+  const previousInScopeIds = new Set(previous.relevanceAssessments
+    .filter((assessment) => assessment.status === "in_scope")
+    .map((assessment) => assessment.paperId));
+  const nextInScopeIds = next.relevanceAssessments
+    .filter((assessment) => assessment.status === "in_scope")
+    .map((assessment) => assessment.paperId);
+  const gainedInScopePaper = nextInScopeIds.some((paperId) => !previousInScopeIds.has(paperId));
+  const previousMissing = previous.selectionQuality?.missingRequiredFacets.length ?? 0;
+  const nextMissing = next.selectionQuality?.missingRequiredFacets.length ?? 0;
+
+  return gainedInScopePaper
+    || nextMissing < previousMissing
+    || canonicalReviewQualityScore(next) > canonicalReviewQualityScore(previous);
+}
+
+function shouldRunRecoveryPass(
+  state: CanonicalReviewState,
+  literatureReviewActive: boolean,
+  recoveryPasses: number
+): boolean {
+  return literatureReviewActive
+    && recoveryPasses < 2
+    && (
+      state.canonicalPapers.length === 0
+      || state.reviewedPapers.length < 3
+      || selectionQualityNeedsRecovery(state.selectionQuality)
+    );
+}
+
+function recoveryReason(state: CanonicalReviewState): string {
+  if (state.canonicalPapers.length === 0 || state.reviewedPapers.length < 3) {
+    return "Evidence remained thin after the first pass";
+  }
+
+  const missing = state.selectionQuality?.missingRequiredFacets.map((facet) => facet.label).slice(0, 4) ?? [];
+
+  return missing.length > 0
+    ? `Review facet coverage remained incomplete (${missing.join(", ")})`
+    : "Review selection quality remained below the confidence target";
 }
 
 export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
@@ -3953,10 +4228,12 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
     }
 
     let canonicalReview = await buildCanonicalReviewState(scholarlySources, routing, request, reviewFacets);
+    let nonImprovingRecoveryPasses = 0;
 
-    if (shouldRunRecoveryPass(canonicalReview, literatureReviewActive)) {
+    while (shouldRunRecoveryPass(canonicalReview, literatureReviewActive, recoveryPasses)) {
+      const previousReview = canonicalReview;
       const initialQueryKeys = new Set(queries.map(normalizeQueryKey));
-      const recoveryCandidates = buildRecoveryQueryCandidates(request, rejectedSamples);
+      const recoveryCandidates = buildRecoveryQueryCandidates(request, rejectedSamples, canonicalReview.selectionQuality);
       queryPlan = buildQueryPlan(request, domain, {
         ...budget,
         maxQueries: Math.min(12, budget.maxQueries)
@@ -3967,10 +4244,10 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
         .map((candidate) => candidate.query);
 
       if (recoveryQueries.length > 0) {
-        recoveryPasses = 1;
+        recoveryPasses += 1;
         queries = uniqueStrings([...queries, ...recoveryQueries]);
         routing.plannedQueries = queries;
-        notes.push(`Evidence remained thin after the first pass; running one recovery pass with ${recoveryQueries.length} additional queries.`);
+        notes.push(`${recoveryReason(canonicalReview)}; running recovery pass ${recoveryPasses} with ${recoveryQueries.length} additional queries.`);
         await runScholarlyDiscoveryPass(recoveryQueries, {
           ...budget,
           maxQueries: recoveryQueries.length,
@@ -3980,10 +4257,24 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
           targetAcceptedSources: Math.max(24, Math.floor(budget.targetAcceptedSources / 2))
         }, "recovery");
         canonicalReview = await buildCanonicalReviewState(scholarlySources, routing, request, reviewFacets);
+        if (canonicalReviewImproved(previousReview, canonicalReview)) {
+          nonImprovingRecoveryPasses = 0;
+          notes.push("Recovery improved the in-scope evidence set or reduced missing evidence targets.");
+        } else {
+          nonImprovingRecoveryPasses += 1;
+          notes.push("Recovery did not improve the in-scope evidence set; the next recovery pass must pivot strategy or stop.");
+          if (nonImprovingRecoveryPasses >= 2) {
+            notes.push("Recovery stopped because repeated passes did not improve protocol relevance or coverage.");
+            break;
+          }
+        }
+      } else {
+        notes.push(`${recoveryReason(canonicalReview)}; no unused recovery queries remained, so retrieval stopped.`);
+        break;
       }
     }
 
-    const { canonicalPapers, reviewedPapers, reviewWorkflow, selectionQuality } = canonicalReview;
+    const { canonicalPapers, reviewedPapers, reviewWorkflow, selectionQuality, relevanceAssessments } = canonicalReview;
     mergeDiagnostics.push(...canonicalReview.mergeDiagnostics);
     notes.push(`Canonical merge produced ${canonicalPapers.length} scholarly papers from ${scholarlySources.length} discovery hits.`);
     notes.push(...reviewWorkflow.notes);
@@ -4000,7 +4291,7 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
       },
       recoveryPasses,
       accessLimitations: accessLimitationsFromAuth(authStatus),
-      suggestedNextQueries: buildRecoveryQueryCandidates(request, rejectedSamples)
+      suggestedNextQueries: buildRecoveryQueryCandidates(request, rejectedSamples, selectionQuality)
         .map((candidate) => candidate.query)
         .filter((query) => !queries.map(normalizeQueryKey).includes(normalizeQueryKey(query)))
         .slice(0, 8)
@@ -4046,10 +4337,12 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
         : {
           active: true,
           profile: literatureProfile,
-          selectedAssessments
+          selectedAssessments,
+          relevanceAssessments
         },
       retrievalDiagnostics,
-      selectionQuality
+      selectionQuality,
+      relevanceAssessments
     };
   }
 }

@@ -33,9 +33,11 @@ import {
   authStatesForSelectedProviders,
   formatSelectedLiteratureProviders,
   ProjectConfigStore,
+  resolveRuntimeLlmConfig,
   selectedGeneralWebProviders,
   selectedProviderIdsForCategory,
-  selectedScholarlySourceProviders
+  selectedScholarlySourceProviders,
+  type RuntimeLlmConfig
 } from "./project-config-store.js";
 import type {
   ResearchAgenda,
@@ -47,7 +49,11 @@ import type {
   ResearchDirectionCandidate,
   WorkPackage
 } from "./research-backend.js";
-import { createDefaultResearchBackend } from "./research-backend.js";
+import {
+  createDefaultResearchBackend,
+  ResearchBackendError,
+  type ResearchBackendOperation
+} from "./research-backend.js";
 import {
   buildEvidenceMatrix,
   briefFingerprint,
@@ -55,6 +61,12 @@ import {
   type EvidenceMatrixInsight,
   type PaperExtraction
 } from "./research-evidence.js";
+import {
+  buildManuscriptBundle,
+  buildReviewProtocol,
+  reviewProtocolMarkdown,
+  type ManuscriptBundle
+} from "./research-manuscript.js";
 import {
   collectResearchLocalFileHints,
   createDefaultResearchSourceGatherer,
@@ -79,6 +91,10 @@ import {
   type VerificationReport,
   type VerifiedClaim
 } from "./verifier.js";
+import {
+  isRetrievalQualityConstraintPhrase,
+  isSubstantiveReviewFacet
+} from "./literature-review.js";
 
 type WorkerOptions = {
   projectRoot: string;
@@ -96,9 +112,40 @@ type PaperExtractionsArtifact = {
   schemaVersion: number;
   runId: string;
   briefFingerprint: string;
+  status?: "pending" | "in_progress" | "completed" | "failed";
   paperCount: number;
   extractionCount: number;
+  completedPaperIds?: string[];
+  failedPaperIds?: string[];
+  batchAttempts?: ExtractionBatchAttempt[];
   extractions: PaperExtraction[];
+};
+
+type ArtifactStatus = {
+  schemaVersion: number;
+  runId: string;
+  artifactKind: string;
+  status: "pending" | "in_progress" | "failed";
+  stage: string;
+  createdAt: string;
+  updatedAt: string;
+  counts: Record<string, number>;
+  error: {
+    message: string;
+    kind: string;
+    operation: string | null;
+  } | null;
+};
+
+type ExtractionBatchAttempt = {
+  attempt: number;
+  paperIds: string[];
+  batchSize: number;
+  status: "succeeded" | "failed";
+  compact: boolean;
+  errorKind: string | null;
+  errorMessage: string | null;
+  timeoutMs: number;
 };
 
 type ClaimsArtifact = {
@@ -167,14 +214,24 @@ async function writeJsonArtifact(filePath: string, value: JsonValue | Record<str
 function paperExtractionsArtifact(
   run: RunRecord,
   paperCount: number,
-  extractions: PaperExtraction[]
+  extractions: PaperExtraction[],
+  options: {
+    status?: "pending" | "in_progress" | "completed" | "failed";
+    completedPaperIds?: string[];
+    failedPaperIds?: string[];
+    batchAttempts?: ExtractionBatchAttempt[];
+  } = {}
 ): PaperExtractionsArtifact {
   return {
     schemaVersion: 1,
     runId: run.id,
     briefFingerprint: briefFingerprint(run.brief),
+    status: options.status ?? (extractions.length >= paperCount ? "completed" : "in_progress"),
     paperCount,
     extractionCount: extractions.length,
+    completedPaperIds: options.completedPaperIds ?? extractions.map((extraction) => extraction.paperId),
+    failedPaperIds: options.failedPaperIds ?? [],
+    batchAttempts: options.batchAttempts ?? [],
     extractions
   };
 }
@@ -189,6 +246,241 @@ function claimsArtifact(run: RunRecord, claims: ResearchClaim[]): ClaimsArtifact
   };
 }
 
+function uniqueStrings(values: Array<string | null | undefined>): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+
+  for (const value of values) {
+    const normalized = typeof value === "string"
+      ? value.replace(/\s+/g, " ").trim()
+      : "";
+
+    if (normalized.length === 0) {
+      continue;
+    }
+
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    result.push(normalized);
+  }
+
+  return result;
+}
+
+const recoveryQueryStopWords = new Set([
+  "about",
+  "after",
+  "against",
+  "also",
+  "and",
+  "are",
+  "because",
+  "before",
+  "between",
+  "comprehensive",
+  "comprehensiveness",
+  "could",
+  "does",
+  "evidence",
+  "expected",
+  "from",
+  "have",
+  "high-quality",
+  "into",
+  "including",
+  "meet",
+  "meets",
+  "more",
+  "needs",
+  "paper",
+  "papers",
+  "review",
+  "reviewed",
+  "selected",
+  "should",
+  "source",
+  "sources",
+  "standard",
+  "standards",
+  "that",
+  "the",
+  "this",
+  "typically",
+  "with"
+]);
+
+function normalizedRecoveryQueryKey(query: string): string {
+  return query.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function compactRecoveryQuery(text: string | null | undefined, limit = 12): string | null {
+  if (typeof text !== "string") {
+    return null;
+  }
+
+  const tokens = text.toLowerCase().match(/[a-z0-9][a-z0-9-]*/g) ?? [];
+  const filtered = tokens
+    .filter((token) => token.length > 1)
+    .filter((token) => !recoveryQueryStopWords.has(token));
+
+  const compact = filtered.length > 0 ? filtered.slice(0, limit).join(" ") : null;
+  return compact !== null && !isRetrievalQualityConstraintPhrase(compact) ? compact : null;
+}
+
+function recoveryQueryAnchor(run: RunRecord, plan: ResearchPlan): string {
+  return compactRecoveryQuery(run.brief.topic, 6)
+    ?? compactRecoveryQuery(run.brief.researchQuestion, 6)
+    ?? compactRecoveryQuery(plan.objective, 6)
+    ?? "literature";
+}
+
+function facetRecoveryQueries(
+  run: RunRecord,
+  plan: ResearchPlan,
+  gathered: ResearchSourceGatherResult
+): { queries: string[]; focusTerms: string[] } {
+  const anchor = recoveryQueryAnchor(run, plan);
+  const missingFacets = [
+    ...(gathered.selectionQuality?.missingRequiredFacets ?? []),
+    ...(gathered.selectionQuality?.backgroundOnlyFacets ?? [])
+  ].filter((facet) => isSubstantiveReviewFacet(facet));
+  const focusTerms = uniqueStrings(missingFacets.flatMap((facet) => [
+    facet.label,
+    ...facet.terms
+  ])).filter((term) => !isRetrievalQualityConstraintPhrase(term));
+  const queries = focusTerms.flatMap((term) => {
+    const compact = compactRecoveryQuery(term, 6);
+    return compact === null ? [] : [`${anchor} ${compact}`];
+  });
+
+  return {
+    queries,
+    focusTerms
+  };
+}
+
+function buildEvidenceRecoveryQueries(input: {
+  run: RunRecord;
+  plan: ResearchPlan;
+  gathered: ResearchSourceGatherResult;
+  synthesis?: ResearchSynthesis | null;
+  agenda?: ResearchAgenda | null;
+  verification?: VerificationReport | null;
+  extraQuestions?: string[];
+}): { queries: string[]; focusTerms: string[] } {
+  const anchor = recoveryQueryAnchor(input.run, input.plan);
+  const facetQueries = facetRecoveryQueries(input.run, input.plan, input.gathered);
+  const diagnosticQueries = input.gathered.retrievalDiagnostics?.suggestedNextQueries ?? [];
+  const questionQueries = [
+    ...(input.synthesis?.nextQuestions ?? []),
+    ...(input.agenda?.holdReasons ?? []),
+    ...(input.verification?.unknowns ?? []),
+    ...(input.verification?.unverifiedClaims.map((claim) => claim.reason) ?? []),
+    ...(input.extraQuestions ?? [])
+  ].flatMap((question) => {
+    const compact = compactRecoveryQuery(question, 8);
+    return compact === null ? [] : [`${anchor} ${compact}`];
+  });
+  const thinSetQueries = input.gathered.reviewedPapers.length < 8
+    || input.gathered.selectionQuality?.adequacy !== "strong"
+    ? [
+      `${anchor} systematic review`,
+      `${anchor} survey`,
+      `${anchor} empirical evaluation`,
+      `${anchor} limitations`
+    ]
+    : [];
+
+  return {
+    queries: uniqueStrings([
+      ...facetQueries.queries,
+      ...diagnosticQueries,
+      ...questionQueries,
+      ...thinSetQueries
+    ]).slice(0, 16),
+    focusTerms: facetQueries.focusTerms
+  };
+}
+
+function evidenceRecoveryPlanUpdate(
+  plan: ResearchPlan,
+  queries: string[],
+  focusTerms: string[]
+): { plan: ResearchPlan; recoveryQueries: string[] } | null {
+  const existingQueryKeys = new Set(plan.searchQueries.map(normalizedRecoveryQueryKey));
+  const recoveryQueries = uniqueStrings(queries)
+    .filter((query) => !existingQueryKeys.has(normalizedRecoveryQueryKey(query)))
+    .slice(0, 12);
+
+  if (recoveryQueries.length === 0) {
+    return null;
+  }
+
+  const rationaleSuffix = "Autonomous evidence recovery may expand retrieval when manuscript checks require more evidence.";
+
+  return {
+    recoveryQueries,
+    plan: {
+      ...plan,
+      rationale: plan.rationale.includes(rationaleSuffix)
+        ? plan.rationale
+        : `${plan.rationale} ${rationaleSuffix}`,
+      searchQueries: uniqueStrings([...plan.searchQueries, ...recoveryQueries]).slice(0, 28),
+      localFocus: uniqueStrings([...plan.localFocus, ...focusTerms]).slice(0, 16)
+    }
+  };
+}
+
+function evidenceRecoveryBudgetExhausted(startedAtMs: number, runtimeConfig: RuntimeLlmConfig): boolean {
+  return Date.now() - startedAtMs >= runtimeConfig.totalRecoveryBudgetMs;
+}
+
+type EvidenceQualitySnapshot = {
+  inScopeIds: Set<string>;
+  inScopeCount: number;
+  borderlineCount: number;
+  excludedCount: number;
+  missingTargetCount: number;
+  selectedCount: number;
+  score: number;
+};
+
+function evidenceQualitySnapshot(gathered: ResearchSourceGatherResult): EvidenceQualitySnapshot {
+  const relevanceAssessments = gathered.relevanceAssessments ?? [];
+  const inScopeIds = new Set(relevanceAssessments
+    .filter((assessment) => assessment.status === "in_scope")
+    .map((assessment) => assessment.paperId));
+  const inScopeCount = inScopeIds.size;
+  const borderlineCount = relevanceAssessments.filter((assessment) => assessment.status === "borderline").length;
+  const excludedCount = relevanceAssessments.filter((assessment) => assessment.status === "excluded").length;
+  const missingTargetCount = gathered.selectionQuality?.missingRequiredFacets.length ?? 0;
+  const selectedCount = gathered.reviewedPapers.length;
+
+  return {
+    inScopeIds,
+    inScopeCount,
+    borderlineCount,
+    excludedCount,
+    missingTargetCount,
+    selectedCount,
+    score: inScopeCount * 20 + selectedCount * 5 - missingTargetCount * 12 - borderlineCount * 3 - excludedCount
+  };
+}
+
+function evidenceQualityImproved(previous: EvidenceQualitySnapshot | null, next: EvidenceQualitySnapshot): boolean {
+  if (previous === null) {
+    return true;
+  }
+
+  return [...next.inScopeIds].some((paperId) => !previous.inScopeIds.has(paperId))
+    || next.missingTargetCount < previous.missingTargetCount
+    || next.score > previous.score;
+}
+
 async function writeResearchDirection(
   run: RunRecord,
   agenda: ResearchAgenda,
@@ -201,33 +493,55 @@ async function writeResearchDirection(
   );
 }
 
+function pendingArtifactStatus(run: RunRecord, artifactKind: string, timestamp: string): ArtifactStatus {
+  return {
+    schemaVersion: 1,
+    runId: run.id,
+    artifactKind,
+    status: "pending",
+    stage: run.stage,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    counts: {},
+    error: null
+  };
+}
+
 async function writeRunArtifacts(run: RunRecord): Promise<void> {
   await mkdir(run.artifacts.runDirectory, { recursive: true });
+  const createdAt = run.startedAt ?? run.createdAt;
   await writeJsonArtifact(run.artifacts.briefPath, run.brief);
   await writeFile(run.artifacts.tracePath, "", "utf8");
   await writeFile(run.artifacts.eventsPath, "", "utf8");
   await writeFile(run.artifacts.stdoutPath, "", "utf8");
   await writeFile(run.artifacts.stderrPath, "", "utf8");
-  await writeFile(run.artifacts.planPath, "", "utf8");
-  await writeFile(run.artifacts.sourcesPath, "", "utf8");
-  await writeFile(run.artifacts.literaturePath, "", "utf8");
-  await writeFile(run.artifacts.paperExtractionsPath, "", "utf8");
-  await writeFile(run.artifacts.evidenceMatrixPath, "", "utf8");
-  await writeFile(run.artifacts.synthesisPath, "", "utf8");
-  await writeFile(run.artifacts.claimsPath, "", "utf8");
-  await writeFile(run.artifacts.verificationPath, "", "utf8");
-  await writeFile(run.artifacts.nextQuestionsPath, "", "utf8");
-  await writeFile(run.artifacts.agendaPath, "", "utf8");
-  await writeFile(run.artifacts.agendaMarkdownPath, "", "utf8");
-  await writeFile(run.artifacts.workPackagePath, "", "utf8");
+  await writeJsonArtifact(run.artifacts.planPath, pendingArtifactStatus(run, "plan", createdAt));
+  await writeJsonArtifact(run.artifacts.sourcesPath, pendingArtifactStatus(run, "sources", createdAt));
+  await writeJsonArtifact(run.artifacts.literaturePath, pendingArtifactStatus(run, "literature-review", createdAt));
+  await writeJsonArtifact(run.artifacts.reviewProtocolPath, pendingArtifactStatus(run, "review-protocol", createdAt));
+  await writeFile(run.artifacts.reviewProtocolMarkdownPath, "# Review Protocol\n\nStatus: pending.\n", "utf8");
+  await writeJsonArtifact(run.artifacts.paperExtractionsPath, pendingArtifactStatus(run, "paper-extractions", createdAt));
+  await writeJsonArtifact(run.artifacts.evidenceMatrixPath, pendingArtifactStatus(run, "evidence-matrix", createdAt));
+  await writeFile(run.artifacts.synthesisPath, "# Research Synthesis\n\nStatus: pending.\n", "utf8");
+  await writeJsonArtifact(run.artifacts.claimsPath, pendingArtifactStatus(run, "claims", createdAt));
+  await writeJsonArtifact(run.artifacts.verificationPath, pendingArtifactStatus(run, "verification", createdAt));
+  await writeJsonArtifact(run.artifacts.paperOutlinePath, pendingArtifactStatus(run, "paper-outline", createdAt));
+  await writeFile(run.artifacts.paperPath, "# Review Paper\n\nStatus: pending.\n", "utf8");
+  await writeJsonArtifact(run.artifacts.paperJsonPath, pendingArtifactStatus(run, "paper", createdAt));
+  await writeJsonArtifact(run.artifacts.referencesPath, pendingArtifactStatus(run, "references", createdAt));
+  await writeJsonArtifact(run.artifacts.manuscriptChecksPath, pendingArtifactStatus(run, "manuscript-checks", createdAt));
+  await writeJsonArtifact(run.artifacts.nextQuestionsPath, pendingArtifactStatus(run, "next-questions", createdAt));
+  await writeJsonArtifact(run.artifacts.agendaPath, pendingArtifactStatus(run, "agenda", createdAt));
+  await writeFile(run.artifacts.agendaMarkdownPath, "# Research Agenda\n\nStatus: pending.\n", "utf8");
+  await writeJsonArtifact(run.artifacts.workPackagePath, pendingArtifactStatus(run, "work-package", createdAt));
   if (run.stage === "work_package") {
-    await writeFile(run.artifacts.methodPlanPath, "", "utf8");
-    await writeFile(run.artifacts.executionChecklistPath, "", "utf8");
-    await writeFile(run.artifacts.findingsPath, "", "utf8");
-    await writeFile(run.artifacts.decisionPath, "", "utf8");
+    await writeJsonArtifact(run.artifacts.methodPlanPath, pendingArtifactStatus(run, "method-plan", createdAt));
+    await writeJsonArtifact(run.artifacts.executionChecklistPath, pendingArtifactStatus(run, "execution-checklist", createdAt));
+    await writeJsonArtifact(run.artifacts.findingsPath, pendingArtifactStatus(run, "findings", createdAt));
+    await writeJsonArtifact(run.artifacts.decisionPath, pendingArtifactStatus(run, "decision", createdAt));
   }
   await writeFile(run.artifacts.summaryPath, "", "utf8");
-  await writeFile(run.artifacts.memoryPath, "", "utf8");
+  await writeJsonArtifact(run.artifacts.memoryPath, pendingArtifactStatus(run, "research-journal", createdAt));
 }
 
 function relativeArtifactPath(projectRoot: string, targetPath: string): string {
@@ -1082,6 +1396,18 @@ function buildArtifactRecords(
       linkIds: sourceIds
     },
     {
+      path: run.artifacts.reviewProtocolPath,
+      title: "Review protocol artifact",
+      text: `Saved the review protocol for ${run.id}.`,
+      linkIds: sourceIds.length > 0 ? sourceIds : [summaryId]
+    },
+    {
+      path: run.artifacts.reviewProtocolMarkdownPath,
+      title: "Review protocol summary artifact",
+      text: `Saved the human-readable review protocol for ${run.id}.`,
+      linkIds: sourceIds.length > 0 ? sourceIds : [summaryId]
+    },
+    {
       path: run.artifacts.paperExtractionsPath,
       title: "Paper extractions artifact",
       text: `Saved paper-by-paper extraction records for ${run.id}.`,
@@ -1114,6 +1440,40 @@ function buildArtifactRecords(
       path: run.artifacts.verificationPath,
       title: "Verification artifact",
       text: `Saved verification report for ${run.id}.`,
+      linkIds: claimIds.length > 0 ? claimIds : [summaryId]
+    },
+    {
+      path: run.artifacts.paperOutlinePath,
+      title: "Paper outline artifact",
+      text: `Saved the structured review-paper outline for ${run.id}.`,
+      linkIds: claimIds.length > 0 ? claimIds : [summaryId]
+    },
+    {
+      path: run.artifacts.paperPath,
+      title: "Review paper draft artifact",
+      text: `Saved the review-paper draft for ${run.id}.`,
+      linkIds: [
+        summaryId,
+        ...findingIds,
+        ...claimIds
+      ]
+    },
+    {
+      path: run.artifacts.paperJsonPath,
+      title: "Structured review paper artifact",
+      text: `Saved the structured paper representation for ${run.id}.`,
+      linkIds: claimIds.length > 0 ? claimIds : [summaryId]
+    },
+    {
+      path: run.artifacts.referencesPath,
+      title: "References artifact",
+      text: `Saved canonical bibliography records for ${run.id}.`,
+      linkIds: sourceIds
+    },
+    {
+      path: run.artifacts.manuscriptChecksPath,
+      title: "Manuscript checks artifact",
+      text: `Saved manuscript readiness checks for ${run.id}.`,
       linkIds: claimIds.length > 0 ? claimIds : [summaryId]
     },
     {
@@ -1209,6 +1569,228 @@ function completePaperExtractions(
   return reviewedPapers
     .map((paper) => byPaperId.get(paper.id))
     .filter((extraction): extraction is PaperExtraction => extraction !== undefined);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function recoveryFailureKind(error: unknown): string {
+  if (error instanceof ResearchBackendError) {
+    return error.kind;
+  }
+
+  const message = errorMessage(error);
+
+  if (/timeout|aborted/i.test(message)) {
+    return "timeout";
+  }
+
+  if (/json|parse/i.test(message)) {
+    return "malformed_json";
+  }
+
+  if (/empty/i.test(message)) {
+    return "empty_result";
+  }
+
+  return "unexpected";
+}
+
+function isRecoverableExtractionError(error: unknown): boolean {
+  return ["timeout", "malformed_json", "empty_result"].includes(recoveryFailureKind(error));
+}
+
+class ResearchStageBlockedError extends Error {
+  constructor(
+    message: string,
+    public readonly operation: ResearchBackendOperation,
+    public readonly attempts: ExtractionBatchAttempt[]
+  ) {
+    super(message);
+    this.name = "ResearchStageBlockedError";
+  }
+}
+
+async function writeExtractionCheckpoint(
+  run: RunRecord,
+  reviewedPapers: CanonicalPaper[],
+  extractions: PaperExtraction[],
+  attempts: ExtractionBatchAttempt[],
+  status: "in_progress" | "completed" | "failed",
+  failedPaperIds: string[] = []
+): Promise<void> {
+  await writeJsonArtifact(run.artifacts.paperExtractionsPath, paperExtractionsArtifact(
+    run,
+    reviewedPapers.length,
+    extractions,
+    {
+      status,
+      completedPaperIds: [...new Set(extractions.map((extraction) => extraction.paperId))],
+      failedPaperIds,
+      batchAttempts: attempts
+    }
+  ));
+}
+
+async function extractReviewedPapersWithRecovery(options: {
+  run: RunRecord;
+  now: () => string;
+  researchBackend: ResearchBackend;
+  runtimeConfig: RuntimeLlmConfig;
+  plan: ResearchPlan;
+  papers: CanonicalPaper[];
+  literatureContext: Parameters<ResearchBackend["extractReviewedPapers"]>[0]["literatureContext"];
+}): Promise<{
+  extractions: PaperExtraction[];
+  attempts: ExtractionBatchAttempt[];
+}> {
+  const {
+    run,
+    now,
+    researchBackend,
+    runtimeConfig,
+    plan,
+    papers,
+    literatureContext
+  } = options;
+  const attempts: ExtractionBatchAttempt[] = [];
+  const extractions: PaperExtraction[] = [];
+  let cursor = 0;
+  let batchSize = Math.max(
+    runtimeConfig.extractionMinBatchSize,
+    Math.min(runtimeConfig.extractionInitialBatchSize, Math.max(1, papers.length))
+  );
+  const minBatchSize = Math.max(1, runtimeConfig.extractionMinBatchSize);
+  const startedAt = Date.now();
+
+  await writeExtractionCheckpoint(run, papers, extractions, attempts, "in_progress");
+
+  while (cursor < papers.length) {
+    if (attempts.filter((attempt) => attempt.status === "failed").length >= runtimeConfig.extractionRetryBudget) {
+      const failedPaperIds = papers.slice(cursor).map((paper) => paper.id);
+      await writeExtractionCheckpoint(run, papers, extractions, attempts, "failed", failedPaperIds);
+      throw new ResearchStageBlockedError(
+        `Extraction recovery budget exhausted before all selected papers were extracted (${cursor}/${papers.length} batches complete).`,
+        "extraction",
+        attempts
+      );
+    }
+
+    if (Date.now() - startedAt > runtimeConfig.totalRecoveryBudgetMs) {
+      const failedPaperIds = papers.slice(cursor).map((paper) => paper.id);
+      await writeExtractionCheckpoint(run, papers, extractions, attempts, "failed", failedPaperIds);
+      throw new ResearchStageBlockedError(
+        `Extraction recovery time budget exhausted before all selected papers were extracted (${cursor}/${papers.length} papers complete).`,
+        "extraction",
+        attempts
+      );
+    }
+
+    const batch = papers.slice(cursor, Math.min(papers.length, cursor + batchSize));
+    const compact = batchSize <= minBatchSize && attempts.some((attempt) => (
+      attempt.status === "failed"
+      && attempt.paperIds.join("\0") === batch.map((paper) => paper.id).join("\0")
+    ));
+    const attemptBase = {
+      attempt: attempts.length + 1,
+      paperIds: batch.map((paper) => paper.id),
+      batchSize,
+      compact,
+      timeoutMs: runtimeConfig.extractionTimeoutMs
+    };
+
+    await appendEvent(
+      run,
+      now,
+      "next",
+      `Extracting reviewed paper batch ${cursor + 1}-${cursor + batch.length} of ${papers.length} (${batch.length} papers${compact ? ", compact prompt" : ""}).`
+    );
+
+    try {
+      const batchExtractions = await researchBackend.extractReviewedPapers({
+        projectRoot: run.projectRoot,
+        runId: run.id,
+        brief: run.brief,
+        plan,
+        papers: batch,
+        literatureContext,
+        compact
+      }, {
+        operation: "extraction",
+        timeoutMs: runtimeConfig.extractionTimeoutMs
+      });
+
+      if (batchExtractions.length === 0 && batch.length > 0) {
+        throw new Error("empty extraction result");
+      }
+
+      attempts.push({
+        ...attemptBase,
+        status: "succeeded",
+        errorKind: null,
+        errorMessage: null
+      });
+      extractions.push(...batchExtractions);
+      cursor += batch.length;
+      await writeExtractionCheckpoint(run, papers, extractions, attempts, "in_progress");
+      await appendStdout(run, `Extraction batch succeeded: ${cursor}/${papers.length} selected papers processed.`);
+    } catch (error) {
+      const kind = recoveryFailureKind(error);
+      const message = errorMessage(error);
+      attempts.push({
+        ...attemptBase,
+        status: "failed",
+        errorKind: kind,
+        errorMessage: message
+      });
+      await writeExtractionCheckpoint(run, papers, extractions, attempts, "in_progress", batch.map((paper) => paper.id));
+      await appendEvent(
+        run,
+        now,
+        "stderr",
+        `Extraction batch failed (${kind}): ${message}`
+      );
+
+      if (!isRecoverableExtractionError(error)) {
+        await writeExtractionCheckpoint(run, papers, extractions, attempts, "failed", batch.map((paper) => paper.id));
+        throw new ResearchStageBlockedError(
+          `Extraction failed with an unrecoverable ${kind}: ${message}`,
+          "extraction",
+          attempts
+        );
+      }
+
+      if (batchSize > minBatchSize) {
+        batchSize = Math.max(minBatchSize, Math.ceil(batchSize / 2));
+        await appendEvent(
+          run,
+          now,
+          "next",
+          `Recovering extraction by shrinking the next batch size to ${batchSize}.`
+        );
+        continue;
+      }
+
+      if (!compact) {
+        await appendEvent(run, now, "next", "Recovering extraction with a compact single-paper prompt.");
+        continue;
+      }
+
+      await writeExtractionCheckpoint(run, papers, extractions, attempts, "failed", batch.map((paper) => paper.id));
+      throw new ResearchStageBlockedError(
+        `Extraction could not recover for selected paper ${batch[0]?.id ?? "<unknown>"}: ${message}`,
+        "extraction",
+        attempts
+      );
+    }
+  }
+
+  await writeExtractionCheckpoint(run, papers, extractions, attempts, "completed");
+  return {
+    extractions,
+    attempts
+  };
 }
 
 function buildMemoryInputs(
@@ -1666,6 +2248,7 @@ async function writeLiteratureSnapshot(
     reviewedPapers: canonicalizePapers(gathered.reviewedPapers),
     reviewWorkflow: remapReviewWorkflow(gathered.reviewWorkflow, canonicalIdByAnyId),
     selectionQuality: gathered.selectionQuality ?? null,
+    relevanceAssessments: gathered.relevanceAssessments ?? [],
     mergeDiagnostics: gathered.mergeDiagnostics,
     authStatus: gathered.authStatus,
     retrievalDiagnostics: gathered.retrievalDiagnostics ?? null,
@@ -1677,6 +2260,19 @@ async function writeLiteratureSnapshot(
       notebooks: result.state.notebookCount
     }
   });
+}
+
+async function writeManuscriptArtifacts(
+  run: RunRecord,
+  bundle: ManuscriptBundle
+): Promise<void> {
+  await writeJsonArtifact(run.artifacts.reviewProtocolPath, bundle.protocol);
+  await writeFile(run.artifacts.reviewProtocolMarkdownPath, `${bundle.protocolMarkdown}\n`, "utf8");
+  await writeJsonArtifact(run.artifacts.paperOutlinePath, bundle.outline);
+  await writeFile(run.artifacts.paperPath, `${bundle.paperMarkdown}\n`, "utf8");
+  await writeJsonArtifact(run.artifacts.paperJsonPath, bundle.paper);
+  await writeJsonArtifact(run.artifacts.referencesPath, bundle.references);
+  await writeJsonArtifact(run.artifacts.manuscriptChecksPath, bundle.checks);
 }
 
 async function writeMemorySnapshot(
@@ -1792,8 +2388,19 @@ function selectionQualityHoldReasons(gathered: ResearchSourceGatherResult): stri
     return [];
   }
 
-  const missing = selectionQuality.missingRequiredFacets.map((facet) => facet.label).slice(0, 5);
-  const backgroundOnly = selectionQuality.backgroundOnlyFacets.map((facet) => facet.label).slice(0, 3);
+  const missing = selectionQuality.missingRequiredFacets
+    .filter((facet) => !isRetrievalQualityConstraintPhrase(facet.label))
+    .map((facet) => facet.label)
+    .slice(0, 5);
+  const backgroundOnly = selectionQuality.backgroundOnlyFacets
+    .filter((facet) => !isRetrievalQualityConstraintPhrase(facet.label))
+    .map((facet) => facet.label)
+    .slice(0, 3);
+
+  if (missing.length === 0 && backgroundOnly.length === 0 && selectionQuality.adequacy !== "thin") {
+    return [];
+  }
+
   const reasons = [
     missing.length > 0
       ? `The reviewed set does not cover required success-criterion facets: ${missing.join(", ")}.`
@@ -2055,6 +2662,58 @@ async function launchDerivedWorkPackageRun(
   return childRun;
 }
 
+function failedArtifactStatus(
+  run: RunRecord,
+  artifactKind: string,
+  timestamp: string,
+  error: unknown
+): ArtifactStatus {
+  const backendError = error instanceof ResearchBackendError ? error : null;
+  return {
+    schemaVersion: 1,
+    runId: run.id,
+    artifactKind,
+    status: "failed",
+    stage: run.stage,
+    createdAt: run.startedAt ?? run.createdAt,
+    updatedAt: timestamp,
+    counts: {},
+    error: {
+      message: errorMessage(error),
+      kind: error instanceof ResearchStageBlockedError
+        ? "stage_blocked"
+        : backendError?.kind ?? recoveryFailureKind(error),
+      operation: error instanceof ResearchStageBlockedError
+        ? error.operation
+        : backendError?.operation ?? null
+    }
+  };
+}
+
+async function writeFailureDiagnostics(
+  run: RunRecord,
+  timestamp: string,
+  error: unknown
+): Promise<void> {
+  const paperStatus = failedArtifactStatus(run, "paper", timestamp, error);
+  const checkStatus = failedArtifactStatus(run, "manuscript-checks", timestamp, error);
+
+  await writeJsonArtifact(run.artifacts.paperJsonPath, paperStatus);
+  await writeJsonArtifact(run.artifacts.manuscriptChecksPath, checkStatus);
+  await writeFile(
+    run.artifacts.paperPath,
+    [
+      "# Review Paper",
+      "",
+      "No review-paper draft was produced.",
+      "",
+      `Run failed during ${run.stage}.`,
+      `Reason: ${errorMessage(error)}`
+    ].join("\n"),
+    "utf8"
+  );
+}
+
 export async function runDetachedJobWorker(options: WorkerOptions): Promise<number> {
   const now = options.now ?? (() => new Date().toISOString());
   const store = new RunStore(options.projectRoot, options.version, now);
@@ -2064,6 +2723,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
   const sourceGatherer = options.sourceGatherer ?? createDefaultResearchSourceGatherer();
   const projectConfigStore = new ProjectConfigStore(options.projectRoot, now);
   const projectConfig = await projectConfigStore.load();
+  const runtimeLlmConfig = resolveRuntimeLlmConfig(projectConfig);
   const credentialStore = new CredentialStore(options.projectRoot, now);
   const credentials = await credentialStore.load();
   applyCredentialsToEnvironment(credentials);
@@ -2166,20 +2826,50 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
 
     const localFiles = await collectResearchLocalFileHints(run.projectRoot, run.brief);
 
-    const plan = await researchBackend.planResearch({
+    let plan = await researchBackend.planResearch({
       projectRoot: run.projectRoot,
       brief: run.brief,
       localFiles,
       memoryContext,
       literatureContext
+    }, {
+      operation: "planning",
+      timeoutMs: runtimeLlmConfig.planningTimeoutMs
     });
 
     await writeJsonArtifact(run.artifacts.planPath, plan);
+    const initialProtocol = buildReviewProtocol({
+      run,
+      plan,
+      scholarlyDiscoveryProviders,
+      publisherFullTextProviders,
+      oaRetrievalHelperProviders,
+      generalWebProviders,
+      localContextEnabled: localEnabled
+    });
+    await writeJsonArtifact(run.artifacts.reviewProtocolPath, initialProtocol);
+    await writeFile(run.artifacts.reviewProtocolMarkdownPath, `${reviewProtocolMarkdown(initialProtocol)}\n`, "utf8");
     await appendTrace(run, now, `Selected research mode: ${plan.researchMode}`);
     await appendEvent(run, now, "summary", `Selected research mode ${plan.researchMode}: ${plan.objective}`);
     await appendStdout(run, `Selected research mode: ${plan.researchMode}`);
     await appendStdout(run, `Planning rationale: ${plan.rationale}`);
     await appendEvent(run, now, "next", "Gather provider-aware scholarly sources and merge them into canonical papers.");
+
+    let pendingRecoveryQueries: string[] = [];
+    let autonomousRecoveryPasses = 0;
+    const evidenceRecoveryStartedAtMs = Date.now();
+    let finalAgenda: ResearchAgenda | null = null;
+    let finalManuscriptBundle: ManuscriptBundle | null = null;
+    let previousEvidenceQuality: EvidenceQualitySnapshot | null = null;
+    let nonImprovingEvidencePasses = 0;
+
+    while (true) {
+    await writeJsonArtifact(run.artifacts.planPath, plan);
+    const evidencePassNumber = autonomousRecoveryPasses + 1;
+    await appendEvent(run, now, "literature", `Starting evidence pass ${evidencePassNumber}.`);
+    if (pendingRecoveryQueries.length > 0) {
+      await appendStdout(run, `Autonomous evidence recovery queries: ${pendingRecoveryQueries.join(" | ")}`);
+    }
 
     const gathered = await sourceGatherer.gather({
       projectRoot: run.projectRoot,
@@ -2187,11 +2877,27 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       plan,
       memoryContext,
       literatureContext,
+      recoveryQueries: pendingRecoveryQueries,
       scholarlyProviderIds: scholarlyProviders,
       generalWebProviderIds: generalWebProviders,
       projectFilesEnabled: localEnabled,
       credentials
     });
+    pendingRecoveryQueries = [];
+    const currentEvidenceQuality = evidenceQualitySnapshot(gathered);
+    const evidenceImproved = evidenceQualityImproved(previousEvidenceQuality, currentEvidenceQuality);
+    if (previousEvidenceQuality !== null) {
+      if (evidenceImproved) {
+        nonImprovingEvidencePasses = 0;
+        await appendEvent(run, now, "literature", "Evidence recovery improved the in-scope source set or reduced missing targets.");
+        await appendStdout(run, "Evidence recovery improved the protocol relevance/coverage score.");
+      } else {
+        nonImprovingEvidencePasses += 1;
+        await appendEvent(run, now, "literature", "Evidence recovery did not improve the protocol relevance/coverage score.");
+        await appendStdout(run, "Evidence recovery did not improve the protocol relevance/coverage score.");
+      }
+    }
+    previousEvidenceQuality = currentEvidenceQuality;
     const canonicalIdByAnyPaperId = canonicalPaperIdMap(gathered.canonicalPapers);
     const canonicalReviewedPapers = canonicalizePapers(gathered.reviewedPapers);
 
@@ -2209,6 +2915,11 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
             fields: state.configuredFieldIds
           }))
       },
+      autonomousEvidence: {
+        pass: evidencePassNumber,
+        recoveryPasses: autonomousRecoveryPasses,
+        maxRecoveryPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses
+      },
       scholarlyProviders,
       generalWebProviders,
       routing: gathered.routing,
@@ -2218,11 +2929,12 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       rawSources: gathered.sources,
       reviewWorkflow: gathered.reviewWorkflow,
       selectionQuality: gathered.selectionQuality ?? null,
+      relevanceAssessments: gathered.relevanceAssessments ?? [],
       mergeDiagnostics: gathered.mergeDiagnostics,
       literatureReview: gathered.literatureReview ?? null
     });
-    await appendTrace(run, now, `Gathered ${gathered.sources.length} raw sources and ${gathered.canonicalPapers.length} canonical papers.`);
-    await appendEvent(run, now, "summary", `Gathered ${gathered.canonicalPapers.length} canonical papers for synthesis.`);
+    await appendTrace(run, now, `Evidence pass ${evidencePassNumber} gathered ${gathered.sources.length} raw sources and ${gathered.canonicalPapers.length} canonical papers.`);
+    await appendEvent(run, now, "summary", `Evidence pass ${evidencePassNumber} gathered ${gathered.canonicalPapers.length} canonical papers for synthesis.`);
     await appendEvent(
       run,
       now,
@@ -2246,8 +2958,30 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     if (gathered.canonicalPapers.length === 0 || gathered.reviewedPapers.length === 0) {
       const nextQuestions = insufficientEvidenceNextQuestions(plan, gathered);
       const failureMessage = gathered.canonicalPapers.length === 0
-        ? "Literature retrieval did not retain any canonical papers that could ground synthesis. The run stopped before unsupported synthesis."
-        : "The review workflow did not retain any sufficiently reviewed papers for synthesis. The run stopped before unsupported synthesis.";
+        ? "Literature retrieval did not retain any canonical papers that could ground synthesis."
+        : "The review workflow did not retain any sufficiently reviewed papers for synthesis.";
+      const recovery = buildEvidenceRecoveryQueries({
+        run,
+        plan,
+        gathered,
+        extraQuestions: nextQuestions
+      });
+      const recoveryUpdate = evidenceRecoveryPlanUpdate(plan, recovery.queries, recovery.focusTerms);
+      if (
+        recoveryUpdate !== null
+        && autonomousRecoveryPasses < runtimeLlmConfig.evidenceRecoveryMaxPasses
+        && !evidenceRecoveryBudgetExhausted(evidenceRecoveryStartedAtMs, runtimeLlmConfig)
+        && nonImprovingEvidencePasses < 2
+      ) {
+        autonomousRecoveryPasses += 1;
+        plan = recoveryUpdate.plan;
+        pendingRecoveryQueries = recoveryUpdate.recoveryQueries;
+        await appendEvent(run, now, "next", `${failureMessage} Continuing autonomously with evidence recovery pass ${autonomousRecoveryPasses}.`);
+        await appendStdout(run, `Evidence recovery pass ${autonomousRecoveryPasses}: ${pendingRecoveryQueries.join(" | ")}`);
+        continue;
+      }
+
+      const terminalFailureMessage = `${failureMessage} Autonomous evidence recovery could not find a stronger evidence set within the configured recovery budget.`;
       const paperExtractions: PaperExtraction[] = [];
       const evidenceMatrix = buildEvidenceMatrix({
         runId: run.id,
@@ -2266,17 +3000,39 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       await writeJsonArtifact(run.artifacts.verificationPath, verification);
       await writeJsonArtifact(run.artifacts.nextQuestionsPath, nextQuestions);
       const agenda = agendaWithRetrievalHoldReasons(
-        insufficientEvidenceAgenda(run, plan, nextQuestions, failureMessage),
+        insufficientEvidenceAgenda(run, plan, nextQuestions, terminalFailureMessage),
         gathered,
         evidenceMatrix
       );
+      const insufficientSynthesis: ResearchSynthesis = {
+        executiveSummary: terminalFailureMessage,
+        themes: [],
+        claims: [],
+        nextQuestions
+      };
+      const manuscriptBundle = buildManuscriptBundle({
+        run,
+        plan,
+        scholarlyDiscoveryProviders,
+        publisherFullTextProviders,
+        oaRetrievalHelperProviders,
+        generalWebProviders,
+        localContextEnabled: localEnabled,
+        gathered,
+        reviewedPapers: canonicalReviewedPapers,
+        evidenceMatrix,
+        synthesis: insufficientSynthesis,
+        verification,
+        agenda
+      });
       await writeJsonArtifact(run.artifacts.agendaPath, agenda);
       await writeResearchDirection(run, agenda, now());
       await writeFile(run.artifacts.agendaMarkdownPath, `${agendaMarkdown(run, plan, agenda)}\n`, "utf8");
       await writeJsonArtifact(run.artifacts.workPackagePath, null);
+      await writeManuscriptArtifacts(run, manuscriptBundle);
       await writeFile(
         run.artifacts.synthesisPath,
-        `${insufficientEvidenceSynthesisMarkdown(run, plan, gathered, nextQuestions, failureMessage)}\n`,
+        `${insufficientEvidenceSynthesisMarkdown(run, plan, gathered, nextQuestions, terminalFailureMessage)}\n`,
         "utf8"
       );
       await writeFile(
@@ -2287,8 +3043,9 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
           `- Topic: ${run.brief.topic ?? "<missing>"}`,
           `- Research mode: ${plan.researchMode}`,
           `- Objective: ${plan.objective}`,
+          `- Autonomous evidence recovery passes: ${autonomousRecoveryPasses}`,
           "",
-          failureMessage
+          terminalFailureMessage
         ].join("\n"),
         "utf8"
       );
@@ -2301,12 +3058,12 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
             plan,
             gathered,
             evidenceMatrix,
-            failureMessage,
+            terminalFailureMessage,
             [],
             [],
             verification,
             nextQuestions,
-            failureMessage
+            terminalFailureMessage
           ),
           ...buildAgendaMemoryInputs(run, agenda)
         ]
@@ -2316,7 +3073,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
           run,
           plan,
           gathered,
-          failureMessage,
+          terminalFailureMessage,
           [],
           [],
           nextQuestions
@@ -2324,9 +3081,9 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       );
       await writeLiteratureSnapshot(run, literatureStore, literatureResult, gathered);
 
-      await appendStderr(run, failureMessage);
-      await appendTrace(run, now, failureMessage);
-      await appendEvent(run, now, "summary", failureMessage);
+      await appendStderr(run, terminalFailureMessage);
+      await appendTrace(run, now, terminalFailureMessage);
+      await appendEvent(run, now, "summary", terminalFailureMessage);
       await appendEvent(run, now, "verify", verification.summary);
       await appendStdout(run, `Verification: ${verification.summary}`);
       await appendEvent(
@@ -2354,8 +3111,10 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         await appendEvent(run, now, "next", question);
       }
 
-      await appendEvent(run, now, "plan", "Agenda generation completed with a hold because the evidence base remained too thin.");
+      await appendEvent(run, now, "plan", "Agenda generation completed with a hold after autonomous evidence recovery was exhausted.");
       await appendStdout(run, `Agenda hold: ${agenda.recommendedHumanDecision}`);
+      await appendEvent(run, now, "summary", `Manuscript status: ${manuscriptBundle.checks.readinessStatus}.`);
+      await appendStdout(run, `Paper artifact: ${relativeArtifactPath(run.projectRoot, run.artifacts.paperPath)} (${manuscriptBundle.checks.readinessStatus})`);
 
       run.job.finishedAt = now();
       run.finishedAt = now();
@@ -2363,7 +3122,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       run.job.signal = null;
       run.workerPid = null;
       run.status = "completed";
-      run.statusMessage = "Literature review completed, but the agenda is on hold because the evidence base was too thin.";
+      run.statusMessage = "Literature review completed after autonomous evidence recovery, but the evidence base remained too thin.";
       await store.save(run);
       await appendEvent(run, now, "run", run.statusMessage);
       return 0;
@@ -2371,10 +3130,11 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
 
     await appendEvent(run, now, "next", "Extract structured paper records from the reviewed paper set.");
 
-    const extractedPapers = await researchBackend.extractReviewedPapers({
-      projectRoot: run.projectRoot,
-      runId: run.id,
-      brief: run.brief,
+    const extractionResult = await extractReviewedPapersWithRecovery({
+      run,
+      now,
+      researchBackend,
+      runtimeConfig: runtimeLlmConfig,
       plan,
       papers: canonicalReviewedPapers,
       literatureContext
@@ -2382,10 +3142,20 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     const paperExtractions = completePaperExtractions(
       run,
       canonicalReviewedPapers,
-      remapPaperExtractions(extractedPapers, canonicalIdByAnyPaperId)
+      remapPaperExtractions(extractionResult.extractions, canonicalIdByAnyPaperId)
     );
 
-    await writeJsonArtifact(run.artifacts.paperExtractionsPath, paperExtractionsArtifact(run, canonicalReviewedPapers.length, paperExtractions));
+    await writeJsonArtifact(run.artifacts.paperExtractionsPath, paperExtractionsArtifact(
+      run,
+      canonicalReviewedPapers.length,
+      paperExtractions,
+      {
+        status: "completed",
+        completedPaperIds: paperExtractions.map((extraction) => extraction.paperId),
+        failedPaperIds: [],
+        batchAttempts: extractionResult.attempts
+      }
+    ));
     await appendEvent(run, now, "summary", `Extracted ${paperExtractions.length} paper records from the reviewed set.`);
     await appendStdout(run, `Paper extractions written: ${paperExtractions.length}`);
 
@@ -2412,6 +3182,9 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       evidenceMatrix: normalizedEvidenceMatrix,
       selectionQuality: gathered.selectionQuality ?? null,
       literatureContext
+    }, {
+      operation: "synthesis",
+      timeoutMs: runtimeLlmConfig.synthesisTimeoutMs
     });
     const normalizedSynthesis = remapSynthesisSourceIds(synthesis, canonicalIdByAnyPaperId);
     const verification = verifyResearchClaims({
@@ -2431,12 +3204,72 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       selectionQuality: gathered.selectionQuality ?? null,
       memoryContext,
       literatureContext
+    }, {
+      operation: "agenda",
+      timeoutMs: runtimeLlmConfig.agendaTimeoutMs
     });
     const normalizedAgenda = agendaWithRetrievalHoldReasons(
       remapAgendaSourceIds(agenda, canonicalIdByAnyPaperId),
       gathered,
       normalizedEvidenceMatrix
     );
+    const manuscriptBundle = buildManuscriptBundle({
+      run,
+      plan,
+      scholarlyDiscoveryProviders,
+      publisherFullTextProviders,
+      oaRetrievalHelperProviders,
+      generalWebProviders,
+      localContextEnabled: localEnabled,
+      gathered,
+      reviewedPapers: canonicalReviewedPapers,
+      evidenceMatrix: normalizedEvidenceMatrix,
+      synthesis: normalizedSynthesis,
+      verification,
+      agenda: normalizedAgenda
+    });
+
+    if (manuscriptBundle.checks.readinessStatus === "needs_more_evidence") {
+      const recovery = buildEvidenceRecoveryQueries({
+        run,
+        plan,
+        gathered,
+        synthesis: normalizedSynthesis,
+        agenda: normalizedAgenda,
+        verification
+      });
+      const recoveryUpdate = evidenceRecoveryPlanUpdate(plan, recovery.queries, recovery.focusTerms);
+
+      if (
+          recoveryUpdate !== null
+          && autonomousRecoveryPasses < runtimeLlmConfig.evidenceRecoveryMaxPasses
+          && !evidenceRecoveryBudgetExhausted(evidenceRecoveryStartedAtMs, runtimeLlmConfig)
+          && nonImprovingEvidencePasses < 2
+      ) {
+        autonomousRecoveryPasses += 1;
+        plan = recoveryUpdate.plan;
+        pendingRecoveryQueries = recoveryUpdate.recoveryQueries;
+        await appendEvent(
+          run,
+          now,
+          "next",
+          `Manuscript checks need more evidence; continuing autonomously with evidence recovery pass ${autonomousRecoveryPasses}.`
+        );
+        await appendStdout(run, `Evidence recovery pass ${autonomousRecoveryPasses}: ${pendingRecoveryQueries.join(" | ")}`);
+        continue;
+      }
+
+      await appendEvent(
+        run,
+        now,
+        "next",
+        nonImprovingEvidencePasses >= 2
+          ? "Manuscript checks still need more evidence, but repeated evidence recovery passes did not improve relevance or coverage."
+          : recoveryUpdate === null
+          ? "Manuscript checks still need more evidence, but no unused recovery queries remained."
+          : "Manuscript checks still need more evidence, but the autonomous evidence recovery budget was exhausted."
+      );
+    }
 
     await writeJsonArtifact(run.artifacts.claimsPath, claimsArtifact(run, normalizedSynthesis.claims));
     await writeJsonArtifact(run.artifacts.nextQuestionsPath, normalizedSynthesis.nextQuestions);
@@ -2445,6 +3278,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     await writeResearchDirection(run, normalizedAgenda, now());
     await writeFile(run.artifacts.agendaMarkdownPath, `${agendaMarkdown(run, plan, normalizedAgenda)}\n`, "utf8");
     await writeJsonArtifact(run.artifacts.workPackagePath, normalizedAgenda.selectedWorkPackage);
+    await writeManuscriptArtifacts(run, manuscriptBundle);
     await writeFile(run.artifacts.synthesisPath, `${synthesisMarkdown(run, plan, gathered, paperExtractions, normalizedEvidenceMatrix, normalizedSynthesis, verification)}\n`, "utf8");
     await writeFile(run.artifacts.summaryPath, `${researchSummaryMarkdown(run, plan, gathered, paperExtractions, normalizedEvidenceMatrix, normalizedSynthesis, verification)}\n`, "utf8");
     const memoryResult = await writeMemorySnapshot(
@@ -2481,8 +3315,10 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
 
     await appendTrace(run, now, "Synthesis completed.");
     await appendEvent(run, now, "summary", normalizedSynthesis.executiveSummary);
+    await appendEvent(run, now, "summary", `Manuscript status: ${manuscriptBundle.checks.readinessStatus}.`);
     await appendEvent(run, now, "verify", verification.summary);
     await appendStdout(run, `Verification: ${verification.summary}`);
+    await appendStdout(run, `Paper artifact: ${relativeArtifactPath(run.projectRoot, run.artifacts.paperPath)} (${manuscriptBundle.checks.readinessStatus})`);
     for (const verifiedClaim of verification.verifiedClaims.slice(0, 4)) {
       await appendStdout(run, `Verification detail: ${summarizeVerifiedClaim(verifiedClaim)}`);
     }
@@ -2528,13 +3364,22 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       await appendStdout(run, `Selected work package: ${normalizedAgenda.selectedWorkPackage.title}`);
     }
 
+    finalAgenda = normalizedAgenda;
+    finalManuscriptBundle = manuscriptBundle;
+    break;
+    }
+
+    if (finalAgenda === null || finalManuscriptBundle === null) {
+      throw new Error("Literature review loop ended without a final agenda and manuscript bundle.");
+    }
+
     let derivedRun: RunRecord | null = null;
 
     if (projectConfig.runtime.postReviewBehavior === "auto_continue") {
-      derivedRun = await launchDerivedWorkPackageRun(store, runController, run, normalizedAgenda);
+      derivedRun = await launchDerivedWorkPackageRun(store, runController, run, finalAgenda);
 
-      if (derivedRun === null && agendaHasActionableWorkPackage(normalizedAgenda)) {
-        const blockers = workPackageAutoContinueBlockers(normalizedAgenda);
+      if (derivedRun === null && agendaHasActionableWorkPackage(finalAgenda)) {
+        const blockers = workPackageAutoContinueBlockers(finalAgenda);
         await appendEvent(
           run,
           now,
@@ -2546,16 +3391,23 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       }
     }
 
-    run.job.finishedAt = now();
-    run.finishedAt = now();
+    const completedAt = now();
+    run.job.finishedAt = completedAt;
+    run.finishedAt = completedAt;
     run.job.exitCode = 0;
     run.job.signal = null;
     run.workerPid = null;
     run.status = "completed";
     run.statusMessage = derivedRun !== null
       ? `Provider-aware literature run completed and auto-launched derived work-package run ${derivedRun.id}.`
-      : !agendaHasActionableWorkPackage(normalizedAgenda)
-        ? "Provider-aware literature run completed, but the agenda remains on hold for human review."
+      : finalManuscriptBundle.checks.readinessStatus === "needs_more_evidence"
+        ? "Provider-aware literature run completed after autonomous evidence recovery, but the evidence base still needs more work."
+        : finalManuscriptBundle.checks.readinessStatus === "blocked"
+          ? "Provider-aware literature run completed with blockers; no full paper was released."
+        : finalManuscriptBundle.checks.readinessStatus === "needs_human_review"
+          ? "Provider-aware literature run completed, but manuscript checks require human review before release."
+        : !agendaHasActionableWorkPackage(finalAgenda)
+        ? "Provider-aware literature run completed, but no actionable bounded work package was selected."
         : projectConfig.runtime.postReviewBehavior === "confirm"
           ? "Provider-aware literature run completed and is waiting for `/continue` on the selected work package."
           : "Provider-aware literature run completed successfully.";
@@ -2564,14 +3416,16 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     return 0;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const finishedAt = now();
     run.job.finishedAt = now();
-    run.finishedAt = now();
+    run.finishedAt = finishedAt;
     run.job.exitCode = 1;
     run.job.signal = null;
     run.workerPid = null;
     run.status = "failed";
     run.statusMessage = `Run worker failed: ${message}`;
     await store.save(run);
+    await writeFailureDiagnostics(run, finishedAt, error);
     await appendStderr(run, run.statusMessage);
     await appendTrace(run, now, run.statusMessage);
     await appendEvent(run, now, "stderr", run.statusMessage);

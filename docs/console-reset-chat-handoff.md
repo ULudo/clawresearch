@@ -4,6 +4,8 @@ Date: 2026-04-24
 
 This document is a compact orientation for continuing the ClawResearch reset in a fresh Codex chat. It describes what the current system is meant to be, how the runtime state is organized, what invariants matter, and where development should continue.
 
+The next product boundary is described in `docs/release-1-review-paper-agent-concept.md`. In short: finish Release 1 as an autonomous review-paper research agent before expanding the original-research execution loop.
+
 ## Product Vision
 
 ClawResearch is an autonomous research runtime for research projects.

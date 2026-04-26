@@ -1275,6 +1275,116 @@ test("review workflow promotes high-quality uncertain abstract papers when inclu
   }
 });
 
+test("review workflow does not promote off-topic papers that only match generic design or efficiency terms", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-topic-gate-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.openalex.org" && url.pathname === "/works") {
+        const page = Number(url.searchParams.get("page") ?? "1");
+
+        if (page > 1) {
+          return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+
+        return new Response(JSON.stringify({
+          results: [
+            {
+              id: "https://openalex.org/W-agent-review",
+              display_name: "Autonomous research agents for literature review and summarization",
+              publication_year: 2025,
+              authorships: [
+                { author: { display_name: "Relevant Author" } }
+              ],
+              primary_location: {
+                source: {
+                  display_name: "AI Systems Review"
+                },
+                landing_page_url: "https://example.org/agent-review"
+              },
+              doi: "https://doi.org/10.1000/agent-review",
+              abstract_inverted_index: toAbstractIndex(
+                "Autonomous research agents perform literature review workflows with information retrieval summarization and information organization."
+              )
+            },
+            {
+              id: "https://openalex.org/W-cmip6",
+              display_name: "Overview of CMIP6 experimental design and organization",
+              publication_year: 2016,
+              authorships: [
+                { author: { display_name: "Climate Author" } }
+              ],
+              primary_location: {
+                source: {
+                  display_name: "Geoscientific Model Development"
+                },
+                landing_page_url: "https://example.org/cmip6"
+              },
+              doi: "https://doi.org/10.1000/cmip6",
+              abstract_inverted_index: toAbstractIndex(
+                "Experimental design architecture evaluation memory provenance and efficient organization for climate model comparison."
+              )
+            },
+            {
+              id: "https://openalex.org/W-industrial-iot",
+              display_name: "Resource-efficient federated learning in industrial IoT environments",
+              publication_year: 2024,
+              authorships: [
+                { author: { display_name: "IoT Author" } }
+              ],
+              primary_location: {
+                source: {
+                  display_name: "Industrial AI"
+                },
+                landing_page_url: "https://example.org/iot"
+              },
+              doi: "https://doi.org/10.1000/iot",
+              abstract_inverted_index: toAbstractIndex(
+                "Efficient architecture evaluation benchmarks memory provenance and task organization for industrial IoT systems."
+              )
+            }
+          ]
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "Design and build efficient autonomous research agents",
+        researchQuestion: "How can autonomous research agents perform literature review, information retrieval, summarization, and information organization?",
+        researchDirection: "Review systems for autonomous literature-review workflows.",
+        successCriterion: "Meet the standards of quality and comprehensiveness typically expected in academic research."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review autonomous research-agent literature review systems.",
+        rationale: "Generic design and efficiency papers should not enter synthesis.",
+        searchQueries: ["autonomous research agents literature review summarization"],
+        localFocus: ["information retrieval", "summarization", "information organization"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: ["openalex"]
+    });
+
+    assert.equal(gathered.reviewedPapers.length, 1);
+    assert.match(gathered.reviewedPapers[0]?.title ?? "", /Autonomous research agents/i);
+    assert.equal(gathered.reviewWorkflow.counts.selectedForSynthesis, 1);
+    assert.match(gathered.reviewWorkflow.notes.join("\n"), /Held back 2 otherwise retained papers/i);
+    assert.equal(gathered.relevanceAssessments?.filter((assessment) => assessment.status === "excluded").length, 2);
+    assert.ok(!gathered.reviewedPapers.some((paper) => /CMIP6|industrial IoT/i.test(paper.title)));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("review selection records success-criterion facet coverage for the selected papers", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-facet-coverage-"));
   const originalFetch = globalThis.fetch;
@@ -1438,6 +1548,8 @@ test("review selection records missing method facets when zeta evidence drifts a
 
     const missingLabels = gathered.selectionQuality?.missingRequiredFacets.map((facet) => facet.label.toLowerCase()) ?? [];
 
+    assert.equal(gathered.reviewedPapers.length, 0);
+    assert.equal(gathered.relevanceAssessments?.[0]?.status, "borderline");
     assert.ok(missingLabels.some((label) => /error bounds|rigorous numerical verification|verification/.test(label)));
     assert.notEqual(gathered.selectionQuality?.adequacy, "strong");
   } finally {
@@ -1457,7 +1569,7 @@ test("thin evidence triggers one recovery pass and records recovery diagnostics"
       if (url.hostname === "api.openalex.org" && url.pathname === "/works") {
         const search = url.searchParams.get("search") ?? "";
 
-        if (!/limitations/i.test(search)) {
+        if (!/(limitations|evaluation)/i.test(search)) {
           return new Response(JSON.stringify({
             results: [
               {

@@ -1,6 +1,49 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import type { CanonicalPaper } from "../src/runtime/literature-store.js";
 import { verifyResearchClaims } from "../src/runtime/verifier.js";
+
+function canonicalPaper(overrides: Partial<CanonicalPaper> & Pick<CanonicalPaper, "id" | "key" | "title" | "citation">): CanonicalPaper {
+  return {
+    abstract: null,
+    year: 2026,
+    authors: ["Example Author"],
+    venue: "Example Venue",
+    discoveredVia: ["openalex"],
+    identifiers: {
+      doi: null,
+      pmid: null,
+      pmcid: null,
+      arxivId: null
+    },
+    discoveryRecords: [],
+    accessCandidates: [],
+    bestAccessUrl: "https://example.org/paper",
+    bestAccessProvider: "openalex",
+    accessMode: "abstract_available",
+    fulltextFormat: "none",
+    license: null,
+    tdmAllowed: null,
+    contentStatus: {
+      abstractAvailable: true,
+      fulltextAvailable: false,
+      fulltextFetched: false,
+      fulltextExtracted: false
+    },
+    screeningHistory: [],
+    screeningStage: "abstract",
+    screeningDecision: "include",
+    screeningRationale: "Included for test.",
+    accessErrors: [],
+    tags: [],
+    runIds: [],
+    linkedThemeIds: [],
+    linkedClaimIds: [],
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    ...overrides
+  };
+}
 
 test("verifier records provenance, evidence links, and supported claims from canonical papers", () => {
   const report = verifyResearchClaims({
@@ -82,6 +125,42 @@ test("verifier records provenance, evidence links, and supported claims from can
   assert.equal(report.verifiedClaims[0]?.confidence, "high");
   assert.equal(report.verifiedClaims[0]?.provenance.length, 1);
   assert.equal(report.verifiedClaims[0]?.evidenceLinks.length, 1);
+});
+
+test("verifier does not treat off-topic cited papers as support for scoped claims", () => {
+  const report = verifyResearchClaims({
+    brief: {
+      topic: "autonomous research agents",
+      researchQuestion: "How should autonomous research agents perform literature reviews?",
+      researchDirection: "Review retrieval, summarization, and evidence organization.",
+      successCriterion: "Produce a scoped literature review."
+    },
+    papers: [
+      canonicalPaper({
+        id: "paper-cmip6",
+        key: "doi:10.1000/cmip6",
+        title: "Overview of CMIP6 experimental design and organization",
+        citation: "Climate Author (2016). Overview of CMIP6 experimental design and organization.",
+        abstract: "This paper describes climate-model intercomparison experimental design and organization.",
+        accessMode: "fulltext_open",
+        fulltextFormat: "pdf"
+      })
+    ],
+    claims: [
+      {
+        claim: "Autonomous research agents can organize literature-review evidence using benchmarked workflows.",
+        evidence: "The cited source discusses experimental design and organization.",
+        sourceIds: ["paper-cmip6"]
+      }
+    ]
+  });
+
+  assert.equal(report.overallStatus, "mixed");
+  assert.equal(report.counts.offTopicSources, 1);
+  assert.equal(report.counts.unverified, 1);
+  assert.equal(report.verifiedClaims[0]?.supportStatus, "unverified");
+  assert.deepEqual(report.verifiedClaims[0]?.offTopicSourceIds, ["paper-cmip6"]);
+  assert.match(report.unverifiedClaims[0]?.reason ?? "", /outside the scoped topic/i);
 });
 
 test("verifier marks claims linked only to blocked papers as unverified", () => {
@@ -229,4 +308,76 @@ test("verifier emits explicit unknown when the claim itself states evidence is l
   assert.equal(report.verifiedClaims[0]?.supportStatus, "unknown");
   assert.equal(report.verifiedClaims[0]?.confidence, "unknown");
   assert.ok(report.unknowns.some((entry) => /Unknown: There is no direct evidence yet/i.test(entry)));
+});
+
+test("verifier rejects broad nursing AI sources outside nursing-home scope", () => {
+  const report = verifyResearchClaims({
+    brief: {
+      topic: "AI adoption in nursing homes",
+      researchQuestion: "What evidence exists about AI adoption in nursing homes and its effects on staffing, workforce displacement, and care quality?",
+      researchDirection: "Review long-term-care evidence.",
+      successCriterion: "Use only nursing-home or long-term-care evidence."
+    },
+    papers: [
+      canonicalPaper({
+        id: "paper-broad-nursing-ai",
+        key: "doi:10.1000/broad-nursing-ai",
+        title: "The integration of AI in nursing: applications and challenges",
+        citation: "Example Author (2025). The integration of AI in nursing.",
+        abstract: "A broad review of artificial intelligence in nursing education and clinical practice."
+      })
+    ],
+    claims: []
+  });
+
+  assert.equal(report.counts.offTopicSources, 1);
+  assert.equal(report.sourceRelevance[0]?.status, "off_topic");
+});
+
+test("verifier rejects generic rigorous numerics outside zeta-zero verification scope", () => {
+  const report = verifyResearchClaims({
+    brief: {
+      topic: "rigorous numerical verification of Riemann zeta zeros",
+      researchQuestion: "Which rigorous numerical verification methods for Riemann zeta zeros use explicit error bounds?",
+      researchDirection: "Review verified computation methods for zeta zeros.",
+      successCriterion: "Distinguish rigorous verification from heuristic computation."
+    },
+    papers: [
+      canonicalPaper({
+        id: "paper-advection",
+        key: "doi:10.1000/advection",
+        title: "Rigorous numerical computations for 1D advection equations",
+        citation: "Example Author (2024). Rigorous numerical computations for 1D advection equations.",
+        abstract: "Validated numerics for partial differential equations with interval enclosures."
+      })
+    ],
+    claims: []
+  });
+
+  assert.equal(report.counts.offTopicSources, 1);
+  assert.equal(report.sourceRelevance[0]?.status, "off_topic");
+});
+
+test("verifier rejects unrelated AI/autonomous papers outside research-agent review scope", () => {
+  const report = verifyResearchClaims({
+    brief: {
+      topic: "autonomous research agents for literature review automation",
+      researchQuestion: "How can autonomous research agents perform high-quality literature reviews?",
+      researchDirection: "Review retrieval, summarization, evidence organization, and evaluation.",
+      successCriterion: "Use only on-topic evidence about literature review automation or evidence synthesis."
+    },
+    papers: [
+      canonicalPaper({
+        id: "paper-colloid-ai",
+        key: "doi:10.1000/colloid-ai",
+        title: "Artificial intelligence in colloid and interface science",
+        citation: "Example Author (2024). Artificial intelligence in colloid and interface science.",
+        abstract: "A review of machine-learning applications for materials discovery."
+      })
+    ],
+    claims: []
+  });
+
+  assert.equal(report.counts.offTopicSources, 1);
+  assert.equal(report.sourceRelevance[0]?.status, "off_topic");
 });

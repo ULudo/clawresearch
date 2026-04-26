@@ -91,6 +91,10 @@ import type {
   ResearchAgenda,
   WorkPackage
 } from "./research-backend.js";
+import type {
+  ManuscriptChecksArtifact,
+  ReviewPaperArtifact
+} from "./research-manuscript.js";
 
 export type OutputWriter = {
   write: (chunk: string) => void;
@@ -135,7 +139,7 @@ const fieldPrefixMatchers: Array<{ field: ResearchBriefField; pattern: RegExp }>
 const userAmbitionPattern = /\b(prove|proof|solve|solution|solvab|solvability|cure|eradicate|eliminate|breakthrough|invent|discover the answer|fully automate|full solution)\b/i;
 const directEndStatePattern = /\b(prove|proof|cure|eradicate|eliminate|breakthrough|resolve|resolution|fully automate|full solution|solve (?:it|this|the problem|the hypothesis|the disease|the crisis))\b/i;
 const boundedModePattern = /\b(literature|survey|review|map|mapping|synthesis|synthesize|evaluate|evaluation|compare|comparison|benchmark|benchmarking|replicat|reproduc|exploratory|exploration|pilot|feasibility|bounded|subproblem|case study|research note|note|prototype|ablation|identify|assessment|assess|scope|follow[- ]?up|baseline|artifact|memo|analysis)\b/i;
-const deliverablePattern = /\b(note|report|analysis|benchmark|evaluation|survey|mapping|synthesis|prototype|experiment|ablation|dataset|replication|reproduction|review|plan|feasibility|baseline|artifact|memo)\b/i;
+const deliverablePattern = /\b(note|report|analysis|benchmark|evaluation|survey|mapping|synthesis|prototype|experiment|ablation|dataset|replication|reproduction|review|plan|feasibility|baseline|artifact|memo|paper|manuscript|publication|publications)\b/i;
 const genericFieldPattern = /^(?:algorithmic approaches?|computational methods?|literature review|historical context|theoretical frameworks?|number theory|physics|mathematics|applications?)$/i;
 const taggedLabelWidth = 10;
 
@@ -210,10 +214,49 @@ export type AgendaSnapshot = {
   provenanceKnown: boolean;
 };
 
+type RuntimeArtifactStatus = {
+  schemaVersion: number;
+  runId: string;
+  artifactKind: string;
+  status: "pending" | "in_progress" | "failed";
+  stage: string;
+  error: {
+    message: string;
+    kind: string;
+    operation: string | null;
+  } | null;
+};
+
+function isRuntimeArtifactStatus(value: unknown): value is RuntimeArtifactStatus {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const record = value as Record<string, unknown>;
+  return typeof record.artifactKind === "string"
+    && (record.status === "pending" || record.status === "in_progress" || record.status === "failed");
+}
+
 async function readJsonFileOrNull<T>(filePath: string): Promise<T | null> {
   try {
     const contents = await readFile(filePath, "utf8");
-    return JSON.parse(contents) as T;
+    const parsed = JSON.parse(contents) as unknown;
+
+    if (isRuntimeArtifactStatus(parsed)) {
+      return null;
+    }
+
+    return parsed as T;
+  } catch {
+    return null;
+  }
+}
+
+async function readArtifactStatusOrNull(filePath: string): Promise<RuntimeArtifactStatus | null> {
+  try {
+    const contents = await readFile(filePath, "utf8");
+    const parsed = JSON.parse(contents) as unknown;
+    return isRuntimeArtifactStatus(parsed) ? parsed : null;
   } catch {
     return null;
   }
@@ -394,6 +437,7 @@ export function renderHelp(writer: OutputWriter, session: SessionState): void {
   writeLine(writer, "  /sources Show the current literature providers for this project");
   writeLine(writer, "  /go     Start the initial detached literature-review run");
   writeLine(writer, "  /agenda Show the latest saved research agenda and selected work package");
+  writeLine(writer, "  /paper  Show the latest review-paper draft status");
   writeLine(writer, "  /continue Start the selected work package when the latest agenda is actionable");
   writeLine(writer, "  /pause  Pause the active detached run");
   writeLine(writer, "  /resume Resume the active detached run");
@@ -405,6 +449,7 @@ export function renderHelp(writer: OutputWriter, session: SessionState): void {
   writeLine(writer, "  You can still force a specific field with `topic:`, `question:`, `direction:`, or `success:`.");
   writeLine(writer, "  You can configure providers with `scholarly: openalex, crossref`, `publishers: arxiv, europe-pmc`, `helpers: core, unpaywall`, `web: wikipedia`, `local: off`, or `sources: openalex, crossref`.");
   writeLine(writer, "  Detached runs stream progress in the console and save a debug transcript locally.");
+  writeLine(writer, "  Use `/paper open` to print the latest paper draft and `/paper checks` to inspect manuscript readiness checks.");
   writeLine(writer, `  Local intake backend: ${session.intake.backendLabel ?? "not configured"}`);
 }
 
@@ -457,7 +502,8 @@ export function renderStatus(
   writeLine(writer, `  research direction: ${session.brief.researchDirection ?? "<missing>"}`);
   writeLine(writer, `  success criterion: ${session.brief.successCriterion ?? "<missing>"}`);
   writeLine(writer);
-  writeLine(writer, `Readiness: ${session.intake.readiness}`);
+  writeLine(writer, `Brief readiness: ${session.intake.readiness}`);
+  writeLine(writer, `Readiness: ${session.intake.readiness} (brief)`);
 
   if (session.intake.summary !== null) {
     writeLine(writer, `Summary: ${session.intake.summary}`);
@@ -488,6 +534,7 @@ export function renderStatus(
     writeLine(writer, `  id: ${run.id}`);
     writeLine(writer, `  stage: ${run.stage}`);
     writeLine(writer, `  status: ${run.status}`);
+    writeLine(writer, `  latest run outcome: ${run.status}${run.status === "failed" ? " (paper not generated)" : ""}`);
 
     if (run.statusMessage !== null) {
       writeLine(writer, `  detail: ${run.statusMessage}`);
@@ -504,9 +551,12 @@ export function renderStatus(
     writeLine(writer, `  plan: ${relativeProjectPath(session.projectRoot, run.artifacts.planPath)}`);
     writeLine(writer, `  sources: ${relativeProjectPath(session.projectRoot, run.artifacts.sourcesPath)}`);
     writeLine(writer, `  literature: ${relativeProjectPath(session.projectRoot, run.artifacts.literaturePath)}`);
+    writeLine(writer, `  review protocol: ${relativeProjectPath(session.projectRoot, run.artifacts.reviewProtocolPath)}`);
     writeLine(writer, `  synthesis: ${relativeProjectPath(session.projectRoot, run.artifacts.synthesisPath)}`);
     writeLine(writer, `  claims: ${relativeProjectPath(session.projectRoot, run.artifacts.claimsPath)}`);
     writeLine(writer, `  verification: ${relativeProjectPath(session.projectRoot, run.artifacts.verificationPath)}`);
+    writeLine(writer, `  paper: ${relativeProjectPath(session.projectRoot, run.artifacts.paperPath)}`);
+    writeLine(writer, `  paper checks: ${relativeProjectPath(session.projectRoot, run.artifacts.manuscriptChecksPath)}`);
     writeLine(writer, `  next questions: ${relativeProjectPath(session.projectRoot, run.artifacts.nextQuestionsPath)}`);
     writeLine(writer, `  agenda: ${relativeProjectPath(session.projectRoot, run.artifacts.agendaPath)}`);
     writeLine(writer, `  agenda summary: ${relativeProjectPath(session.projectRoot, run.artifacts.agendaMarkdownPath)}`);
@@ -734,7 +784,7 @@ async function promptProviderCredentials(
   writer: OutputWriter,
   credentials: CredentialStoreState,
   providerIds: SourceProviderId[]
-): Promise<boolean> {
+): Promise<{ completed: boolean; pendingInput: string | null }> {
   for (const providerId of providerIds) {
     const definition = getSourceProviderDefinition(providerId);
     for (const field of providerCredentialFields(providerId)) {
@@ -743,7 +793,13 @@ async function promptProviderCredentials(
       const response = await io.prompt(promptText);
 
       if (response === null) {
-        return false;
+        return { completed: false, pendingInput: null };
+      }
+
+      if (parseExplicitBriefUpdate(response) !== null) {
+        transcript.appendInput(promptText, "[moved to main chat]");
+        writeLine(writer, "Detected a research brief during credential setup; leaving remaining credentials unset for now.");
+        return { completed: true, pendingInput: response };
       }
 
       transcript.appendInput(promptText, response.trim().length === 0 ? "[blank]" : "[secret redacted]");
@@ -766,7 +822,7 @@ async function promptProviderCredentials(
     }
   }
 
-  return true;
+  return { completed: true, pendingInput: null };
 }
 
 async function promptSetupInput(
@@ -822,10 +878,20 @@ async function runInitialSourceSetup(
   projectConfigStore: ProjectConfigStore,
   credentialStore: CredentialStore,
   credentials: CredentialStoreState
-): Promise<boolean> {
+): Promise<{ completed: boolean; pendingInput: string | null }> {
   if (projectConfig.sources.explicitlyConfigured) {
-    return true;
+    return { completed: true, pendingInput: null };
   }
+
+  const finishWithDefaults = async (pendingInput: string): Promise<{ completed: boolean; pendingInput: string | null }> => {
+    projectConfig.sources.explicitlyConfigured = true;
+    await projectConfigStore.save(projectConfig);
+    await credentialStore.save(credentials);
+    writeLine(writer, "Detected a research brief during source setup; kept source defaults and moved the brief into the main chat.");
+    writeLine(writer, `Saved source configuration to ${relativeProjectPath(projectConfig.projectRoot, projectConfigPath(projectConfig.projectRoot))}.`);
+    writeLine(writer);
+    return { completed: true, pendingInput };
+  };
 
   writeLine(writer, "Source setup");
   writeLine(writer, "------------");
@@ -839,7 +905,11 @@ async function runInitialSourceSetup(
     const input = await promptSetupInput(io, transcript, writer, session, projectConfig, credentials, prompt);
 
     if (input === null) {
-      return false;
+      return { completed: false, pendingInput: null };
+    }
+
+    if (parseExplicitBriefUpdate(input) !== null) {
+      return finishWithDefaults(input);
     }
 
     const selection = input.trim().length === 0
@@ -858,7 +928,11 @@ async function runInitialSourceSetup(
   const localInput = await promptSetupInput(io, transcript, writer, session, projectConfig, credentials, localPrompt);
 
   if (localInput === null) {
-    return false;
+    return { completed: false, pendingInput: null };
+  }
+
+  if (parseExplicitBriefUpdate(localInput) !== null) {
+    return finishWithDefaults(localInput);
   }
 
   if (localInput.trim().length > 0) {
@@ -879,8 +953,8 @@ async function runInitialSourceSetup(
     selectedScholarlySourceProviders(projectConfig)
   );
 
-  if (!authPrompted) {
-    return false;
+  if (!authPrompted.completed) {
+    return { completed: false, pendingInput: null };
   }
 
   projectConfig.sources.explicitlyConfigured = true;
@@ -888,7 +962,7 @@ async function runInitialSourceSetup(
   await credentialStore.save(credentials);
   writeLine(writer, `Saved source configuration to ${relativeProjectPath(projectConfig.projectRoot, projectConfigPath(projectConfig.projectRoot))}.`);
   writeLine(writer);
-  return true;
+  return { completed: true, pendingInput: authPrompted.pendingInput };
 }
 
 function normalizeDraftLabel(label: string): ResearchBriefField | null {
@@ -1041,7 +1115,7 @@ function fieldSpecificityScore(value: string): number {
     score += 1;
   }
 
-  if (/\b(with|through|using|around|focused|focus|rather than|identify|produce|review|compare|evaluate|explor|grounded|deliverable)\b/i.test(value)) {
+  if (/\b(with|through|using|around|focused|focus|rather than|identify|produce|review|compare|evaluate|explor|grounded|deliverable|paper|manuscript|publication|publications)\b/i.test(value)) {
     score += 2;
   }
 
@@ -1068,9 +1142,12 @@ function shouldKeepExistingField(existing: string, incoming: string): boolean {
   const sharedRoots = sharedComparableRoots(existing, incoming);
   const specificityGap = fieldSpecificityScore(existing) - fieldSpecificityScore(incoming);
   const incomingWordCount = normalizedIncoming.split(" ").filter((word) => word.length > 0).length;
+  const existingIsConcreteDeliverable = deliverablePattern.test(existing);
+  const incomingIsConcreteDeliverable = deliverablePattern.test(incoming);
 
   return specificityGap >= 3
-    && (sharedRoots > 0 || existingContainsIncoming || incomingWordCount <= 3);
+    && (sharedRoots > 0 || existingContainsIncoming || incomingWordCount <= 3)
+    || (existingIsConcreteDeliverable && !incomingIsConcreteDeliverable && incomingWordCount > 4);
 }
 
 function mergeBriefFieldValue(existing: string | null, incoming: string | null): string | null {
@@ -1571,6 +1648,166 @@ async function readTextFileOrNull(filePath: string): Promise<string | null> {
     return trimmed.length > 0 ? trimmed : null;
   } catch {
     return null;
+  }
+}
+
+type PaperSnapshot = {
+  run: RunRecord;
+  paper: ReviewPaperArtifact | null;
+  checks: ManuscriptChecksArtifact | null;
+  markdown: string | null;
+  diagnostics: RuntimeArtifactStatus | null;
+  recentEvents: string[];
+};
+
+async function latestPaperSnapshot(runStore: RunStore): Promise<PaperSnapshot | null> {
+  const runs = await runStore.list();
+  let latestFailedRun: RunRecord | null = null;
+
+  for (const run of runs) {
+    const paper = await readJsonFileOrNull<ReviewPaperArtifact>(run.artifacts.paperJsonPath);
+    const checks = await readJsonFileOrNull<ManuscriptChecksArtifact>(run.artifacts.manuscriptChecksPath);
+    const markdown = await readTextFileOrNull(run.artifacts.paperPath);
+    const meaningfulMarkdown = markdown !== null && !/^# Review Paper\s+Status: /is.test(markdown)
+      ? markdown
+      : null;
+
+    if (paper !== null || checks !== null || meaningfulMarkdown !== null) {
+      return {
+        run,
+        paper,
+        checks,
+        markdown: meaningfulMarkdown,
+        diagnostics: await readArtifactStatusOrNull(run.artifacts.manuscriptChecksPath)
+          ?? await readArtifactStatusOrNull(run.artifacts.paperJsonPath),
+        recentEvents: await readRecentRunEvents(run)
+      };
+    }
+
+    if (latestFailedRun === null && run.status === "failed") {
+      latestFailedRun = run;
+    }
+  }
+
+  if (latestFailedRun !== null) {
+    return {
+      run: latestFailedRun,
+      paper: null,
+      checks: null,
+      markdown: null,
+      diagnostics: await readArtifactStatusOrNull(latestFailedRun.artifacts.manuscriptChecksPath)
+        ?? await readArtifactStatusOrNull(latestFailedRun.artifacts.paperJsonPath),
+      recentEvents: await readRecentRunEvents(latestFailedRun)
+    };
+  }
+
+  return null;
+}
+
+function paperNextAction(snapshot: PaperSnapshot): string {
+  const readiness = snapshot.checks?.readinessStatus ?? snapshot.paper?.readinessStatus ?? "not_started";
+
+  if (snapshot.run.status === "failed" && snapshot.paper === null && snapshot.checks === null) {
+    return "Inspect the failed run diagnostics, then rerun after the blocked stage is recoverable.";
+  }
+
+  switch (readiness) {
+    case "ready_for_revision":
+      return "Read the draft, inspect checks, and revise scientifically before publication review.";
+    case "needs_more_evidence":
+      return "Inspect retrieval diagnostics, missing facets, and access limits before treating the draft as mature.";
+    case "needs_human_review":
+      return "Resolve manuscript-check blockers before relying on the draft.";
+    case "blocked":
+      return "Do not treat this as a review paper yet; rerun retrieval or fix access/evidence blockers first.";
+    case "drafted":
+      return "Inspect `/paper checks` before using the draft.";
+    case "not_started":
+      return "Run `/go` to produce review-paper artifacts.";
+  }
+}
+
+function renderPaperStatus(
+  writer: OutputWriter,
+  snapshot: PaperSnapshot | null,
+  projectRoot: string
+): void {
+  writeLine(writer, "Paper:");
+
+  if (snapshot === null) {
+    writeLine(writer, "  none yet");
+    return;
+  }
+
+  const paper = snapshot.paper;
+  const checks = snapshot.checks;
+
+  writeLine(writer, `  run id: ${snapshot.run.id}`);
+  writeLine(writer, `  run status: ${snapshot.run.status}`);
+  writeLine(writer, `  run stage: ${snapshot.run.stage}`);
+  writeLine(writer, `  paper path: ${relativeProjectPath(projectRoot, snapshot.run.artifacts.paperPath)}`);
+  writeLine(writer, `  checks path: ${relativeProjectPath(projectRoot, snapshot.run.artifacts.manuscriptChecksPath)}`);
+  writeLine(writer, `  title: ${paper?.title ?? "<unknown>"}`);
+  writeLine(writer, `  readiness: ${checks?.readinessStatus ?? paper?.readinessStatus ?? "not_started"}`);
+  writeLine(writer, `  cited papers: ${paper?.referencedPaperIds.length ?? 0}`);
+  writeLine(writer, `  claims: ${paper?.claims.length ?? 0}`);
+  writeLine(writer, `  blockers: ${checks?.blockerCount ?? 0}`);
+
+  if (paper === null && checks === null && snapshot.run.status === "failed") {
+    writeLine(writer, `  no draft reason: ${snapshot.run.statusMessage ?? "run failed before manuscript generation"}`);
+  }
+
+  if (snapshot.diagnostics?.error !== null && snapshot.diagnostics?.error !== undefined) {
+    writeLine(writer, `  diagnostic: ${snapshot.diagnostics.error.kind} during ${snapshot.diagnostics.error.operation ?? snapshot.diagnostics.stage} - ${snapshot.diagnostics.error.message}`);
+  }
+
+  if (checks !== null && checks.blockers.length > 0) {
+    writeLine(writer, "  blocker details:");
+    for (const blocker of checks.blockers) {
+      writeLine(writer, `    - ${blocker}`);
+    }
+  }
+
+  writeLine(writer, `  next action: ${paperNextAction(snapshot)}`);
+}
+
+function renderPaperChecks(writer: OutputWriter, snapshot: PaperSnapshot | null): void {
+  writeLine(writer, "Paper checks:");
+
+  if (snapshot === null || snapshot.checks === null) {
+    if (snapshot === null) {
+      writeLine(writer, "  none yet");
+      return;
+    }
+
+    writeLine(writer, "  none yet");
+    writeLine(writer, `  run id: ${snapshot.run.id}`);
+    writeLine(writer, `  run status: ${snapshot.run.status}`);
+    writeLine(writer, `  run stage: ${snapshot.run.stage}`);
+
+    if (snapshot.run.statusMessage !== null) {
+      writeLine(writer, `  detail: ${snapshot.run.statusMessage}`);
+    }
+
+    if (snapshot.diagnostics?.error !== null && snapshot.diagnostics?.error !== undefined) {
+      writeLine(writer, `  diagnostic: ${snapshot.diagnostics.error.kind} during ${snapshot.diagnostics.error.operation ?? snapshot.diagnostics.stage} - ${snapshot.diagnostics.error.message}`);
+    }
+
+    if (snapshot.recentEvents.length > 0) {
+      writeLine(writer, "  recent events:");
+      for (const event of snapshot.recentEvents) {
+        writeLine(writer, `    - ${event}`);
+      }
+    }
+    return;
+  }
+
+  writeLine(writer, `  readiness: ${snapshot.checks.readinessStatus}`);
+  writeLine(writer, `  blockers: ${snapshot.checks.blockerCount}`);
+  writeLine(writer, `  warnings: ${snapshot.checks.warningCount}`);
+
+  for (const checkItem of snapshot.checks.checks) {
+    writeLine(writer, `  - ${checkItem.status}: ${checkItem.title} - ${checkItem.message}`);
   }
 }
 
@@ -2227,8 +2464,11 @@ export async function handleGoCommand(
     `Plan: ${relativeProjectPath(session.projectRoot, run.artifacts.planPath)}`,
     `Sources: ${relativeProjectPath(session.projectRoot, run.artifacts.sourcesPath)}`,
     `Literature review: ${relativeProjectPath(session.projectRoot, run.artifacts.literaturePath)}`,
+    `Review protocol: ${relativeProjectPath(session.projectRoot, run.artifacts.reviewProtocolPath)}`,
     `Synthesis: ${relativeProjectPath(session.projectRoot, run.artifacts.synthesisPath)}`,
     `Verification: ${relativeProjectPath(session.projectRoot, run.artifacts.verificationPath)}`,
+    `Paper: ${relativeProjectPath(session.projectRoot, run.artifacts.paperPath)}`,
+    `Paper checks: ${relativeProjectPath(session.projectRoot, run.artifacts.manuscriptChecksPath)}`,
     `Research journal snapshot: ${relativeProjectPath(session.projectRoot, run.artifacts.memoryPath)}`,
     watchRuns
       ? "The detached run is working in the current project directory, and the console will stream live progress until the current run reaches a terminal state."
@@ -2622,6 +2862,31 @@ async function handleCommand(
       await store.save(session);
       return "continue";
     }
+    case "/paper": {
+      const snapshot = await latestPaperSnapshot(runStore);
+      renderPaperStatus(writer, snapshot, session.projectRoot);
+      saveAssistantMessage(session, "Displayed the latest review-paper status.", now(), "command");
+      await store.save(session);
+      return "continue";
+    }
+    case "/paper open": {
+      const snapshot = await latestPaperSnapshot(runStore);
+      if (snapshot === null || snapshot.markdown === null) {
+        renderTaggedBlock(writer, "paper", "No review-paper draft is available yet.");
+      } else {
+        renderTaggedBlock(writer, "paper", snapshot.markdown);
+      }
+      saveAssistantMessage(session, "Displayed the latest review-paper draft.", now(), "command");
+      await store.save(session);
+      return "continue";
+    }
+    case "/paper checks": {
+      const snapshot = await latestPaperSnapshot(runStore);
+      renderPaperChecks(writer, snapshot);
+      saveAssistantMessage(session, "Displayed the latest manuscript readiness checks.", now(), "command");
+      await store.save(session);
+      return "continue";
+    }
     case "/sources": {
       const currentProjectConfig = await projectConfigStore.load();
       const currentCredentials = await credentialStore.load();
@@ -2696,7 +2961,7 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
 
   renderBanner(writer, session, transcript.filePath);
   renderWelcome(writer, session);
-  const setupCompleted = await runInitialSourceSetup(
+  const setupResult = await runInitialSourceSetup(
     io,
     transcript,
     writer,
@@ -2707,7 +2972,7 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
     credentials
   );
 
-  if (!setupCompleted) {
+  if (!setupResult.completed) {
     io.close?.();
     return 0;
   }
@@ -2733,6 +2998,25 @@ export async function runPhaseOneConsole(io: ConsoleIo, options: RunOptions): Pr
     await emitAssistantTurn(writer, session, store, runStore, backend, projectAssistantBackend, "start", now);
   } else if (initialChatEntry.role === "user") {
     await emitAssistantTurn(writer, session, store, runStore, backend, projectAssistantBackend, "resume", now);
+  }
+
+  if (setupResult.pendingInput !== null) {
+    await handleUserInput(
+      setupResult.pendingInput.trim(),
+      io,
+      transcript,
+      writer,
+      session,
+      store,
+      runStore,
+      projectConfig,
+      projectConfigStore,
+      credentials,
+      credentialStore,
+      backend,
+      projectAssistantBackend,
+      now
+    );
   }
 
   while (true) {

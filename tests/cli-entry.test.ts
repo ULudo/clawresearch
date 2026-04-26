@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { mkdtemp, rm, symlink } from "node:fs/promises";
+import { access } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -165,10 +166,30 @@ test("help flag prints interactive usage and slash commands", async () => {
   assert.equal(code, 0);
   assert.match(sink.output, /Starts the TUI research console in the current directory, launches detached runs from `\/go`, and streams their saved progress events in the terminal\./);
   assert.match(sink.output, /Use `--plain` to force the older line-oriented console/);
+  assert.match(sink.output, /--project-root PATH/);
   assert.match(sink.output, /\/go/);
   assert.match(sink.output, /\/status/);
+  assert.match(sink.output, /\/paper checks/);
   assert.match(sink.output, /\/pause/);
   assert.match(sink.output, /\/resume/);
+});
+
+test("plain cli honors explicit project root outside current working directory", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-cli-project-root-"));
+
+  try {
+    const io = createScriptedIo(["/quit"]);
+    const code = await main(["--plain", "--project-root", projectRoot], {
+      io,
+      intakeBackend: new QuietStubBackend()
+    });
+
+    assert.equal(code, 0);
+    assert.match(io.output, new RegExp(`Project root: ${projectRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    await access(path.join(projectRoot, ".clawresearch", "session.json"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
 });
 
 test("default entry launches the console runtime in the current project directory", async () => {
@@ -202,6 +223,27 @@ test("compiled plain cli processes piped quit during source setup", async () => 
   }
 });
 
+test("compiled plain cli writes state under explicit project root", async () => {
+  const cwdRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-cli-explicit-cwd-"));
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-cli-explicit-root-"));
+
+  try {
+    const { stdout, stderr, code } = await runCompiledCliWithInput(
+      ["--plain", "--project-root", projectRoot],
+      "/quit\n",
+      cwdRoot
+    );
+
+    assert.equal(code, 0);
+    assert.equal(stderr, "");
+    assert.match(stdout, new RegExp(`Project root: ${projectRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    await access(path.join(projectRoot, ".clawresearch", "session.json"));
+  } finally {
+    await rm(cwdRoot, { recursive: true, force: true });
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("compiled plain cli processes piped status after source setup", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-cli-plain-status-"));
   const now = createNow();
@@ -229,6 +271,26 @@ test("compiled plain cli processes piped status after source setup", async () =>
     assert.equal(stderr, "");
     assert.match(stdout, /Current brief:/);
     assert.match(stdout, /Session saved\. Closing ClawResearch\./);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("compiled plain cli does not swallow a brief typed during first source setup prompt", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-cli-plain-brief-setup-"));
+
+  try {
+    const { stdout, stderr, code } = await runCompiledCliWithInput(
+      ["--plain"],
+      "Topic: autonomous research agents for literature review automation\n/quit\n",
+      projectRoot
+    );
+    const session = await new SessionStore(projectRoot, "0.6.0").load();
+
+    assert.equal(code, 0);
+    assert.equal(stderr, "");
+    assert.match(stdout, /Detected a research brief during source setup/i);
+    assert.equal(session.brief.topic, "autonomous research agents for literature review automation");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

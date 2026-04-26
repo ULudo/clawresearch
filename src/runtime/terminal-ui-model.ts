@@ -62,6 +62,7 @@ type AuthPromptFrameOptions = {
 
 const minimumWidth = 60;
 const defaultHeight = 24;
+const rightEdgeSafetyGutter = 4;
 
 function clampWidth(width: number): number {
   return Math.max(minimumWidth, Number.isFinite(width) ? Math.floor(width) : 80);
@@ -69,6 +70,10 @@ function clampWidth(width: number): number {
 
 function clampHeight(height: number): number {
   return Math.max(defaultHeight, Number.isFinite(height) ? Math.floor(height) : defaultHeight);
+}
+
+function contentWidth(width: number): number {
+  return Math.max(20, clampWidth(width) - rightEdgeSafetyGutter);
 }
 
 function truncate(text: string, limit: number): string {
@@ -505,9 +510,9 @@ export function renderSourceChecklist(
   width: number,
   height: number
 ): string {
-  const normalizedWidth = clampWidth(width);
+  const normalizedWidth = contentWidth(width);
   const normalizedHeight = clampHeight(height);
-  const lineWidth = normalizedWidth - 2;
+  const lineWidth = normalizedWidth;
   const entries = buildSourceChecklistEntries(config);
   const sections: Array<{ title: string; category: SourceChecklistEntry["category"] }> = [
     { title: "Scholarly Discovery", category: "scholarlyDiscovery" },
@@ -549,9 +554,9 @@ export function renderSourceChecklist(
 }
 
 export function renderAuthPromptFrame(options: AuthPromptFrameOptions): string {
-  const width = clampWidth(options.width);
+  const width = contentWidth(options.width);
   const height = clampHeight(options.height);
-  const innerWidth = width - 2;
+  const innerWidth = width;
 
   const lines = [
     truncate(options.title, innerWidth),
@@ -573,9 +578,9 @@ export function renderAuthPromptFrame(options: AuthPromptFrameOptions): string {
 }
 
 export function renderChatFrame(options: ChatFrameOptions): string {
-  const width = clampWidth(options.width);
+  const width = contentWidth(options.width);
   const height = clampHeight(options.height);
-  const innerWidth = width - 2;
+  const innerWidth = width;
   const header = [
     truncate(options.title, innerWidth),
     truncate(options.subtitle, innerWidth)

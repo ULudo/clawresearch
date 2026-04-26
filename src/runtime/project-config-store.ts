@@ -18,7 +18,7 @@ import {
 } from "./provider-registry.js";
 import { runtimeDirectoryPath } from "./session-store.js";
 
-const projectConfigSchemaVersion = 6;
+const projectConfigSchemaVersion = 7;
 const projectConfigFileName = "project-config.json";
 const selectableProviderCategories = [
   "scholarlyDiscovery",
@@ -49,6 +49,18 @@ export type ProjectConfigSourcesState = {
   explicitlyConfigured: boolean;
 };
 
+export type RuntimeLlmConfig = {
+  planningTimeoutMs: number;
+  extractionTimeoutMs: number;
+  synthesisTimeoutMs: number;
+  agendaTimeoutMs: number;
+  extractionInitialBatchSize: number;
+  extractionMinBatchSize: number;
+  extractionRetryBudget: number;
+  totalRecoveryBudgetMs: number;
+  evidenceRecoveryMaxPasses: number;
+};
+
 export type ProjectConfigState = {
   schemaVersion: number;
   projectRoot: string;
@@ -58,6 +70,7 @@ export type ProjectConfigState = {
   sources: ProjectConfigSourcesState;
   runtime: {
     postReviewBehavior: "confirm" | "auto_continue";
+    llm: RuntimeLlmConfig;
   };
 };
 
@@ -79,6 +92,25 @@ function readBoolean(value: unknown): boolean | null {
   return typeof value === "boolean" ? value : null;
 }
 
+function readPositiveInteger(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    return null;
+  }
+
+  return value;
+}
+
+function readEnvPositiveInteger(env: NodeJS.ProcessEnv, name: string): number | null {
+  const value = env[name];
+
+  if (value === undefined || value.trim().length === 0) {
+    return null;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
 function readStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) {
     return [];
@@ -88,6 +120,80 @@ function readStringArray(value: unknown): string[] {
     const text = readString(entry);
     return text === null ? [] : [text];
   });
+}
+
+export const defaultRuntimeLlmConfig: RuntimeLlmConfig = {
+  planningTimeoutMs: 300_000,
+  extractionTimeoutMs: 300_000,
+  synthesisTimeoutMs: 300_000,
+  agendaTimeoutMs: 300_000,
+  extractionInitialBatchSize: 6,
+  extractionMinBatchSize: 1,
+  extractionRetryBudget: 24,
+  totalRecoveryBudgetMs: 1_800_000,
+  evidenceRecoveryMaxPasses: 3
+};
+
+function normalizeRuntimeLlmConfig(raw: unknown): RuntimeLlmConfig {
+  const record = asObject(raw);
+  const base = defaultRuntimeLlmConfig;
+  const extractionMinBatchSize = readPositiveInteger(record.extractionMinBatchSize)
+    ?? base.extractionMinBatchSize;
+  const extractionInitialBatchSize = Math.max(
+    extractionMinBatchSize,
+    readPositiveInteger(record.extractionInitialBatchSize)
+      ?? base.extractionInitialBatchSize
+  );
+
+  return {
+    planningTimeoutMs: readPositiveInteger(record.planningTimeoutMs) ?? base.planningTimeoutMs,
+    extractionTimeoutMs: readPositiveInteger(record.extractionTimeoutMs) ?? base.extractionTimeoutMs,
+    synthesisTimeoutMs: readPositiveInteger(record.synthesisTimeoutMs) ?? base.synthesisTimeoutMs,
+    agendaTimeoutMs: readPositiveInteger(record.agendaTimeoutMs) ?? base.agendaTimeoutMs,
+    extractionInitialBatchSize,
+    extractionMinBatchSize,
+    extractionRetryBudget: readPositiveInteger(record.extractionRetryBudget) ?? base.extractionRetryBudget,
+    totalRecoveryBudgetMs: readPositiveInteger(record.totalRecoveryBudgetMs) ?? base.totalRecoveryBudgetMs,
+    evidenceRecoveryMaxPasses: readPositiveInteger(record.evidenceRecoveryMaxPasses) ?? base.evidenceRecoveryMaxPasses
+  };
+}
+
+export function resolveRuntimeLlmConfig(
+  config: ProjectConfigState,
+  env: NodeJS.ProcessEnv = process.env
+): RuntimeLlmConfig {
+  const baseTimeout = readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_TIMEOUT_MS");
+  const configured = normalizeRuntimeLlmConfig(config.runtime.llm);
+  const extractionMinBatchSize = readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_EXTRACTION_MIN_BATCH_SIZE")
+    ?? configured.extractionMinBatchSize;
+  const extractionInitialBatchSize = Math.max(
+    extractionMinBatchSize,
+    readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_EXTRACTION_BATCH_SIZE")
+      ?? configured.extractionInitialBatchSize
+  );
+
+  return {
+    planningTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_PLANNING_TIMEOUT_MS")
+      ?? baseTimeout
+      ?? configured.planningTimeoutMs,
+    extractionTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_EXTRACTION_TIMEOUT_MS")
+      ?? baseTimeout
+      ?? configured.extractionTimeoutMs,
+    synthesisTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_SYNTHESIS_TIMEOUT_MS")
+      ?? baseTimeout
+      ?? configured.synthesisTimeoutMs,
+    agendaTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_AGENDA_TIMEOUT_MS")
+      ?? baseTimeout
+      ?? configured.agendaTimeoutMs,
+    extractionInitialBatchSize,
+    extractionMinBatchSize,
+    extractionRetryBudget: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_EXTRACTION_RETRY_BUDGET")
+      ?? configured.extractionRetryBudget,
+    totalRecoveryBudgetMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_RECOVERY_BUDGET_MS")
+      ?? configured.totalRecoveryBudgetMs,
+    evidenceRecoveryMaxPasses: readEnvPositiveInteger(env, "CLAWRESEARCH_EVIDENCE_RECOVERY_MAX_PASSES")
+      ?? configured.evidenceRecoveryMaxPasses
+  };
 }
 
 function normalizeProviderIds(
@@ -129,7 +235,8 @@ function emptyConfig(projectRoot: string, timestamp: string): ProjectConfigState
       explicitlyConfigured: false
     },
     runtime: {
-      postReviewBehavior: "confirm"
+      postReviewBehavior: "confirm",
+      llm: { ...defaultRuntimeLlmConfig }
     }
   };
 }
@@ -186,7 +293,8 @@ function mergeProjectConfig(
     runtime: {
       postReviewBehavior: readString(asObject(record.runtime).postReviewBehavior) === "auto_continue"
         ? "auto_continue"
-        : "confirm"
+        : "confirm",
+      llm: normalizeRuntimeLlmConfig(asObject(record.runtime).llm)
     }
   };
 }
@@ -345,7 +453,8 @@ export class ProjectConfigStore {
       runtime: {
         postReviewBehavior: config.runtime.postReviewBehavior === "auto_continue"
           ? "auto_continue"
-          : "confirm"
+          : "confirm",
+        llm: normalizeRuntimeLlmConfig(config.runtime.llm)
       }
     };
 

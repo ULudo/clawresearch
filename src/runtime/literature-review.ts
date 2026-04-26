@@ -434,38 +434,110 @@ function slug(text: string): string {
 
 const facetStopTokens = new Set([
   ...stopTokens,
+  "academic",
+  "academically",
+  "agent",
+  "agents",
   "also",
   "affect",
   "affects",
+  "autonomous",
   "available",
+  "backed",
   "bounded",
+  "build",
+  "building",
+  "built",
+  "capable",
+  "citation",
+  "citations",
   "clarify",
+  "clear",
+  "coherent",
   "concrete",
+  "comprehensive",
+  "comprehensively",
+  "comprehensiveness",
+  "contribute",
+  "contributes",
+  "contributing",
+  "development",
+  "design",
+  "designed",
+  "designing",
+  "discovery",
   "distinguish",
+  "diverse",
+  "domain",
+  "domains",
+  "effective",
+  "efficient",
+  "efficiency",
   "exists",
+  "expected",
+  "evidence",
+  "evidence-backed",
   "explain",
   "first",
   "follow",
   "grounded",
+  "identifying",
+  "implemented",
+  "implementing",
+  "including",
   "likely",
+  "limitation",
+  "limitations",
+  "meaningful",
+  "meaningfully",
+  "meet",
+  "meets",
+  "meeting",
   "next",
   "note",
   "open",
+  "paper",
+  "perform",
+  "performing",
+  "progress",
+  "proven",
   "produce",
   "proposes",
+  "quality",
+  "relevant",
+  "reference",
+  "references",
   "realistic",
   "reliable",
+  "review",
+  "revision",
+  "scientific",
+  "separation",
+  "standard",
+  "standards",
+  "statements",
+  "statement",
+  "strong",
+  "structured",
   "speculation",
   "summarizes",
-  "there"
+  "synthesize",
+  "that",
+  "there",
+  "typically",
+  "with",
+  "utilized",
+  "way",
+  "write",
+  "writing"
 ]);
 
 const singleTermFacetKinds: Array<{ pattern: RegExp; kind: ReviewFacetKind }> = [
   { pattern: /^(staffing|workforce|displacement|employment|labor|labour|quality|safety|costs?|outcomes?|impact|impacts?)$/, kind: "outcome" },
-  { pattern: /^(verification|bounds?|control|computation|arithmetic|proof|implementation|architecture|runtime|memory|provenance)$/, kind: "method" },
+  { pattern: /^(verification|bounds?|control|computation|arithmetic|proof|implementation|architecture|runtime|memory|provenance|experimentation|exploration)$/, kind: "method" },
   { pattern: /^(evaluation|benchmark|benchmarks|metrics?|baselines?)$/, kind: "evaluation" },
   { pattern: /^(patients?|residents?|caregivers?|workers?|nurses?)$/, kind: "population" },
-  { pattern: /^(ai|automation|agents?|models?|algorithms?|tools?)$/, kind: "intervention" }
+  { pattern: /^(ai|automation|models?|algorithms?|tools?)$/, kind: "intervention" }
 ];
 
 const protectedFacetPhrases: Array<{ pattern: RegExp; label: string; kind: ReviewFacetKind; aliases?: string[] }> = [
@@ -527,7 +599,35 @@ const protectedFacetPhrases: Array<{ pattern: RegExp; label: string; kind: Revie
     pattern: /\bautonomous research agents?\b/i,
     label: "autonomous research agents",
     kind: "domain",
-    aliases: ["autonomous research agents", "research agents", "AI research agents"]
+    aliases: [
+      "autonomous research agents",
+      "research agents",
+      "AI research agents",
+      "automated research agents",
+      "research automation agents",
+      "scientific assistants",
+      "AI scientists",
+      "AI scientist",
+      "literature synthesis agents"
+    ]
+  },
+  {
+    pattern: /\bscientific discovery\b/i,
+    label: "scientific discovery",
+    kind: "task",
+    aliases: ["scientific discovery", "scientific progress", "research discovery"]
+  },
+  {
+    pattern: /\bexperimentation\b/i,
+    label: "experimentation",
+    kind: "method",
+    aliases: ["experimentation", "experiment design", "scientific experimentation"]
+  },
+  {
+    pattern: /\bexploration\b/i,
+    label: "exploration",
+    kind: "method",
+    aliases: ["exploration", "hypothesis exploration", "research exploration"]
   },
   {
     pattern: /\bagent evaluation\b/i,
@@ -536,10 +636,61 @@ const protectedFacetPhrases: Array<{ pattern: RegExp; label: string; kind: Revie
     aliases: ["agent evaluation", "agent benchmarks", "research agent evaluation"]
   },
   {
+    pattern: /\bevaluation\b/i,
+    label: "evaluation",
+    kind: "evaluation",
+    aliases: ["evaluation", "benchmarking", "agent evaluation", "research evaluation"]
+  },
+  {
+    pattern: /\binformation retrieval\b/i,
+    label: "information retrieval",
+    kind: "method",
+    aliases: ["information retrieval", "retrieval", "literature retrieval", "paper retrieval", "search"]
+  },
+  {
+    pattern: /\bsummar(?:y|ization|isation|izing|ising)\b/i,
+    label: "summarization",
+    kind: "method",
+    aliases: ["summarization", "summarisation", "summarizing", "paper summarization", "literature summarization"]
+  },
+  {
+    pattern: /\b(?:(?:information|knowledge) organi[sz](?:ation|ing)|organi[sz]ing information)\b/i,
+    label: "information organization",
+    kind: "method",
+    aliases: ["information organization", "information organisation", "organizing information", "knowledge organization", "knowledge organisation"]
+  },
+  {
+    pattern: /\bliterature reviews?\b/i,
+    label: "literature review",
+    kind: "task",
+    aliases: [
+      "literature review",
+      "literature reviews",
+      "literature synthesis",
+      "literature summary",
+      "comparative literature summary",
+      "systematic literature review",
+      "review generation",
+      "related work"
+    ]
+  },
+  {
     pattern: /\bliterature synthesis\b/i,
     label: "literature synthesis",
     kind: "task",
-    aliases: ["literature synthesis", "literature review", "related work"]
+    aliases: ["literature synthesis", "literature review", "literature summary", "review generation", "related work"]
+  },
+  {
+    pattern: /\bpaper writing\b/i,
+    label: "paper writing",
+    kind: "task",
+    aliases: ["paper writing", "manuscript writing", "scientific writing"]
+  },
+  {
+    pattern: /\bpeer[- ]reviewed publications?\b/i,
+    label: "peer-reviewed publications",
+    kind: "outcome",
+    aliases: ["peer-reviewed publications", "peer-reviewed publication", "peer reviewed publications", "peer reviewed publication", "scientific publications", "publication output"]
   }
 ];
 
@@ -622,9 +773,14 @@ function addFacet(
     return;
   }
 
-  const key = slug(normalizedLabel);
-  const existing = facets.find((facet) => slug(facet.label) === key || facet.id === `facet-${key}`);
   const terms = uniqueStrings([...facetAliases(normalizedLabel, kind), ...extraTerms]);
+  const key = slug(normalizedLabel);
+  const termKeys = new Set(terms.map(slug));
+  const existing = facets.find((facet) => (
+    slug(facet.label) === key
+    || facet.id === `facet-${key}`
+    || facet.terms.some((term) => termKeys.has(slug(term)) || slug(term) === key)
+  ));
 
   if (existing !== undefined) {
     existing.required = existing.required || required;
@@ -650,9 +806,9 @@ function sourcePriority(source: ReviewFacetSource): number {
   switch (source) {
     case "topic":
       return 0;
-    case "research_question":
-      return 1;
     case "success_criterion":
+      return 1;
+    case "research_question":
       return 2;
     case "research_direction":
       return 3;
@@ -671,6 +827,151 @@ function facetTokens(text: string): string[] {
   return phraseTokens(text)
     .filter((token) => !facetStopTokens.has(token))
     .filter((token) => token.length >= 3 || preservedShortTokens.has(token));
+}
+
+const listLikeFacetTokens = new Set([
+  "experimentation",
+  "exploration",
+  "evaluation",
+  "benchmark",
+  "benchmarking",
+  "publication",
+  "publications",
+  "review",
+  "synthesis"
+]);
+
+const outputQualityFacetTokens = new Set([
+  "academic",
+  "academically",
+  "citation",
+  "citations",
+  "complete",
+  "reference",
+  "references",
+  "coherent",
+  "comprehensive",
+  "comprehensiveness",
+  "evidence",
+  "evidence-backed",
+  "expected",
+  "backed",
+  "limitation",
+  "limitations",
+  "clear",
+  "separation",
+  "separate",
+  "proven",
+  "statements",
+  "statement",
+  "strong",
+  "paper",
+  "manuscript",
+  "publication",
+  "publication-style",
+  "review",
+  "human",
+  "section",
+  "standard",
+  "standards",
+  "style",
+  "typically",
+  "traceable",
+  "revision",
+  "narrative",
+  "quality",
+  "notes",
+  "observed",
+  "uses",
+  "write"
+]);
+
+const genericInstructionFacetTokens = new Set([
+  "build",
+  "built",
+  "design",
+  "efficient",
+  "efficiency",
+  "expected",
+  "high",
+  "including",
+  "meet",
+  "meets",
+  "standard",
+  "standards",
+  "typically"
+]);
+
+const manuscriptQualityPhrasePatterns = [
+  /\b(?:academic|scientific|publication|review)\s+standards?\b/i,
+  /\b(?:meet|meets|meeting)\s+(?:the\s+)?(?:standard|standards|requirements?)\b/i,
+  /\b(?:comprehensive|comprehensiveness|high[- ]quality|expected|typically expected)\b/i,
+  /\b(?:references?|citations?|limitations?|manuscript|review paper|paper draft|writing style)\b/i,
+  /\b(?:proven statements?|speculation|human revision|clear separation)\b/i,
+  /\b(?:complete|publication[- ]style|traceable|section)\b/i,
+  /\b(?:observed effects?|separate observed|separate speculation|only on[- ]topic)\b/i
+];
+
+const malformedFacetPhrasePatterns = [
+  /\bcomplete publication[- ]style(?: section)?\b/i,
+  /\b(?:on[- ]topic separate|separate retrieval|only on[- ]topic|only .* separate)\b/i,
+  /\b(?:publication[- ]style section traceable|section traceable|traceable only)\b/i,
+  /\b(?:effect from uses|from uses only|uses only|observed effect from|separate observed effect)\b/i,
+  /\b(?:method constraint distinguishing|constraint distinguishing|distinguishing rigorous|rigorous verification from|verified-computation method constraint)\b/i,
+  /\borganization evaluation direction\b/i
+];
+
+function isProtectedFacetPhrase(phrase: string): boolean {
+  const lower = normalizeWhitespace(phrase).toLowerCase();
+
+  return protectedFacetPhrases.some((protectedPhrase) => (
+    protectedPhrase.label.toLowerCase() === lower
+    || protectedPhrase.aliases?.some((alias) => alias.toLowerCase() === lower) === true
+  ));
+}
+
+export function isRetrievalQualityConstraintPhrase(phrase: string): boolean {
+  const normalized = normalizeWhitespace(phrase);
+  const tokens = phraseTokens(normalized);
+
+  if (tokens.length === 0) {
+    return true;
+  }
+
+  if (isProtectedFacetPhrase(normalized)) {
+    return false;
+  }
+
+  return malformedFacetPhrasePatterns.some((pattern) => pattern.test(normalized))
+    || manuscriptQualityPhrasePatterns.some((pattern) => pattern.test(normalized))
+    || (tokens.length >= 2 && tokens.every((token) => genericInstructionFacetTokens.has(token)))
+    || (tokens.length >= 2 && tokens.filter((token) => outputQualityFacetTokens.has(token)).length >= Math.ceil(tokens.length / 2));
+}
+
+function isLowQualityFacetPhrase(phrase: string): boolean {
+  const tokens = phraseTokens(phrase);
+
+  return malformedFacetPhrasePatterns.some((pattern) => pattern.test(phrase))
+    || (tokens.length >= 2 && tokens.every((token) => listLikeFacetTokens.has(token)))
+    || tokens.some((token) => /\d/.test(token))
+    || isRetrievalQualityConstraintPhrase(phrase)
+    || (tokens.length >= 2 && tokens.filter((token) => outputQualityFacetTokens.has(token)).length >= Math.ceil(tokens.length / 2));
+}
+
+export function isCoreTopicReviewFacet(facet: ReviewFacet): boolean {
+  return facet.kind === "domain" || facet.kind === "population" || facet.kind === "intervention";
+}
+
+export function isSubstantiveReviewFacet(facet: ReviewFacet): boolean {
+  return !isRetrievalQualityConstraintPhrase(facet.label)
+    && facet.terms.some((term) => !isRetrievalQualityConstraintPhrase(term))
+    && (
+      facet.kind === "method"
+      || facet.kind === "task"
+      || facet.kind === "evaluation"
+      || facet.kind === "outcome"
+      || facet.kind === "constraint"
+    );
 }
 
 function fieldFacetPhrases(text: string, limit: number): string[] {
@@ -697,6 +998,7 @@ function fieldFacetPhrases(text: string, limit: number): string[] {
   }
 
   return uniqueStrings(phrases)
+    .filter((phrase) => !isLowQualityFacetPhrase(phrase))
     .filter((phrase) => phrase.length >= 3)
     .slice(0, limit);
 }
@@ -709,6 +1011,10 @@ function addFacetsFromField(
   phraseLimit: number
 ): void {
   if (text === null || normalizeWhitespace(text).length === 0) {
+    return;
+  }
+
+  if (/^\.clawresearch\/|\/\.clawresearch\//.test(normalizeWhitespace(text))) {
     return;
   }
 
@@ -733,7 +1039,7 @@ function addFacetsFromField(
       facets,
       phrase,
       singleKind ?? kind,
-      requiredByDefault && kind !== "task",
+      false,
       source,
       `Extracted from ${source.replace(/_/g, " ")}.`
     );
@@ -773,8 +1079,8 @@ export function buildReviewFacets(input: {
         || left.label.localeCompare(right.label);
     });
 
-  const required = sorted.filter((facet) => facet.required).slice(0, 8);
-  const optional = sorted.filter((facet) => !facet.required).slice(0, Math.max(0, 14 - required.length));
+  const required = sorted.filter((facet) => facet.required).slice(0, 12);
+  const optional = sorted.filter((facet) => !facet.required).slice(0, Math.max(0, 18 - required.length));
   const selected = [...required, ...optional];
 
   if (selected.length === 0 && input.brief.topic !== null) {

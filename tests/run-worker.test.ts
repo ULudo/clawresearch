@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -17,8 +17,10 @@ import type {
   ResearchPlan,
   ResearchAgendaRequest,
   ResearchSynthesisRequest,
-  ResearchSynthesis
+  ResearchSynthesis,
+  ResearchBackendCallOptions
 } from "../src/runtime/research-backend.js";
+import { ResearchBackendError } from "../src/runtime/research-backend.js";
 import type {
   EvidenceMatrix,
   PaperExtraction
@@ -31,7 +33,7 @@ import type {
 } from "../src/runtime/research-sources.js";
 import { MemoryStore, memoryFilePath } from "../src/runtime/memory-store.js";
 import { ProjectConfigStore } from "../src/runtime/project-config-store.js";
-import { researchDirectionPath, RunStore } from "../src/runtime/run-store.js";
+import { researchDirectionPath, runDirectoryPath, runFilePath, RunStore } from "../src/runtime/run-store.js";
 import { runDetachedJobWorker } from "../src/runtime/run-worker.js";
 
 function createNow(): () => string {
@@ -172,6 +174,53 @@ function reviewWorkflowFor(papers: CanonicalPaper[], reviewedPaperIds?: string[]
       deferred: 0
     },
     notes: []
+  };
+}
+
+function selectionQualityFor(
+  papers: CanonicalPaper[],
+  options: {
+    adequacy: "thin" | "partial" | "strong";
+    facetLabel: string;
+    missing?: boolean;
+  }
+) {
+  const facet = {
+    id: `facet-${options.facetLabel.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`,
+    label: options.facetLabel,
+    kind: "method" as const,
+    required: true,
+    terms: [options.facetLabel],
+    source: "success_criterion" as const,
+    rationale: "Extracted from the test success criterion."
+  };
+  const selectedIds = papers.map((paper) => paper.id);
+
+  return {
+    schemaVersion: 1 as const,
+    requiredFacets: [facet],
+    optionalFacets: [],
+    paperFacetCoverage: papers.map((paper) => ({
+      paperId: paper.id,
+      coveredFacetIds: options.missing ? [] : [facet.id],
+      missingRequiredFacetIds: options.missing ? [facet.id] : [],
+      coverageScore: options.missing ? 0 : 4,
+      matchedTerms: options.missing ? [] : [options.facetLabel],
+      rationale: options.missing ? "The facet is not visible in this pass." : "The facet is covered by the selected paper."
+    })),
+    selectedSetCoverage: [{
+      facetId: facet.id,
+      label: facet.label,
+      required: true,
+      coveredByPaperIds: options.missing ? [] : selectedIds,
+      count: options.missing ? 0 : selectedIds.length
+    }],
+    missingRequiredFacets: options.missing ? [facet] : [],
+    backgroundOnlyFacets: [],
+    adequacy: options.adequacy,
+    selectionRationale: options.missing
+      ? [`Missing required facets in the selected reviewed set: ${options.facetLabel}.`]
+      : [`Selected set covers the ${options.facetLabel} facet.`]
   };
 }
 
@@ -426,6 +475,173 @@ class StubSourceGatherer implements ResearchSourceGatherer {
   }
 }
 
+class MultiPaperSourceGatherer implements ResearchSourceGatherer {
+  constructor(private readonly count: number) {}
+
+  async gather(): Promise<ResearchSourceGatherResult> {
+    const papers = Array.from({ length: this.count }, (_, index) => canonicalPaper({
+      id: `paper-${index + 1}`,
+      key: `doi:10.1000/recovery-${index + 1}`,
+      title: `Recovery test paper ${index + 1}`,
+      citation: `Example Author (${2020 + index}). Recovery test paper ${index + 1}.`,
+      abstract: `Paper ${index + 1} discusses autonomous research-agent recovery behavior.`,
+      year: 2020 + index
+    }));
+
+    return {
+      notes: [`Collected ${papers.length} recovery-test sources.`],
+      sources: [],
+      canonicalPapers: papers,
+      reviewedPapers: papers,
+      routing: {
+        domain: "mixed",
+        plannedQueries: ["adaptive extraction recovery"],
+        discoveryProviderIds: ["openalex"],
+        resolverProviderIds: [],
+        acquisitionProviderIds: ["openalex"]
+      },
+      mergeDiagnostics: [],
+      authStatus: [],
+      reviewWorkflow: reviewWorkflowFor(papers)
+    };
+  }
+}
+
+class EvidenceRecoverySourceGatherer implements ResearchSourceGatherer {
+  requests: ResearchSourceGatherRequest[] = [];
+
+  async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
+    this.requests.push(request);
+
+    if (this.requests.length === 1) {
+      const papers = [
+        canonicalPaper({
+          id: "paper-thin",
+          key: "doi:10.1000/thin-recovery",
+          title: "Thin autonomous research agent note",
+          citation: "Example Author (2024). Thin autonomous research agent note.",
+          abstract: "A narrow note about autonomous agents without benchmark evidence."
+        })
+      ];
+
+      return {
+        notes: ["Collected an initial thin reviewed set."],
+        sources: [],
+        canonicalPapers: papers,
+        reviewedPapers: papers,
+        routing: {
+          domain: "mixed",
+          plannedQueries: request.plan.searchQueries,
+          discoveryProviderIds: ["openalex"],
+          resolverProviderIds: [],
+          acquisitionProviderIds: ["openalex"]
+        },
+        mergeDiagnostics: [],
+        authStatus: [],
+        reviewWorkflow: reviewWorkflowFor(papers),
+        retrievalDiagnostics: {
+          queries: [],
+          providerAttempts: [],
+          screeningSummary: {
+            accepted: 1,
+            rejected: 0,
+            weakMatchSamples: []
+          },
+          recoveryPasses: 0,
+          accessLimitations: [],
+          suggestedNextQueries: ["autonomous research agents benchmark evaluation"]
+        },
+        selectionQuality: selectionQualityFor(papers, {
+          adequacy: "partial",
+          facetLabel: "benchmark evaluation",
+          missing: true
+        })
+      };
+    }
+
+    assert.ok(request.recoveryQueries?.some((query) => /benchmark evaluation/i.test(query)));
+    const papers = Array.from({ length: 3 }, (_, index) => canonicalPaper({
+      id: `paper-recovered-${index + 1}`,
+      key: `doi:10.1000/recovered-evidence-${index + 1}`,
+      title: `Recovered benchmark evaluation paper ${index + 1}`,
+      citation: `Example Author (${2021 + index}). Recovered benchmark evaluation paper ${index + 1}.`,
+      abstract: `Paper ${index + 1} reports benchmark evaluation evidence for autonomous research agents.`,
+      year: 2021 + index
+    }));
+
+    return {
+      notes: ["Recovered a stronger benchmark-evaluation evidence set."],
+      sources: [],
+      canonicalPapers: papers,
+      reviewedPapers: papers,
+      routing: {
+        domain: "mixed",
+        plannedQueries: request.plan.searchQueries,
+        discoveryProviderIds: ["openalex"],
+        resolverProviderIds: [],
+        acquisitionProviderIds: ["openalex"]
+      },
+      mergeDiagnostics: [],
+      authStatus: [],
+      reviewWorkflow: reviewWorkflowFor(papers),
+      retrievalDiagnostics: {
+        queries: [],
+        providerAttempts: [],
+        screeningSummary: {
+          accepted: 3,
+          rejected: 0,
+          weakMatchSamples: []
+        },
+        recoveryPasses: 0,
+        accessLimitations: [],
+        suggestedNextQueries: []
+      },
+      selectionQuality: selectionQualityFor(papers, {
+        adequacy: "strong",
+        facetLabel: "benchmark evaluation"
+      })
+    };
+  }
+}
+
+class RecoveringExtractionBackend extends StubResearchBackend {
+  calls: string[][] = [];
+  private failedLargeBatch = false;
+
+  override async extractReviewedPapers(
+    request: PaperExtractionRequest,
+    options?: ResearchBackendCallOptions
+  ): Promise<PaperExtraction[]> {
+    this.calls.push(request.papers.map((paper) => paper.id));
+
+    if (!this.failedLargeBatch && request.papers.length > 1) {
+      this.failedLargeBatch = true;
+      throw new ResearchBackendError(
+        "timeout",
+        "extraction",
+        "simulated oversized extraction batch",
+        options?.timeoutMs ?? null
+      );
+    }
+
+    return super.extractReviewedPapers(request);
+  }
+}
+
+class PersistentlyFailingExtractionBackend extends StubResearchBackend {
+  override async extractReviewedPapers(
+    request: PaperExtractionRequest,
+    options?: ResearchBackendCallOptions
+  ): Promise<PaperExtraction[]> {
+    throw new ResearchBackendError(
+      "malformed_json",
+      "extraction",
+      `simulated malformed extraction for ${request.papers.map((paper) => paper.id).join(", ")}`,
+      options?.timeoutMs ?? null
+    );
+  }
+}
+
 class NoEvidenceSourceGatherer implements ResearchSourceGatherer {
   async gather(): Promise<ResearchSourceGatherResult> {
     return {
@@ -559,6 +775,83 @@ class LiteratureAwareSourceGatherer implements ResearchSourceGatherer {
   }
 }
 
+test("run store loads legacy run records with manuscript artifact defaults", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-store-legacy-manuscript-"));
+  const runId = "run-legacy-manuscript";
+
+  try {
+    await mkdir(runDirectoryPath(projectRoot, runId), { recursive: true });
+    await writeFile(runFilePath(projectRoot, runId), `${JSON.stringify({
+      schemaVersion: 1,
+      appVersion: "0.6.0",
+      id: runId,
+      projectRoot,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      startedAt: null,
+      finishedAt: null,
+      status: "completed",
+      stage: "literature_review",
+      statusMessage: "legacy run",
+      parentRunId: null,
+      derivedFromWorkPackageId: null,
+      brief: {
+        topic: "Legacy topic",
+        researchQuestion: "Legacy question?",
+        researchDirection: "Legacy direction.",
+        successCriterion: "Legacy criterion."
+      },
+      workerPid: null,
+      job: {
+        command: ["clawresearch", "research-loop"],
+        cwd: projectRoot,
+        pid: null,
+        startedAt: null,
+        finishedAt: null,
+        exitCode: 0,
+        signal: null
+      },
+      artifacts: {
+        runDirectory: runDirectoryPath(projectRoot, runId),
+        tracePath: path.join(runDirectoryPath(projectRoot, runId), "trace.log"),
+        eventsPath: path.join(runDirectoryPath(projectRoot, runId), "events.jsonl"),
+        stdoutPath: path.join(runDirectoryPath(projectRoot, runId), "stdout.log"),
+        stderrPath: path.join(runDirectoryPath(projectRoot, runId), "stderr.log"),
+        briefPath: path.join(runDirectoryPath(projectRoot, runId), "brief.json"),
+        planPath: path.join(runDirectoryPath(projectRoot, runId), "plan.json"),
+        sourcesPath: path.join(runDirectoryPath(projectRoot, runId), "sources.json"),
+        literaturePath: path.join(runDirectoryPath(projectRoot, runId), "literature-review.json"),
+        paperExtractionsPath: path.join(runDirectoryPath(projectRoot, runId), "paper-extractions.json"),
+        evidenceMatrixPath: path.join(runDirectoryPath(projectRoot, runId), "evidence-matrix.json"),
+        synthesisPath: path.join(runDirectoryPath(projectRoot, runId), "synthesis.md"),
+        claimsPath: path.join(runDirectoryPath(projectRoot, runId), "claims.json"),
+        verificationPath: path.join(runDirectoryPath(projectRoot, runId), "verification.json"),
+        nextQuestionsPath: path.join(runDirectoryPath(projectRoot, runId), "next-questions.json"),
+        agendaPath: path.join(runDirectoryPath(projectRoot, runId), "agenda.json"),
+        agendaMarkdownPath: path.join(runDirectoryPath(projectRoot, runId), "agenda.md"),
+        workPackagePath: path.join(runDirectoryPath(projectRoot, runId), "work-package.json"),
+        methodPlanPath: path.join(runDirectoryPath(projectRoot, runId), "method-plan.json"),
+        executionChecklistPath: path.join(runDirectoryPath(projectRoot, runId), "execution-checklist.json"),
+        findingsPath: path.join(runDirectoryPath(projectRoot, runId), "findings.json"),
+        decisionPath: path.join(runDirectoryPath(projectRoot, runId), "decision.json"),
+        summaryPath: path.join(runDirectoryPath(projectRoot, runId), "summary.md"),
+        memoryPath: path.join(runDirectoryPath(projectRoot, runId), "research-journal.json")
+      }
+    }, null, 2)}\n`, "utf8");
+
+    const loaded = await new RunStore(projectRoot, "0.7.0", createNow()).load(runId);
+
+    assert.match(loaded.artifacts.reviewProtocolPath, /review-protocol\.json$/);
+    assert.match(loaded.artifacts.paperOutlinePath, /paper-outline\.json$/);
+    assert.match(loaded.artifacts.paperPath, /paper\.md$/);
+    assert.match(loaded.artifacts.paperJsonPath, /paper\.json$/);
+    assert.match(loaded.artifacts.referencesPath, /references\.json$/);
+    assert.match(loaded.artifacts.manuscriptChecksPath, /manuscript-checks\.json$/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("run worker writes raw retrieval and canonical literature artifacts, and synthesizes from canonical papers", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-"));
   const now = createNow();
@@ -623,6 +916,46 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
       claimCount: number;
       claims: Array<Record<string, unknown>>;
     };
+    const reviewProtocol = JSON.parse(await readFile(completedRun.artifacts.reviewProtocolPath, "utf8")) as {
+      schemaVersion: number;
+      runId: string;
+      reviewType: string;
+      actualRetrieval: {
+        canonicalPaperCount: number;
+        reviewedPaperCount: number;
+      } | null;
+      requiredSuccessCriterionFacets: Array<{ label: string }>;
+      evidenceTargets: string[];
+      manuscriptConstraints: string[];
+    };
+    const paperOutline = JSON.parse(await readFile(completedRun.artifacts.paperOutlinePath, "utf8")) as {
+      schemaVersion: number;
+      runId: string;
+      structureRationale: string;
+      rhetoricalPlan: Array<{ role: string }>;
+    };
+    const paperArtifact = JSON.parse(await readFile(completedRun.artifacts.paperJsonPath, "utf8")) as {
+      schemaVersion: number;
+      runId: string;
+      readinessStatus: string;
+      referencedPaperIds: string[];
+      claims: Array<Record<string, unknown>>;
+      scientificRoles: string[];
+    };
+    const referencesArtifact = JSON.parse(await readFile(completedRun.artifacts.referencesPath, "utf8")) as {
+      schemaVersion: number;
+      runId: string;
+      referenceCount: number;
+      references: Array<{ sourceId: string }>;
+    };
+    const manuscriptChecks = JSON.parse(await readFile(completedRun.artifacts.manuscriptChecksPath, "utf8")) as {
+      schemaVersion: number;
+      runId: string;
+      readinessStatus: string;
+      checks: Array<{ id: string; status: string }>;
+    };
+    const reviewProtocolMarkdown = await readFile(completedRun.artifacts.reviewProtocolMarkdownPath, "utf8");
+    const paperMarkdown = await readFile(completedRun.artifacts.paperPath, "utf8");
     const agendaMarkdown = await readFile(completedRun.artifacts.agendaMarkdownPath, "utf8");
     const literatureStoreContents = await readFile(literatureStoreFilePath(projectRoot), "utf8");
     const memoryContents = await readFile(memoryFilePath(projectRoot), "utf8");
@@ -659,6 +992,34 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     assert.equal(typeof claimsArtifact.briefFingerprint, "string");
     assert.equal(claimsArtifact.claimCount, 1);
     assert.equal(claimsArtifact.claims.length, 1);
+    assert.equal(reviewProtocol.schemaVersion, 1);
+    assert.equal(reviewProtocol.runId, completedRun.id);
+    assert.equal(reviewProtocol.actualRetrieval?.canonicalPaperCount, 1);
+    assert.equal(reviewProtocol.actualRetrieval?.reviewedPaperCount, 1);
+    assert.match(JSON.stringify(reviewProtocol.requiredSuccessCriterionFacets), /proof techniques/);
+    assert.match(reviewProtocol.evidenceTargets.join(" "), /proof techniques/i);
+    assert.match(reviewProtocol.manuscriptConstraints.join(" "), /Do not present a full manuscript/i);
+    assert.match(reviewProtocolMarkdown, /Review Protocol/);
+    assert.equal(paperOutline.schemaVersion, 1);
+    assert.equal(paperOutline.runId, completedRun.id);
+    assert.match(paperOutline.structureRationale, /scientific roles/i);
+    assert.ok(paperOutline.rhetoricalPlan.some((section) => section.role === "review_method"));
+    assert.equal(paperArtifact.schemaVersion, 1);
+    assert.equal(paperArtifact.runId, completedRun.id);
+    assert.equal(paperArtifact.readinessStatus, "needs_more_evidence");
+    assert.deepEqual(paperArtifact.referencedPaperIds, []);
+    assert.equal(paperArtifact.claims.length, 0);
+    assert.ok(paperArtifact.scientificRoles.includes("status_report"));
+    assert.equal(referencesArtifact.schemaVersion, 1);
+    assert.equal(referencesArtifact.runId, completedRun.id);
+    assert.equal(referencesArtifact.referenceCount, 1);
+    assert.equal(referencesArtifact.references[0]?.sourceId, canonicalPaperId(canonicalPaper()));
+    assert.equal(manuscriptChecks.schemaVersion, 1);
+    assert.equal(manuscriptChecks.runId, completedRun.id);
+    assert.equal(manuscriptChecks.readinessStatus, "needs_more_evidence");
+    assert.ok(manuscriptChecks.checks.some((check) => check.id === "evidence-matrix-ready" && check.status === "fail"));
+    assert.match(paperMarkdown, /No full review manuscript was released/i);
+    assert.doesNotMatch(paperMarkdown, new RegExp(`\\[${canonicalPaperId(canonicalPaper())}\\]`));
     assert.equal(evidenceMatrixArtifact.rowCount, 1);
     assert.equal(evidenceMatrixArtifact.rows.length, 1);
     assert.ok(evidenceMatrixArtifact.derivedInsights.length > 0);
@@ -675,6 +1036,188 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     assert.match(literatureStoreContents, /"paperCount": 1/);
     assert.match(memoryContents, /paper-1/);
     assert.doesNotMatch(memoryContents, /"type": "source"/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("run worker shrinks extraction batches after timeout and checkpoints recovery", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-extraction-recovery-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "Autonomous research agents",
+      researchQuestion: "How should extraction recover from oversized prompts?",
+      researchDirection: "Test adaptive extraction batches.",
+      successCriterion: "Complete extraction for every selected paper before drafting."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.explicitlyConfigured = true;
+    projectConfig.runtime.llm.extractionInitialBatchSize = 4;
+    projectConfig.runtime.llm.extractionMinBatchSize = 1;
+    projectConfig.runtime.llm.extractionRetryBudget = 8;
+    await projectConfigStore.save(projectConfig);
+
+    const backend = new RecoveringExtractionBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer: new MultiPaperSourceGatherer(3)
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const artifact = JSON.parse(await readFile(completedRun.artifacts.paperExtractionsPath, "utf8")) as {
+      status: string;
+      paperCount: number;
+      extractionCount: number;
+      batchAttempts: Array<{ status: string; errorKind: string | null; batchSize: number }>;
+    };
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.deepEqual(backend.calls.map((call) => call.length), [3, 2, 1]);
+    assert.equal(artifact.status, "completed");
+    assert.equal(artifact.paperCount, 3);
+    assert.equal(artifact.extractionCount, 3);
+    assert.equal(artifact.batchAttempts[0]?.status, "failed");
+    assert.equal(artifact.batchAttempts[0]?.errorKind, "timeout");
+    assert.ok(artifact.batchAttempts.some((attempt) => attempt.status === "succeeded" && attempt.batchSize === 2));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("run worker autonomously reruns retrieval when manuscript checks need more evidence", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-evidence-recovery-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "Autonomous research agents",
+      researchQuestion: "How should autonomous research agents be evaluated?",
+      researchDirection: "Review benchmark evaluation evidence.",
+      successCriterion: "Cover benchmark evaluation before writing the paper."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.explicitlyConfigured = true;
+    projectConfig.runtime.llm.evidenceRecoveryMaxPasses = 2;
+    await projectConfigStore.save(projectConfig);
+
+    const backend = new StubResearchBackend();
+    const sourceGatherer = new EvidenceRecoverySourceGatherer();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const paper = JSON.parse(await readFile(completedRun.artifacts.paperJsonPath, "utf8")) as {
+      readinessStatus: string;
+      referencedPaperIds: string[];
+    };
+    const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as {
+      autonomousEvidence: { pass: number; recoveryPasses: number };
+    };
+    const planArtifact = JSON.parse(await readFile(completedRun.artifacts.planPath, "utf8")) as {
+      searchQueries: string[];
+    };
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.equal(sourceGatherer.requests.length, 2);
+    assert.ok(sourceGatherer.requests[1]?.recoveryQueries?.some((query) => /benchmark evaluation/i.test(query)));
+    assert.equal(sourcesArtifact.autonomousEvidence.pass, 2);
+    assert.equal(sourcesArtifact.autonomousEvidence.recoveryPasses, 1);
+    assert.ok(planArtifact.searchQueries.some((query) => /benchmark evaluation/i.test(query)));
+    assert.equal(backend.capturedExtractionPaperIds.length, 3);
+    assert.equal(backend.capturedPaperIds.length, 3);
+    assert.equal(paper.readinessStatus, "needs_human_review");
+    assert.equal(paper.referencedPaperIds.length, 0);
+    assert.match(stdout, /Evidence recovery pass 1/i);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("run worker blocks manuscript generation when extraction cannot recover", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-extraction-blocked-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "Autonomous research agents",
+      researchQuestion: "How should persistent extraction failures be handled?",
+      researchDirection: "Do not draft when selected evidence is not fully extracted.",
+      successCriterion: "Block manuscript generation until extraction succeeds."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.explicitlyConfigured = true;
+    projectConfig.runtime.llm.extractionInitialBatchSize = 2;
+    projectConfig.runtime.llm.extractionMinBatchSize = 1;
+    projectConfig.runtime.llm.extractionRetryBudget = 4;
+    await projectConfigStore.save(projectConfig);
+
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: new PersistentlyFailingExtractionBackend(),
+      sourceGatherer: new MultiPaperSourceGatherer(2)
+    });
+
+    const failedRun = await runStore.load(run.id);
+    const extractionArtifact = JSON.parse(await readFile(failedRun.artifacts.paperExtractionsPath, "utf8")) as {
+      status: string;
+      extractionCount: number;
+      failedPaperIds: string[];
+    };
+    const paperArtifact = JSON.parse(await readFile(failedRun.artifacts.paperJsonPath, "utf8")) as {
+      artifactKind: string;
+      status: string;
+      error: { kind: string };
+    };
+    const paperMarkdown = await readFile(failedRun.artifacts.paperPath, "utf8");
+
+    assert.equal(exitCode, 1);
+    assert.equal(failedRun.status, "failed");
+    assert.equal(extractionArtifact.status, "failed");
+    assert.equal(extractionArtifact.extractionCount, 0);
+    assert.ok(extractionArtifact.failedPaperIds.length > 0);
+    assert.equal(paperArtifact.artifactKind, "paper");
+    assert.equal(paperArtifact.status, "failed");
+    assert.equal(paperArtifact.error.kind, "stage_blocked");
+    assert.match(paperMarkdown, /No review-paper draft was produced/);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -1178,6 +1721,20 @@ test("run worker writes a hold agenda when no canonical papers are retained", as
       claimCount: number;
       claims: unknown[];
     };
+    const paper = JSON.parse(await readFile(completedRun.artifacts.paperJsonPath, "utf8")) as {
+      readinessStatus: string;
+      referencedPaperIds: string[];
+      claims: unknown[];
+    };
+    const references = JSON.parse(await readFile(completedRun.artifacts.referencesPath, "utf8")) as {
+      referenceCount: number;
+      references: unknown[];
+    };
+    const checks = JSON.parse(await readFile(completedRun.artifacts.manuscriptChecksPath, "utf8")) as {
+      readinessStatus: string;
+      blockerCount: number;
+    };
+    const paperMarkdown = await readFile(completedRun.artifacts.paperPath, "utf8");
     const evidenceMatrix = JSON.parse(await readFile(completedRun.artifacts.evidenceMatrixPath, "utf8")) as {
       rowCount: number;
       rows: unknown[];
@@ -1200,6 +1757,13 @@ test("run worker writes a hold agenda when no canonical papers are retained", as
     assert.equal(claims.runId, completedRun.id);
     assert.equal(claims.claimCount, 0);
     assert.equal(claims.claims.length, 0);
+    assert.equal(paper.readinessStatus, "blocked");
+    assert.equal(paper.referencedPaperIds.length, 0);
+    assert.equal(paper.claims.length, 0);
+    assert.equal(references.referenceCount, 0);
+    assert.equal(references.references.length, 0);
+    assert.equal(checks.readinessStatus, "blocked");
+    assert.match(paperMarkdown, /blocked/i);
     assert.equal(evidenceMatrix.rowCount, 0);
     assert.equal(evidenceMatrix.rows.length, 0);
     assert.equal(agenda.selectedDirectionId, null);
