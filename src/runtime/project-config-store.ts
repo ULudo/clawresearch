@@ -17,6 +17,7 @@ import {
   type SourceProviderId
 } from "./provider-registry.js";
 import { runtimeDirectoryPath } from "./session-store.js";
+import type { ResearchAgentControlMode } from "./research-agent.js";
 
 const projectConfigSchemaVersion = 7;
 const projectConfigFileName = "project-config.json";
@@ -62,6 +63,7 @@ export type RuntimeLlmConfig = {
   synthesisInitialClusterSize: number;
   synthesisMinClusterSize: number;
   synthesisRetryBudget: number;
+  agentControlMode: ResearchAgentControlMode;
   agentInvalidActionBudget: number;
   totalRecoveryBudgetMs: number;
   evidenceRecoveryMaxPasses: number;
@@ -96,6 +98,17 @@ function readString(value: unknown): string | null {
 
 function readBoolean(value: unknown): boolean | null {
   return typeof value === "boolean" ? value : null;
+}
+
+function readAgentControlMode(value: unknown): ResearchAgentControlMode | null {
+  switch (value) {
+    case "auto":
+    case "native_tool_calls":
+    case "strict_json":
+      return value;
+    default:
+      return null;
+  }
 }
 
 function readPositiveInteger(value: unknown): number | null {
@@ -141,6 +154,7 @@ export const defaultRuntimeLlmConfig: RuntimeLlmConfig = {
   synthesisInitialClusterSize: 6,
   synthesisMinClusterSize: 1,
   synthesisRetryBudget: 12,
+  agentControlMode: "auto",
   agentInvalidActionBudget: 2,
   totalRecoveryBudgetMs: 1_800_000,
   evidenceRecoveryMaxPasses: 3
@@ -177,6 +191,7 @@ function normalizeRuntimeLlmConfig(raw: unknown): RuntimeLlmConfig {
     synthesisInitialClusterSize,
     synthesisMinClusterSize,
     synthesisRetryBudget: readPositiveInteger(record.synthesisRetryBudget) ?? base.synthesisRetryBudget,
+    agentControlMode: readAgentControlMode(record.agentControlMode) ?? base.agentControlMode,
     agentInvalidActionBudget: readPositiveInteger(record.agentInvalidActionBudget) ?? base.agentInvalidActionBudget,
     totalRecoveryBudgetMs: readPositiveInteger(record.totalRecoveryBudgetMs) ?? base.totalRecoveryBudgetMs,
     evidenceRecoveryMaxPasses: readPositiveInteger(record.evidenceRecoveryMaxPasses) ?? base.evidenceRecoveryMaxPasses
@@ -231,6 +246,8 @@ export function resolveRuntimeLlmConfig(
     synthesisMinClusterSize,
     synthesisRetryBudget: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_SYNTHESIS_RETRY_BUDGET")
       ?? configured.synthesisRetryBudget,
+    agentControlMode: readAgentControlMode(env.CLAWRESEARCH_AGENT_CONTROL_MODE)
+      ?? configured.agentControlMode,
     agentInvalidActionBudget: readEnvPositiveInteger(env, "CLAWRESEARCH_AGENT_INVALID_ACTION_BUDGET")
       ?? configured.agentInvalidActionBudget,
     totalRecoveryBudgetMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_RECOVERY_BUDGET_MS")

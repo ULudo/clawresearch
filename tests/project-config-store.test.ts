@@ -149,6 +149,7 @@ test("runtime llm config resolves env overrides over project defaults", async ()
       CLAWRESEARCH_LLM_SYNTHESIS_MIN_CLUSTER_SIZE: "2",
       CLAWRESEARCH_LLM_SYNTHESIS_RETRY_BUDGET: "11",
       CLAWRESEARCH_LLM_AGENT_STEP_TIMEOUT_MS: "555000",
+      CLAWRESEARCH_AGENT_CONTROL_MODE: "native_tool_calls",
       CLAWRESEARCH_AGENT_INVALID_ACTION_BUDGET: "3",
       CLAWRESEARCH_EVIDENCE_RECOVERY_MAX_PASSES: "4"
     });
@@ -164,6 +165,7 @@ test("runtime llm config resolves env overrides over project defaults", async ()
     assert.equal(resolved.synthesisMinClusterSize, 2);
     assert.equal(resolved.synthesisRetryBudget, 11);
     assert.equal(resolved.agentStepTimeoutMs, 555_000);
+    assert.equal(resolved.agentControlMode, "native_tool_calls");
     assert.equal(resolved.agentInvalidActionBudget, 3);
     assert.equal(resolved.evidenceRecoveryMaxPasses, 4);
   } finally {

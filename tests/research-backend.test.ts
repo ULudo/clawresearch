@@ -227,27 +227,132 @@ test("Ollama backend accumulates streamed JSON chunks instead of relying on one 
   }
 });
 
-test("research-agent backend asks for one allowed structured action", async () => {
+test("research-agent backend uses native tool calls by default", async () => {
   const originalFetch = globalThis.fetch;
-  let capturedPrompt = "";
+  let capturedBody: {
+    tools?: Array<{ function?: { name?: string; parameters?: { properties?: { action?: { enum?: string[] } } } } }>;
+    messages?: Array<{ content?: string }>;
+  } = {};
 
   try {
     globalThis.fetch = async (_input, init): Promise<Response> => {
-      const body = JSON.parse(String(init?.body)) as {
-        messages?: Array<{ content?: string }>;
-      };
-      capturedPrompt = body.messages?.[0]?.content ?? "";
+      capturedBody = JSON.parse(String(init?.body)) as typeof capturedBody;
+
+      return new Response(JSON.stringify({
+        message: {
+          tool_calls: [{
+            function: {
+              name: "choose_research_action",
+              arguments: {
+                action: "synthesize_clustered",
+                rationale: "The selected evidence is ready for clustered synthesis.",
+                confidence: 0.88,
+                inputs: {
+                  searchQueries: [],
+                  evidenceTargets: [],
+                  paperIds: ["paper-1"],
+                  criticStage: null,
+                  reason: null
+                },
+                expectedOutcome: "A synthesis checkpoint is written.",
+                stopCondition: "Stop after synthesis artifacts are checkpointed."
+              }
+            }
+          }]
+        }
+      }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json"
+        }
+      });
+    };
+
+    const backend = new OllamaResearchBackend("127.0.0.1:11434", "stub-model");
+    const decision = await backend.chooseResearchAction({
+      projectRoot: "/tmp/project",
+      runId: "run-agent-step",
+      phase: "synthesis",
+      attempt: 1,
+      maxAttempts: 2,
+      allowedActions: ["revise_search_strategy", "synthesize_clustered", "finalize_status_report"],
+      brief: {
+        topic: "autonomous research agents",
+        researchQuestion: "How should the runtime continue?",
+        researchDirection: "Use an action loop.",
+        successCriterion: "Choose the next validated action."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review action-loop designs.",
+        rationale: "The brief asks for autonomous research behavior.",
+        searchQueries: ["autonomous research agents tool use"],
+        localFocus: ["action loop"]
+      },
+      observations: {
+        canonicalPapers: 5,
+        selectedPapers: 4,
+        extractedPapers: 4,
+        evidenceRows: 4,
+        evidenceInsights: 2,
+        manuscriptReadiness: null,
+        revisionPassesUsed: 0,
+        revisionPassesRemaining: 3
+      },
+      criticReports: []
+    });
+
+    assert.equal(decision.action, "synthesize_clustered");
+    assert.equal(decision.transport, "native_tool_call");
+    assert.equal(decision.inputs.paperIds[0], "paper-1");
+    assert.equal(capturedBody.tools?.[0]?.function?.name, "choose_research_action");
+    assert.deepEqual(capturedBody.tools?.[0]?.function?.parameters?.properties?.action?.enum, [
+      "revise_search_strategy",
+      "synthesize_clustered",
+      "finalize_status_report"
+    ]);
+    assert.match(capturedBody.messages?.[0]?.content ?? "", /Call choose_research_action exactly once/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("research-agent backend falls back to strict JSON when native tool calls are unavailable", async () => {
+  const originalFetch = globalThis.fetch;
+  const capturedBodies: Array<{
+    tools?: unknown[];
+    format?: string;
+    messages?: Array<{ content?: string }>;
+  }> = [];
+
+  try {
+    globalThis.fetch = async (_input, init): Promise<Response> => {
+      const body = JSON.parse(String(init?.body)) as typeof capturedBodies[number];
+      capturedBodies.push(body);
+
+      if (capturedBodies.length === 1) {
+        return new Response(JSON.stringify({
+          message: {
+            content: "I cannot call tools from this model."
+          }
+        }), {
+          status: 200,
+          headers: {
+            "content-type": "application/json"
+          }
+        });
+      }
 
       return new Response(JSON.stringify({
         message: {
           content: JSON.stringify({
             action: "synthesize_clustered",
-            rationale: "The selected evidence is ready for clustered synthesis.",
-            confidence: 0.88,
+            rationale: "The strict JSON fallback selected synthesis.",
+            confidence: 0.72,
             inputs: {
               searchQueries: [],
               evidenceTargets: [],
-              paperIds: ["paper-1"],
+              paperIds: [],
               criticStage: null,
               reason: null
             },
@@ -298,9 +403,11 @@ test("research-agent backend asks for one allowed structured action", async () =
     });
 
     assert.equal(decision.action, "synthesize_clustered");
-    assert.equal(decision.inputs.paperIds[0], "paper-1");
-    assert.match(capturedPrompt, /Allowed actions: revise_search_strategy, synthesize_clustered, finalize_status_report/);
-    assert.match(capturedPrompt, /Do not execute the action yourself/);
+    assert.equal(decision.transport, "strict_json");
+    assert.equal(capturedBodies.length, 2);
+    assert.ok(Array.isArray(capturedBodies[0]?.tools));
+    assert.equal(capturedBodies[1]?.format, "json");
+    assert.equal(capturedBodies[1]?.tools, undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }

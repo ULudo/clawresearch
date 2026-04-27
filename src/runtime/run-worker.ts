@@ -749,7 +749,8 @@ async function chooseResearchActionStrict(input: {
       await appendEvent(run, now, "next", `Ask research agent for next ${request.phase} action (${attempt}/${maxAttempts}).`);
       const decision = await researchBackend.chooseResearchAction(actionRequest, {
         operation: "agent_step",
-        timeoutMs: runtimeConfig.agentStepTimeoutMs
+        timeoutMs: runtimeConfig.agentStepTimeoutMs,
+        agentControlMode: runtimeConfig.agentControlMode
       });
       await agent.record({
         phase: request.phase,
@@ -982,6 +983,7 @@ function buildQualityReport(input: {
   manuscriptBundle: ManuscriptBundle;
   criticReportsByStage: Map<CriticReviewStage, CriticReviewArtifact[]>;
   agentActionDiagnostics?: ResearchActionDiagnostic[];
+  agentControlMode?: RuntimeLlmConfig["agentControlMode"];
   autonomousRevisionPasses: number;
   revisionBudgetPasses: number;
 }): Record<string, unknown> {
@@ -1024,7 +1026,7 @@ function buildQualityReport(input: {
       finalSatisfaction: criticIterations.every((summary) => summary.finalReadiness === "pass") ? "pass" : "unresolved"
     },
     agentControl: {
-      mode: "strict_json",
+      mode: input.agentControlMode ?? "strict_json",
       invalidActionCount: actionDiagnostics.length,
       diagnostics: actionDiagnostics
     },
@@ -4398,6 +4400,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         manuscriptBundle,
         criticReportsByStage,
         agentActionDiagnostics,
+        agentControlMode: runtimeLlmConfig.agentControlMode,
         autonomousRevisionPasses: autonomousRecoveryPasses,
         revisionBudgetPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses
       }));
@@ -4828,6 +4831,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         manuscriptBundle: statusManuscriptBundle,
         criticReportsByStage,
         agentActionDiagnostics,
+        agentControlMode: runtimeLlmConfig.agentControlMode,
         autonomousRevisionPasses: autonomousRecoveryPasses,
         revisionBudgetPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses
       }));
@@ -5149,6 +5153,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       manuscriptBundle,
       criticReportsByStage,
       agentActionDiagnostics,
+      agentControlMode: runtimeLlmConfig.agentControlMode,
       autonomousRevisionPasses: autonomousRecoveryPasses,
       revisionBudgetPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses
     }));

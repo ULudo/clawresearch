@@ -1533,6 +1533,7 @@ test("run worker finishes status-only when the model cannot choose structured ac
     projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
     projectConfig.sources.generalWeb.selectedProviderIds = [];
     projectConfig.sources.explicitlyConfigured = true;
+    projectConfig.runtime.llm.agentControlMode = "strict_json";
     projectConfig.runtime.llm.agentInvalidActionBudget = 2;
     await projectConfigStore.save(projectConfig);
 

@@ -15,6 +15,11 @@ export type ResearchActionName =
   | "finalize_status_report"
   | "release_manuscript";
 
+export type ResearchAgentControlMode =
+  | "auto"
+  | "native_tool_calls"
+  | "strict_json";
+
 export type ResearchAgentPhase =
   | "protocol"
   | "source_selection"
@@ -36,6 +41,7 @@ export type ResearchActionDecision = {
   };
   expectedOutcome: string;
   stopCondition: string;
+  transport?: "native_tool_call" | "strict_json";
 };
 
 export type ResearchActionRequest = {

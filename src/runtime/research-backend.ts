@@ -28,6 +28,7 @@ import {
 } from "./literature-review.js";
 import {
   normalizeResearchActionDecision,
+  type ResearchAgentControlMode,
   type ResearchActionDecision,
   type ResearchActionRequest
 } from "./research-agent.js";
@@ -205,6 +206,14 @@ export type ResearchBackendOperation =
 export type ResearchBackendCallOptions = {
   operation: ResearchBackendOperation;
   timeoutMs: number;
+  agentControlMode?: ResearchAgentControlMode;
+};
+
+export type ResearchBackendCapabilities = {
+  actionControl: {
+    nativeToolCalls: boolean;
+    strictJsonFallback: boolean;
+  };
 };
 
 export type ResearchBackendFailureKind =
@@ -227,6 +236,7 @@ export class ResearchBackendError extends Error {
 
 export interface ResearchBackend {
   readonly label: string;
+  readonly capabilities?: ResearchBackendCapabilities;
   planResearch(request: ResearchPlanningRequest, options?: ResearchBackendCallOptions): Promise<ResearchPlan>;
   chooseResearchAction(request: ResearchActionRequest, options?: ResearchBackendCallOptions): Promise<ResearchActionDecision>;
   extractReviewedPapers(request: PaperExtractionRequest, options?: ResearchBackendCallOptions): Promise<PaperExtraction[]>;
@@ -235,15 +245,24 @@ export interface ResearchBackend {
   reviewResearchArtifact(request: CriticReviewRequest, options?: ResearchBackendCallOptions): Promise<CriticReviewArtifact>;
 }
 
+type OllamaToolCall = {
+  function?: {
+    name?: string;
+    arguments?: unknown;
+  };
+};
+
 type OllamaChatResponse = {
   message?: {
     content?: string;
+    tool_calls?: OllamaToolCall[];
   };
 };
 
 type OllamaStreamChunk = {
   message?: {
     content?: string;
+    tool_calls?: OllamaToolCall[];
   };
   done?: boolean;
 };
@@ -1485,12 +1504,11 @@ function criticPacketLines(
   }
 }
 
-async function ollamaJsonCall<T>(
+async function ollamaChatRaw(
   host: string,
-  model: string,
-  systemPrompt: string,
+  body: Record<string, unknown>,
   options: ResearchBackendCallOptions
-): Promise<T> {
+): Promise<string> {
   let response: Response;
   const controller = new AbortController();
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1539,18 +1557,7 @@ async function ollamaJsonCall<T>(
       headers: {
         "content-type": "application/json"
       },
-      body: JSON.stringify({
-        model,
-        stream: true,
-        think: false,
-        format: "json",
-        messages: [
-          {
-            role: "system",
-            content: systemPrompt
-          }
-        ]
-      }),
+      body: JSON.stringify(body),
       signal: controller.signal
     });
   } catch (error) {
@@ -1614,6 +1621,31 @@ async function ollamaJsonCall<T>(
     clearIdleTimer();
   }
 
+  return rawResponseText;
+}
+
+async function ollamaJsonCall<T>(
+  host: string,
+  model: string,
+  systemPrompt: string,
+  options: ResearchBackendCallOptions
+): Promise<T> {
+  const rawResponseText = await ollamaChatRaw(
+    host,
+    {
+      model,
+      stream: true,
+      think: false,
+      format: "json",
+      messages: [
+        {
+          role: "system",
+          content: systemPrompt
+        }
+      ]
+    },
+    options
+  );
   const content = parseOllamaContent(rawResponseText);
 
   if (typeof content !== "string") {
@@ -1638,8 +1670,205 @@ async function ollamaJsonCall<T>(
   }
 }
 
+const researchActionToolName = "choose_research_action";
+
+function researchActionToolDefinition(request: ResearchActionRequest): Record<string, unknown> {
+  return {
+    type: "function",
+    function: {
+      name: researchActionToolName,
+      description: "Choose exactly one validated next action for the ClawResearch runtime. The runtime executes the action after validating it.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          action: {
+            type: "string",
+            enum: request.allowedActions,
+            description: "The single next action the runtime should execute."
+          },
+          rationale: {
+            type: "string",
+            description: "Brief reason this action is the best next step."
+          },
+          confidence: {
+            type: "number",
+            minimum: 0,
+            maximum: 1
+          },
+          inputs: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              searchQueries: {
+                type: "array",
+                items: {
+                  type: "string"
+                }
+              },
+              evidenceTargets: {
+                type: "array",
+                items: {
+                  type: "string"
+                }
+              },
+              paperIds: {
+                type: "array",
+                items: {
+                  type: "string"
+                }
+              },
+              criticStage: {
+                type: ["string", "null"],
+                enum: ["protocol", "source_selection", "evidence", "release", null]
+              },
+              reason: {
+                type: ["string", "null"]
+              }
+            },
+            required: ["searchQueries", "evidenceTargets", "paperIds", "criticStage", "reason"]
+          },
+          expectedOutcome: {
+            type: "string"
+          },
+          stopCondition: {
+            type: "string"
+          }
+        },
+        required: ["action", "rationale", "confidence", "inputs", "expectedOutcome", "stopCondition"]
+      }
+    }
+  };
+}
+
+function nativeAgentStepInstruction(request: ResearchActionRequest): string {
+  return [
+    "You are ClawResearch's research-agent controller.",
+    `Call ${researchActionToolName} exactly once.`,
+    "Do not answer in prose. Do not invent tools. The runtime validates and executes the chosen action.",
+    "If evidence is not ready and useful revision budget remains, choose revise_search_strategy with concrete searchQueries.",
+    "If the selected evidence is ready for synthesis, choose synthesize_clustered.",
+    "If the model cannot justify another useful step or action control is unsafe, choose finalize_status_report.",
+    "",
+    `Project root: ${request.projectRoot}`,
+    `Run id: ${request.runId}`,
+    `Phase: ${request.phase}`,
+    `Attempt: ${request.attempt}/${request.maxAttempts}`,
+    `Allowed actions: ${request.allowedActions.join(", ")}`,
+    `Brief: ${JSON.stringify(request.brief)}`,
+    `Plan: ${JSON.stringify(request.plan)}`,
+    `Observations: ${JSON.stringify(request.observations)}`,
+    `Critic reports: ${JSON.stringify(request.criticReports.map((report) => ({
+      stage: report.stage,
+      readiness: report.readiness,
+      confidence: report.confidence,
+      objections: report.objections.map((objection) => ({
+        code: objection.code,
+        severity: objection.severity,
+        target: objection.target,
+        message: objection.message,
+        suggestedRevision: objection.suggestedRevision
+      })),
+      revisionAdvice: report.revisionAdvice
+    })))}`,
+    request.retryInstruction === undefined ? "Retry instruction: null" : `Retry instruction: ${request.retryInstruction}`
+  ].join("\n");
+}
+
+function parseToolArguments(value: unknown): unknown {
+  if (typeof value === "string") {
+    return extractJson(value);
+  }
+
+  return value;
+}
+
+function extractNativeToolArguments(rawResponseText: string, toolName: string): unknown | null {
+  let payload: OllamaChatResponse | null = null;
+
+  try {
+    payload = JSON.parse(rawResponseText) as OllamaChatResponse;
+  } catch {
+    return null;
+  }
+
+  const toolCall = payload.message?.tool_calls?.find((call) => call.function?.name === toolName);
+  if (toolCall === undefined) {
+    return null;
+  }
+
+  return parseToolArguments(toolCall.function?.arguments);
+}
+
+async function ollamaResearchActionToolCall(
+  host: string,
+  model: string,
+  request: ResearchActionRequest,
+  options: ResearchBackendCallOptions
+): Promise<ResearchActionDecision> {
+  const rawResponseText = await ollamaChatRaw(
+    host,
+    {
+      model,
+      stream: false,
+      think: false,
+      messages: [
+        {
+          role: "system",
+          content: nativeAgentStepInstruction(request)
+        }
+      ],
+      tools: [researchActionToolDefinition(request)]
+    },
+    options
+  );
+  let toolArguments: unknown | null;
+
+  try {
+    toolArguments = extractNativeToolArguments(rawResponseText, researchActionToolName);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new ResearchBackendError(
+      "malformed_json",
+      "agent_step",
+      `Ollama agent_step tool-call arguments were not valid JSON: ${message}`,
+      options.timeoutMs
+    );
+  }
+
+  if (toolArguments === null) {
+    throw new ResearchBackendError(
+      "malformed_json",
+      "agent_step",
+      `Ollama agent_step response did not include a ${researchActionToolName} tool call.`,
+      options.timeoutMs
+    );
+  }
+
+  try {
+    return {
+      ...normalizeResearchActionDecision(toolArguments, request),
+      transport: "native_tool_call"
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new ResearchBackendError(
+      "malformed_json",
+      "agent_step",
+      `Research agent returned an invalid native tool call: ${message}`,
+      options.timeoutMs
+    );
+  }
+}
+
 export class OllamaResearchBackend implements ResearchBackend {
   readonly label: string;
+  readonly capabilities: ResearchBackendCapabilities = {
+    actionControl: {
+      nativeToolCalls: true,
+      strictJsonFallback: true
+    }
+  };
 
   constructor(
     private readonly host = defaultHost,
@@ -1670,6 +1899,26 @@ export class OllamaResearchBackend implements ResearchBackend {
     operation: "agent_step",
     timeoutMs: 300_000
   }): Promise<ResearchActionDecision> {
+    const agentControlMode = options.agentControlMode ?? "auto";
+
+    if (agentControlMode === "native_tool_calls") {
+      return ollamaResearchActionToolCall(this.host, this.model, request, options);
+    }
+
+    if (agentControlMode === "auto") {
+      try {
+        return await ollamaResearchActionToolCall(this.host, this.model, request, options);
+      } catch (error) {
+        if (!(error instanceof ResearchBackendError)) {
+          throw error;
+        }
+
+        if (error.kind === "timeout") {
+          throw error;
+        }
+      }
+    }
+
     const raw = await ollamaJsonCall<unknown>(
       this.host,
       this.model,
@@ -1678,7 +1927,10 @@ export class OllamaResearchBackend implements ResearchBackend {
     );
 
     try {
-      return normalizeResearchActionDecision(raw, request);
+      return {
+        ...normalizeResearchActionDecision(raw, request),
+        transport: "strict_json"
+      };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new ResearchBackendError(
