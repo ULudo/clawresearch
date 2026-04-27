@@ -1927,7 +1927,7 @@ function buildIdeaRecords(
   if (failureMessage !== null) {
     return [{
       type: "idea",
-      key: `run:${run.id}:retrieval-recovery`,
+      key: `run:${run.id}:retrieval-revision`,
       title: "Broaden literature retrieval",
       text: `Refine the query plan, provider routing, or access configuration before the next research pass on ${run.brief.topic ?? "this project"}.`,
       runId: run.id,
@@ -2148,7 +2148,7 @@ function completePaperExtractions(
       limitations: [],
       supportedClaims: [],
       confidence: "low",
-      evidenceNotes: ["No structured extraction was recovered for this reviewed paper; the record remains intentionally sparse."]
+      evidenceNotes: ["No structured extraction was completed for this reviewed paper; the record remains intentionally sparse."]
     });
   }
 
@@ -2257,7 +2257,7 @@ async function extractReviewedPapersWithRecovery(options: {
       const failedPaperIds = papers.slice(cursor).map((paper) => paper.id);
       await writeExtractionCheckpoint(run, papers, extractions, attempts, "failed", failedPaperIds);
       throw new ResearchStageBlockedError(
-        `Extraction recovery budget exhausted before all selected papers were extracted (${cursor}/${papers.length} batches complete).`,
+        `Extraction retry budget exhausted before all selected papers were extracted (${cursor}/${papers.length} batches complete).`,
         "extraction",
         attempts
       );
@@ -2267,7 +2267,7 @@ async function extractReviewedPapersWithRecovery(options: {
       const failedPaperIds = papers.slice(cursor).map((paper) => paper.id);
       await writeExtractionCheckpoint(run, papers, extractions, attempts, "failed", failedPaperIds);
       throw new ResearchStageBlockedError(
-        `Extraction recovery time budget exhausted before all selected papers were extracted (${cursor}/${papers.length} papers complete).`,
+        `Extraction retry time budget exhausted before all selected papers were extracted (${cursor}/${papers.length} papers complete).`,
         "extraction",
         attempts
       );
@@ -2353,19 +2353,19 @@ async function extractReviewedPapersWithRecovery(options: {
           run,
           now,
           "next",
-          `Recovering extraction by shrinking the next batch size to ${batchSize}.`
+          `Retrying extraction by shrinking the next batch size to ${batchSize}.`
         );
         continue;
       }
 
       if (!compact) {
-        await appendEvent(run, now, "next", "Recovering extraction with a compact single-paper prompt.");
+        await appendEvent(run, now, "next", "Retrying extraction with a compact single-paper prompt.");
         continue;
       }
 
       await writeExtractionCheckpoint(run, papers, extractions, attempts, "failed", batch.map((paper) => paper.id));
       throw new ResearchStageBlockedError(
-        `Extraction could not recover for selected paper ${batch[0]?.id ?? "<unknown>"}: ${message}`,
+        `Extraction could not complete after retries for selected paper ${batch[0]?.id ?? "<unknown>"}: ${message}`,
         "extraction",
         attempts
       );
@@ -3425,8 +3425,9 @@ function retrievalDiagnosticHoldReasons(gathered: ResearchSourceGatherResult): s
     .filter((attempt) => attempt.error !== null)
     .map((attempt) => `${attempt.providerId} failed: ${attempt.error}`)
     .slice(0, 2);
-  const recoverySummary = diagnostics.recoveryPasses > 0
-    ? [`One revision retrieval pass ran, but only ${gathered.reviewedPapers.length} reviewed papers were selected for synthesis.`]
+  const revisionPasses = diagnostics.revisionPasses ?? diagnostics.recoveryPasses ?? 0;
+  const recoverySummary = revisionPasses > 0
+    ? [`${revisionPasses} revision retrieval pass${revisionPasses === 1 ? "" : "es"} ran, but only ${gathered.reviewedPapers.length} reviewed papers were selected for synthesis.`]
     : [];
   const accessLimitations = diagnostics.accessLimitations.slice(0, 2);
   const suggestedQueries = diagnostics.suggestedNextQueries.length > 0
@@ -4105,7 +4106,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       plan,
       memoryContext,
       literatureContext,
-      recoveryQueries: pendingRecoveryQueries,
+      revisionQueries: pendingRecoveryQueries,
       scholarlyProviderIds: scholarlyProviders,
       generalWebProviderIds: generalWebProviders,
       projectFilesEnabled: localEnabled,
@@ -4146,9 +4147,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       autonomousEvidence: {
         pass: evidencePassNumber,
         revisionPasses: autonomousRecoveryPasses,
-        maxRevisionPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses,
-        recoveryPasses: autonomousRecoveryPasses,
-        maxRecoveryPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses
+        maxRevisionPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses
       },
       scholarlyProviders,
       generalWebProviders,

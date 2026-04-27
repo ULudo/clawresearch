@@ -94,7 +94,7 @@ function buildInstruction(request: IntakeRequest): string {
     `Project root: ${request.projectRoot}`,
     `Current brief: ${JSON.stringify(request.brief)}`,
     `Current open questions: ${JSON.stringify(request.openQuestions)}`,
-    request.recoveryReason !== undefined ? `Recovery reason: ${request.recoveryReason}` : null,
+    request.recoveryReason !== undefined ? `Completion hint: ${request.recoveryReason}` : null,
     "",
     "Conversation so far follows below in chat-message order."
   ].filter((line): line is string => line !== null).join("\n");

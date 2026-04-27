@@ -1596,7 +1596,7 @@ test("phase one console explains failed runs before manuscript generation", asyn
       successCriterion: "Paper commands explain the failed stage."
     }, ["clawresearch", "research-loop"]);
     run.status = "failed";
-    run.statusMessage = "Run worker failed: extraction recovery budget exhausted";
+    run.statusMessage = "Run worker failed: extraction retry budget exhausted";
     run.finishedAt = "2026-01-01T00:00:10.000Z";
     await runStore.save(run);
     await mkdir(run.artifacts.runDirectory, { recursive: true });
@@ -1615,7 +1615,7 @@ test("phase one console explains failed runs before manuscript generation", asyn
       updatedAt: "2026-01-01T00:00:10.000Z",
       counts: {},
       error: {
-        message: "extraction recovery budget exhausted",
+        message: "extraction retry budget exhausted",
         kind: "stage_blocked",
         operation: "extraction"
       }
@@ -1640,7 +1640,7 @@ test("phase one console explains failed runs before manuscript generation", asyn
     assert.match(io.output, /Paper:/);
     assert.match(io.output, /run status: failed/);
     assert.match(io.output, /readiness: not_started/);
-    assert.match(io.output, /no draft reason: Run worker failed: extraction recovery budget exhausted/);
+    assert.match(io.output, /no draft reason: Run worker failed: extraction retry budget exhausted/);
     assert.match(io.output, /Paper checks:/);
     assert.match(io.output, /diagnostic: stage_blocked during extraction/);
     assert.match(io.output, /recent events:/);

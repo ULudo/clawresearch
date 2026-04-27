@@ -151,7 +151,7 @@ test("runtime llm config resolves env overrides over project defaults", async ()
       CLAWRESEARCH_LLM_AGENT_STEP_TIMEOUT_MS: "555000",
       CLAWRESEARCH_AGENT_CONTROL_MODE: "native_tool_calls",
       CLAWRESEARCH_AGENT_INVALID_ACTION_BUDGET: "3",
-      CLAWRESEARCH_EVIDENCE_RECOVERY_MAX_PASSES: "4"
+      CLAWRESEARCH_EVIDENCE_REVISION_MAX_PASSES: "4"
     });
 
     assert.equal(resolved.planningTimeoutMs, 222_000);

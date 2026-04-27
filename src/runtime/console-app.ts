@@ -1708,7 +1708,7 @@ function paperNextAction(snapshot: PaperSnapshot): string {
   const readiness = snapshot.checks?.readinessStatus ?? snapshot.paper?.readinessStatus ?? "not_started";
 
   if (snapshot.run.status === "failed" && snapshot.paper === null && snapshot.checks === null) {
-    return "Inspect the failed run diagnostics, then rerun after the blocked stage is recoverable.";
+    return "Inspect the failed run diagnostics, then rerun after the blocked stage has been fixed.";
   }
 
   switch (readiness) {

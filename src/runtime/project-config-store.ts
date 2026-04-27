@@ -193,8 +193,12 @@ function normalizeRuntimeLlmConfig(raw: unknown): RuntimeLlmConfig {
     synthesisRetryBudget: readPositiveInteger(record.synthesisRetryBudget) ?? base.synthesisRetryBudget,
     agentControlMode: readAgentControlMode(record.agentControlMode) ?? base.agentControlMode,
     agentInvalidActionBudget: readPositiveInteger(record.agentInvalidActionBudget) ?? base.agentInvalidActionBudget,
-    totalRecoveryBudgetMs: readPositiveInteger(record.totalRecoveryBudgetMs) ?? base.totalRecoveryBudgetMs,
-    evidenceRecoveryMaxPasses: readPositiveInteger(record.evidenceRecoveryMaxPasses) ?? base.evidenceRecoveryMaxPasses
+    totalRecoveryBudgetMs: readPositiveInteger(record.totalRevisionBudgetMs)
+      ?? readPositiveInteger(record.totalRecoveryBudgetMs)
+      ?? base.totalRecoveryBudgetMs,
+    evidenceRecoveryMaxPasses: readPositiveInteger(record.evidenceRevisionMaxPasses)
+      ?? readPositiveInteger(record.evidenceRecoveryMaxPasses)
+      ?? base.evidenceRecoveryMaxPasses
   };
 }
 
@@ -250,9 +254,11 @@ export function resolveRuntimeLlmConfig(
       ?? configured.agentControlMode,
     agentInvalidActionBudget: readEnvPositiveInteger(env, "CLAWRESEARCH_AGENT_INVALID_ACTION_BUDGET")
       ?? configured.agentInvalidActionBudget,
-    totalRecoveryBudgetMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_RECOVERY_BUDGET_MS")
+    totalRecoveryBudgetMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_REVISION_BUDGET_MS")
+      ?? readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_RECOVERY_BUDGET_MS")
       ?? configured.totalRecoveryBudgetMs,
-    evidenceRecoveryMaxPasses: readEnvPositiveInteger(env, "CLAWRESEARCH_EVIDENCE_RECOVERY_MAX_PASSES")
+    evidenceRecoveryMaxPasses: readEnvPositiveInteger(env, "CLAWRESEARCH_EVIDENCE_REVISION_MAX_PASSES")
+      ?? readEnvPositiveInteger(env, "CLAWRESEARCH_EVIDENCE_RECOVERY_MAX_PASSES")
       ?? configured.evidenceRecoveryMaxPasses
   };
 }

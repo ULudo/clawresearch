@@ -471,7 +471,7 @@ test("critic backend uses the separate critic model and excludes research memory
     assert.match(prompt, /Missing selected papers is expected/i);
     assert.doesNotMatch(prompt, /Selected papers:/);
     assert.doesNotMatch(prompt, /Project memory context/i);
-    assert.doesNotMatch(prompt, /trace\.log|events\.jsonl|recovery history/i);
+    assert.doesNotMatch(prompt, /trace\.log|events\.jsonl|revision history/i);
   } finally {
     globalThis.fetch = originalFetch;
   }

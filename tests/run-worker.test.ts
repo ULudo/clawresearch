@@ -524,21 +524,21 @@ class MultiPaperSourceGatherer implements ResearchSourceGatherer {
   async gather(): Promise<ResearchSourceGatherResult> {
     const papers = Array.from({ length: this.count }, (_, index) => canonicalPaper({
       id: `paper-${index + 1}`,
-      key: `doi:10.1000/recovery-${index + 1}`,
-      title: `Recovery test paper ${index + 1}`,
-      citation: `Example Author (${2020 + index}). Recovery test paper ${index + 1}.`,
-      abstract: `Paper ${index + 1} discusses autonomous research-agent recovery behavior.`,
+      key: `doi:10.1000/revision-${index + 1}`,
+      title: `Revision test paper ${index + 1}`,
+      citation: `Example Author (${2020 + index}). Revision test paper ${index + 1}.`,
+      abstract: `Paper ${index + 1} discusses autonomous research-agent revision behavior.`,
       year: 2020 + index
     }));
 
     return {
-      notes: [`Collected ${papers.length} recovery-test sources.`],
+      notes: [`Collected ${papers.length} revision-test sources.`],
       sources: [],
       canonicalPapers: papers,
       reviewedPapers: papers,
       routing: {
         domain: "mixed",
-        plannedQueries: ["adaptive extraction recovery"],
+        plannedQueries: ["adaptive extraction revision"],
         discoveryProviderIds: ["openalex"],
         resolverProviderIds: [],
         acquisitionProviderIds: ["openalex"]
@@ -560,7 +560,7 @@ class EvidenceRecoverySourceGatherer implements ResearchSourceGatherer {
       const papers = [
         canonicalPaper({
           id: "paper-thin",
-          key: "doi:10.1000/thin-recovery",
+          key: "doi:10.1000/thin-revision",
           title: "Thin autonomous research agent note",
           citation: "Example Author (2024). Thin autonomous research agent note.",
           abstract: "A narrow note about autonomous agents without benchmark evidence."
@@ -586,11 +586,11 @@ class EvidenceRecoverySourceGatherer implements ResearchSourceGatherer {
           queries: [],
           providerAttempts: [],
           screeningSummary: {
-            accepted: 1,
-            rejected: 0,
-            weakMatchSamples: []
-          },
-          recoveryPasses: 0,
+          accepted: 1,
+          rejected: 0,
+          weakMatchSamples: []
+        },
+          revisionPasses: 0,
           accessLimitations: [],
           suggestedNextQueries: ["autonomous research agents benchmark evaluation"]
         },
@@ -602,18 +602,18 @@ class EvidenceRecoverySourceGatherer implements ResearchSourceGatherer {
       };
     }
 
-    assert.ok(request.recoveryQueries?.some((query) => /benchmark evaluation/i.test(query)));
+    assert.ok(request.revisionQueries?.some((query) => /benchmark evaluation/i.test(query)));
     const papers = Array.from({ length: 3 }, (_, index) => canonicalPaper({
-      id: `paper-recovered-${index + 1}`,
-      key: `doi:10.1000/recovered-evidence-${index + 1}`,
-      title: `Recovered benchmark evaluation paper ${index + 1}`,
-      citation: `Example Author (${2021 + index}). Recovered benchmark evaluation paper ${index + 1}.`,
+      id: `paper-revised-${index + 1}`,
+      key: `doi:10.1000/revised-evidence-${index + 1}`,
+      title: `Revised benchmark evaluation paper ${index + 1}`,
+      citation: `Example Author (${2021 + index}). Revised benchmark evaluation paper ${index + 1}.`,
       abstract: `Paper ${index + 1} reports benchmark evaluation evidence for autonomous research agents.`,
       year: 2021 + index
     }));
 
     return {
-      notes: ["Recovered a stronger benchmark-evaluation evidence set."],
+      notes: ["Revised into a stronger benchmark-evaluation evidence set."],
       sources: [],
       canonicalPapers: papers,
       reviewedPapers: papers,
@@ -635,7 +635,7 @@ class EvidenceRecoverySourceGatherer implements ResearchSourceGatherer {
           rejected: 0,
           weakMatchSamples: []
         },
-        recoveryPasses: 0,
+        revisionPasses: 0,
         accessLimitations: [],
         suggestedNextQueries: []
       },
@@ -1079,18 +1079,18 @@ class ReleaseBlockingBackend extends StubResearchBackend {
     const sourceIds = request.evidenceMatrix.rows.map((row) => row.paperId);
 
     return {
-      executiveSummary: "The reviewed papers report autonomous research-agent recovery behavior.",
+      executiveSummary: "The reviewed papers report autonomous research-agent revision behavior.",
       themes: [{
-        title: "Recovery behavior",
-        summary: "The selected papers describe autonomous research-agent recovery behavior.",
+        title: "Revision behavior",
+        summary: "The selected papers describe autonomous research-agent revision behavior.",
         sourceIds
       }],
       claims: sourceIds.map((sourceId) => ({
-        claim: "Autonomous research-agent recovery behavior is discussed in the reviewed paper.",
-        evidence: "The reviewed paper abstract discusses autonomous research-agent recovery behavior.",
+        claim: "Autonomous research-agent revision behavior is discussed in the reviewed paper.",
+        evidence: "The reviewed paper abstract discusses autonomous research-agent revision behavior.",
         sourceIds: [sourceId]
       })),
-      nextQuestions: ["Which recovery behaviors are most reliable across reviewed papers?"]
+      nextQuestions: ["Which revision behaviors are most reliable across reviewed papers?"]
     };
   }
 
@@ -1391,15 +1391,15 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
   }
 });
 
-test("run worker shrinks extraction batches after timeout and checkpoints recovery", async () => {
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-extraction-recovery-"));
+test("run worker shrinks extraction batches after timeout and checkpoints retries", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-extraction-retry-"));
   const now = createNow();
 
   try {
     const runStore = new RunStore(projectRoot, "0.7.0", now);
     const run = await runStore.create({
       topic: "Autonomous research agents",
-      researchQuestion: "How should extraction recover from oversized prompts?",
+      researchQuestion: "How should extraction retry after oversized prompts?",
       researchDirection: "Test adaptive extraction batches.",
       successCriterion: "Complete extraction for every selected paper before drafting."
     }, ["clawresearch", "research-loop"]);
@@ -1456,7 +1456,7 @@ test("run worker splits synthesis clusters after timeout and records agent steps
     const runStore = new RunStore(projectRoot, "0.7.0", now);
     const run = await runStore.create({
       topic: "Autonomous research agents",
-      researchQuestion: "How should synthesis recover from oversized prompts?",
+      researchQuestion: "How should synthesis retry after oversized prompts?",
       researchDirection: "Test clustered synthesis revision.",
       successCriterion: "Complete synthesis without losing extracted evidence."
     }, ["clawresearch", "research-loop"]);
@@ -1590,7 +1590,7 @@ test("run worker finishes status-only when the model cannot choose structured ac
 });
 
 test("run worker autonomously reruns retrieval when manuscript checks need more evidence", async () => {
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-evidence-recovery-"));
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-evidence-revision-"));
   const now = createNow();
 
   try {
@@ -1639,7 +1639,7 @@ test("run worker autonomously reruns retrieval when manuscript checks need more 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
     assert.equal(sourceGatherer.requests.length, 2);
-    assert.ok(sourceGatherer.requests[1]?.recoveryQueries?.some((query) => /benchmark evaluation/i.test(query)));
+    assert.ok(sourceGatherer.requests[1]?.revisionQueries?.some((query) => /benchmark evaluation/i.test(query)));
     assert.equal(sourcesArtifact.autonomousEvidence.pass, 2);
     assert.equal(sourcesArtifact.autonomousEvidence.revisionPasses, 1);
     assert.ok(planArtifact.searchQueries.some((query) => /benchmark evaluation/i.test(query)));
@@ -1653,7 +1653,7 @@ test("run worker autonomously reruns retrieval when manuscript checks need more 
   }
 });
 
-test("run worker blocks manuscript generation when extraction cannot recover", async () => {
+test("run worker blocks manuscript generation when extraction cannot complete after retries", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-extraction-blocked-"));
   const now = createNow();
 
@@ -2429,7 +2429,7 @@ test("protocol critic block records a warning and continues to source gathering"
 });
 
 test("protocol critic feedback revises the protocol and continues autonomously", async () => {
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-protocol-recovery-"));
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-protocol-revision-"));
   const now = createNow();
 
   class CapturingSourceGatherer implements ResearchSourceGatherer {
@@ -2528,7 +2528,7 @@ test("persistent protocol critic revise continues to source gathering after boun
 });
 
 test("source-selection critic feedback triggers an autonomous revision pass", async () => {
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-source-recovery-"));
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-source-revision-"));
   const now = createNow();
 
   try {
@@ -2536,7 +2536,7 @@ test("source-selection critic feedback triggers an autonomous revision pass", as
     const run = await runStore.create({
       topic: "autonomous research agents",
       researchQuestion: "What evidence supports benchmark evaluation?",
-      researchDirection: "Recover benchmark evaluation evidence.",
+      researchDirection: "Revise benchmark evaluation evidence.",
       successCriterion: "Cover benchmark evaluation directly."
     }, ["clawresearch", "research-loop"]);
 
@@ -2573,9 +2573,9 @@ test("persistent source-selection critic concerns are reported without stopping 
   try {
     const runStore = new RunStore(projectRoot, "0.7.0", now);
     const run = await runStore.create({
-      topic: "autonomous research-agent recovery",
-      researchQuestion: "Which recovery behaviors are reported in autonomous research-agent papers?",
-      researchDirection: "Review autonomous research-agent recovery behavior.",
+      topic: "autonomous research-agent revision",
+      researchQuestion: "Which revision behaviors are reported in autonomous research-agent papers?",
+      researchDirection: "Review autonomous research-agent revision behavior.",
       successCriterion: "Produce a grounded review paper."
     }, ["clawresearch", "research-loop"]);
 
@@ -2638,9 +2638,9 @@ test("release critic block converts an otherwise ready manuscript to status-only
   try {
     const runStore = new RunStore(projectRoot, "0.7.0", now);
     const run = await runStore.create({
-      topic: "autonomous research-agent recovery",
-      researchQuestion: "Which recovery behaviors are reported in autonomous research-agent papers?",
-      researchDirection: "Review autonomous research-agent recovery behavior.",
+      topic: "autonomous research-agent revision",
+      researchQuestion: "Which revision behaviors are reported in autonomous research-agent papers?",
+      researchDirection: "Review autonomous research-agent revision behavior.",
       successCriterion: "Produce a grounded review paper."
     }, ["clawresearch", "research-loop"]);
 

@@ -171,12 +171,12 @@ test("chat frame keeps narrow terminal lines inside the safety gutter", () => {
       { tag: "you", text: "x".repeat(180) }
     ],
     activityLogs: [
-      { tag: "next", text: "Extracting reviewed paper batch with an extremely long canonical path and recovery diagnostic message ".repeat(3) }
+      { tag: "next", text: "Extracting reviewed paper batch with an extremely long canonical path and revision diagnostic message ".repeat(3) }
     ],
     latestReply: { tag: "consultant", text: "I will keep the layout readable even on a narrow terminal." },
-    activityLabel: "Recovering extraction by shrinking the next batch size to 1",
+    activityLabel: "Revising extraction by shrinking the next batch size to 1",
     commandSuggestions: [
-      { command: "/paper checks", description: "Show manuscript readiness checks and recovery diagnostics", selected: true },
+      { command: "/paper checks", description: "Show manuscript readiness checks and revision diagnostics", selected: true },
       { command: "/status", description: "Show the current brief and latest run state", selected: false }
     ],
     inputLabel: "Chat >",

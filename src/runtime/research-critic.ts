@@ -94,7 +94,7 @@ export type CriticReviewRequest = {
 };
 
 const maxObjections = 12;
-const maxRecoveryItems = 12;
+const maxRevisionItems = 12;
 const maxMessageLength = 700;
 
 function asObject(value: unknown): Record<string, unknown> {
@@ -127,7 +127,7 @@ function compactText(value: string, limit = maxMessageLength): string {
   return compact.length <= limit ? compact : `${compact.slice(0, limit - 3).trim()}...`;
 }
 
-function uniqueStrings(values: string[], limit = maxRecoveryItems): string[] {
+function uniqueStrings(values: string[], limit = maxRevisionItems): string[] {
   return [...new Set(values.map((value) => compactText(value, 220)).filter((value) => value.length > 0))].slice(0, limit);
 }
 
@@ -208,7 +208,7 @@ function filterKnownIds(values: unknown, allowedIds: Set<string>): string[] {
 
   return readStringArray(values)
     .filter((id) => allowedIds.has(id))
-    .slice(0, maxRecoveryItems);
+    .slice(0, maxRevisionItems);
 }
 
 function normalizeObjections(

@@ -201,6 +201,7 @@ export type QueryExpansionSource =
   | "literature"
   | "domain_vocabulary"
   | "rejected_candidate"
+  | "revision"
   | "recovery";
 
 export type QueryExpansionCandidate = {
@@ -245,7 +246,7 @@ export type RetrievalDiagnostics = {
   queries: QueryExpansionCandidate[];
   providerAttempts: Array<{
     providerId: SourceProviderId;
-    phase: "initial" | "recovery";
+    phase: "initial" | "revision" | "recovery";
     rawCandidateCount: number;
     acceptedSourceCount: number;
     error: string | null;
@@ -255,7 +256,8 @@ export type RetrievalDiagnostics = {
     rejected: number;
     weakMatchSamples: Array<{ title: string; rationale: string }>;
   };
-  recoveryPasses: number;
+  revisionPasses: number;
+  recoveryPasses?: number;
   accessLimitations: string[];
   suggestedNextQueries: string[];
 };
@@ -305,6 +307,7 @@ export type ResearchSourceGatherRequest = {
   plan: ResearchPlan;
   memoryContext: ProjectMemoryContext;
   literatureContext?: LiteratureContext;
+  revisionQueries?: string[];
   recoveryQueries?: string[];
   providerIds?: SourceProviderId[];
   scholarlyProviderIds?: SourceProviderId[];
@@ -968,6 +971,7 @@ function buildRetrievalBudget(
     request.brief.researchDirection,
     request.brief.successCriterion,
     ...request.plan.localFocus,
+    ...(request.revisionQueries ?? []),
     ...(request.recoveryQueries ?? [])
   ].filter((value): value is string => typeof value === "string" && value.trim().length > 0).length;
   const broadTopic = tokenize(request.brief.topic ?? request.plan.objective).length <= 4;
@@ -1112,20 +1116,20 @@ function buildRecoveryQueryCandidates(
       .filter((query) => !isRetrievalQualityConstraintPhrase(query))
       .flatMap((query) => queryCandidate(
         `${anchor} ${query}`,
-        "recovery",
-        "Recovered from missing required review-facet coverage."
+        "revision",
+        "Revision query for missing required review-facet coverage."
       ))) ?? [];
   const sampleQueries = rejectedSamples
     .slice(0, 8)
     .flatMap((sample) => keyPhrasesFromText(`${sample.title} ${sample.excerpt}`, 2))
     .slice(0, 8)
-    .flatMap((phrase) => queryCandidate(`${anchor} ${phrase}`, "rejected_candidate", "Recovered from weakly matched candidate metadata."));
+    .flatMap((phrase) => queryCandidate(`${anchor} ${phrase}`, "rejected_candidate", "Revision query from weakly matched candidate metadata."));
   const broadTaskQueries = [
     `${anchor} review`,
     `${anchor} survey`,
     `${anchor} evaluation`,
     `${anchor} limitations`
-  ].flatMap((query) => queryCandidate(query, "recovery", "Broad recovery query for a thin evidence base."));
+  ].flatMap((query) => queryCandidate(query, "revision", "Broad revision query for a thin evidence base."));
 
   return uniqueQueryCandidates([
     ...missingFacetQueries,
@@ -1151,8 +1155,12 @@ function buildQueryExpansionCandidates(
   const literatureHints = request.literatureContext?.queryHints ?? [];
   const memoryHints = request.memoryContext.queryHints ?? [];
   const planCandidates = explicitQueries.flatMap((query) => queryCandidate(query, "plan", "Model-planned retrieval query."));
-  const explicitRecoveryCandidates = uniqueStrings(request.recoveryQueries ?? [])
-    .flatMap((query) => queryCandidate(query, "recovery", "Requested by the autonomous evidence-revision loop."));
+  const explicitRevisionQueries = uniqueStrings([
+    ...(request.revisionQueries ?? []),
+    ...(request.recoveryQueries ?? [])
+  ]);
+  const explicitRecoveryCandidates = explicitRevisionQueries
+    .flatMap((query) => queryCandidate(query, "revision", "Requested by the autonomous evidence-revision loop."));
   const briefTaskCandidates = [
     ...focusQueries.map((query) => `${topicPhrase} ${query}`),
     topicPhrase
@@ -1189,6 +1197,7 @@ function interleaveQueryCandidates(candidates: QueryExpansionCandidate[], limit:
     "literature",
     "domain_vocabulary",
     "rejected_candidate",
+    "revision",
     "recovery"
   ];
   const buckets = sourceOrder.map((source) => candidates.filter((candidate) => candidate.source === source));
@@ -4130,7 +4139,7 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
     const backgroundSources: ResearchSource[] = [];
     let acceptedScreeningCount = 0;
     let rejectedScreeningCount = 0;
-    let recoveryPasses = 0;
+    let revisionPasses = 0;
 
     if (literatureProfile !== null) {
       notes.push("Literature review subsystem active.");
@@ -4154,7 +4163,7 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
     const runScholarlyDiscoveryPass = async (
       passQueries: string[],
       passBudget: RetrievalBudget,
-      phase: "initial" | "recovery"
+      phase: "initial" | "revision"
     ): Promise<void> => {
       for (const [providerIndex, providerId] of routing.discoveryProviderIds.entries()) {
         try {
@@ -4182,7 +4191,7 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
             error: null
           });
           notes.push(
-            `Collected ${newSources.length} new screened scholarly hits from ${getSourceProviderDefinition(providerId).label} after reviewing ${rawCandidates.length} raw candidates${phase === "recovery" ? " during revision" : ""}.`
+            `Collected ${newSources.length} new screened scholarly hits from ${getSourceProviderDefinition(providerId).label} after reviewing ${rawCandidates.length} raw candidates${phase === "revision" ? " during revision" : ""}.`
           );
 
           if (
@@ -4230,7 +4239,7 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
     let canonicalReview = await buildCanonicalReviewState(scholarlySources, routing, request, reviewFacets);
     let nonImprovingRecoveryPasses = 0;
 
-    while (shouldRunRecoveryPass(canonicalReview, literatureReviewActive, recoveryPasses)) {
+    while (shouldRunRecoveryPass(canonicalReview, literatureReviewActive, revisionPasses)) {
       const previousReview = canonicalReview;
       const initialQueryKeys = new Set(queries.map(normalizeQueryKey));
       const recoveryCandidates = buildRecoveryQueryCandidates(request, rejectedSamples, canonicalReview.selectionQuality);
@@ -4244,10 +4253,10 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
         .map((candidate) => candidate.query);
 
       if (recoveryQueries.length > 0) {
-        recoveryPasses += 1;
+        revisionPasses += 1;
         queries = uniqueStrings([...queries, ...recoveryQueries]);
         routing.plannedQueries = queries;
-        notes.push(`${recoveryReason(canonicalReview)}; running revision pass ${recoveryPasses} with ${recoveryQueries.length} additional queries.`);
+        notes.push(`${recoveryReason(canonicalReview)}; running revision pass ${revisionPasses} with ${recoveryQueries.length} additional queries.`);
         await runScholarlyDiscoveryPass(recoveryQueries, {
           ...budget,
           maxQueries: recoveryQueries.length,
@@ -4255,7 +4264,7 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
           maxPagesPerQuery: Math.min(2, budget.maxPagesPerQuery),
           maxCandidatesPerProvider: Math.min(80, budget.maxCandidatesPerProvider),
           targetAcceptedSources: Math.max(24, Math.floor(budget.targetAcceptedSources / 2))
-        }, "recovery");
+        }, "revision");
         canonicalReview = await buildCanonicalReviewState(scholarlySources, routing, request, reviewFacets);
         if (canonicalReviewImproved(previousReview, canonicalReview)) {
           nonImprovingRecoveryPasses = 0;
@@ -4289,7 +4298,7 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
           rationale: sample.rationale
         }))
       },
-      recoveryPasses,
+      revisionPasses,
       accessLimitations: accessLimitationsFromAuth(authStatus),
       suggestedNextQueries: buildRecoveryQueryCandidates(request, rejectedSamples, selectionQuality)
         .map((candidate) => candidate.query)

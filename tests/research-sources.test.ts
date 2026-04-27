@@ -1559,7 +1559,7 @@ test("review selection records missing method facets when zeta evidence drifts a
 });
 
 test("thin evidence triggers one revision pass and records diagnostics", async () => {
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-recovery-"));
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-revision-"));
   const originalFetch = globalThis.fetch;
 
   try {
@@ -1596,19 +1596,19 @@ test("thin evidence triggers one revision pass and records diagnostics", async (
         return new Response(JSON.stringify({
           results: [
             {
-              id: "https://openalex.org/W-recovery",
+              id: "https://openalex.org/W-revision",
               display_name: "Autonomous research agents limitations and evaluation practices",
               publication_year: 2025,
               authorships: [
-                { author: { display_name: "Recovery Author" } }
+                { author: { display_name: "Revision Author" } }
               ],
               primary_location: {
                 source: {
                   display_name: "AI Systems Review"
                 },
-                landing_page_url: "https://example.org/recovery"
+                landing_page_url: "https://example.org/revision"
               },
-              doi: "https://doi.org/10.1000/recovery",
+              doi: "https://doi.org/10.1000/revision",
               abstract_inverted_index: toAbstractIndex(
                 "Autonomous research agents limitations evaluation practices memory provenance and literature synthesis."
               )
@@ -1632,7 +1632,7 @@ test("thin evidence triggers one revision pass and records diagnostics", async (
       plan: {
         researchMode: "literature_synthesis",
         objective: "Review autonomous research-agent evidence.",
-        rationale: "The first pass should be too thin and trigger recovery.",
+        rationale: "The first pass should be too thin and trigger revision.",
         searchQueries: ["autonomous research agents evidence"],
         localFocus: ["planning", "evaluation"]
       },
@@ -1640,9 +1640,9 @@ test("thin evidence triggers one revision pass and records diagnostics", async (
       scholarlyProviderIds: ["openalex"]
     });
 
-    assert.equal(gathered.retrievalDiagnostics?.recoveryPasses, 1);
-    assert.ok(gathered.retrievalDiagnostics?.providerAttempts.some((attempt) => attempt.phase === "recovery"));
-    assert.ok(gathered.retrievalDiagnostics?.queries.some((query) => query.source === "recovery" || query.source === "rejected_candidate"));
+    assert.equal(gathered.retrievalDiagnostics?.revisionPasses, 1);
+    assert.ok(gathered.retrievalDiagnostics?.providerAttempts.some((attempt) => attempt.phase === "revision"));
+    assert.ok(gathered.retrievalDiagnostics?.queries.some((query) => query.source === "revision" || query.source === "rejected_candidate"));
     assert.ok(gathered.canonicalPapers.some((paper) => /limitations and evaluation/i.test(paper.title)));
   } finally {
     globalThis.fetch = originalFetch;

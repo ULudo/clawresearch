@@ -81,7 +81,8 @@ export type ReviewProtocol = {
     reviewWorkflow: ResearchSourceGatherResult["reviewWorkflow"];
     providerAttempts: NonNullable<ResearchSourceGatherResult["retrievalDiagnostics"]>["providerAttempts"];
     screeningSummary: NonNullable<ResearchSourceGatherResult["retrievalDiagnostics"]>["screeningSummary"] | null;
-    recoveryPasses: number;
+    revisionPasses: number;
+    recoveryPasses?: number;
     accessLimitations: string[];
   } | null;
 };
@@ -460,7 +461,9 @@ export function buildReviewProtocol(input: ReviewProtocolInput): ReviewProtocol 
         reviewWorkflow: gathered.reviewWorkflow,
         providerAttempts: gathered.retrievalDiagnostics?.providerAttempts ?? [],
         screeningSummary: gathered.retrievalDiagnostics?.screeningSummary ?? null,
-        recoveryPasses: gathered.retrievalDiagnostics?.recoveryPasses ?? 0,
+        revisionPasses: gathered.retrievalDiagnostics?.revisionPasses
+          ?? gathered.retrievalDiagnostics?.recoveryPasses
+          ?? 0,
         accessLimitations
       }
   };
@@ -519,7 +522,7 @@ export function reviewProtocolMarkdown(protocol: ReviewProtocol): string {
     "",
     protocol.actualRetrieval === null
       ? "- Retrieval has not completed yet."
-      : `- Raw sources: ${protocol.actualRetrieval.rawSourceCount}\n- Canonical papers: ${protocol.actualRetrieval.canonicalPaperCount}\n- Reviewed papers: ${protocol.actualRetrieval.reviewedPaperCount}\n- Revision passes: ${protocol.actualRetrieval.recoveryPasses}`
+      : `- Raw sources: ${protocol.actualRetrieval.rawSourceCount}\n- Canonical papers: ${protocol.actualRetrieval.canonicalPaperCount}\n- Reviewed papers: ${protocol.actualRetrieval.reviewedPaperCount}\n- Revision passes: ${protocol.actualRetrieval.revisionPasses ?? protocol.actualRetrieval.recoveryPasses ?? 0}`
   ].join("\n");
 }
 
