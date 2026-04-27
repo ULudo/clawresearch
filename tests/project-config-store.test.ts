@@ -141,18 +141,30 @@ test("runtime llm config resolves env overrides over project defaults", async ()
     const resolved = resolveRuntimeLlmConfig(config, {
       CLAWRESEARCH_LLM_TIMEOUT_MS: "222000",
       CLAWRESEARCH_LLM_SYNTHESIS_TIMEOUT_MS: "333000",
+      CLAWRESEARCH_LLM_CRITIC_TIMEOUT_MS: "444000",
       CLAWRESEARCH_LLM_EXTRACTION_BATCH_SIZE: "5",
       CLAWRESEARCH_LLM_EXTRACTION_MIN_BATCH_SIZE: "3",
       CLAWRESEARCH_LLM_EXTRACTION_RETRY_BUDGET: "9",
+      CLAWRESEARCH_LLM_SYNTHESIS_CLUSTER_SIZE: "7",
+      CLAWRESEARCH_LLM_SYNTHESIS_MIN_CLUSTER_SIZE: "2",
+      CLAWRESEARCH_LLM_SYNTHESIS_RETRY_BUDGET: "11",
+      CLAWRESEARCH_LLM_AGENT_STEP_TIMEOUT_MS: "555000",
+      CLAWRESEARCH_AGENT_INVALID_ACTION_BUDGET: "3",
       CLAWRESEARCH_EVIDENCE_RECOVERY_MAX_PASSES: "4"
     });
 
     assert.equal(resolved.planningTimeoutMs, 222_000);
     assert.equal(resolved.extractionTimeoutMs, 222_000);
     assert.equal(resolved.synthesisTimeoutMs, 333_000);
+    assert.equal(resolved.criticTimeoutMs, 444_000);
     assert.equal(resolved.extractionInitialBatchSize, 5);
     assert.equal(resolved.extractionMinBatchSize, 3);
     assert.equal(resolved.extractionRetryBudget, 9);
+    assert.equal(resolved.synthesisInitialClusterSize, 7);
+    assert.equal(resolved.synthesisMinClusterSize, 2);
+    assert.equal(resolved.synthesisRetryBudget, 11);
+    assert.equal(resolved.agentStepTimeoutMs, 555_000);
+    assert.equal(resolved.agentInvalidActionBudget, 3);
     assert.equal(resolved.evidenceRecoveryMaxPasses, 4);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });

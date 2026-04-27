@@ -2507,6 +2507,51 @@ export async function handleContinueCommand(
   const reconciledRun = await reconcileRelevantRun(session, store, runStore, runController, now);
 
   if (reconciledRun !== null && !isTerminalRun(reconciledRun)) {
+    if (reconciledRun.status === "paused") {
+      if (reconciledRun.workerPid === null) {
+        const lines = [
+          "The active research run is paused, but it does not currently have a live worker process to resume.",
+          `Run id: ${reconciledRun.id}`,
+          `Trace: ${relativeProjectPath(session.projectRoot, reconciledRun.artifacts.tracePath)}`
+        ];
+
+        renderTaggedLines(writer, "run", lines);
+        saveAssistantMessage(session, lines.join(" "), now(), "command");
+        await store.save(session);
+        return;
+      }
+
+      await runController.resume(reconciledRun.workerPid);
+      reconciledRun.status = "running";
+      reconciledRun.statusMessage = "Run resumed from /continue.";
+      await runStore.save(reconciledRun);
+
+      const lines = [
+        `Resumed paused run ${reconciledRun.id}.`,
+        `Trace: ${relativeProjectPath(session.projectRoot, reconciledRun.artifacts.tracePath)}`,
+        "Use `/status` to inspect it, or `/pause` to stop it temporarily."
+      ];
+
+      renderTaggedLines(writer, "run", lines);
+      saveAssistantMessage(session, lines.join(" "), now(), "command");
+      await store.save(session);
+
+      if (watchRuns) {
+        await watchRunProgress(
+          writer,
+          session,
+          store,
+          runStore,
+          runController,
+          reconciledRun,
+          now,
+          watchPollMs
+        );
+      }
+
+      return;
+    }
+
     const lines = [
       "A detached research run is already active for this project.",
       `Run id: ${reconciledRun.id}`,

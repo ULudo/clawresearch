@@ -1558,7 +1558,7 @@ test("review selection records missing method facets when zeta evidence drifts a
   }
 });
 
-test("thin evidence triggers one recovery pass and records recovery diagnostics", async () => {
+test("thin evidence triggers one revision pass and records diagnostics", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-recovery-"));
   const originalFetch = globalThis.fetch;
 

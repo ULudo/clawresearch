@@ -54,9 +54,15 @@ export type RuntimeLlmConfig = {
   extractionTimeoutMs: number;
   synthesisTimeoutMs: number;
   agendaTimeoutMs: number;
+  criticTimeoutMs: number;
+  agentStepTimeoutMs: number;
   extractionInitialBatchSize: number;
   extractionMinBatchSize: number;
   extractionRetryBudget: number;
+  synthesisInitialClusterSize: number;
+  synthesisMinClusterSize: number;
+  synthesisRetryBudget: number;
+  agentInvalidActionBudget: number;
   totalRecoveryBudgetMs: number;
   evidenceRecoveryMaxPasses: number;
 };
@@ -127,9 +133,15 @@ export const defaultRuntimeLlmConfig: RuntimeLlmConfig = {
   extractionTimeoutMs: 300_000,
   synthesisTimeoutMs: 300_000,
   agendaTimeoutMs: 300_000,
+  criticTimeoutMs: 300_000,
+  agentStepTimeoutMs: 300_000,
   extractionInitialBatchSize: 6,
   extractionMinBatchSize: 1,
   extractionRetryBudget: 24,
+  synthesisInitialClusterSize: 6,
+  synthesisMinClusterSize: 1,
+  synthesisRetryBudget: 12,
+  agentInvalidActionBudget: 2,
   totalRecoveryBudgetMs: 1_800_000,
   evidenceRecoveryMaxPasses: 3
 };
@@ -144,15 +156,28 @@ function normalizeRuntimeLlmConfig(raw: unknown): RuntimeLlmConfig {
     readPositiveInteger(record.extractionInitialBatchSize)
       ?? base.extractionInitialBatchSize
   );
+  const synthesisMinClusterSize = readPositiveInteger(record.synthesisMinClusterSize)
+    ?? base.synthesisMinClusterSize;
+  const synthesisInitialClusterSize = Math.max(
+    synthesisMinClusterSize,
+    readPositiveInteger(record.synthesisInitialClusterSize)
+      ?? base.synthesisInitialClusterSize
+  );
 
   return {
     planningTimeoutMs: readPositiveInteger(record.planningTimeoutMs) ?? base.planningTimeoutMs,
     extractionTimeoutMs: readPositiveInteger(record.extractionTimeoutMs) ?? base.extractionTimeoutMs,
     synthesisTimeoutMs: readPositiveInteger(record.synthesisTimeoutMs) ?? base.synthesisTimeoutMs,
     agendaTimeoutMs: readPositiveInteger(record.agendaTimeoutMs) ?? base.agendaTimeoutMs,
+    criticTimeoutMs: readPositiveInteger(record.criticTimeoutMs) ?? base.criticTimeoutMs,
+    agentStepTimeoutMs: readPositiveInteger(record.agentStepTimeoutMs) ?? base.agentStepTimeoutMs,
     extractionInitialBatchSize,
     extractionMinBatchSize,
     extractionRetryBudget: readPositiveInteger(record.extractionRetryBudget) ?? base.extractionRetryBudget,
+    synthesisInitialClusterSize,
+    synthesisMinClusterSize,
+    synthesisRetryBudget: readPositiveInteger(record.synthesisRetryBudget) ?? base.synthesisRetryBudget,
+    agentInvalidActionBudget: readPositiveInteger(record.agentInvalidActionBudget) ?? base.agentInvalidActionBudget,
     totalRecoveryBudgetMs: readPositiveInteger(record.totalRecoveryBudgetMs) ?? base.totalRecoveryBudgetMs,
     evidenceRecoveryMaxPasses: readPositiveInteger(record.evidenceRecoveryMaxPasses) ?? base.evidenceRecoveryMaxPasses
   };
@@ -171,6 +196,13 @@ export function resolveRuntimeLlmConfig(
     readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_EXTRACTION_BATCH_SIZE")
       ?? configured.extractionInitialBatchSize
   );
+  const synthesisMinClusterSize = readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_SYNTHESIS_MIN_CLUSTER_SIZE")
+    ?? configured.synthesisMinClusterSize;
+  const synthesisInitialClusterSize = Math.max(
+    synthesisMinClusterSize,
+    readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_SYNTHESIS_CLUSTER_SIZE")
+      ?? configured.synthesisInitialClusterSize
+  );
 
   return {
     planningTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_PLANNING_TIMEOUT_MS")
@@ -185,10 +217,22 @@ export function resolveRuntimeLlmConfig(
     agendaTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_AGENDA_TIMEOUT_MS")
       ?? baseTimeout
       ?? configured.agendaTimeoutMs,
+    criticTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_CRITIC_TIMEOUT_MS")
+      ?? baseTimeout
+      ?? configured.criticTimeoutMs,
+    agentStepTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_AGENT_STEP_TIMEOUT_MS")
+      ?? baseTimeout
+      ?? configured.agentStepTimeoutMs,
     extractionInitialBatchSize,
     extractionMinBatchSize,
     extractionRetryBudget: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_EXTRACTION_RETRY_BUDGET")
       ?? configured.extractionRetryBudget,
+    synthesisInitialClusterSize,
+    synthesisMinClusterSize,
+    synthesisRetryBudget: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_SYNTHESIS_RETRY_BUDGET")
+      ?? configured.synthesisRetryBudget,
+    agentInvalidActionBudget: readEnvPositiveInteger(env, "CLAWRESEARCH_AGENT_INVALID_ACTION_BUDGET")
+      ?? configured.agentInvalidActionBudget,
     totalRecoveryBudgetMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_RECOVERY_BUDGET_MS")
       ?? configured.totalRecoveryBudgetMs,
     evidenceRecoveryMaxPasses: readEnvPositiveInteger(env, "CLAWRESEARCH_EVIDENCE_RECOVERY_MAX_PASSES")

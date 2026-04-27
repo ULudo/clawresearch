@@ -12,6 +12,7 @@ import {
   isRetrievalQualityConstraintPhrase
 } from "./literature-review.js";
 import type { ResearchSourceGatherResult } from "./research-sources.js";
+import type { CriticReviewArtifact } from "./research-critic.js";
 import type { RunRecord } from "./run-store.js";
 import type { VerificationReport, VerifiedClaim } from "./verifier.js";
 
@@ -307,17 +308,28 @@ function splitSentences(text: string | null | undefined): string[] {
     .filter((sentence) => sentence.length > 0);
 }
 
+function isFileLikeProtocolPhrase(phrase: string): boolean {
+  const compact = phrase.trim();
+  return /(^|[/\\])[\w.-]+\.(txt|md|json|jsonl|log|csv|ts|tsx|js|jsx|py|yaml|yml)$/i.test(compact)
+    || /^[\w.-]+\.(txt|md|json|jsonl|log|csv|ts|tsx|js|jsx|py|yaml|yml)$/i.test(compact);
+}
+
+function isProtocolEvidencePhrase(phrase: string): boolean {
+  return !isRetrievalQualityConstraintPhrase(phrase)
+    && !isFileLikeProtocolPhrase(phrase);
+}
+
 function protocolFacetsFor(input: ReviewProtocolInput): NonNullable<ResearchSourceGatherResult["selectionQuality"]>["requiredFacets"] {
   const gatheredFacets = input.gathered?.selectionQuality?.requiredFacets ?? [];
 
   if (gatheredFacets.length > 0) {
-    return gatheredFacets.filter((facet) => !isRetrievalQualityConstraintPhrase(facet.label));
+    return gatheredFacets.filter((facet) => isProtocolEvidencePhrase(facet.label));
   }
 
   return buildReviewFacets({
     brief: input.run.brief,
     plan: input.plan
-  }).filter((facet) => facet.required && !isRetrievalQualityConstraintPhrase(facet.label));
+  }).filter((facet) => facet.required && isProtocolEvidencePhrase(facet.label));
 }
 
 function manuscriptConstraintsFor(input: ReviewProtocolInput): string[] {
@@ -333,10 +345,10 @@ function manuscriptConstraintsFor(input: ReviewProtocolInput): string[] {
 
 function evidenceTargetsFor(input: ReviewProtocolInput, labels: string[]): string[] {
   return uniqueStrings([
-    ...labels,
-    ...input.plan.localFocus.filter((focus) => !isRetrievalQualityConstraintPhrase(focus)),
+    ...labels.filter(isProtocolEvidencePhrase),
+    ...input.plan.localFocus.filter(isProtocolEvidencePhrase),
     ...splitSentences(input.run.brief.researchQuestion)
-      .filter((sentence) => !isRetrievalQualityConstraintPhrase(sentence))
+      .filter(isProtocolEvidencePhrase)
       .slice(0, 2)
   ]).slice(0, 16);
 }
@@ -507,7 +519,7 @@ export function reviewProtocolMarkdown(protocol: ReviewProtocol): string {
     "",
     protocol.actualRetrieval === null
       ? "- Retrieval has not completed yet."
-      : `- Raw sources: ${protocol.actualRetrieval.rawSourceCount}\n- Canonical papers: ${protocol.actualRetrieval.canonicalPaperCount}\n- Reviewed papers: ${protocol.actualRetrieval.reviewedPaperCount}\n- Recovery passes: ${protocol.actualRetrieval.recoveryPasses}`
+      : `- Raw sources: ${protocol.actualRetrieval.rawSourceCount}\n- Canonical papers: ${protocol.actualRetrieval.canonicalPaperCount}\n- Reviewed papers: ${protocol.actualRetrieval.reviewedPaperCount}\n- Revision passes: ${protocol.actualRetrieval.recoveryPasses}`
   ].join("\n");
 }
 
@@ -1161,6 +1173,111 @@ function readinessAfterChecks(
   }
 
   return preliminary;
+}
+
+function criticCheckSeverity(report: CriticReviewArtifact, objectionSeverity: string): "warning" | "blocker" {
+  if (report.stage === "release" && report.readiness !== "pass") {
+    return "blocker";
+  }
+
+  return objectionSeverity === "blocking" && report.stage === "release" ? "blocker" : "warning";
+}
+
+function criticReportsToChecks(reports: CriticReviewArtifact[]): ManuscriptCheck[] {
+  return reports.flatMap((report) => {
+    if (report.objections.length === 0) {
+      const severity = report.stage === "release" && report.readiness !== "pass"
+        ? "blocker" as const
+        : "warning" as const;
+      return report.readiness === "pass"
+        ? []
+        : [{
+          id: `critic-${report.stage}`,
+          title: `${report.stage.replace(/_/g, " ")} critic passed release gate`,
+          status: severity === "blocker" ? "fail" as const : "warning" as const,
+          severity,
+          message: `The ${report.stage.replace(/_/g, " ")} critic returned ${report.readiness}.`
+        }];
+    }
+
+    return report.objections.map((objection, index) => {
+      const severity = criticCheckSeverity(report, objection.severity);
+      const paperSuffix = objection.affectedPaperIds.length > 0
+        ? ` Papers: ${objection.affectedPaperIds.join(", ")}.`
+        : "";
+      const claimSuffix = objection.affectedClaimIds.length > 0
+        ? ` Claims: ${objection.affectedClaimIds.join(", ")}.`
+        : "";
+      const revisionSuffix = objection.suggestedRevision !== null
+        ? ` Suggested revision: ${objection.suggestedRevision}`
+        : "";
+
+      return {
+        id: `critic-${report.stage}-${objection.code || index + 1}`,
+        title: `${report.stage.replace(/_/g, " ")} critic: ${objection.target.replace(/_/g, " ")}`,
+        status: severity === "blocker" ? "fail" as const : "warning" as const,
+        severity,
+        message: `${objection.message}${paperSuffix}${claimSuffix}${revisionSuffix}`
+      };
+    });
+  });
+}
+
+function readinessWithCriticReports(
+  current: ManuscriptReadinessState,
+  reports: CriticReviewArtifact[]
+): ManuscriptReadinessState {
+  if (reports.some((report) => report.stage === "release" && report.readiness !== "pass")) {
+    return current === "ready_for_revision" ? "needs_human_review" : current;
+  }
+
+  return current;
+}
+
+export function applyCriticReportsToManuscriptBundle(
+  input: ManuscriptBundleInput,
+  bundle: ManuscriptBundle,
+  reports: CriticReviewArtifact[]
+): ManuscriptBundle {
+  const criticChecks = criticReportsToChecks(reports);
+  if (criticChecks.length === 0) {
+    return bundle;
+  }
+
+  const checks = [...bundle.checks.checks, ...criticChecks];
+  const preliminaryReadiness = readinessWithCriticReports(bundle.checks.readinessStatus, reports);
+  const readinessStatus = readinessAfterChecks(preliminaryReadiness, checks);
+  const blockerCount = checks.filter((item) => item.severity === "blocker" && item.status === "fail").length;
+  const warningCount = checks.filter((item) => item.status === "warning").length;
+  const blockers = checks
+    .filter((item) => item.severity === "blocker" && item.status === "fail")
+    .map((item) => item.message);
+  const manuscriptReady = readinessStatus === "ready_for_revision" && blockerCount === 0;
+  const paper = manuscriptReady
+    ? { ...bundle.paper, readinessStatus }
+    : buildStatusOnlyPaperArtifact(
+      input,
+      bundle.outline,
+      readinessStatus,
+      bundle.paper.limitations,
+      blockers
+    );
+
+  return {
+    ...bundle,
+    paper,
+    paperMarkdown: manuscriptReady
+      ? renderPaperMarkdown(paper, bundle.references)
+      : renderStatusOnlyPaperMarkdown(paper),
+    checks: {
+      ...bundle.checks,
+      readinessStatus,
+      blockerCount,
+      warningCount,
+      checks,
+      blockers
+    }
+  };
 }
 
 export function buildManuscriptBundle(input: ManuscriptBundleInput): ManuscriptBundle {

@@ -50,6 +50,12 @@ import type {
   WorkPackage
 } from "./research-backend.js";
 import {
+  modelUnsuitableActionDecision,
+  type ResearchActionDecision,
+  type ResearchActionDiagnostic,
+  type ResearchActionRequest
+} from "./research-agent.js";
+import {
   createDefaultResearchBackend,
   ResearchBackendError,
   type ResearchBackendOperation
@@ -57,16 +63,27 @@ import {
 import {
   buildEvidenceMatrix,
   briefFingerprint,
+  evidenceMatrixNextQuestions,
   type EvidenceMatrix,
   type EvidenceMatrixInsight,
   type PaperExtraction
 } from "./research-evidence.js";
 import {
+  applyCriticReportsToManuscriptBundle,
   buildManuscriptBundle,
   buildReviewProtocol,
   reviewProtocolMarkdown,
   type ManuscriptBundle
 } from "./research-manuscript.js";
+import {
+  criticRevisionTexts,
+  criticReviewNeedsRevision,
+  criticReviewPassed,
+  criticUnavailableReview,
+  type CriticReviewArtifact,
+  type CriticReviewRequest,
+  type CriticReviewStage
+} from "./research-critic.js";
 import {
   collectResearchLocalFileHints,
   createDefaultResearchSourceGatherer,
@@ -125,7 +142,7 @@ type ArtifactStatus = {
   schemaVersion: number;
   runId: string;
   artifactKind: string;
-  status: "pending" | "in_progress" | "failed";
+  status: "pending" | "in_progress" | "failed" | "skipped";
   stage: string;
   createdAt: string;
   updatedAt: string;
@@ -154,6 +171,63 @@ type ClaimsArtifact = {
   briefFingerprint: string;
   claimCount: number;
   claims: ResearchClaim[];
+};
+
+type AgentStepStatus =
+  | "started"
+  | "completed"
+  | "revising"
+  | "blocked"
+  | "warning";
+
+type AgentStepRecord = {
+  schemaVersion: number;
+  runId: string;
+  step: number;
+  timestamp: string;
+  actor: "research_agent" | "critic" | "runtime";
+  phase: string;
+  action: string;
+  status: AgentStepStatus;
+  summary: string;
+  artifactPaths: string[];
+  counts: Record<string, number>;
+};
+
+type AgentStateArtifact = {
+  schemaVersion: number;
+  runId: string;
+  status: "pending" | "running" | "completed" | "blocked";
+  currentPhase: string;
+  lastAction: string | null;
+  lastStatus: AgentStepStatus | null;
+  completedSteps: number;
+  updatedAt: string;
+};
+
+type SynthesisAttempt = {
+  attempt: number;
+  clusterId: string;
+  paperIds: string[];
+  clusterSize: number;
+  status: "succeeded" | "failed" | "fallback";
+  errorKind: string | null;
+  errorMessage: string | null;
+  timeoutMs: number;
+};
+
+type SynthesisCheckpointArtifact = {
+  schemaVersion: number;
+  runId: string;
+  briefFingerprint: string;
+  status: "pending" | "in_progress" | "completed" | "completed_with_fallback";
+  strategy: "clustered";
+  clusterSize: number;
+  clusterCount: number;
+  completedClusterIds: string[];
+  failedClusterIds: string[];
+  attempts: SynthesisAttempt[];
+  synthesis: ResearchSynthesis | null;
 };
 
 function markdownBrief(brief: ResearchBrief): string {
@@ -209,6 +283,69 @@ async function appendStderr(run: RunRecord, message: string): Promise<void> {
 
 async function writeJsonArtifact(filePath: string, value: JsonValue | Record<string, unknown> | unknown[]): Promise<void> {
   await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+class AgentStepRecorder {
+  private completedSteps = 0;
+
+  constructor(
+    private readonly run: RunRecord,
+    private readonly now: () => string
+  ) {}
+
+  async record(input: {
+    actor?: AgentStepRecord["actor"];
+    phase: string;
+    action: string;
+    status: AgentStepStatus;
+    summary: string;
+    artifactPaths?: string[];
+    counts?: Record<string, number>;
+  }): Promise<void> {
+    const timestamp = this.now();
+    this.completedSteps += 1;
+    const artifactPaths = (input.artifactPaths ?? [])
+      .map((artifactPath) => relativeArtifactPath(this.run.projectRoot, artifactPath));
+    const record: AgentStepRecord = {
+      schemaVersion: 1,
+      runId: this.run.id,
+      step: this.completedSteps,
+      timestamp,
+      actor: input.actor ?? "research_agent",
+      phase: input.phase,
+      action: input.action,
+      status: input.status,
+      summary: input.summary,
+      artifactPaths,
+      counts: input.counts ?? {}
+    };
+    const state: AgentStateArtifact = {
+      schemaVersion: 1,
+      runId: this.run.id,
+      status: input.status === "blocked" ? "blocked" : input.status === "completed" ? "completed" : "running",
+      currentPhase: input.phase,
+      lastAction: input.action,
+      lastStatus: input.status,
+      completedSteps: this.completedSteps,
+      updatedAt: timestamp
+    };
+
+    await appendFile(this.run.artifacts.agentStepsPath, `${JSON.stringify(record)}\n`, "utf8");
+    await writeJsonArtifact(this.run.artifacts.agentStatePath, state);
+  }
+}
+
+function pendingAgentState(run: RunRecord, timestamp: string): AgentStateArtifact {
+  return {
+    schemaVersion: 1,
+    runId: run.id,
+    status: "pending",
+    currentPhase: run.stage,
+    lastAction: null,
+    lastStatus: null,
+    completedSteps: 0,
+    updatedAt: timestamp
+  };
 }
 
 function paperExtractionsArtifact(
@@ -317,8 +454,17 @@ function normalizedRecoveryQueryKey(query: string): string {
   return query.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
 }
 
+function isFileLikeResearchTerm(text: string): boolean {
+  const compact = text.trim();
+  return /(^|[/\\])[\w.-]+\.(txt|md|json|jsonl|log|csv|ts|tsx|js|jsx|py|yaml|yml)$/i.test(compact)
+    || /^[\w.-]+\.(txt|md|json|jsonl|log|csv|ts|tsx|js|jsx|py|yaml|yml)$/i.test(compact);
+}
+
 function compactRecoveryQuery(text: string | null | undefined, limit = 12): string | null {
   if (typeof text !== "string") {
+    return null;
+  }
+  if (isFileLikeResearchTerm(text)) {
     return null;
   }
 
@@ -370,6 +516,7 @@ function buildEvidenceRecoveryQueries(input: {
   synthesis?: ResearchSynthesis | null;
   agenda?: ResearchAgenda | null;
   verification?: VerificationReport | null;
+  criticReports?: CriticReviewArtifact[];
   extraQuestions?: string[];
 }): { queries: string[]; focusTerms: string[] } {
   const anchor = recoveryQueryAnchor(input.run, input.plan);
@@ -380,6 +527,7 @@ function buildEvidenceRecoveryQueries(input: {
     ...(input.agenda?.holdReasons ?? []),
     ...(input.verification?.unknowns ?? []),
     ...(input.verification?.unverifiedClaims.map((claim) => claim.reason) ?? []),
+    ...criticRevisionTexts(input.criticReports ?? []),
     ...(input.extraQuestions ?? [])
   ].flatMap((question) => {
     const compact = compactRecoveryQuery(question, 8);
@@ -400,9 +548,58 @@ function buildEvidenceRecoveryQueries(input: {
       ...facetQueries.queries,
       ...diagnosticQueries,
       ...questionQueries,
+      ...criticRevisionTexts(input.criticReports ?? []),
       ...thinSetQueries
     ]).slice(0, 16),
-    focusTerms: facetQueries.focusTerms
+    focusTerms: uniqueStrings([
+      ...facetQueries.focusTerms,
+      ...(input.criticReports ?? []).flatMap((report) => report.revisionAdvice.evidenceTargets)
+    ])
+  };
+}
+
+function buildProtocolCriticRecoveryQueries(input: {
+  run: RunRecord;
+  plan: ResearchPlan;
+  criticReport: CriticReviewArtifact;
+}): { queries: string[]; focusTerms: string[] } {
+  return {
+    queries: uniqueStrings(input.criticReport.revisionAdvice.searchQueries).slice(0, 12),
+    focusTerms: uniqueStrings(input.criticReport.revisionAdvice.evidenceTargets)
+      .filter((term) => !isFileLikeResearchTerm(term))
+  };
+}
+
+function protocolRecoveryPlanUpdate(
+  plan: ResearchPlan,
+  queries: string[],
+  focusTerms: string[]
+): { plan: ResearchPlan; recoveryQueries: string[] } | null {
+  const cleanExistingQueries = plan.searchQueries.filter((query) => compactRecoveryQuery(query, 12) !== null);
+  const existingQueryKeys = new Set(cleanExistingQueries.map(normalizedRecoveryQueryKey));
+  const recoveryQueries = uniqueStrings(queries)
+    .filter((query) => compactRecoveryQuery(query, 12) !== null)
+    .filter((query) => !existingQueryKeys.has(normalizedRecoveryQueryKey(query)))
+    .slice(0, 8);
+
+  if (recoveryQueries.length === 0) {
+    return null;
+  }
+
+  const rationaleSuffix = "Autonomous protocol revision refined retrieval scope before source gathering.";
+
+  return {
+    recoveryQueries,
+    plan: {
+      ...plan,
+      rationale: plan.rationale.includes(rationaleSuffix)
+        ? plan.rationale
+        : `${plan.rationale} ${rationaleSuffix}`,
+      searchQueries: uniqueStrings([...cleanExistingQueries, ...recoveryQueries]).slice(0, 16),
+      localFocus: uniqueStrings([...plan.localFocus, ...focusTerms])
+        .filter((focus) => compactRecoveryQuery(focus, 8) !== null)
+        .slice(0, 16)
+    }
   };
 }
 
@@ -420,7 +617,7 @@ function evidenceRecoveryPlanUpdate(
     return null;
   }
 
-  const rationaleSuffix = "Autonomous evidence recovery may expand retrieval when manuscript checks require more evidence.";
+  const rationaleSuffix = "Autonomous evidence revision may expand retrieval when manuscript checks require more evidence.";
 
   return {
     recoveryQueries,
@@ -430,13 +627,215 @@ function evidenceRecoveryPlanUpdate(
         ? plan.rationale
         : `${plan.rationale} ${rationaleSuffix}`,
       searchQueries: uniqueStrings([...plan.searchQueries, ...recoveryQueries]).slice(0, 28),
-      localFocus: uniqueStrings([...plan.localFocus, ...focusTerms]).slice(0, 16)
+      localFocus: uniqueStrings([...plan.localFocus, ...focusTerms])
+        .filter((focus) => compactRecoveryQuery(focus, 8) !== null)
+        .slice(0, 16)
     }
   };
 }
 
 function evidenceRecoveryBudgetExhausted(startedAtMs: number, runtimeConfig: RuntimeLlmConfig): boolean {
   return Date.now() - startedAtMs >= runtimeConfig.totalRecoveryBudgetMs;
+}
+
+function criticArtifactPath(run: RunRecord, stage: CriticReviewStage): string {
+  switch (stage) {
+    case "protocol":
+      return run.artifacts.criticProtocolReviewPath;
+    case "source_selection":
+      return run.artifacts.criticSourceSelectionPath;
+    case "evidence":
+      return run.artifacts.criticEvidenceReviewPath;
+    case "release":
+      return run.artifacts.criticReleaseReviewPath;
+  }
+}
+
+function criticStructuredRetryNeeded(report: CriticReviewArtifact): boolean {
+  return report.readiness !== "pass"
+    && report.objections.length === 1
+    && report.objections[0]?.code === `critic-${report.stage}-nonpass`;
+}
+
+async function reviewWithCritic(input: {
+  run: RunRecord;
+  now: () => string;
+  researchBackend: ResearchBackend;
+  runtimeConfig: RuntimeLlmConfig;
+  request: CriticReviewRequest;
+}): Promise<CriticReviewArtifact> {
+  const { run, now, researchBackend, runtimeConfig, request } = input;
+  await appendEvent(run, now, "next", `Run ${request.stage.replace(/_/g, " ")} critic review.`);
+
+  try {
+    let report = await researchBackend.reviewResearchArtifact(request, {
+      operation: "critic",
+      timeoutMs: runtimeConfig.criticTimeoutMs
+    });
+    if (criticStructuredRetryNeeded(report) && request.retryInstruction === undefined) {
+      await appendEvent(
+        run,
+        now,
+        "next",
+        `${request.stage.replace(/_/g, " ")} critic returned no structured objections; retrying once for precise feedback.`
+      );
+      report = await researchBackend.reviewResearchArtifact({
+        ...request,
+        retryInstruction: "Your previous critic response did not include structured objections. Return JSON with concrete objections, precise affected criteria or paper IDs when known, and actionable revision advice. If no severe issue remains, return pass."
+      }, {
+        operation: "critic",
+        timeoutMs: runtimeConfig.criticTimeoutMs
+      });
+    }
+    await writeJsonArtifact(criticArtifactPath(run, request.stage), report);
+    await appendEvent(
+      run,
+      now,
+      report.readiness === "pass" ? "summary" : "stderr",
+      `${request.stage.replace(/_/g, " ")} critic returned ${report.readiness}.`
+    );
+    for (const objection of report.objections.slice(0, 4)) {
+      await appendStdout(run, `Critic ${request.stage}: ${objection.severity} - ${objection.message}`);
+    }
+    return report;
+  } catch (error) {
+    const report = criticUnavailableReview(request, errorMessage(error));
+    await writeJsonArtifact(criticArtifactPath(run, request.stage), report);
+    await appendEvent(run, now, "stderr", `${request.stage.replace(/_/g, " ")} critic unavailable: ${errorMessage(error)}`);
+    await appendStdout(run, `Critic ${request.stage} unavailable: ${errorMessage(error)}`);
+    return report;
+  }
+}
+
+function researchActionDiagnosticKind(error: unknown): ResearchActionDiagnostic["kind"] {
+  if (error instanceof ResearchBackendError) {
+    return error.kind === "malformed_json" ? "malformed_action" : "provider_failure";
+  }
+
+  return /action/i.test(errorMessage(error)) ? "invalid_action" : "provider_failure";
+}
+
+async function chooseResearchActionStrict(input: {
+  run: RunRecord;
+  now: () => string;
+  researchBackend: ResearchBackend;
+  runtimeConfig: RuntimeLlmConfig;
+  agent: AgentStepRecorder;
+  request: Omit<ResearchActionRequest, "attempt" | "maxAttempts">;
+  diagnostics: ResearchActionDiagnostic[];
+}): Promise<ResearchActionDecision> {
+  const {
+    run,
+    now,
+    researchBackend,
+    runtimeConfig,
+    agent,
+    request,
+    diagnostics
+  } = input;
+  const maxAttempts = Math.max(1, runtimeConfig.agentInvalidActionBudget);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const actionRequest: ResearchActionRequest = {
+      ...request,
+      attempt,
+      maxAttempts,
+      retryInstruction: attempt === 1
+        ? request.retryInstruction
+        : "Your previous response was not a valid structured action. Return exactly one allowed action with valid JSON arguments. Do not explain in prose."
+    };
+
+    try {
+      await appendEvent(run, now, "next", `Ask research agent for next ${request.phase} action (${attempt}/${maxAttempts}).`);
+      const decision = await researchBackend.chooseResearchAction(actionRequest, {
+        operation: "agent_step",
+        timeoutMs: runtimeConfig.agentStepTimeoutMs
+      });
+      await agent.record({
+        phase: request.phase,
+        action: decision.action,
+        status: "completed",
+        summary: decision.rationale,
+        artifactPaths: [run.artifacts.agentStatePath],
+        counts: {
+          confidencePercent: Math.round(decision.confidence * 100),
+          searchQueries: decision.inputs.searchQueries.length,
+          evidenceTargets: decision.inputs.evidenceTargets.length
+        }
+      });
+      await appendStdout(run, `Research agent action (${request.phase}): ${decision.action} - ${decision.rationale}`);
+      return decision;
+    } catch (error) {
+      const diagnostic: ResearchActionDiagnostic = {
+        phase: request.phase,
+        attempt,
+        kind: researchActionDiagnosticKind(error),
+        message: errorMessage(error)
+      };
+      diagnostics.push(diagnostic);
+      await appendEvent(run, now, "stderr", `Research agent action selection failed (${diagnostic.kind}): ${diagnostic.message}`);
+      await appendStdout(run, `Research agent action selection failed: ${diagnostic.message}`);
+    }
+  }
+
+  const fallback = modelUnsuitableActionDecision({
+    ...request,
+    attempt: maxAttempts,
+    maxAttempts
+  }, diagnostics);
+  await agent.record({
+    phase: request.phase,
+    action: fallback.action,
+    status: "warning",
+    summary: fallback.rationale,
+    artifactPaths: [run.artifacts.agentStatePath],
+    counts: {
+      invalidActions: diagnostics.filter((diagnostic) => diagnostic.phase === request.phase).length
+    }
+  });
+  await appendEvent(run, now, "next", "Research agent could not produce a reliable structured action; finalizing status-only diagnostics.");
+  return fallback;
+}
+
+function emptyGatheredResult(plan: ResearchPlan): ResearchSourceGatherResult {
+  return {
+    notes: [],
+    sources: [],
+    canonicalPapers: [],
+    reviewedPapers: [],
+    routing: {
+      domain: "mixed",
+      plannedQueries: plan.searchQueries,
+      discoveryProviderIds: [],
+      resolverProviderIds: [],
+      acquisitionProviderIds: []
+    },
+    mergeDiagnostics: [],
+    authStatus: [],
+    reviewWorkflow: {
+      titleScreenedPaperIds: [],
+      abstractScreenedPaperIds: [],
+      fulltextScreenedPaperIds: [],
+      includedPaperIds: [],
+      excludedPaperIds: [],
+      uncertainPaperIds: [],
+      blockedPaperIds: [],
+      synthesisPaperIds: [],
+      deferredPaperIds: [],
+      counts: {
+        titleScreened: 0,
+        abstractScreened: 0,
+        fulltextScreened: 0,
+        included: 0,
+        excluded: 0,
+        uncertain: 0,
+        blocked: 0,
+        selectedForSynthesis: 0,
+        deferred: 0
+      },
+      notes: []
+    }
+  };
 }
 
 type EvidenceQualitySnapshot = {
@@ -481,6 +880,164 @@ function evidenceQualityImproved(previous: EvidenceQualitySnapshot | null, next:
     || next.score > previous.score;
 }
 
+type CriticIterationSummary = {
+  stage: CriticReviewStage;
+  iterations: number;
+  finalReadiness: string;
+  finalConfidence: number;
+  objectionCount: number;
+  topObjections: string[];
+};
+
+function finalCriticIterationSummaries(
+  reportsByStage: Map<CriticReviewStage, CriticReviewArtifact[]>
+): CriticIterationSummary[] {
+  return (["protocol", "source_selection", "evidence", "release"] as CriticReviewStage[])
+    .flatMap((stage) => {
+      const reports = reportsByStage.get(stage) ?? [];
+      const finalReport = reports.at(-1);
+      if (finalReport === undefined) {
+        return [];
+      }
+
+      return [{
+        stage,
+        iterations: reports.length,
+        finalReadiness: finalReport.readiness,
+        finalConfidence: finalReport.confidence,
+        objectionCount: finalReport.objections.length,
+        topObjections: finalReport.objections.slice(0, 4).map((objection) => objection.message)
+      }];
+    });
+}
+
+function modelSuitabilityRating(input: {
+  reviewedPaperCount: number;
+  selectedPaperCount: number;
+  extractionCount: number;
+  evidenceRowCount: number;
+  manuscriptReadiness: string;
+  criticSummaries: CriticIterationSummary[];
+  actionDiagnostics: ResearchActionDiagnostic[];
+}): { score: number; label: "strong" | "adequate" | "limited" | "poor"; rationale: string[] } {
+  const rationale: string[] = [];
+  let score = 100;
+  const nonPassingCritics = input.criticSummaries.filter((summary) => summary.finalReadiness !== "pass");
+
+  if (input.selectedPaperCount < 3) {
+    score -= 25;
+    rationale.push("Fewer than three papers were selected for synthesis.");
+  } else if (input.selectedPaperCount < 8) {
+    score -= 10;
+    rationale.push("The selected evidence set is modest.");
+  }
+
+  if (input.extractionCount < input.selectedPaperCount) {
+    score -= 20;
+    rationale.push("Not every selected paper was extracted.");
+  }
+
+  if (input.evidenceRowCount < 3) {
+    score -= 20;
+    rationale.push("The evidence matrix remained thin.");
+  }
+
+  if (nonPassingCritics.length > 0) {
+    score -= Math.min(30, nonPassingCritics.length * 10);
+    rationale.push(`Critic review ended with unresolved ${nonPassingCritics.map((summary) => `${summary.stage}:${summary.finalReadiness}`).join(", ")} status.`);
+  }
+
+  if (input.actionDiagnostics.length > 0) {
+    score -= Math.min(35, input.actionDiagnostics.length * 15);
+    rationale.push(`Research-agent action control had ${input.actionDiagnostics.length} structured-output issue(s).`);
+  }
+
+  if (input.manuscriptReadiness !== "ready_for_revision") {
+    score -= input.manuscriptReadiness === "needs_human_review" ? 10 : 20;
+    rationale.push(`Manuscript readiness ended as ${input.manuscriptReadiness}.`);
+  }
+
+  const boundedScore = Math.max(0, Math.min(100, score));
+  const label = boundedScore >= 80
+    ? "strong"
+    : boundedScore >= 60
+    ? "adequate"
+    : boundedScore >= 40
+    ? "limited"
+    : "poor";
+
+  return {
+    score: boundedScore,
+    label,
+    rationale: rationale.length > 0 ? rationale : ["The run completed with sufficient evidence, extraction, and critic agreement signals."]
+  };
+}
+
+function buildQualityReport(input: {
+  run: RunRecord;
+  backendLabel: string;
+  gathered: ResearchSourceGatherResult | null;
+  paperExtractions: PaperExtraction[];
+  evidenceMatrix: EvidenceMatrix;
+  manuscriptBundle: ManuscriptBundle;
+  criticReportsByStage: Map<CriticReviewStage, CriticReviewArtifact[]>;
+  agentActionDiagnostics?: ResearchActionDiagnostic[];
+  autonomousRevisionPasses: number;
+  revisionBudgetPasses: number;
+}): Record<string, unknown> {
+  const criticIterations = finalCriticIterationSummaries(input.criticReportsByStage);
+  const actionDiagnostics = input.agentActionDiagnostics ?? [];
+  const reviewedPaperCount = input.gathered?.reviewedPapers.length ?? 0;
+  const selectedPaperCount = input.gathered?.reviewWorkflow.counts.selectedForSynthesis ?? reviewedPaperCount;
+  const suitability = modelSuitabilityRating({
+    reviewedPaperCount,
+    selectedPaperCount,
+    extractionCount: input.paperExtractions.length,
+    evidenceRowCount: input.evidenceMatrix.rowCount,
+    manuscriptReadiness: input.manuscriptBundle.checks.readinessStatus,
+    criticSummaries: criticIterations,
+    actionDiagnostics
+  });
+
+  return {
+    schemaVersion: 1,
+    runId: input.run.id,
+    status: "completed",
+    backend: input.backendLabel,
+    evidence: {
+      rawSources: input.gathered?.sources.length ?? 0,
+      canonicalPapers: input.gathered?.canonicalPapers.length ?? 0,
+      titleScreened: input.gathered?.reviewWorkflow.counts.titleScreened ?? 0,
+      abstractScreened: input.gathered?.reviewWorkflow.counts.abstractScreened ?? 0,
+      fulltextScreened: input.gathered?.reviewWorkflow.counts.fulltextScreened ?? 0,
+      includedPapers: input.gathered?.reviewWorkflow.counts.included ?? 0,
+      selectedForSynthesis: selectedPaperCount,
+      reviewedPapers: reviewedPaperCount,
+      extractedPapers: input.paperExtractions.length,
+      evidenceRows: input.evidenceMatrix.rowCount,
+      referencedPapers: input.manuscriptBundle.references.referenceCount
+    },
+    critic: {
+      autonomousRevisionPasses: input.autonomousRevisionPasses,
+      revisionBudgetPasses: input.revisionBudgetPasses,
+      iterations: criticIterations,
+      finalSatisfaction: criticIterations.every((summary) => summary.finalReadiness === "pass") ? "pass" : "unresolved"
+    },
+    agentControl: {
+      mode: "strict_json",
+      invalidActionCount: actionDiagnostics.length,
+      diagnostics: actionDiagnostics
+    },
+    manuscript: {
+      readinessStatus: input.manuscriptBundle.checks.readinessStatus,
+      blockerCount: input.manuscriptBundle.checks.blockerCount,
+      warningCount: input.manuscriptBundle.checks.warningCount,
+      fullManuscriptReleased: input.manuscriptBundle.checks.readinessStatus === "ready_for_revision"
+    },
+    modelSuitability: suitability
+  };
+}
+
 async function writeResearchDirection(
   run: RunRecord,
   agenda: ResearchAgenda,
@@ -507,22 +1064,48 @@ function pendingArtifactStatus(run: RunRecord, artifactKind: string, timestamp: 
   };
 }
 
+function skippedArtifactStatus(run: RunRecord, artifactKind: string, timestamp: string, reason: string): ArtifactStatus {
+  return {
+    schemaVersion: 1,
+    runId: run.id,
+    artifactKind,
+    status: "skipped",
+    stage: run.stage,
+    createdAt: run.startedAt ?? run.createdAt,
+    updatedAt: timestamp,
+    counts: {},
+    error: {
+      message: reason,
+      kind: "skipped",
+      operation: "critic"
+    }
+  };
+}
+
 async function writeRunArtifacts(run: RunRecord): Promise<void> {
   await mkdir(run.artifacts.runDirectory, { recursive: true });
+  await mkdir(run.artifacts.synthesisClusterDirectory, { recursive: true });
   const createdAt = run.startedAt ?? run.createdAt;
   await writeJsonArtifact(run.artifacts.briefPath, run.brief);
   await writeFile(run.artifacts.tracePath, "", "utf8");
   await writeFile(run.artifacts.eventsPath, "", "utf8");
   await writeFile(run.artifacts.stdoutPath, "", "utf8");
   await writeFile(run.artifacts.stderrPath, "", "utf8");
+  await writeJsonArtifact(run.artifacts.agentStatePath, pendingAgentState(run, createdAt));
+  await writeFile(run.artifacts.agentStepsPath, "", "utf8");
   await writeJsonArtifact(run.artifacts.planPath, pendingArtifactStatus(run, "plan", createdAt));
   await writeJsonArtifact(run.artifacts.sourcesPath, pendingArtifactStatus(run, "sources", createdAt));
   await writeJsonArtifact(run.artifacts.literaturePath, pendingArtifactStatus(run, "literature-review", createdAt));
   await writeJsonArtifact(run.artifacts.reviewProtocolPath, pendingArtifactStatus(run, "review-protocol", createdAt));
   await writeFile(run.artifacts.reviewProtocolMarkdownPath, "# Review Protocol\n\nStatus: pending.\n", "utf8");
+  await writeJsonArtifact(run.artifacts.criticProtocolReviewPath, pendingArtifactStatus(run, "critic-protocol-review", createdAt));
+  await writeJsonArtifact(run.artifacts.criticSourceSelectionPath, pendingArtifactStatus(run, "critic-source-selection", createdAt));
+  await writeJsonArtifact(run.artifacts.criticEvidenceReviewPath, pendingArtifactStatus(run, "critic-evidence-review", createdAt));
+  await writeJsonArtifact(run.artifacts.criticReleaseReviewPath, pendingArtifactStatus(run, "critic-release-review", createdAt));
   await writeJsonArtifact(run.artifacts.paperExtractionsPath, pendingArtifactStatus(run, "paper-extractions", createdAt));
   await writeJsonArtifact(run.artifacts.evidenceMatrixPath, pendingArtifactStatus(run, "evidence-matrix", createdAt));
   await writeFile(run.artifacts.synthesisPath, "# Research Synthesis\n\nStatus: pending.\n", "utf8");
+  await writeJsonArtifact(run.artifacts.synthesisJsonPath, pendingArtifactStatus(run, "synthesis", createdAt));
   await writeJsonArtifact(run.artifacts.claimsPath, pendingArtifactStatus(run, "claims", createdAt));
   await writeJsonArtifact(run.artifacts.verificationPath, pendingArtifactStatus(run, "verification", createdAt));
   await writeJsonArtifact(run.artifacts.paperOutlinePath, pendingArtifactStatus(run, "paper-outline", createdAt));
@@ -530,6 +1113,7 @@ async function writeRunArtifacts(run: RunRecord): Promise<void> {
   await writeJsonArtifact(run.artifacts.paperJsonPath, pendingArtifactStatus(run, "paper", createdAt));
   await writeJsonArtifact(run.artifacts.referencesPath, pendingArtifactStatus(run, "references", createdAt));
   await writeJsonArtifact(run.artifacts.manuscriptChecksPath, pendingArtifactStatus(run, "manuscript-checks", createdAt));
+  await writeJsonArtifact(run.artifacts.qualityReportPath, pendingArtifactStatus(run, "quality-report", createdAt));
   await writeJsonArtifact(run.artifacts.nextQuestionsPath, pendingArtifactStatus(run, "next-questions", createdAt));
   await writeJsonArtifact(run.artifacts.agendaPath, pendingArtifactStatus(run, "agenda", createdAt));
   await writeFile(run.artifacts.agendaMarkdownPath, "# Research Agenda\n\nStatus: pending.\n", "utf8");
@@ -1793,6 +2377,454 @@ async function extractReviewedPapersWithRecovery(options: {
   };
 }
 
+function chunkPapers(papers: CanonicalPaper[], chunkSize: number): CanonicalPaper[][] {
+  const chunks: CanonicalPaper[][] = [];
+
+  for (let index = 0; index < papers.length; index += chunkSize) {
+    chunks.push(papers.slice(index, index + chunkSize));
+  }
+
+  return chunks;
+}
+
+function evidenceMatrixForPaperIds(evidenceMatrix: EvidenceMatrix, paperIds: Set<string>): EvidenceMatrix {
+  const rows = evidenceMatrix.rows.filter((row) => paperIds.has(row.paperId));
+
+  return {
+    ...evidenceMatrix,
+    rowCount: rows.length,
+    rows,
+    derivedInsights: evidenceMatrix.derivedInsights
+      .map((insight) => ({
+        ...insight,
+        paperIds: insight.paperIds.filter((paperId) => paperIds.has(paperId))
+      }))
+      .filter((insight) => insight.paperIds.length > 0)
+  };
+}
+
+function synthesisCheckpointArtifact(input: {
+  run: RunRecord;
+  status: SynthesisCheckpointArtifact["status"];
+  clusterSize: number;
+  clusterCount: number;
+  completedClusterIds: string[];
+  failedClusterIds: string[];
+  attempts: SynthesisAttempt[];
+  synthesis: ResearchSynthesis | null;
+}): SynthesisCheckpointArtifact {
+  return {
+    schemaVersion: 1,
+    runId: input.run.id,
+    briefFingerprint: briefFingerprint(input.run.brief),
+    status: input.status,
+    strategy: "clustered",
+    clusterSize: input.clusterSize,
+    clusterCount: input.clusterCount,
+    completedClusterIds: input.completedClusterIds,
+    failedClusterIds: input.failedClusterIds,
+    attempts: input.attempts,
+    synthesis: input.synthesis
+  };
+}
+
+async function writeSynthesisCheckpoint(input: {
+  run: RunRecord;
+  status: SynthesisCheckpointArtifact["status"];
+  clusterSize: number;
+  clusterCount: number;
+  completedClusterIds: string[];
+  failedClusterIds: string[];
+  attempts: SynthesisAttempt[];
+  synthesis: ResearchSynthesis | null;
+}): Promise<void> {
+  await writeJsonArtifact(input.run.artifacts.synthesisJsonPath, synthesisCheckpointArtifact(input));
+}
+
+function synthesisClusterPath(run: RunRecord, clusterId: string): string {
+  return path.join(run.artifacts.synthesisClusterDirectory, `${clusterId}.json`);
+}
+
+function fallbackSynthesisForCluster(input: {
+  clusterId: string;
+  papers: CanonicalPaper[];
+  paperExtractions: PaperExtraction[];
+  evidenceMatrix: EvidenceMatrix;
+  reason: string;
+}): ResearchSynthesis {
+  const sourceIds = input.papers.map((paper) => paper.id);
+  const extractedSignals = input.paperExtractions
+    .flatMap((extraction) => extraction.successSignals)
+    .filter((signal) => signal.trim().length > 0)
+    .slice(0, 6);
+  const extractedLimitations = input.paperExtractions
+    .flatMap((extraction) => extraction.limitations)
+    .filter((limitation) => limitation.trim().length > 0)
+    .slice(0, 6);
+  const nextQuestions = evidenceMatrixNextQuestions(input.evidenceMatrix);
+
+  return {
+    executiveSummary: `Synthesis cluster ${input.clusterId} could not be completed by the model: ${input.reason}. The run retained extraction-grounded status information instead of inventing cross-paper claims.`,
+    themes: input.evidenceMatrix.derivedInsights.slice(0, 4).map((insight) => themeFromInsight(insight)),
+    claims: [],
+    nextQuestions: uniqueStrings([
+      ...nextQuestions,
+      ...extractedSignals.map((signal) => `Which reviewed evidence best supports this recurring signal: ${signal}?`),
+      ...extractedLimitations.map((limitation) => `How should the manuscript qualify evidence limited by: ${limitation}?`)
+    ]).slice(0, 6)
+  };
+}
+
+function mergeClusterSyntheses(input: {
+  run: RunRecord;
+  papers: CanonicalPaper[];
+  syntheses: ResearchSynthesis[];
+  usedFallback: boolean;
+}): ResearchSynthesis {
+  const themeByTitle = new Map<string, ResearchTheme>();
+  const claimByText = new Map<string, ResearchClaim>();
+  const nextQuestions: string[] = [];
+
+  for (const synthesis of input.syntheses) {
+    for (const theme of synthesis.themes) {
+      const key = theme.title.toLowerCase();
+      const existing = themeByTitle.get(key);
+      if (existing === undefined) {
+        themeByTitle.set(key, {
+          ...theme,
+          sourceIds: uniqueStrings(theme.sourceIds)
+        });
+      } else {
+        themeByTitle.set(key, {
+          ...existing,
+          summary: uniqueStrings([existing.summary, theme.summary]).join(" "),
+          sourceIds: uniqueStrings([...existing.sourceIds, ...theme.sourceIds])
+        });
+      }
+    }
+
+    for (const claim of synthesis.claims) {
+      const key = claim.claim.toLowerCase();
+      const existing = claimByText.get(key);
+      if (existing === undefined) {
+        claimByText.set(key, {
+          ...claim,
+          sourceIds: uniqueStrings(claim.sourceIds)
+        });
+      } else {
+        claimByText.set(key, {
+          ...existing,
+          evidence: uniqueStrings([existing.evidence, claim.evidence]).join(" "),
+          sourceIds: uniqueStrings([...existing.sourceIds, ...claim.sourceIds])
+        });
+      }
+    }
+
+    nextQuestions.push(...synthesis.nextQuestions);
+  }
+
+  const fallbackClause = input.usedFallback
+    ? " Some synthesis clusters used extraction-grounded fallback summaries because the model could not complete those subtasks."
+    : "";
+
+  return {
+    executiveSummary: [
+      `Clustered synthesis covered ${input.papers.length} reviewed papers across ${input.syntheses.length} synthesis work units.`,
+      ...input.syntheses.map((synthesis) => synthesis.executiveSummary).slice(0, 4),
+      fallbackClause
+    ].filter((part) => part.trim().length > 0).join(" "),
+    themes: [...themeByTitle.values()].slice(0, 12),
+    claims: [...claimByText.values()].slice(0, 16),
+    nextQuestions: uniqueStrings(nextQuestions).slice(0, 10)
+  };
+}
+
+async function synthesizeResearchAdaptively(options: {
+  run: RunRecord;
+  now: () => string;
+  researchBackend: ResearchBackend;
+  runtimeConfig: RuntimeLlmConfig;
+  agent: AgentStepRecorder;
+  plan: ResearchPlan;
+  papers: CanonicalPaper[];
+  paperExtractions: PaperExtraction[];
+  evidenceMatrix: EvidenceMatrix;
+  selectionQuality: ResearchSourceGatherResult["selectionQuality"];
+  literatureContext: Parameters<ResearchBackend["synthesizeResearch"]>[0]["literatureContext"];
+}): Promise<{
+  synthesis: ResearchSynthesis;
+  attempts: SynthesisAttempt[];
+  usedFallback: boolean;
+}> {
+  const {
+    run,
+    now,
+    researchBackend,
+    runtimeConfig,
+    agent,
+    plan,
+    papers,
+    paperExtractions,
+    evidenceMatrix,
+    selectionQuality,
+    literatureContext
+  } = options;
+  const initialClusterSize = Math.max(
+    runtimeConfig.synthesisMinClusterSize,
+    Math.min(runtimeConfig.synthesisInitialClusterSize, Math.max(1, papers.length))
+  );
+  const minClusterSize = Math.max(1, runtimeConfig.synthesisMinClusterSize);
+  const attempts: SynthesisAttempt[] = [];
+  const completedClusterIds: string[] = [];
+  const failedClusterIds: string[] = [];
+  const clusterSyntheses: ResearchSynthesis[] = [];
+  const queue = chunkPapers(papers, initialClusterSize).map((clusterPapers, index) => ({
+    id: `cluster-${index + 1}`,
+    papers: clusterPapers
+  }));
+  let clusterSequence = queue.length;
+  let usedFallback = false;
+
+  await mkdir(run.artifacts.synthesisClusterDirectory, { recursive: true });
+  await writeSynthesisCheckpoint({
+    run,
+    status: "in_progress",
+    clusterSize: initialClusterSize,
+    clusterCount: queue.length,
+    completedClusterIds,
+    failedClusterIds,
+    attempts,
+    synthesis: null
+  });
+  await agent.record({
+    phase: "synthesis",
+    action: "plan_clustered_synthesis",
+    status: "started",
+    summary: `Plan clustered synthesis for ${papers.length} reviewed papers in chunks of up to ${initialClusterSize}.`,
+    artifactPaths: [run.artifacts.synthesisJsonPath],
+    counts: {
+      papers: papers.length,
+      clusters: queue.length,
+      clusterSize: initialClusterSize
+    }
+  });
+
+  while (queue.length > 0) {
+    const cluster = queue.shift();
+
+    if (cluster === undefined) {
+      break;
+    }
+
+    const paperIds = new Set(cluster.papers.map((paper) => paper.id));
+    const clusterExtractions = paperExtractions.filter((extraction) => paperIds.has(extraction.paperId));
+    const clusterMatrix = evidenceMatrixForPaperIds(evidenceMatrix, paperIds);
+    const attemptBase = {
+      attempt: attempts.length + 1,
+      clusterId: cluster.id,
+      paperIds: cluster.papers.map((paper) => paper.id),
+      clusterSize: cluster.papers.length,
+      timeoutMs: runtimeConfig.synthesisTimeoutMs
+    };
+
+    await appendEvent(
+      run,
+      now,
+      "next",
+      `Synthesize evidence ${cluster.id} (${cluster.papers.length} reviewed papers).`
+    );
+
+    try {
+      const synthesis = await researchBackend.synthesizeResearch({
+        projectRoot: run.projectRoot,
+        brief: run.brief,
+        plan,
+        papers: cluster.papers,
+        paperExtractions: clusterExtractions,
+        evidenceMatrix: clusterMatrix,
+        selectionQuality: selectionQuality ?? null,
+        literatureContext
+      }, {
+        operation: "synthesis",
+        timeoutMs: runtimeConfig.synthesisTimeoutMs
+      });
+
+      attempts.push({
+        ...attemptBase,
+        status: "succeeded",
+        errorKind: null,
+        errorMessage: null
+      });
+      completedClusterIds.push(cluster.id);
+      clusterSyntheses.push(synthesis);
+      await writeJsonArtifact(synthesisClusterPath(run, cluster.id), {
+        schemaVersion: 1,
+        runId: run.id,
+        clusterId: cluster.id,
+        status: "completed",
+        paperIds: [...paperIds],
+        synthesis
+      });
+      await writeSynthesisCheckpoint({
+        run,
+        status: "in_progress",
+        clusterSize: initialClusterSize,
+        clusterCount: completedClusterIds.length + failedClusterIds.length + queue.length,
+        completedClusterIds,
+        failedClusterIds,
+        attempts,
+        synthesis: null
+      });
+      await appendStdout(run, `Synthesis cluster ${cluster.id} completed: ${completedClusterIds.length} cluster(s) done.`);
+      await agent.record({
+        phase: "synthesis",
+        action: "synthesize_evidence_cluster",
+        status: "completed",
+        summary: `Completed synthesis for ${cluster.id}.`,
+        artifactPaths: [synthesisClusterPath(run, cluster.id), run.artifacts.synthesisJsonPath],
+        counts: {
+          papers: cluster.papers.length,
+          themes: synthesis.themes.length,
+          claims: synthesis.claims.length
+        }
+      });
+    } catch (error) {
+      const kind = recoveryFailureKind(error);
+      const message = errorMessage(error);
+      attempts.push({
+        ...attemptBase,
+        status: "failed",
+        errorKind: kind,
+        errorMessage: message
+      });
+      await appendEvent(run, now, "stderr", `Synthesis ${cluster.id} failed (${kind}): ${message}`);
+
+      const failedAttempts = attempts.filter((attempt) => attempt.status === "failed").length;
+      if (
+        ["timeout", "malformed_json", "empty_result"].includes(kind)
+        && cluster.papers.length > minClusterSize
+        && failedAttempts < runtimeConfig.synthesisRetryBudget
+      ) {
+        const smallerClusterSize = Math.max(minClusterSize, Math.ceil(cluster.papers.length / 2));
+        const splitClusters = chunkPapers(cluster.papers, smallerClusterSize)
+          .map((clusterPapers) => {
+            clusterSequence += 1;
+            return {
+              id: `cluster-${clusterSequence}`,
+              papers: clusterPapers
+            };
+          });
+        queue.unshift(...splitClusters);
+        await appendEvent(
+          run,
+          now,
+          "next",
+          `Revising synthesis work unit by splitting ${cluster.id} into ${splitClusters.length} smaller cluster(s).`
+        );
+        await agent.record({
+          phase: "synthesis",
+          action: "revise_synthesis_cluster",
+          status: "revising",
+          summary: `Split ${cluster.id} after ${kind}; continuing with smaller synthesis work units.`,
+          artifactPaths: [run.artifacts.synthesisJsonPath],
+          counts: {
+            papers: cluster.papers.length,
+            splitClusters: splitClusters.length,
+            failedAttempts
+          }
+        });
+        continue;
+      }
+
+      const fallback = fallbackSynthesisForCluster({
+        clusterId: cluster.id,
+        papers: cluster.papers,
+        paperExtractions: clusterExtractions,
+        evidenceMatrix: clusterMatrix,
+        reason: message
+      });
+      usedFallback = true;
+      failedClusterIds.push(cluster.id);
+      clusterSyntheses.push(fallback);
+      attempts.push({
+        ...attemptBase,
+        attempt: attempts.length + 1,
+        status: "fallback",
+        errorKind: kind,
+        errorMessage: message
+      });
+      await writeJsonArtifact(synthesisClusterPath(run, cluster.id), {
+        schemaVersion: 1,
+        runId: run.id,
+        clusterId: cluster.id,
+        status: "fallback",
+        paperIds: [...paperIds],
+        reason: message,
+        synthesis: fallback
+      });
+      await writeSynthesisCheckpoint({
+        run,
+        status: "in_progress",
+        clusterSize: initialClusterSize,
+        clusterCount: completedClusterIds.length + failedClusterIds.length + queue.length,
+        completedClusterIds,
+        failedClusterIds,
+        attempts,
+        synthesis: null
+      });
+      await agent.record({
+        phase: "synthesis",
+        action: "fallback_synthesis_cluster",
+        status: "warning",
+        summary: `Retained extraction-grounded status synthesis for ${cluster.id} after model failure.`,
+        artifactPaths: [synthesisClusterPath(run, cluster.id), run.artifacts.synthesisJsonPath],
+        counts: {
+          papers: cluster.papers.length,
+          failedAttempts
+        }
+      });
+    }
+  }
+
+  const mergedSynthesis = mergeClusterSyntheses({
+    run,
+    papers,
+    syntheses: clusterSyntheses,
+    usedFallback
+  });
+  await writeSynthesisCheckpoint({
+    run,
+    status: usedFallback ? "completed_with_fallback" : "completed",
+    clusterSize: initialClusterSize,
+    clusterCount: completedClusterIds.length + failedClusterIds.length,
+    completedClusterIds,
+    failedClusterIds,
+    attempts,
+    synthesis: mergedSynthesis
+  });
+  await agent.record({
+    phase: "synthesis",
+    action: "merge_cluster_syntheses",
+    status: usedFallback ? "warning" : "completed",
+    summary: usedFallback
+      ? "Merged completed synthesis clusters with fallback status clusters."
+      : "Merged completed synthesis clusters into a run-level synthesis.",
+    artifactPaths: [run.artifacts.synthesisJsonPath],
+    counts: {
+      clusters: completedClusterIds.length + failedClusterIds.length,
+      fallbackClusters: failedClusterIds.length,
+      themes: mergedSynthesis.themes.length,
+      claims: mergedSynthesis.claims.length
+    }
+  });
+
+  return {
+    synthesis: mergedSynthesis,
+    attempts,
+    usedFallback
+  };
+}
+
 function buildMemoryInputs(
   run: RunRecord,
   plan: ResearchPlan,
@@ -2308,7 +3340,7 @@ function insufficientEvidenceNextQuestions(plan: ResearchPlan, gathered?: Resear
   const accessLimitations = diagnostics?.accessLimitations.slice(0, 2) ?? [];
   const diagnosticQuestions = [
     suggestedQueries.length > 0
-      ? `Which of these recovery queries should be tried next: ${suggestedQueries.join(" | ")}?`
+      ? `Which of these revision queries should be tried next: ${suggestedQueries.join(" | ")}?`
       : null,
     providerErrors.length > 0
       ? `Which provider failure should be addressed first: ${providerErrors.join(" | ")}?`
@@ -2324,6 +3356,32 @@ function insufficientEvidenceNextQuestions(plan: ResearchPlan, gathered?: Resear
     "Which provider configuration or credentials are still limiting access to relevant papers?",
     `Which of these planned queries should be refined first: ${plan.searchQueries.slice(0, 3).join(" | ") || "no queries were generated"}?`
   ].slice(0, 5);
+}
+
+function statusOnlySynthesisFromEvidence(input: {
+  reason: string;
+  evidenceMatrix: EvidenceMatrix;
+  paperExtractions: PaperExtraction[];
+}): ResearchSynthesis {
+  const extractionLimitations = input.paperExtractions
+    .flatMap((extraction) => extraction.limitations)
+    .slice(0, 4)
+    .map((limitation) => `How should the review qualify evidence limited by: ${limitation}?`);
+  const insightQuestions = input.evidenceMatrix.derivedInsights
+    .slice(0, 4)
+    .map(questionFromInsight);
+
+  return {
+    executiveSummary: `${input.reason} The run retained extracted evidence and matrix diagnostics, but withheld full manuscript synthesis until the agent-control step is reliable.`,
+    themes: input.evidenceMatrix.derivedInsights.slice(0, 6).map(themeFromInsight),
+    claims: [],
+    nextQuestions: uniqueStrings([
+      ...evidenceMatrixNextQuestions(input.evidenceMatrix),
+      ...insightQuestions,
+      ...extractionLimitations,
+      "Which model or provider should be used for reliable structured research-action control?"
+    ]).slice(0, 8)
+  };
 }
 
 function insufficientEvidenceAgenda(
@@ -2366,7 +3424,7 @@ function retrievalDiagnosticHoldReasons(gathered: ResearchSourceGatherResult): s
     .map((attempt) => `${attempt.providerId} failed: ${attempt.error}`)
     .slice(0, 2);
   const recoverySummary = diagnostics.recoveryPasses > 0
-    ? [`One recovery retrieval pass ran, but only ${gathered.reviewedPapers.length} reviewed papers were selected for synthesis.`]
+    ? [`One revision retrieval pass ran, but only ${gathered.reviewedPapers.length} reviewed papers were selected for synthesis.`]
     : [];
   const accessLimitations = diagnostics.accessLimitations.slice(0, 2);
   const suggestedQueries = diagnostics.suggestedNextQueries.length > 0
@@ -2774,6 +3832,24 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
 
     await writeRunArtifacts(run);
     await writeFile(run.artifacts.summaryPath, `${markdownBrief(run.brief)}\n`, "utf8");
+    const agent = new AgentStepRecorder(run, now);
+    await agent.record({
+      actor: "runtime",
+      phase: "startup",
+      action: "observe_brief_and_project_state",
+      status: "started",
+      summary: "Initialized run artifacts and loaded project memory, literature memory, providers, and credentials.",
+      artifactPaths: [
+        run.artifacts.briefPath,
+        run.artifacts.agentStatePath,
+        run.artifacts.agentStepsPath
+      ],
+      counts: {
+        memoryRecords: memoryContext.recordCount,
+        literaturePapers: literatureContext.paperCount,
+        selectedProviders: scholarlyProviders.length + generalWebProviders.length
+      }
+    });
 
     await appendTrace(run, now, "Run worker started.");
     await appendEvent(run, now, "run", "Run worker started.");
@@ -2823,6 +3899,13 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     }
 
     await appendEvent(run, now, "plan", "Plan the research mode and generate initial retrieval queries.");
+    await agent.record({
+      phase: "planning",
+      action: "plan_next_research_step",
+      status: "started",
+      summary: "Ask the research model to choose the initial research mode, objective, retrieval queries, and local focus.",
+      artifactPaths: [run.artifacts.planPath]
+    });
 
     const localFiles = await collectResearchLocalFileHints(run.projectRoot, run.brief);
 
@@ -2836,9 +3919,29 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       operation: "planning",
       timeoutMs: runtimeLlmConfig.planningTimeoutMs
     });
+    await agent.record({
+      phase: "planning",
+      action: "write_research_plan",
+      status: "completed",
+      summary: `Selected ${plan.researchMode} with ${plan.searchQueries.length} initial retrieval queries.`,
+      artifactPaths: [run.artifacts.planPath],
+      counts: {
+        searchQueries: plan.searchQueries.length,
+        localFocus: plan.localFocus.length
+      }
+    });
+
+    const criticReportsByStage = new Map<CriticReviewStage, CriticReviewArtifact[]>();
+    const unresolvedNonTerminalCriticReports: CriticReviewArtifact[] = [];
+    const agentActionDiagnostics: ResearchActionDiagnostic[] = [];
+    const rememberCriticReport = (report: CriticReviewArtifact): void => {
+      const reports = criticReportsByStage.get(report.stage) ?? [];
+      reports.push(report);
+      criticReportsByStage.set(report.stage, reports);
+    };
 
     await writeJsonArtifact(run.artifacts.planPath, plan);
-    const initialProtocol = buildReviewProtocol({
+    let currentProtocol = buildReviewProtocol({
       run,
       plan,
       scholarlyDiscoveryProviders,
@@ -2847,8 +3950,131 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       generalWebProviders,
       localContextEnabled: localEnabled
     });
-    await writeJsonArtifact(run.artifacts.reviewProtocolPath, initialProtocol);
-    await writeFile(run.artifacts.reviewProtocolMarkdownPath, `${reviewProtocolMarkdown(initialProtocol)}\n`, "utf8");
+    await writeJsonArtifact(run.artifacts.reviewProtocolPath, currentProtocol);
+    await writeFile(run.artifacts.reviewProtocolMarkdownPath, `${reviewProtocolMarkdown(currentProtocol)}\n`, "utf8");
+
+    let protocolCritic = await reviewWithCritic({
+      run,
+      now,
+      researchBackend,
+      runtimeConfig: runtimeLlmConfig,
+      request: {
+        projectRoot: run.projectRoot,
+        runId: run.id,
+        stage: "protocol",
+        iteration: {
+          attempt: 1,
+          maxAttempts: Math.max(1, runtimeLlmConfig.evidenceRecoveryMaxPasses + 1),
+          revisionPassesUsed: 0
+        },
+        brief: run.brief,
+        protocol: currentProtocol,
+        plan
+      }
+    });
+    const maxProtocolCriticAttempts = Math.max(1, runtimeLlmConfig.evidenceRecoveryMaxPasses + 1);
+    const protocolRecoveryStartedAtMs = Date.now();
+    let protocolCriticAttempts = 1;
+    rememberCriticReport(protocolCritic);
+    await agent.record({
+      actor: "critic",
+      phase: "protocol",
+      action: "review_protocol",
+      status: criticReviewPassed(protocolCritic) ? "completed" : "revising",
+      summary: `Protocol critic returned ${protocolCritic.readiness}.`,
+      artifactPaths: [run.artifacts.reviewProtocolPath, run.artifacts.criticProtocolReviewPath],
+      counts: {
+        objections: protocolCritic.objections.length,
+        attempt: protocolCriticAttempts
+      }
+    });
+
+    while (
+      !criticReviewPassed(protocolCritic)
+      && protocolCriticAttempts < maxProtocolCriticAttempts
+      && criticReviewNeedsRevision(protocolCritic)
+      && !evidenceRecoveryBudgetExhausted(protocolRecoveryStartedAtMs, runtimeLlmConfig)
+    ) {
+      const recovery = buildProtocolCriticRecoveryQueries({
+        run,
+        plan,
+        criticReport: protocolCritic
+      });
+      const recoveryUpdate = protocolRecoveryPlanUpdate(plan, recovery.queries, recovery.focusTerms);
+
+      if (recoveryUpdate === null) {
+        break;
+      }
+
+      protocolCriticAttempts += 1;
+      plan = recoveryUpdate.plan;
+      currentProtocol = buildReviewProtocol({
+        run,
+        plan,
+        scholarlyDiscoveryProviders,
+        publisherFullTextProviders,
+        oaRetrievalHelperProviders,
+        generalWebProviders,
+        localContextEnabled: localEnabled
+      });
+      await writeJsonArtifact(run.artifacts.planPath, plan);
+      await writeJsonArtifact(run.artifacts.reviewProtocolPath, currentProtocol);
+      await writeFile(run.artifacts.reviewProtocolMarkdownPath, `${reviewProtocolMarkdown(currentProtocol)}\n`, "utf8");
+      await appendEvent(
+        run,
+        now,
+        "next",
+        `Protocol critic requested autonomous protocol revision ${protocolCriticAttempts - 1}.`
+      );
+      await appendStdout(run, `Protocol revision ${protocolCriticAttempts - 1}: ${recoveryUpdate.recoveryQueries.join(" | ")}`);
+      protocolCritic = await reviewWithCritic({
+        run,
+        now,
+        researchBackend,
+        runtimeConfig: runtimeLlmConfig,
+        request: {
+          projectRoot: run.projectRoot,
+          runId: run.id,
+          stage: "protocol",
+          iteration: {
+            attempt: protocolCriticAttempts,
+            maxAttempts: maxProtocolCriticAttempts,
+            revisionPassesUsed: protocolCriticAttempts - 1
+          },
+          brief: run.brief,
+          protocol: currentProtocol,
+          plan
+        }
+      });
+      rememberCriticReport(protocolCritic);
+      await agent.record({
+        actor: "critic",
+        phase: "protocol",
+        action: "review_revised_protocol",
+        status: criticReviewPassed(protocolCritic) ? "completed" : "revising",
+        summary: `Protocol critic returned ${protocolCritic.readiness} after revision ${protocolCriticAttempts - 1}.`,
+        artifactPaths: [run.artifacts.reviewProtocolPath, run.artifacts.criticProtocolReviewPath],
+        counts: {
+          objections: protocolCritic.objections.length,
+          attempt: protocolCriticAttempts,
+          revisions: protocolCriticAttempts - 1
+        }
+      });
+    }
+
+    if (!criticReviewPassed(protocolCritic)) {
+      unresolvedNonTerminalCriticReports.push(protocolCritic);
+      await appendEvent(
+        run,
+        now,
+        "literature",
+        "Protocol critic still had concerns after bounded protocol revisions; continuing to retrieval and recording the concerns in the quality report."
+      );
+      await appendStdout(
+        run,
+        "Protocol critic still had concerns after bounded self-validation; continuing to retrieval so source-selection, evidence, and release checks can validate the actual work."
+      );
+    }
     await appendTrace(run, now, `Selected research mode: ${plan.researchMode}`);
     await appendEvent(run, now, "summary", `Selected research mode ${plan.researchMode}: ${plan.objective}`);
     await appendStdout(run, `Selected research mode: ${plan.researchMode}`);
@@ -2868,7 +4094,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     const evidencePassNumber = autonomousRecoveryPasses + 1;
     await appendEvent(run, now, "literature", `Starting evidence pass ${evidencePassNumber}.`);
     if (pendingRecoveryQueries.length > 0) {
-      await appendStdout(run, `Autonomous evidence recovery queries: ${pendingRecoveryQueries.join(" | ")}`);
+      await appendStdout(run, `Autonomous evidence revision queries: ${pendingRecoveryQueries.join(" | ")}`);
     }
 
     const gathered = await sourceGatherer.gather({
@@ -2889,12 +4115,12 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     if (previousEvidenceQuality !== null) {
       if (evidenceImproved) {
         nonImprovingEvidencePasses = 0;
-        await appendEvent(run, now, "literature", "Evidence recovery improved the in-scope source set or reduced missing targets.");
-        await appendStdout(run, "Evidence recovery improved the protocol relevance/coverage score.");
+        await appendEvent(run, now, "literature", "Evidence revision improved the in-scope source set or reduced missing targets.");
+        await appendStdout(run, "Evidence revision improved the protocol relevance/coverage score.");
       } else {
         nonImprovingEvidencePasses += 1;
-        await appendEvent(run, now, "literature", "Evidence recovery did not improve the protocol relevance/coverage score.");
-        await appendStdout(run, "Evidence recovery did not improve the protocol relevance/coverage score.");
+        await appendEvent(run, now, "literature", "Evidence revision did not improve the protocol relevance/coverage score.");
+        await appendStdout(run, "Evidence revision did not improve the protocol relevance/coverage score.");
       }
     }
     previousEvidenceQuality = currentEvidenceQuality;
@@ -2917,6 +4143,8 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       },
       autonomousEvidence: {
         pass: evidencePassNumber,
+        revisionPasses: autonomousRecoveryPasses,
+        maxRevisionPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses,
         recoveryPasses: autonomousRecoveryPasses,
         maxRecoveryPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses
       },
@@ -2941,6 +4169,116 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       "literature",
       `Review workflow: title ${gathered.reviewWorkflow.counts.titleScreened}, abstract ${gathered.reviewWorkflow.counts.abstractScreened}, full-text ${gathered.reviewWorkflow.counts.fulltextScreened}, included ${gathered.reviewWorkflow.counts.included}, selected ${gathered.reviewWorkflow.counts.selectedForSynthesis}.`
     );
+    await agent.record({
+      phase: "evidence",
+      action: "gather_and_screen_sources",
+      status: "completed",
+      summary: `Evidence pass ${evidencePassNumber} gathered and screened candidate literature.`,
+      artifactPaths: [run.artifacts.sourcesPath],
+      counts: {
+        pass: evidencePassNumber,
+        rawSources: gathered.sources.length,
+        canonicalPapers: gathered.canonicalPapers.length,
+        includedPapers: gathered.reviewWorkflow.counts.included,
+        selectedPapers: gathered.reviewWorkflow.counts.selectedForSynthesis
+      }
+    });
+
+    const currentProtocol = buildReviewProtocol({
+      run,
+      plan,
+      scholarlyDiscoveryProviders,
+      publisherFullTextProviders,
+      oaRetrievalHelperProviders,
+      generalWebProviders,
+      localContextEnabled: localEnabled,
+      gathered
+    });
+    await writeJsonArtifact(run.artifacts.reviewProtocolPath, currentProtocol);
+    await writeFile(run.artifacts.reviewProtocolMarkdownPath, `${reviewProtocolMarkdown(currentProtocol)}\n`, "utf8");
+
+    const sourceSelectionCritic = await reviewWithCritic({
+      run,
+      now,
+      researchBackend,
+      runtimeConfig: runtimeLlmConfig,
+      request: {
+        projectRoot: run.projectRoot,
+        runId: run.id,
+        stage: "source_selection",
+        iteration: {
+          attempt: autonomousRecoveryPasses + 1,
+          maxAttempts: runtimeLlmConfig.evidenceRecoveryMaxPasses + 1,
+          revisionPassesUsed: autonomousRecoveryPasses
+        },
+        brief: run.brief,
+        protocol: currentProtocol,
+        plan,
+        selectedPapers: canonicalReviewedPapers,
+        relevanceAssessments: gathered.relevanceAssessments ?? [],
+        selectionQuality: gathered.selectionQuality ?? null,
+        gathered: {
+          reviewWorkflow: gathered.reviewWorkflow,
+          retrievalDiagnostics: gathered.retrievalDiagnostics,
+          notes: gathered.notes
+        }
+      }
+    });
+    rememberCriticReport(sourceSelectionCritic);
+    await agent.record({
+      actor: "critic",
+      phase: "source_selection",
+      action: "review_selected_sources",
+      status: criticReviewPassed(sourceSelectionCritic) ? "completed" : "revising",
+      summary: `Source-selection critic returned ${sourceSelectionCritic.readiness}.`,
+      artifactPaths: [run.artifacts.criticSourceSelectionPath],
+      counts: {
+        objections: sourceSelectionCritic.objections.length,
+        revisionPasses: autonomousRecoveryPasses
+      }
+    });
+
+    if (!criticReviewPassed(sourceSelectionCritic)) {
+      const recovery = buildEvidenceRecoveryQueries({
+        run,
+        plan,
+        gathered,
+        criticReports: [sourceSelectionCritic]
+      });
+      const recoveryUpdate = evidenceRecoveryPlanUpdate(plan, recovery.queries, recovery.focusTerms);
+
+      if (
+        criticReviewNeedsRevision(sourceSelectionCritic)
+        && recoveryUpdate !== null
+        && autonomousRecoveryPasses < runtimeLlmConfig.evidenceRecoveryMaxPasses
+        && !evidenceRecoveryBudgetExhausted(evidenceRecoveryStartedAtMs, runtimeLlmConfig)
+        && nonImprovingEvidencePasses < 2
+      ) {
+        autonomousRecoveryPasses += 1;
+        plan = recoveryUpdate.plan;
+        pendingRecoveryQueries = recoveryUpdate.recoveryQueries;
+        await appendEvent(
+          run,
+          now,
+          "next",
+          `Source-selection critic requested evidence revision pass ${autonomousRecoveryPasses}.`
+        );
+        await appendStdout(run, `Evidence revision pass ${autonomousRecoveryPasses}: ${pendingRecoveryQueries.join(" | ")}`);
+        continue;
+      }
+
+      unresolvedNonTerminalCriticReports.push(sourceSelectionCritic);
+      await appendEvent(
+        run,
+        now,
+        "next",
+        "Source-selection critic still had concerns after bounded revision; continuing to extraction and recording the concerns in the quality report."
+      );
+      await appendStdout(
+        run,
+        "Source-selection critic still had concerns after bounded revision; continuing so later evidence, synthesis, and final quality checks can complete."
+      );
+    }
 
     for (const note of gathered.notes) {
       await appendStdout(run, note);
@@ -2976,12 +4314,12 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         autonomousRecoveryPasses += 1;
         plan = recoveryUpdate.plan;
         pendingRecoveryQueries = recoveryUpdate.recoveryQueries;
-        await appendEvent(run, now, "next", `${failureMessage} Continuing autonomously with evidence recovery pass ${autonomousRecoveryPasses}.`);
-        await appendStdout(run, `Evidence recovery pass ${autonomousRecoveryPasses}: ${pendingRecoveryQueries.join(" | ")}`);
+        await appendEvent(run, now, "next", `${failureMessage} Continuing autonomously with evidence revision pass ${autonomousRecoveryPasses}.`);
+        await appendStdout(run, `Evidence revision pass ${autonomousRecoveryPasses}: ${pendingRecoveryQueries.join(" | ")}`);
         continue;
       }
 
-      const terminalFailureMessage = `${failureMessage} Autonomous evidence recovery could not find a stronger evidence set within the configured recovery budget.`;
+      const terminalFailureMessage = `${failureMessage} Autonomous evidence revision could not find a stronger evidence set within the configured revision budget.`;
       const paperExtractions: PaperExtraction[] = [];
       const evidenceMatrix = buildEvidenceMatrix({
         runId: run.id,
@@ -3010,7 +4348,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         claims: [],
         nextQuestions
       };
-      const manuscriptBundle = buildManuscriptBundle({
+      let manuscriptBundle = buildManuscriptBundle({
         run,
         plan,
         scholarlyDiscoveryProviders,
@@ -3025,16 +4363,59 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         verification,
         agenda
       });
+      if (unresolvedNonTerminalCriticReports.length > 0) {
+        manuscriptBundle = applyCriticReportsToManuscriptBundle(
+          {
+            run,
+            plan,
+            scholarlyDiscoveryProviders,
+            publisherFullTextProviders,
+            oaRetrievalHelperProviders,
+            generalWebProviders,
+            localContextEnabled: localEnabled,
+            gathered,
+            reviewedPapers: canonicalReviewedPapers,
+            evidenceMatrix,
+            synthesis: insufficientSynthesis,
+            verification,
+            agenda
+          },
+          manuscriptBundle,
+          unresolvedNonTerminalCriticReports
+        );
+      }
       await writeJsonArtifact(run.artifacts.agendaPath, agenda);
       await writeResearchDirection(run, agenda, now());
       await writeFile(run.artifacts.agendaMarkdownPath, `${agendaMarkdown(run, plan, agenda)}\n`, "utf8");
       await writeJsonArtifact(run.artifacts.workPackagePath, null);
       await writeManuscriptArtifacts(run, manuscriptBundle);
+      await writeJsonArtifact(run.artifacts.qualityReportPath, buildQualityReport({
+        run,
+        backendLabel: researchBackend.label,
+        gathered,
+        paperExtractions,
+        evidenceMatrix,
+        manuscriptBundle,
+        criticReportsByStage,
+        agentActionDiagnostics,
+        autonomousRevisionPasses: autonomousRecoveryPasses,
+        revisionBudgetPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses
+      }));
       await writeFile(
         run.artifacts.synthesisPath,
         `${insufficientEvidenceSynthesisMarkdown(run, plan, gathered, nextQuestions, terminalFailureMessage)}\n`,
         "utf8"
       );
+      await writeSynthesisCheckpoint({
+        run,
+        status: "completed_with_fallback",
+        clusterSize: 0,
+        clusterCount: 0,
+        completedClusterIds: [],
+        failedClusterIds: [],
+        attempts: [],
+        synthesis: insufficientSynthesis
+      });
       await writeFile(
         run.artifacts.summaryPath,
         [
@@ -3043,7 +4424,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
           `- Topic: ${run.brief.topic ?? "<missing>"}`,
           `- Research mode: ${plan.researchMode}`,
           `- Objective: ${plan.objective}`,
-          `- Autonomous evidence recovery passes: ${autonomousRecoveryPasses}`,
+          `- Autonomous evidence revision passes: ${autonomousRecoveryPasses}`,
           "",
           terminalFailureMessage
         ].join("\n"),
@@ -3111,10 +4492,28 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         await appendEvent(run, now, "next", question);
       }
 
-      await appendEvent(run, now, "plan", "Agenda generation completed with a hold after autonomous evidence recovery was exhausted.");
+      await appendEvent(run, now, "plan", "Agenda generation completed with a hold after autonomous evidence revision was exhausted.");
       await appendStdout(run, `Agenda hold: ${agenda.recommendedHumanDecision}`);
       await appendEvent(run, now, "summary", `Manuscript status: ${manuscriptBundle.checks.readinessStatus}.`);
       await appendStdout(run, `Paper artifact: ${relativeArtifactPath(run.projectRoot, run.artifacts.paperPath)} (${manuscriptBundle.checks.readinessStatus})`);
+      await agent.record({
+        phase: "release",
+        action: "write_status_only_artifacts",
+        status: "completed",
+        summary: "Wrote status-only artifacts because autonomous evidence revision could not produce a sufficient reviewed set.",
+        artifactPaths: [
+          run.artifacts.paperPath,
+          run.artifacts.paperJsonPath,
+          run.artifacts.manuscriptChecksPath,
+          run.artifacts.qualityReportPath,
+          run.artifacts.synthesisPath
+        ],
+        counts: {
+          reviewedPapers: canonicalReviewedPapers.length,
+          extractedPapers: paperExtractions.length,
+          revisionPasses: autonomousRecoveryPasses
+        }
+      });
 
       run.job.finishedAt = now();
       run.finishedAt = now();
@@ -3122,13 +4521,23 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       run.job.signal = null;
       run.workerPid = null;
       run.status = "completed";
-      run.statusMessage = "Literature review completed after autonomous evidence recovery, but the evidence base remained too thin.";
+      run.statusMessage = "Literature review completed after autonomous evidence revision, but the evidence base remained too thin.";
       await store.save(run);
       await appendEvent(run, now, "run", run.statusMessage);
       return 0;
     }
 
     await appendEvent(run, now, "next", "Extract structured paper records from the reviewed paper set.");
+    await agent.record({
+      phase: "extraction",
+      action: "extract_selected_papers",
+      status: "started",
+      summary: `Extract structured records for ${canonicalReviewedPapers.length} selected reviewed papers.`,
+      artifactPaths: [run.artifacts.paperExtractionsPath],
+      counts: {
+        selectedPapers: canonicalReviewedPapers.length
+      }
+    });
 
     const extractionResult = await extractReviewedPapersWithRecovery({
       run,
@@ -3158,6 +4567,18 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     ));
     await appendEvent(run, now, "summary", `Extracted ${paperExtractions.length} paper records from the reviewed set.`);
     await appendStdout(run, `Paper extractions written: ${paperExtractions.length}`);
+    await agent.record({
+      phase: "extraction",
+      action: "checkpoint_extractions",
+      status: "completed",
+      summary: `Extracted ${paperExtractions.length}/${canonicalReviewedPapers.length} selected papers with adaptive batches.`,
+      artifactPaths: [run.artifacts.paperExtractionsPath],
+      counts: {
+        extractedPapers: paperExtractions.length,
+        selectedPapers: canonicalReviewedPapers.length,
+        attempts: extractionResult.attempts.length
+      }
+    });
 
     await appendEvent(run, now, "next", "Build the cross-paper evidence matrix from the reviewed extractions.");
 
@@ -3170,23 +4591,367 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
 
     await writeJsonArtifact(run.artifacts.evidenceMatrixPath, normalizedEvidenceMatrix);
     await appendStdout(run, `Evidence matrix rows: ${normalizedEvidenceMatrix.rowCount}`);
+    await agent.record({
+      phase: "evidence",
+      action: "build_evidence_matrix",
+      status: "completed",
+      summary: "Built the cross-paper evidence matrix from selected-paper extractions.",
+      artifactPaths: [run.artifacts.evidenceMatrixPath],
+      counts: {
+        rows: normalizedEvidenceMatrix.rowCount,
+        insights: normalizedEvidenceMatrix.derivedInsights.length
+      }
+    });
+
+    const evidenceCritic = await reviewWithCritic({
+      run,
+      now,
+      researchBackend,
+      runtimeConfig: runtimeLlmConfig,
+      request: {
+        projectRoot: run.projectRoot,
+        runId: run.id,
+        stage: "evidence",
+        iteration: {
+          attempt: autonomousRecoveryPasses + 1,
+          maxAttempts: runtimeLlmConfig.evidenceRecoveryMaxPasses + 1,
+          revisionPassesUsed: autonomousRecoveryPasses
+        },
+        brief: run.brief,
+        protocol: currentProtocol,
+        plan,
+        selectedPapers: canonicalReviewedPapers,
+        relevanceAssessments: gathered.relevanceAssessments ?? [],
+        selectionQuality: gathered.selectionQuality ?? null,
+        paperExtractions,
+        evidenceMatrix: normalizedEvidenceMatrix
+      }
+    });
+    rememberCriticReport(evidenceCritic);
+    await agent.record({
+      actor: "critic",
+      phase: "evidence",
+      action: "review_evidence_matrix",
+      status: criticReviewPassed(evidenceCritic) ? "completed" : "revising",
+      summary: `Evidence critic returned ${evidenceCritic.readiness}.`,
+      artifactPaths: [run.artifacts.criticEvidenceReviewPath, run.artifacts.evidenceMatrixPath],
+      counts: {
+        objections: evidenceCritic.objections.length,
+        rows: normalizedEvidenceMatrix.rowCount,
+        revisionPasses: autonomousRecoveryPasses
+      }
+    });
+
+    if (!criticReviewPassed(evidenceCritic)) {
+      const recovery = buildEvidenceRecoveryQueries({
+        run,
+        plan,
+        gathered,
+        criticReports: [evidenceCritic]
+      });
+      const recoveryUpdate = evidenceRecoveryPlanUpdate(plan, recovery.queries, recovery.focusTerms);
+
+      if (
+        criticReviewNeedsRevision(evidenceCritic)
+        && recoveryUpdate !== null
+        && autonomousRecoveryPasses < runtimeLlmConfig.evidenceRecoveryMaxPasses
+        && !evidenceRecoveryBudgetExhausted(evidenceRecoveryStartedAtMs, runtimeLlmConfig)
+        && nonImprovingEvidencePasses < 2
+      ) {
+        autonomousRecoveryPasses += 1;
+        plan = recoveryUpdate.plan;
+        pendingRecoveryQueries = recoveryUpdate.recoveryQueries;
+        await appendEvent(
+          run,
+          now,
+          "next",
+          `Evidence critic requested evidence revision pass ${autonomousRecoveryPasses}.`
+        );
+        await appendStdout(run, `Evidence revision pass ${autonomousRecoveryPasses}: ${pendingRecoveryQueries.join(" | ")}`);
+        continue;
+      }
+
+      unresolvedNonTerminalCriticReports.push(evidenceCritic);
+      await appendEvent(
+        run,
+        now,
+        "next",
+        "Evidence critic still had concerns after bounded revision; continuing to synthesis and recording the concerns in the quality report."
+      );
+      await appendStdout(
+        run,
+        "Evidence critic still had concerns after bounded revision; continuing to synthesis with quality warnings."
+      );
+    }
+
+    const nextAction = await chooseResearchActionStrict({
+      run,
+      now,
+      researchBackend,
+      runtimeConfig: runtimeLlmConfig,
+      agent,
+      diagnostics: agentActionDiagnostics,
+      request: {
+        projectRoot: run.projectRoot,
+        runId: run.id,
+        phase: "synthesis",
+        allowedActions: ["revise_search_strategy", "synthesize_clustered", "finalize_status_report"],
+        brief: run.brief,
+        plan,
+        observations: {
+          canonicalPapers: gathered.canonicalPapers.length,
+          selectedPapers: canonicalReviewedPapers.length,
+          extractedPapers: paperExtractions.length,
+          evidenceRows: normalizedEvidenceMatrix.rowCount,
+          evidenceInsights: normalizedEvidenceMatrix.derivedInsights.length,
+          manuscriptReadiness: null,
+          revisionPassesUsed: autonomousRecoveryPasses,
+          revisionPassesRemaining: Math.max(0, runtimeLlmConfig.evidenceRecoveryMaxPasses - autonomousRecoveryPasses)
+        },
+        criticReports: [evidenceCritic]
+      }
+    });
+
+    if (nextAction.action === "revise_search_strategy") {
+      const actionQueries = uniqueStrings([
+        ...nextAction.inputs.searchQueries,
+        ...nextAction.inputs.evidenceTargets.map((target) => `${run.brief.topic ?? plan.objective} ${target}`)
+      ]);
+      const recovery = actionQueries.length > 0
+        ? {
+          queries: actionQueries,
+          focusTerms: nextAction.inputs.evidenceTargets
+        }
+        : buildEvidenceRecoveryQueries({
+          run,
+          plan,
+          gathered,
+          criticReports: [evidenceCritic]
+        });
+      const recoveryUpdate = evidenceRecoveryPlanUpdate(plan, recovery.queries, recovery.focusTerms);
+
+      if (
+        recoveryUpdate !== null
+        && autonomousRecoveryPasses < runtimeLlmConfig.evidenceRecoveryMaxPasses
+        && !evidenceRecoveryBudgetExhausted(evidenceRecoveryStartedAtMs, runtimeLlmConfig)
+        && nonImprovingEvidencePasses < 2
+      ) {
+        autonomousRecoveryPasses += 1;
+        plan = recoveryUpdate.plan;
+        pendingRecoveryQueries = recoveryUpdate.recoveryQueries;
+        await appendEvent(
+          run,
+          now,
+          "next",
+          `Research agent requested a strategy revision before synthesis; starting evidence revision pass ${autonomousRecoveryPasses}.`
+        );
+        await appendStdout(run, `Evidence revision pass ${autonomousRecoveryPasses}: ${pendingRecoveryQueries.join(" | ")}`);
+        continue;
+      }
+
+      await appendEvent(
+        run,
+        now,
+        "next",
+        "Research agent requested source strategy revision, but no useful revision budget or unused query plan remained."
+      );
+    }
+
+    if (nextAction.action === "finalize_status_report") {
+      const statusReason = nextAction.inputs.reason ?? nextAction.rationale;
+      const statusSynthesis = statusOnlySynthesisFromEvidence({
+        reason: statusReason,
+        evidenceMatrix: normalizedEvidenceMatrix,
+        paperExtractions
+      });
+      const verification = verifyResearchClaims({
+        brief: run.brief,
+        papers: canonicalReviewedPapers,
+        claims: []
+      });
+      const statusAgenda = agendaWithRetrievalHoldReasons(
+        insufficientEvidenceAgenda(run, plan, statusSynthesis.nextQuestions, statusReason),
+        gathered,
+        normalizedEvidenceMatrix
+      );
+      let statusManuscriptBundle = buildManuscriptBundle({
+        run,
+        plan,
+        scholarlyDiscoveryProviders,
+        publisherFullTextProviders,
+        oaRetrievalHelperProviders,
+        generalWebProviders,
+        localContextEnabled: localEnabled,
+        gathered,
+        reviewedPapers: canonicalReviewedPapers,
+        evidenceMatrix: normalizedEvidenceMatrix,
+        synthesis: statusSynthesis,
+        verification,
+        agenda: statusAgenda
+      });
+      if (unresolvedNonTerminalCriticReports.length > 0) {
+        statusManuscriptBundle = applyCriticReportsToManuscriptBundle(
+          {
+            run,
+            plan,
+            scholarlyDiscoveryProviders,
+            publisherFullTextProviders,
+            oaRetrievalHelperProviders,
+            generalWebProviders,
+            localContextEnabled: localEnabled,
+            gathered,
+            reviewedPapers: canonicalReviewedPapers,
+            evidenceMatrix: normalizedEvidenceMatrix,
+            synthesis: statusSynthesis,
+            verification,
+            agenda: statusAgenda
+          },
+          statusManuscriptBundle,
+          unresolvedNonTerminalCriticReports
+        );
+      }
+
+      await writeJsonArtifact(run.artifacts.claimsPath, claimsArtifact(run, []));
+      await writeJsonArtifact(run.artifacts.nextQuestionsPath, statusSynthesis.nextQuestions);
+      await writeJsonArtifact(run.artifacts.verificationPath, verification);
+      await writeJsonArtifact(run.artifacts.agendaPath, statusAgenda);
+      await writeResearchDirection(run, statusAgenda, now());
+      await writeFile(run.artifacts.agendaMarkdownPath, `${agendaMarkdown(run, plan, statusAgenda)}\n`, "utf8");
+      await writeJsonArtifact(run.artifacts.workPackagePath, null);
+      await writeManuscriptArtifacts(run, statusManuscriptBundle);
+      await writeJsonArtifact(run.artifacts.qualityReportPath, buildQualityReport({
+        run,
+        backendLabel: researchBackend.label,
+        gathered,
+        paperExtractions,
+        evidenceMatrix: normalizedEvidenceMatrix,
+        manuscriptBundle: statusManuscriptBundle,
+        criticReportsByStage,
+        agentActionDiagnostics,
+        autonomousRevisionPasses: autonomousRecoveryPasses,
+        revisionBudgetPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses
+      }));
+      await writeFile(
+        run.artifacts.synthesisPath,
+        `${synthesisMarkdown(run, plan, gathered, paperExtractions, normalizedEvidenceMatrix, statusSynthesis, verification)}\n`,
+        "utf8"
+      );
+      await writeFile(
+        run.artifacts.summaryPath,
+        `${researchSummaryMarkdown(run, plan, gathered, paperExtractions, normalizedEvidenceMatrix, statusSynthesis, verification)}\n`,
+        "utf8"
+      );
+      await writeSynthesisCheckpoint({
+        run,
+        status: "completed_with_fallback",
+        clusterSize: 0,
+        clusterCount: 0,
+        completedClusterIds: [],
+        failedClusterIds: [],
+        attempts: [],
+        synthesis: statusSynthesis
+      });
+      await agent.record({
+        phase: "release",
+        action: "write_status_only_artifacts",
+        status: "completed",
+        summary: "Wrote status-only artifacts because the research agent could not safely proceed to manuscript synthesis.",
+        artifactPaths: [
+          run.artifacts.paperPath,
+          run.artifacts.paperJsonPath,
+          run.artifacts.manuscriptChecksPath,
+          run.artifacts.qualityReportPath,
+          run.artifacts.synthesisPath
+        ],
+        counts: {
+          selectedPapers: canonicalReviewedPapers.length,
+          extractedPapers: paperExtractions.length,
+          invalidActions: agentActionDiagnostics.length
+        }
+      });
+      const memoryResult = await writeMemorySnapshot(
+        run,
+        memoryStore,
+        [
+          ...buildMemoryInputs(
+            run,
+            plan,
+            gathered,
+            normalizedEvidenceMatrix,
+            statusSynthesis.executiveSummary,
+            statusSynthesis.themes,
+            [],
+            verification,
+            statusSynthesis.nextQuestions,
+            statusReason
+          ),
+          ...buildAgendaMemoryInputs(run, statusAgenda)
+        ]
+      );
+      const literatureResult = await literatureStore.upsert(
+        buildLiteratureInputs(
+          run,
+          plan,
+          gathered,
+          statusSynthesis.executiveSummary,
+          statusSynthesis.themes,
+          [],
+          statusSynthesis.nextQuestions
+        )
+      );
+      await writeLiteratureSnapshot(run, literatureStore, literatureResult, gathered);
+
+      await appendEvent(run, now, "summary", statusSynthesis.executiveSummary);
+      await appendEvent(run, now, "summary", `Manuscript status: ${statusManuscriptBundle.checks.readinessStatus}.`);
+      await appendEvent(run, now, "verify", verification.summary);
+      await appendStdout(run, `Verification: ${verification.summary}`);
+      await appendStdout(run, `Paper artifact: ${relativeArtifactPath(run.projectRoot, run.artifacts.paperPath)} (${statusManuscriptBundle.checks.readinessStatus})`);
+      await appendEvent(
+        run,
+        now,
+        "memory",
+        `Recorded ${memoryResult.recordCount} research journal records (${memoryResult.inserted} new, ${memoryResult.updated} updated).`
+      );
+      await appendStdout(
+        run,
+        `Research journal updated: ${memoryResult.recordCount} records (${memoryResult.inserted} new, ${memoryResult.updated} updated).`
+      );
+      await appendEvent(
+        run,
+        now,
+        "literature",
+        `Updated literature store: ${literatureResult.state.paperCount} canonical papers, ${literatureResult.state.themeCount} theme boards, ${literatureResult.state.notebookCount} review notebooks.`
+      );
+      await appendStdout(
+        run,
+        `Literature store updated: ${literatureResult.state.paperCount} canonical papers, ${literatureResult.state.themeCount} theme boards, ${literatureResult.state.notebookCount} review notebooks.`
+      );
+
+      for (const question of statusSynthesis.nextQuestions) {
+        await appendEvent(run, now, "next", question);
+      }
+
+      finalAgenda = statusAgenda;
+      finalManuscriptBundle = statusManuscriptBundle;
+      break;
+    }
 
     await appendEvent(run, now, "next", "Synthesize themes, claims, and next-step questions from the evidence matrix.");
 
-    const synthesis = await researchBackend.synthesizeResearch({
-      projectRoot: run.projectRoot,
-      brief: run.brief,
+    const synthesisResult = await synthesizeResearchAdaptively({
+      run,
+      now,
+      researchBackend,
+      runtimeConfig: runtimeLlmConfig,
+      agent,
       plan,
       papers: canonicalReviewedPapers,
       paperExtractions,
       evidenceMatrix: normalizedEvidenceMatrix,
-      selectionQuality: gathered.selectionQuality ?? null,
+      selectionQuality: gathered.selectionQuality,
       literatureContext
-    }, {
-      operation: "synthesis",
-      timeoutMs: runtimeLlmConfig.synthesisTimeoutMs
     });
-    const normalizedSynthesis = remapSynthesisSourceIds(synthesis, canonicalIdByAnyPaperId);
+    const normalizedSynthesis = remapSynthesisSourceIds(synthesisResult.synthesis, canonicalIdByAnyPaperId);
     const verification = verifyResearchClaims({
       brief: run.brief,
       papers: canonicalReviewedPapers,
@@ -3213,7 +4978,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       gathered,
       normalizedEvidenceMatrix
     );
-    const manuscriptBundle = buildManuscriptBundle({
+    let manuscriptBundle = buildManuscriptBundle({
       run,
       plan,
       scholarlyDiscoveryProviders,
@@ -3229,7 +4994,81 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       agenda: normalizedAgenda
     });
 
-    if (manuscriptBundle.checks.readinessStatus === "needs_more_evidence") {
+    let releaseCriticBlocked = false;
+    if (manuscriptBundle.checks.readinessStatus === "ready_for_revision") {
+      const releaseCritic = await reviewWithCritic({
+        run,
+        now,
+        researchBackend,
+        runtimeConfig: runtimeLlmConfig,
+        request: {
+          projectRoot: run.projectRoot,
+          runId: run.id,
+          stage: "release",
+          iteration: {
+            attempt: 1,
+            maxAttempts: 1,
+            revisionPassesUsed: autonomousRecoveryPasses
+          },
+          brief: run.brief,
+          protocol: manuscriptBundle.protocol,
+          plan,
+          selectedPapers: canonicalReviewedPapers,
+          relevanceAssessments: gathered.relevanceAssessments ?? [],
+          selectionQuality: gathered.selectionQuality ?? null,
+          paperExtractions,
+          evidenceMatrix: normalizedEvidenceMatrix,
+          synthesis: normalizedSynthesis,
+          verification,
+          agenda: normalizedAgenda,
+          paper: manuscriptBundle.paper,
+          references: manuscriptBundle.references,
+          manuscriptChecks: manuscriptBundle.checks
+        }
+      });
+      rememberCriticReport(releaseCritic);
+      releaseCriticBlocked = !criticReviewPassed(releaseCritic);
+      await agent.record({
+        actor: "critic",
+        phase: "release",
+        action: "review_release_candidate",
+        status: criticReviewPassed(releaseCritic) ? "completed" : "revising",
+        summary: `Release critic returned ${releaseCritic.readiness}.`,
+        artifactPaths: [run.artifacts.criticReleaseReviewPath, run.artifacts.manuscriptChecksPath],
+        counts: {
+          objections: releaseCritic.objections.length,
+          revisionPasses: autonomousRecoveryPasses
+        }
+      });
+      manuscriptBundle = applyCriticReportsToManuscriptBundle(
+        {
+          run,
+          plan,
+          scholarlyDiscoveryProviders,
+          publisherFullTextProviders,
+          oaRetrievalHelperProviders,
+          generalWebProviders,
+          localContextEnabled: localEnabled,
+          gathered,
+          reviewedPapers: canonicalReviewedPapers,
+          evidenceMatrix: normalizedEvidenceMatrix,
+          synthesis: normalizedSynthesis,
+          verification,
+          agenda: normalizedAgenda
+        },
+        manuscriptBundle,
+        [releaseCritic]
+      );
+    } else {
+      await writeJsonArtifact(run.artifacts.criticReleaseReviewPath, skippedArtifactStatus(
+        run,
+        "critic-release-review",
+        now(),
+        "Release critic only runs after deterministic manuscript checks are ready for revision."
+      ));
+    }
+
+    if (manuscriptBundle.checks.readinessStatus === "needs_more_evidence" && !releaseCriticBlocked) {
       const recovery = buildEvidenceRecoveryQueries({
         run,
         plan,
@@ -3253,9 +5092,9 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
           run,
           now,
           "next",
-          `Manuscript checks need more evidence; continuing autonomously with evidence recovery pass ${autonomousRecoveryPasses}.`
+          `Manuscript checks need more evidence; continuing autonomously with evidence revision pass ${autonomousRecoveryPasses}.`
         );
-        await appendStdout(run, `Evidence recovery pass ${autonomousRecoveryPasses}: ${pendingRecoveryQueries.join(" | ")}`);
+        await appendStdout(run, `Evidence revision pass ${autonomousRecoveryPasses}: ${pendingRecoveryQueries.join(" | ")}`);
         continue;
       }
 
@@ -3264,10 +5103,32 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         now,
         "next",
         nonImprovingEvidencePasses >= 2
-          ? "Manuscript checks still need more evidence, but repeated evidence recovery passes did not improve relevance or coverage."
+          ? "Manuscript checks still need more evidence, but repeated evidence revision passes did not improve relevance or coverage."
           : recoveryUpdate === null
-          ? "Manuscript checks still need more evidence, but no unused recovery queries remained."
-          : "Manuscript checks still need more evidence, but the autonomous evidence recovery budget was exhausted."
+          ? "Manuscript checks still need more evidence, but no unused revision queries remained."
+          : "Manuscript checks still need more evidence, but the autonomous evidence revision budget was exhausted."
+      );
+    }
+
+    if (unresolvedNonTerminalCriticReports.length > 0) {
+      manuscriptBundle = applyCriticReportsToManuscriptBundle(
+        {
+          run,
+          plan,
+          scholarlyDiscoveryProviders,
+          publisherFullTextProviders,
+          oaRetrievalHelperProviders,
+          generalWebProviders,
+          localContextEnabled: localEnabled,
+          gathered,
+          reviewedPapers: canonicalReviewedPapers,
+          evidenceMatrix: normalizedEvidenceMatrix,
+          synthesis: normalizedSynthesis,
+          verification,
+          agenda: normalizedAgenda
+        },
+        manuscriptBundle,
+        unresolvedNonTerminalCriticReports
       );
     }
 
@@ -3279,8 +5140,38 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     await writeFile(run.artifacts.agendaMarkdownPath, `${agendaMarkdown(run, plan, normalizedAgenda)}\n`, "utf8");
     await writeJsonArtifact(run.artifacts.workPackagePath, normalizedAgenda.selectedWorkPackage);
     await writeManuscriptArtifacts(run, manuscriptBundle);
+    await writeJsonArtifact(run.artifacts.qualityReportPath, buildQualityReport({
+      run,
+      backendLabel: researchBackend.label,
+      gathered,
+      paperExtractions,
+      evidenceMatrix: normalizedEvidenceMatrix,
+      manuscriptBundle,
+      criticReportsByStage,
+      agentActionDiagnostics,
+      autonomousRevisionPasses: autonomousRecoveryPasses,
+      revisionBudgetPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses
+    }));
     await writeFile(run.artifacts.synthesisPath, `${synthesisMarkdown(run, plan, gathered, paperExtractions, normalizedEvidenceMatrix, normalizedSynthesis, verification)}\n`, "utf8");
     await writeFile(run.artifacts.summaryPath, `${researchSummaryMarkdown(run, plan, gathered, paperExtractions, normalizedEvidenceMatrix, normalizedSynthesis, verification)}\n`, "utf8");
+    await agent.record({
+      phase: "release",
+      action: "write_final_artifacts",
+      status: manuscriptBundle.checks.readinessStatus === "blocked" ? "blocked" : "completed",
+      summary: `Final artifacts written with manuscript readiness ${manuscriptBundle.checks.readinessStatus}.`,
+      artifactPaths: [
+        run.artifacts.paperPath,
+        run.artifacts.paperJsonPath,
+        run.artifacts.manuscriptChecksPath,
+        run.artifacts.qualityReportPath,
+        run.artifacts.synthesisPath
+      ],
+      counts: {
+        blockerCount: manuscriptBundle.checks.blockerCount,
+        warningCount: manuscriptBundle.checks.warningCount,
+        claims: normalizedSynthesis.claims.length
+      }
+    });
     const memoryResult = await writeMemorySnapshot(
       run,
       memoryStore,
@@ -3401,7 +5292,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     run.statusMessage = derivedRun !== null
       ? `Provider-aware literature run completed and auto-launched derived work-package run ${derivedRun.id}.`
       : finalManuscriptBundle.checks.readinessStatus === "needs_more_evidence"
-        ? "Provider-aware literature run completed after autonomous evidence recovery, but the evidence base still needs more work."
+        ? "Provider-aware literature run completed after autonomous evidence revision, but the evidence base still needs more work."
         : finalManuscriptBundle.checks.readinessStatus === "blocked"
           ? "Provider-aware literature run completed with blockers; no full paper was released."
         : finalManuscriptBundle.checks.readinessStatus === "needs_human_review"

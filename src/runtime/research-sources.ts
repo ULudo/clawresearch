@@ -1152,7 +1152,7 @@ function buildQueryExpansionCandidates(
   const memoryHints = request.memoryContext.queryHints ?? [];
   const planCandidates = explicitQueries.flatMap((query) => queryCandidate(query, "plan", "Model-planned retrieval query."));
   const explicitRecoveryCandidates = uniqueStrings(request.recoveryQueries ?? [])
-    .flatMap((query) => queryCandidate(query, "recovery", "Requested by the autonomous evidence-recovery loop."));
+    .flatMap((query) => queryCandidate(query, "recovery", "Requested by the autonomous evidence-revision loop."));
   const briefTaskCandidates = [
     ...focusQueries.map((query) => `${topicPhrase} ${query}`),
     topicPhrase
@@ -4182,7 +4182,7 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
             error: null
           });
           notes.push(
-            `Collected ${newSources.length} new screened scholarly hits from ${getSourceProviderDefinition(providerId).label} after reviewing ${rawCandidates.length} raw candidates${phase === "recovery" ? " during recovery" : ""}.`
+            `Collected ${newSources.length} new screened scholarly hits from ${getSourceProviderDefinition(providerId).label} after reviewing ${rawCandidates.length} raw candidates${phase === "recovery" ? " during revision" : ""}.`
           );
 
           if (
@@ -4247,7 +4247,7 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
         recoveryPasses += 1;
         queries = uniqueStrings([...queries, ...recoveryQueries]);
         routing.plannedQueries = queries;
-        notes.push(`${recoveryReason(canonicalReview)}; running recovery pass ${recoveryPasses} with ${recoveryQueries.length} additional queries.`);
+        notes.push(`${recoveryReason(canonicalReview)}; running revision pass ${recoveryPasses} with ${recoveryQueries.length} additional queries.`);
         await runScholarlyDiscoveryPass(recoveryQueries, {
           ...budget,
           maxQueries: recoveryQueries.length,
@@ -4259,17 +4259,17 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
         canonicalReview = await buildCanonicalReviewState(scholarlySources, routing, request, reviewFacets);
         if (canonicalReviewImproved(previousReview, canonicalReview)) {
           nonImprovingRecoveryPasses = 0;
-          notes.push("Recovery improved the in-scope evidence set or reduced missing evidence targets.");
+          notes.push("Revision improved the in-scope evidence set or reduced missing evidence targets.");
         } else {
           nonImprovingRecoveryPasses += 1;
-          notes.push("Recovery did not improve the in-scope evidence set; the next recovery pass must pivot strategy or stop.");
+          notes.push("Revision did not improve the in-scope evidence set; the next revision pass must pivot strategy or stop.");
           if (nonImprovingRecoveryPasses >= 2) {
-            notes.push("Recovery stopped because repeated passes did not improve protocol relevance or coverage.");
+            notes.push("Revision stopped because repeated passes did not improve protocol relevance or coverage.");
             break;
           }
         }
       } else {
-        notes.push(`${recoveryReason(canonicalReview)}; no unused recovery queries remained, so retrieval stopped.`);
+        notes.push(`${recoveryReason(canonicalReview)}; no unused revision queries remained, so retrieval stopped.`);
         break;
       }
     }

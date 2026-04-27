@@ -36,15 +36,23 @@ export type RunArtifactRecord = {
   eventsPath: string;
   stdoutPath: string;
   stderrPath: string;
+  agentStatePath: string;
+  agentStepsPath: string;
   briefPath: string;
   planPath: string;
   sourcesPath: string;
   literaturePath: string;
   reviewProtocolPath: string;
   reviewProtocolMarkdownPath: string;
+  criticProtocolReviewPath: string;
+  criticSourceSelectionPath: string;
+  criticEvidenceReviewPath: string;
+  criticReleaseReviewPath: string;
   paperExtractionsPath: string;
   evidenceMatrixPath: string;
   synthesisPath: string;
+  synthesisJsonPath: string;
+  synthesisClusterDirectory: string;
   claimsPath: string;
   verificationPath: string;
   paperOutlinePath: string;
@@ -52,6 +60,7 @@ export type RunArtifactRecord = {
   paperJsonPath: string;
   referencesPath: string;
   manuscriptChecksPath: string;
+  qualityReportPath: string;
   nextQuestionsPath: string;
   agendaPath: string;
   agendaMarkdownPath: string;
@@ -186,15 +195,23 @@ function createRunArtifacts(projectRoot: string, runId: string): RunArtifactReco
     eventsPath: path.join(runDirectory, "events.jsonl"),
     stdoutPath: path.join(runDirectory, "stdout.log"),
     stderrPath: path.join(runDirectory, "stderr.log"),
+    agentStatePath: path.join(runDirectory, "agent-state.json"),
+    agentStepsPath: path.join(runDirectory, "agent-steps.jsonl"),
     briefPath: path.join(runDirectory, "brief.json"),
     planPath: path.join(runDirectory, "plan.json"),
     sourcesPath: path.join(runDirectory, "sources.json"),
     literaturePath: path.join(runDirectory, "literature-review.json"),
     reviewProtocolPath: path.join(runDirectory, "review-protocol.json"),
     reviewProtocolMarkdownPath: path.join(runDirectory, "review-protocol.md"),
+    criticProtocolReviewPath: path.join(runDirectory, "critic-protocol-review.json"),
+    criticSourceSelectionPath: path.join(runDirectory, "critic-source-selection.json"),
+    criticEvidenceReviewPath: path.join(runDirectory, "critic-evidence-review.json"),
+    criticReleaseReviewPath: path.join(runDirectory, "critic-release-review.json"),
     paperExtractionsPath: path.join(runDirectory, "paper-extractions.json"),
     evidenceMatrixPath: path.join(runDirectory, "evidence-matrix.json"),
     synthesisPath: path.join(runDirectory, "synthesis.md"),
+    synthesisJsonPath: path.join(runDirectory, "synthesis.json"),
+    synthesisClusterDirectory: path.join(runDirectory, "synthesis-clusters"),
     claimsPath: path.join(runDirectory, "claims.json"),
     verificationPath: path.join(runDirectory, "verification.json"),
     paperOutlinePath: path.join(runDirectory, "paper-outline.json"),
@@ -202,6 +219,7 @@ function createRunArtifacts(projectRoot: string, runId: string): RunArtifactReco
     paperJsonPath: path.join(runDirectory, "paper.json"),
     referencesPath: path.join(runDirectory, "references.json"),
     manuscriptChecksPath: path.join(runDirectory, "manuscript-checks.json"),
+    qualityReportPath: path.join(runDirectory, "quality-report.json"),
     nextQuestionsPath: path.join(runDirectory, "next-questions.json"),
     agendaPath: path.join(runDirectory, "agenda.json"),
     agendaMarkdownPath: path.join(runDirectory, "agenda.md"),
@@ -225,15 +243,23 @@ function mergeRunArtifacts(raw: unknown, projectRoot: string, runId: string): Ru
     eventsPath: readString(artifacts.eventsPath) ?? defaults.eventsPath,
     stdoutPath: readString(artifacts.stdoutPath) ?? defaults.stdoutPath,
     stderrPath: readString(artifacts.stderrPath) ?? defaults.stderrPath,
+    agentStatePath: readString(artifacts.agentStatePath) ?? defaults.agentStatePath,
+    agentStepsPath: readString(artifacts.agentStepsPath) ?? defaults.agentStepsPath,
     briefPath: readString(artifacts.briefPath) ?? defaults.briefPath,
     planPath: readString(artifacts.planPath) ?? defaults.planPath,
     sourcesPath: readString(artifacts.sourcesPath) ?? defaults.sourcesPath,
     literaturePath: readString(artifacts.literaturePath) ?? defaults.literaturePath,
     reviewProtocolPath: readString(artifacts.reviewProtocolPath) ?? defaults.reviewProtocolPath,
     reviewProtocolMarkdownPath: readString(artifacts.reviewProtocolMarkdownPath) ?? defaults.reviewProtocolMarkdownPath,
+    criticProtocolReviewPath: readString(artifacts.criticProtocolReviewPath) ?? defaults.criticProtocolReviewPath,
+    criticSourceSelectionPath: readString(artifacts.criticSourceSelectionPath) ?? defaults.criticSourceSelectionPath,
+    criticEvidenceReviewPath: readString(artifacts.criticEvidenceReviewPath) ?? defaults.criticEvidenceReviewPath,
+    criticReleaseReviewPath: readString(artifacts.criticReleaseReviewPath) ?? defaults.criticReleaseReviewPath,
     paperExtractionsPath: readString(artifacts.paperExtractionsPath) ?? defaults.paperExtractionsPath,
     evidenceMatrixPath: readString(artifacts.evidenceMatrixPath) ?? defaults.evidenceMatrixPath,
     synthesisPath: readString(artifacts.synthesisPath) ?? defaults.synthesisPath,
+    synthesisJsonPath: readString(artifacts.synthesisJsonPath) ?? defaults.synthesisJsonPath,
+    synthesisClusterDirectory: readString(artifacts.synthesisClusterDirectory) ?? defaults.synthesisClusterDirectory,
     claimsPath: readString(artifacts.claimsPath) ?? defaults.claimsPath,
     verificationPath: readString(artifacts.verificationPath) ?? defaults.verificationPath,
     paperOutlinePath: readString(artifacts.paperOutlinePath) ?? defaults.paperOutlinePath,
@@ -241,6 +267,7 @@ function mergeRunArtifacts(raw: unknown, projectRoot: string, runId: string): Ru
     paperJsonPath: readString(artifacts.paperJsonPath) ?? defaults.paperJsonPath,
     referencesPath: readString(artifacts.referencesPath) ?? defaults.referencesPath,
     manuscriptChecksPath: readString(artifacts.manuscriptChecksPath) ?? defaults.manuscriptChecksPath,
+    qualityReportPath: readString(artifacts.qualityReportPath) ?? defaults.qualityReportPath,
     nextQuestionsPath: readString(artifacts.nextQuestionsPath) ?? defaults.nextQuestionsPath,
     agendaPath: readString(artifacts.agendaPath) ?? defaults.agendaPath,
     agendaMarkdownPath: readString(artifacts.agendaMarkdownPath) ?? defaults.agendaMarkdownPath,

@@ -14,12 +14,23 @@ import {
   type PaperExtraction,
   type PaperExtractionConfidence
 } from "./research-evidence.js";
+import {
+  normalizeCriticReview,
+  type CriticReviewArtifact,
+  type CriticReviewRequest,
+  type CriticReviewStage
+} from "./research-critic.js";
 import type { VerificationReport } from "./verifier.js";
 import {
   buildLiteratureSynthesisInstruction,
   shouldUseLiteratureReviewSubsystem,
   type ReviewSelectionQuality
 } from "./literature-review.js";
+import {
+  normalizeResearchActionDecision,
+  type ResearchActionDecision,
+  type ResearchActionRequest
+} from "./research-agent.js";
 
 export type {
   EvidenceMatrix,
@@ -33,6 +44,8 @@ export type {
 
 const defaultHost = process.env.OLLAMA_HOST ?? "127.0.0.1:11434";
 const defaultModel = process.env.CLAWRESEARCH_OLLAMA_MODEL ?? "qwen3:14b";
+const defaultCriticHost = process.env.CLAWRESEARCH_OLLAMA_CRITIC_HOST ?? defaultHost;
+const defaultCriticModel = process.env.CLAWRESEARCH_OLLAMA_CRITIC_MODEL ?? defaultModel;
 
 export type ResearchMode =
   | "literature_synthesis"
@@ -183,9 +196,11 @@ export type PaperExtractionRequest = {
 
 export type ResearchBackendOperation =
   | "planning"
+  | "agent_step"
   | "extraction"
   | "synthesis"
-  | "agenda";
+  | "agenda"
+  | "critic";
 
 export type ResearchBackendCallOptions = {
   operation: ResearchBackendOperation;
@@ -213,15 +228,24 @@ export class ResearchBackendError extends Error {
 export interface ResearchBackend {
   readonly label: string;
   planResearch(request: ResearchPlanningRequest, options?: ResearchBackendCallOptions): Promise<ResearchPlan>;
+  chooseResearchAction(request: ResearchActionRequest, options?: ResearchBackendCallOptions): Promise<ResearchActionDecision>;
   extractReviewedPapers(request: PaperExtractionRequest, options?: ResearchBackendCallOptions): Promise<PaperExtraction[]>;
   synthesizeResearch(request: ResearchSynthesisRequest, options?: ResearchBackendCallOptions): Promise<ResearchSynthesis>;
   developResearchAgenda(request: ResearchAgendaRequest, options?: ResearchBackendCallOptions): Promise<ResearchAgenda>;
+  reviewResearchArtifact(request: CriticReviewRequest, options?: ResearchBackendCallOptions): Promise<CriticReviewArtifact>;
 }
 
 type OllamaChatResponse = {
   message?: {
     content?: string;
   };
+};
+
+type OllamaStreamChunk = {
+  message?: {
+    content?: string;
+  };
+  done?: boolean;
 };
 
 function normalizeHost(host: string): string {
@@ -334,6 +358,37 @@ function safePaperExtractionConfidence(value: unknown): PaperExtractionConfidenc
     default:
       return null;
   }
+}
+
+function parseOllamaContent(rawResponseText: string): string | null {
+  try {
+    const payload = JSON.parse(rawResponseText) as OllamaChatResponse;
+    return typeof payload.message?.content === "string" ? payload.message.content : null;
+  } catch {
+    // Fall through to Ollama's streaming NDJSON shape.
+  }
+
+  let content = "";
+
+  for (const line of rawResponseText.split(/\r?\n/)) {
+    const trimmed = line.trim();
+
+    if (trimmed.length === 0) {
+      continue;
+    }
+
+    try {
+      const payload = JSON.parse(trimmed) as OllamaStreamChunk;
+      if (typeof payload.message?.content === "string") {
+        content += payload.message.content;
+      }
+    } catch {
+      // Ignore incomplete/diagnostic stream lines; malformed final JSON is
+      // handled by extractJson after all model content is assembled.
+    }
+  }
+
+  return content.length > 0 ? content : null;
 }
 
 function editDistanceAtMostOne(left: string, right: string): boolean {
@@ -897,6 +952,58 @@ function planningInstruction(request: ResearchPlanningRequest): string {
   ].join("\n");
 }
 
+function agentStepInstruction(request: ResearchActionRequest): string {
+  const criticSummaries = request.criticReports.map((report) => ({
+    stage: report.stage,
+    readiness: report.readiness,
+    confidence: report.confidence,
+    objections: report.objections.map((objection) => ({
+      code: objection.code,
+      severity: objection.severity,
+      target: objection.target,
+      message: objection.message,
+      suggestedRevision: objection.suggestedRevision
+    })),
+    revisionAdvice: report.revisionAdvice
+  }));
+
+  return [
+    "You are ClawResearch's research-agent controller.",
+    "Choose exactly one next action from the allowed action list.",
+    "Do not invent tool names. Do not execute the action yourself. The runtime will validate and execute the chosen action.",
+    "If evidence is not ready and useful revision budget remains, choose revise_search_strategy with concrete searchQueries.",
+    "If the selected evidence is ready for synthesis, choose synthesize_clustered.",
+    "If the model cannot justify another useful step or action control is unsafe, choose finalize_status_report.",
+    "",
+    "Return JSON only with this exact shape:",
+    "{",
+    '  "action": "one allowed action",',
+    '  "rationale": "why this is the best next action",',
+    '  "confidence": 0.0,',
+    '  "inputs": {',
+    '    "searchQueries": ["only if revising/searching"],',
+    '    "evidenceTargets": ["missing evidence targets"],',
+    '    "paperIds": ["known paper ids only"],',
+    '    "criticStage": "protocol|source_selection|evidence|release|null",',
+    '    "reason": "short status reason or null"',
+    "  },",
+    '  "expectedOutcome": "checkpoint/result expected from the action",',
+    '  "stopCondition": "when the runtime should stop this action"',
+    "}",
+    "",
+    `Project root: ${request.projectRoot}`,
+    `Run id: ${request.runId}`,
+    `Phase: ${request.phase}`,
+    `Attempt: ${request.attempt}/${request.maxAttempts}`,
+    `Allowed actions: ${request.allowedActions.join(", ")}`,
+    `Brief: ${JSON.stringify(request.brief)}`,
+    `Plan: ${JSON.stringify(request.plan)}`,
+    `Observations: ${JSON.stringify(request.observations)}`,
+    `Critic reports: ${JSON.stringify(criticSummaries)}`,
+    request.retryInstruction === undefined ? "Retry instruction: null" : `Retry instruction: ${request.retryInstruction}`
+  ].join("\n");
+}
+
 function extractionInstruction(request: PaperExtractionRequest): string {
   const literatureContext = request.literatureContext ?? {
     available: false,
@@ -1203,6 +1310,181 @@ function agendaInstruction(request: ResearchAgendaRequest): string {
   ].join("\n");
 }
 
+function criticInstruction(request: CriticReviewRequest): string {
+  const selectedPapers = (request.selectedPapers ?? []).map((paper) => ({
+    id: paper.id,
+    title: paper.title,
+    citation: paper.citation,
+    year: paper.year,
+    venue: paper.venue,
+    abstract: paper.abstract,
+    accessMode: paper.accessMode,
+    screeningDecision: paper.screeningDecision,
+    screeningRationale: paper.screeningRationale
+  }));
+  const claimIds = [
+    ...(request.paper?.claims.map((claim) => claim.claimId) ?? []),
+    ...(request.verification?.verifiedClaims.map((claim) => claim.claimId) ?? [])
+  ];
+  const stageGuidance = criticStageGuidance(request.stage);
+  const packetLines = criticPacketLines(request, selectedPapers, claimIds);
+
+  return [
+    "You are ClawResearch's stateless critic reviewer.",
+    "You are newly instantiated for this single review. You have no memory, no tools, and no access to retrieval.",
+    "Your job is to falsify readiness, not to continue the research and not to rewrite the artifact.",
+    "Use only the evidence packet below. Do not invent papers, claims, citations, methods, or prior context.",
+    "Give concrete objections tied only to artifacts that are present and expected at this review stage.",
+    stageGuidance.releaseRule,
+    "",
+    "Stage-specific contract:",
+    ...stageGuidance.rules.map((rule) => `- ${rule}`),
+    "",
+    "Readiness rules:",
+    "- pass: no blocking or major evidence-readiness concern remains",
+    "- revise: the worker should revise strategy before release",
+    "- block: the artifact is unsafe to use as the basis for release",
+    "",
+    "Return JSON only with this exact shape:",
+    "{",
+    '  "readiness": "pass|revise|block",',
+    '  "confidence": 0.0,',
+    '  "objections": [',
+    '    {',
+    '      "code": "string",',
+    '      "severity": "blocking|major|minor",',
+    '      "target": "protocol|source_selection|extraction|evidence|synthesis|verification|manuscript|release",',
+    '      "message": "specific objection grounded in the provided packet",',
+    '      "affectedPaperIds": ["known selected paper id only"],',
+    '      "affectedClaimIds": ["known claim id only"],',
+    '      "suggestedRevision": "concrete revision advice or null"',
+    "    }",
+    "  ],",
+    '  "revisionAdvice": {',
+    '    "searchQueries": ["concrete query suggestions"],',
+    '    "evidenceTargets": ["missing evidence targets"],',
+    '    "papersToExclude": ["known selected paper id only"],',
+    '    "claimsToSoften": ["known claim id only"]',
+    "  }",
+    "}",
+    "",
+    `Review stage: ${request.stage}`,
+    `Run id: ${request.runId}`,
+    `Critic iteration: ${JSON.stringify(request.iteration ?? null)}`,
+    request.retryInstruction === undefined || request.retryInstruction === null
+      ? "Retry instruction: null"
+      : `Retry instruction: ${request.retryInstruction}`,
+    ...packetLines
+  ].join("\n");
+}
+
+function criticStageGuidance(stage: CriticReviewStage): { releaseRule: string; rules: string[] } {
+  switch (stage) {
+    case "protocol":
+      return {
+        releaseRule: "This gate decides whether the protocol is ready for autonomous retrieval, not whether the final manuscript is ready.",
+        rules: [
+          "Review only the brief, plan, and review protocol.",
+          "No papers, selected sources, extractions, claims, synthesis, verification, or manuscript should exist yet.",
+          "Missing selected papers is expected and must not be an objection at the protocol stage.",
+          "Criticize unclear scope, bad inclusion/exclusion criteria, output-style constraints treated as evidence targets, unsafe search strategy, or contradictions that would make retrieval unreliable.",
+          "Use revise when concrete query, scope, or evidence-target changes could make retrieval stronger; use block only when the protocol cannot safely guide retrieval."
+        ]
+      };
+    case "source_selection":
+      return {
+        releaseRule: "This gate decides whether the selected sources are ready for extraction.",
+        rules: [
+          "Review the brief, protocol, selected papers, relevance assessments, retrieval diagnostics, and selection quality.",
+          "Do not require extracted evidence, synthesized claims, references, or a manuscript yet.",
+          "Object to off-topic selected papers, missing evidence targets, weak source fit, or selection/relevance contradictions.",
+          "If readiness is revise or block, you must provide at least one concrete objection with a specific message and suggested revision.",
+          "Revision advice may suggest search queries, evidence targets, or selected paper IDs to exclude, but must not introduce invented papers.",
+          "Avoid picky or stylistic objections; after repeated iterations, reserve block for severe evidence-set risks that would make extraction unsafe."
+        ]
+      };
+    case "evidence":
+      return {
+        releaseRule: "This gate decides whether extracted evidence is ready for synthesis.",
+        rules: [
+          "Review selected papers, relevance assessments, paper extractions, and the evidence matrix.",
+          "Do not require final prose, references, or release checks yet.",
+          "Object to missing extractions for selected papers, unsupported evidence rows, weak coverage, or extracted evidence that does not match the protocol.",
+          "If readiness is revise or block, you must provide at least one concrete objection with a specific message and suggested revision.",
+          "Avoid picky or stylistic objections; after repeated iterations, reserve block for severe evidence integrity risks."
+        ]
+      };
+    case "release":
+      return {
+        releaseRule: "This gate decides whether a full manuscript may be released.",
+        rules: [
+          "Review the manuscript, references, verification, deterministic manuscript checks, protocol, and selected papers.",
+          "Object to unsupported claims, missing citations, off-topic evidence, failed checks, missing limitations, or mismatches between the paper and evidence matrix.",
+          "Do not ask for new research unless the provided manuscript cannot be safely released without it."
+        ]
+      };
+  }
+}
+
+function criticPacketLines(
+  request: CriticReviewRequest,
+  selectedPapers: Array<{
+    id: string;
+    title: string;
+    citation: string;
+    year: number | null;
+    venue: string | null;
+    abstract: string | null;
+    accessMode: string;
+    screeningDecision: string;
+    screeningRationale: string | null;
+  }>,
+  claimIds: string[]
+): string[] {
+  const common = [
+    `Brief: ${JSON.stringify(request.brief)}`,
+    `Protocol: ${JSON.stringify(request.protocol ?? null)}`,
+    `Plan objective: ${request.plan?.objective ?? null}`
+  ];
+
+  switch (request.stage) {
+    case "protocol":
+      return common;
+    case "source_selection":
+      return [
+        ...common,
+        `Selected papers: ${JSON.stringify(selectedPapers)}`,
+        `Known selected paper IDs: ${JSON.stringify(selectedPapers.map((paper) => paper.id))}`,
+        `Review workflow: ${JSON.stringify(request.gathered?.reviewWorkflow ?? null)}`,
+        `Selection quality: ${JSON.stringify(request.selectionQuality ?? null)}`,
+        `Relevance assessments: ${JSON.stringify(request.relevanceAssessments ?? [])}`
+      ];
+    case "evidence":
+      return [
+        ...common,
+        `Selected papers: ${JSON.stringify(selectedPapers)}`,
+        `Known selected paper IDs: ${JSON.stringify(selectedPapers.map((paper) => paper.id))}`,
+        `Relevance assessments: ${JSON.stringify(request.relevanceAssessments ?? [])}`,
+        `Paper extractions: ${JSON.stringify(request.paperExtractions ?? [])}`,
+        `Evidence matrix: ${JSON.stringify(request.evidenceMatrix ?? null)}`
+      ];
+    case "release":
+      return [
+        ...common,
+        `Selected papers: ${JSON.stringify(selectedPapers)}`,
+        `Known selected paper IDs: ${JSON.stringify(selectedPapers.map((paper) => paper.id))}`,
+        `Known claim IDs: ${JSON.stringify([...new Set(claimIds)])}`,
+        `Evidence matrix: ${JSON.stringify(request.evidenceMatrix ?? null)}`,
+        `Synthesis: ${JSON.stringify(request.synthesis ?? null)}`,
+        `Verification: ${JSON.stringify(request.verification ?? null)}`,
+        `Agenda hold reasons: ${JSON.stringify(request.agenda?.holdReasons ?? [])}`,
+        `Paper artifact: ${JSON.stringify(request.paper ?? null)}`,
+        `References: ${JSON.stringify(request.references ?? null)}`,
+        `Manuscript checks: ${JSON.stringify(request.manuscriptChecks ?? null)}`
+      ];
+  }
+}
+
 async function ollamaJsonCall<T>(
   host: string,
   model: string,
@@ -1210,8 +1492,48 @@ async function ollamaJsonCall<T>(
   options: ResearchBackendCallOptions
 ): Promise<T> {
   let response: Response;
+  const controller = new AbortController();
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearIdleTimer = (): void => {
+    if (idleTimer !== null) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  };
+
+  const refreshIdleTimer = (): void => {
+    clearIdleTimer();
+    idleTimer = setTimeout(() => {
+      controller.abort();
+    }, options.timeoutMs);
+  };
+
+  const readBody = async (): Promise<string> => {
+    if (response.body === null) {
+      return response.text();
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+
+    while (true) {
+      const result = await reader.read();
+      if (result.done) {
+        text += decoder.decode();
+        break;
+      }
+
+      refreshIdleTimer();
+      text += decoder.decode(result.value, { stream: true });
+    }
+
+    return text;
+  };
 
   try {
+    refreshIdleTimer();
     response = await fetch(`http://${normalizeHost(host)}/api/chat`, {
       method: "POST",
       headers: {
@@ -1219,7 +1541,7 @@ async function ollamaJsonCall<T>(
       },
       body: JSON.stringify({
         model,
-        stream: false,
+        stream: true,
         think: false,
         format: "json",
         messages: [
@@ -1229,17 +1551,18 @@ async function ollamaJsonCall<T>(
           }
         ]
       }),
-      signal: AbortSignal.timeout(options.timeoutMs)
+      signal: controller.signal
     });
   } catch (error) {
+    clearIdleTimer();
     const message = error instanceof Error ? error.message : String(error);
     const name = error instanceof Error ? error.name : "";
 
-    if (/timeout/i.test(name) || /timeout|aborted/i.test(message)) {
+    if (controller.signal.aborted || /timeout/i.test(name) || /timeout|aborted/i.test(message)) {
       throw new ResearchBackendError(
         "timeout",
         options.operation,
-        `${options.operation} model call exceeded ${options.timeoutMs} ms`,
+        `${options.operation} model call had no provider activity for ${options.timeoutMs} ms`,
         options.timeoutMs
       );
     }
@@ -1253,6 +1576,7 @@ async function ollamaJsonCall<T>(
   }
 
   if (!response.ok) {
+    clearIdleTimer();
     throw new ResearchBackendError(
       "http",
       options.operation,
@@ -1261,8 +1585,36 @@ async function ollamaJsonCall<T>(
     );
   }
 
-  const payload = await response.json() as OllamaChatResponse;
-  const content = payload.message?.content;
+  let rawResponseText: string;
+
+  try {
+    refreshIdleTimer();
+    rawResponseText = await readBody();
+  } catch (error) {
+    clearIdleTimer();
+    const message = error instanceof Error ? error.message : String(error);
+    const name = error instanceof Error ? error.name : "";
+
+    if (controller.signal.aborted || /timeout/i.test(name) || /timeout|aborted/i.test(message)) {
+      throw new ResearchBackendError(
+        "timeout",
+        options.operation,
+        `${options.operation} model call had no provider activity for ${options.timeoutMs} ms`,
+        options.timeoutMs
+      );
+    }
+
+    throw new ResearchBackendError(
+      "unexpected",
+      options.operation,
+      `${options.operation} model response could not be read: ${message}`,
+      options.timeoutMs
+    );
+  } finally {
+    clearIdleTimer();
+  }
+
+  const content = parseOllamaContent(rawResponseText);
 
   if (typeof content !== "string") {
     throw new ResearchBackendError(
@@ -1291,9 +1643,13 @@ export class OllamaResearchBackend implements ResearchBackend {
 
   constructor(
     private readonly host = defaultHost,
-    private readonly model = defaultModel
+    private readonly model = defaultModel,
+    private readonly criticHost = defaultCriticHost,
+    private readonly criticModel = defaultCriticModel
   ) {
-    this.label = `ollama:${this.model}`;
+    this.label = this.criticModel === this.model && this.criticHost === this.host
+      ? `ollama:${this.model}`
+      : `ollama:${this.model};critic:${this.criticModel}`;
   }
 
   async planResearch(request: ResearchPlanningRequest, options: ResearchBackendCallOptions = {
@@ -1308,6 +1664,30 @@ export class OllamaResearchBackend implements ResearchBackend {
     );
 
     return normalizePlan(raw, request.brief);
+  }
+
+  async chooseResearchAction(request: ResearchActionRequest, options: ResearchBackendCallOptions = {
+    operation: "agent_step",
+    timeoutMs: 300_000
+  }): Promise<ResearchActionDecision> {
+    const raw = await ollamaJsonCall<unknown>(
+      this.host,
+      this.model,
+      agentStepInstruction(request),
+      options
+    );
+
+    try {
+      return normalizeResearchActionDecision(raw, request);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new ResearchBackendError(
+        "malformed_json",
+        "agent_step",
+        `Research agent returned an invalid structured action: ${message}`,
+        options.timeoutMs
+      );
+    }
   }
 
   async extractReviewedPapers(request: PaperExtractionRequest, options: ResearchBackendCallOptions = {
@@ -1350,6 +1730,20 @@ export class OllamaResearchBackend implements ResearchBackend {
     );
 
     return normalizeAgenda(raw, request);
+  }
+
+  async reviewResearchArtifact(request: CriticReviewRequest, options: ResearchBackendCallOptions = {
+    operation: "critic",
+    timeoutMs: 300_000
+  }): Promise<CriticReviewArtifact> {
+    const raw = await ollamaJsonCall<unknown>(
+      this.criticHost,
+      this.criticModel,
+      criticInstruction(request),
+      options
+    );
+
+    return normalizeCriticReview(raw, request);
   }
 }
 

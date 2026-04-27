@@ -170,6 +170,206 @@ test("planning backend includes project memory context in the prompt it sends to
   }
 });
 
+test("Ollama backend accumulates streamed JSON chunks instead of relying on one response blob", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedStreamFlag: unknown = null;
+
+  try {
+    globalThis.fetch = async (_input, init): Promise<Response> => {
+      const body = JSON.parse(String(init?.body)) as {
+        stream?: unknown;
+      };
+      capturedStreamFlag = body.stream;
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(`${JSON.stringify({
+            message: {
+              content: "{\"researchMode\":\"literature_synthesis\",\"objective\":\"Streamed"
+            }
+          })}\n`));
+          controller.enqueue(encoder.encode(`${JSON.stringify({
+            message: {
+              content: " planning\",\"rationale\":\"The streamed response was assembled.\",\"searchQueries\":[\"streamed planning\"],\"localFocus\":[\"streaming\"]}"
+            }
+          })}\n`));
+          controller.enqueue(encoder.encode(`${JSON.stringify({ done: true })}\n`));
+          controller.close();
+        }
+      });
+
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          "content-type": "application/x-ndjson"
+        }
+      });
+    };
+
+    const backend = new OllamaResearchBackend("127.0.0.1:11434", "stub-model");
+    const plan = await backend.planResearch({
+      projectRoot: "/tmp/project",
+      brief: {
+        topic: "streaming",
+        researchQuestion: "Can streamed responses be assembled?",
+        researchDirection: "Test streaming LLM orchestration.",
+        successCriterion: "Return a valid plan."
+      },
+      localFiles: [],
+      memoryContext: emptyMemoryContext()
+    });
+
+    assert.equal(capturedStreamFlag, true);
+    assert.equal(plan.objective, "Streamed planning");
+    assert.deepEqual(plan.searchQueries, ["streamed planning"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("research-agent backend asks for one allowed structured action", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedPrompt = "";
+
+  try {
+    globalThis.fetch = async (_input, init): Promise<Response> => {
+      const body = JSON.parse(String(init?.body)) as {
+        messages?: Array<{ content?: string }>;
+      };
+      capturedPrompt = body.messages?.[0]?.content ?? "";
+
+      return new Response(JSON.stringify({
+        message: {
+          content: JSON.stringify({
+            action: "synthesize_clustered",
+            rationale: "The selected evidence is ready for clustered synthesis.",
+            confidence: 0.88,
+            inputs: {
+              searchQueries: [],
+              evidenceTargets: [],
+              paperIds: ["paper-1"],
+              criticStage: null,
+              reason: null
+            },
+            expectedOutcome: "A synthesis checkpoint is written.",
+            stopCondition: "Stop after synthesis artifacts are checkpointed."
+          })
+        }
+      }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json"
+        }
+      });
+    };
+
+    const backend = new OllamaResearchBackend("127.0.0.1:11434", "stub-model");
+    const decision = await backend.chooseResearchAction({
+      projectRoot: "/tmp/project",
+      runId: "run-agent-step",
+      phase: "synthesis",
+      attempt: 1,
+      maxAttempts: 2,
+      allowedActions: ["revise_search_strategy", "synthesize_clustered", "finalize_status_report"],
+      brief: {
+        topic: "autonomous research agents",
+        researchQuestion: "How should the runtime continue?",
+        researchDirection: "Use an action loop.",
+        successCriterion: "Choose the next validated action."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review action-loop designs.",
+        rationale: "The brief asks for autonomous research behavior.",
+        searchQueries: ["autonomous research agents tool use"],
+        localFocus: ["action loop"]
+      },
+      observations: {
+        canonicalPapers: 5,
+        selectedPapers: 4,
+        extractedPapers: 4,
+        evidenceRows: 4,
+        evidenceInsights: 2,
+        manuscriptReadiness: null,
+        revisionPassesUsed: 0,
+        revisionPassesRemaining: 3
+      },
+      criticReports: []
+    });
+
+    assert.equal(decision.action, "synthesize_clustered");
+    assert.equal(decision.inputs.paperIds[0], "paper-1");
+    assert.match(capturedPrompt, /Allowed actions: revise_search_strategy, synthesize_clustered, finalize_status_report/);
+    assert.match(capturedPrompt, /Do not execute the action yourself/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("critic backend uses the separate critic model and excludes research memory context", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedUrl = "";
+  let capturedBody: {
+    model?: string;
+    messages?: Array<{ content?: string }>;
+  } = {};
+
+  try {
+    globalThis.fetch = async (input, init): Promise<Response> => {
+      capturedUrl = String(input);
+      capturedBody = JSON.parse(String(init?.body)) as typeof capturedBody;
+
+      return new Response(JSON.stringify({
+        message: {
+          content: JSON.stringify({
+            readiness: "pass",
+            confidence: 0.9,
+            objections: [],
+            revisionAdvice: {
+              searchQueries: [],
+              evidenceTargets: [],
+              papersToExclude: [],
+              claimsToSoften: []
+            }
+          })
+        }
+      }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json"
+        }
+      });
+    };
+
+    const backend = new OllamaResearchBackend("normal-host:11434", "normal-model", "critic-host:11434", "critic-model");
+    const report = await backend.reviewResearchArtifact({
+      projectRoot: "/tmp/project",
+      runId: "run-test",
+      stage: "protocol",
+      brief: {
+        topic: "autonomous research agents",
+        researchQuestion: "What evidence supports literature-review automation?",
+        researchDirection: "Review scoped evidence.",
+        successCriterion: "Use traceable citations."
+      },
+      protocol: null
+    });
+
+    const prompt = capturedBody.messages?.[0]?.content ?? "";
+    assert.equal(report.readiness, "pass");
+    assert.match(capturedUrl, /critic-host:11434/);
+    assert.equal(capturedBody.model, "critic-model");
+    assert.match(prompt, /stateless critic reviewer/);
+    assert.match(prompt, /no tools/i);
+    assert.match(prompt, /Missing selected papers is expected/i);
+    assert.doesNotMatch(prompt, /Selected papers:/);
+    assert.doesNotMatch(prompt, /Project memory context/i);
+    assert.doesNotMatch(prompt, /trace\.log|events\.jsonl|recovery history/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("synthesis backend uses canonical papers in the specialized literature-review prompt", async () => {
   const originalFetch = globalThis.fetch;
   let capturedPrompt = "";

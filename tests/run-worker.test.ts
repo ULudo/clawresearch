@@ -22,6 +22,11 @@ import type {
 } from "../src/runtime/research-backend.js";
 import { ResearchBackendError } from "../src/runtime/research-backend.js";
 import type {
+  ResearchActionDecision,
+  ResearchActionRequest
+} from "../src/runtime/research-agent.js";
+import type { CriticReviewArtifact, CriticReviewRequest } from "../src/runtime/research-critic.js";
+import type {
   EvidenceMatrix,
   PaperExtraction
 } from "../src/runtime/research-evidence.js";
@@ -246,6 +251,26 @@ class StubResearchBackend implements ResearchBackend {
     };
   }
 
+  async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    return {
+      schemaVersion: 1,
+      action: request.allowedActions.includes("synthesize_clustered")
+        ? "synthesize_clustered"
+        : request.allowedActions[0] ?? "finalize_status_report",
+      rationale: "Proceed with the next structured research action.",
+      confidence: 0.9,
+      inputs: {
+        searchQueries: [],
+        evidenceTargets: [],
+        paperIds: [],
+        criticStage: null,
+        reason: null
+      },
+      expectedOutcome: "Continue the run.",
+      stopCondition: "The next artifact is checkpointed."
+    };
+  }
+
   async extractReviewedPapers(request: PaperExtractionRequest): Promise<PaperExtraction[]> {
     this.capturedExtractionPaperIds = request.papers.map((paper) => paper.id);
     return request.papers.map((paper, index) => paperExtraction({
@@ -336,6 +361,24 @@ class StubResearchBackend implements ResearchBackend {
       },
       holdReasons: [],
       recommendedHumanDecision: "Inspect the selected work package and continue if it looks suitably bounded."
+    };
+  }
+
+  async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "pass",
+      confidence: 0.9,
+      objections: [],
+      revisionAdvice: {
+        searchQueries: [],
+        evidenceTargets: [],
+        papersToExclude: [],
+        claimsToSoften: []
+      }
     };
   }
 }
@@ -628,6 +671,44 @@ class RecoveringExtractionBackend extends StubResearchBackend {
   }
 }
 
+class RecoveringSynthesisBackend extends StubResearchBackend {
+  synthesisCalls: string[][] = [];
+  private failedLargeCluster = false;
+
+  override async synthesizeResearch(
+    request: ResearchSynthesisRequest,
+    options?: ResearchBackendCallOptions
+  ): Promise<ResearchSynthesis> {
+    this.synthesisCalls.push(request.papers.map((paper) => paper.id));
+
+    if (!this.failedLargeCluster && request.papers.length > 2) {
+      this.failedLargeCluster = true;
+      throw new ResearchBackendError(
+        "timeout",
+        "synthesis",
+        "simulated oversized synthesis cluster",
+        options?.timeoutMs ?? null
+      );
+    }
+
+    return super.synthesizeResearch(request);
+  }
+}
+
+class InvalidActionResearchBackend extends StubResearchBackend {
+  override async chooseResearchAction(
+    _request: ResearchActionRequest,
+    options?: ResearchBackendCallOptions
+  ): Promise<ResearchActionDecision> {
+    throw new ResearchBackendError(
+      "malformed_json",
+      "agent_step",
+      "simulated invalid action JSON",
+      options?.timeoutMs ?? null
+    );
+  }
+}
+
 class PersistentlyFailingExtractionBackend extends StubResearchBackend {
   override async extractReviewedPapers(
     request: PaperExtractionRequest,
@@ -702,6 +783,26 @@ class LiteratureAwareResearchBackend implements ResearchBackend {
     };
   }
 
+  async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    return {
+      schemaVersion: 1,
+      action: request.allowedActions.includes("synthesize_clustered")
+        ? "synthesize_clustered"
+        : request.allowedActions[0] ?? "finalize_status_report",
+      rationale: "Use the structured action loop to continue the literature-aware run.",
+      confidence: 0.9,
+      inputs: {
+        searchQueries: [],
+        evidenceTargets: [],
+        paperIds: [],
+        criticStage: null,
+        reason: null
+      },
+      expectedOutcome: "Continue with the next checkpointed artifact.",
+      stopCondition: "The artifact is written."
+    };
+  }
+
   async extractReviewedPapers(request: PaperExtractionRequest): Promise<PaperExtraction[]> {
     return request.papers.map((paper, index) => paperExtraction({
       id: `literature-aware-extraction-${index + 1}`,
@@ -730,6 +831,24 @@ class LiteratureAwareResearchBackend implements ResearchBackend {
       selectedWorkPackage: null,
       holdReasons: ["The reviewed evidence is still too thin for an executable work package."],
       recommendedHumanDecision: "Refine the literature review before continuing."
+    };
+  }
+
+  async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "pass",
+      confidence: 0.9,
+      objections: [],
+      revisionAdvice: {
+        searchQueries: [],
+        evidenceTargets: [],
+        papersToExclude: [],
+        claimsToSoften: []
+      }
     };
   }
 }
@@ -771,6 +890,237 @@ class LiteratureAwareSourceGatherer implements ResearchSourceGatherer {
       mergeDiagnostics: [],
       authStatus: [],
       reviewWorkflow: reviewWorkflowFor(papers)
+    };
+  }
+}
+
+class ProtocolBlockingBackend extends StubResearchBackend {
+  override async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    if (request.stage !== "protocol") {
+      return super.reviewResearchArtifact(request);
+    }
+
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "block",
+      confidence: 0.95,
+      objections: [{
+        code: "protocol-output-constraint",
+        severity: "blocking",
+        target: "protocol",
+        message: "The protocol turns output-style requirements into evidence targets.",
+        affectedPaperIds: [],
+        affectedClaimIds: [],
+        suggestedRevision: "Revise the protocol before retrieval."
+      }],
+      revisionAdvice: {
+        searchQueries: [],
+        evidenceTargets: [],
+        papersToExclude: [],
+        claimsToSoften: []
+      }
+    };
+  }
+}
+
+class ProtocolRecoveryBackend extends StubResearchBackend {
+  protocolCalls = 0;
+
+  override async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    if (request.stage !== "protocol") {
+      return super.reviewResearchArtifact(request);
+    }
+
+    this.protocolCalls += 1;
+    if (this.protocolCalls > 1) {
+      return super.reviewResearchArtifact(request);
+    }
+
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "revise",
+      confidence: 0.9,
+      objections: [{
+        code: "query-too-broad",
+        severity: "major",
+        target: "protocol",
+        message: "The protocol search strategy is too broad for autonomous retrieval.",
+        affectedPaperIds: [],
+        affectedClaimIds: [],
+        suggestedRevision: "Narrow retrieval toward direct protocol evidence."
+      }],
+      revisionAdvice: {
+        searchQueries: ["direct protocol evidence autonomous research agents"],
+        evidenceTargets: ["direct protocol evidence"],
+        papersToExclude: [],
+        claimsToSoften: []
+      }
+    };
+  }
+}
+
+class ProtocolAlwaysReviseBackend extends StubResearchBackend {
+  protocolCalls = 0;
+
+  override async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    if (request.stage !== "protocol") {
+      return super.reviewResearchArtifact(request);
+    }
+
+    this.protocolCalls += 1;
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "revise",
+      confidence: 0.8,
+      objections: [{
+        code: "query-too-broad",
+        severity: "major",
+        target: "protocol",
+        message: "The protocol search strategy could still be narrower.",
+        affectedPaperIds: [],
+        affectedClaimIds: [],
+        suggestedRevision: "Narrow retrieval toward direct protocol evidence."
+      }],
+      revisionAdvice: {
+        searchQueries: ["direct protocol evidence autonomous research agents"],
+        evidenceTargets: ["direct protocol evidence"],
+        papersToExclude: [],
+        claimsToSoften: []
+      }
+    };
+  }
+}
+
+class SourceSelectionRecoveryBackend extends StubResearchBackend {
+  sourceSelectionCalls = 0;
+
+  override async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    if (request.stage !== "source_selection") {
+      return super.reviewResearchArtifact(request);
+    }
+
+    this.sourceSelectionCalls += 1;
+    if (this.sourceSelectionCalls > 1) {
+      return super.reviewResearchArtifact(request);
+    }
+
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "revise",
+      confidence: 0.9,
+      objections: [{
+        code: "missing-benchmark-evaluation",
+        severity: "major",
+        target: "source_selection",
+        message: "The selected set lacks direct benchmark evaluation evidence.",
+        affectedPaperIds: [],
+        affectedClaimIds: [],
+        suggestedRevision: "Search for autonomous research agents benchmark evaluation."
+      }],
+      revisionAdvice: {
+        searchQueries: ["autonomous research agents benchmark evaluation"],
+        evidenceTargets: ["benchmark evaluation"],
+        papersToExclude: [],
+        claimsToSoften: []
+      }
+    };
+  }
+}
+
+class SourceSelectionAlwaysBlockBackend extends StubResearchBackend {
+  sourceSelectionCalls = 0;
+
+  override async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    if (request.stage !== "source_selection") {
+      return super.reviewResearchArtifact(request);
+    }
+
+    this.sourceSelectionCalls += 1;
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "block",
+      confidence: 0.87,
+      objections: [{
+        code: "selected-set-too-narrow",
+        severity: "blocking",
+        target: "source_selection",
+        message: "The selected set still lacks direct comparative benchmark evidence.",
+        affectedPaperIds: [],
+        affectedClaimIds: [],
+        suggestedRevision: "Search for direct comparative benchmark evidence before relying on the selected set."
+      }],
+      revisionAdvice: {
+        searchQueries: ["direct comparative benchmark evidence autonomous research agents"],
+        evidenceTargets: ["comparative benchmark evidence"],
+        papersToExclude: [],
+        claimsToSoften: []
+      }
+    };
+  }
+}
+
+class ReleaseBlockingBackend extends StubResearchBackend {
+  override async synthesizeResearch(request: ResearchSynthesisRequest): Promise<ResearchSynthesis> {
+    const sourceIds = request.evidenceMatrix.rows.map((row) => row.paperId);
+
+    return {
+      executiveSummary: "The reviewed papers report autonomous research-agent recovery behavior.",
+      themes: [{
+        title: "Recovery behavior",
+        summary: "The selected papers describe autonomous research-agent recovery behavior.",
+        sourceIds
+      }],
+      claims: sourceIds.map((sourceId) => ({
+        claim: "Autonomous research-agent recovery behavior is discussed in the reviewed paper.",
+        evidence: "The reviewed paper abstract discusses autonomous research-agent recovery behavior.",
+        sourceIds: [sourceId]
+      })),
+      nextQuestions: ["Which recovery behaviors are most reliable across reviewed papers?"]
+    };
+  }
+
+  override async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    if (request.stage !== "release") {
+      return super.reviewResearchArtifact(request);
+    }
+
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "block",
+      confidence: 0.92,
+      objections: [{
+        code: "release-overclaim",
+        severity: "blocking",
+        target: "release",
+        message: "The manuscript presents the synthesis as publishable despite unresolved review risk.",
+        affectedPaperIds: [],
+        affectedClaimIds: [],
+        suggestedRevision: "Hold release and soften the manuscript claims."
+      }],
+      revisionAdvice: {
+        searchQueries: [],
+        evidenceTargets: [],
+        papersToExclude: [],
+        claimsToSoften: []
+      }
     };
   }
 }
@@ -1098,6 +1448,146 @@ test("run worker shrinks extraction batches after timeout and checkpoints recove
   }
 });
 
+test("run worker splits synthesis clusters after timeout and records agent steps", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-synthesis-revision-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "Autonomous research agents",
+      researchQuestion: "How should synthesis recover from oversized prompts?",
+      researchDirection: "Test clustered synthesis revision.",
+      successCriterion: "Complete synthesis without losing extracted evidence."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.explicitlyConfigured = true;
+    projectConfig.runtime.llm.synthesisInitialClusterSize = 4;
+    projectConfig.runtime.llm.synthesisMinClusterSize = 1;
+    projectConfig.runtime.llm.synthesisRetryBudget = 4;
+    await projectConfigStore.save(projectConfig);
+
+    const backend = new RecoveringSynthesisBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer: new MultiPaperSourceGatherer(4)
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const synthesisArtifact = JSON.parse(await readFile(completedRun.artifacts.synthesisJsonPath, "utf8")) as {
+      status: string;
+      attempts: Array<{ status: string; errorKind: string | null; clusterSize: number }>;
+      completedClusterIds: string[];
+      synthesis: { claims: unknown[] };
+    };
+    const agentSteps = await readFile(completedRun.artifacts.agentStepsPath, "utf8");
+    const agentState = JSON.parse(await readFile(completedRun.artifacts.agentStatePath, "utf8")) as {
+      completedSteps: number;
+      currentPhase: string;
+    };
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.deepEqual(backend.synthesisCalls.map((call) => call.length), [4, 2, 2]);
+    assert.equal(synthesisArtifact.status, "completed");
+    assert.ok(synthesisArtifact.attempts.some((attempt) => attempt.status === "failed" && attempt.errorKind === "timeout" && attempt.clusterSize === 4));
+    assert.ok(synthesisArtifact.completedClusterIds.length >= 2);
+    assert.ok(synthesisArtifact.synthesis.claims.length > 0);
+    assert.match(agentSteps, /plan_clustered_synthesis/);
+    assert.match(agentSteps, /revise_synthesis_cluster/);
+    assert.match(agentSteps, /merge_cluster_syntheses/);
+    assert.ok(agentState.completedSteps > 0);
+    assert.equal(agentState.currentPhase, "release");
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("run worker finishes status-only when the model cannot choose structured actions", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-agent-control-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "Autonomous research agents",
+      researchQuestion: "Can the runtime avoid fake completion when action control fails?",
+      researchDirection: "Test strict JSON action control.",
+      successCriterion: "Finish with status diagnostics instead of releasing a paper."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.explicitlyConfigured = true;
+    projectConfig.runtime.llm.agentInvalidActionBudget = 2;
+    await projectConfigStore.save(projectConfig);
+
+    const backend = new InvalidActionResearchBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer: new MultiPaperSourceGatherer(3)
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const qualityReport = JSON.parse(await readFile(completedRun.artifacts.qualityReportPath, "utf8")) as {
+      agentControl: {
+        mode: string;
+        invalidActionCount: number;
+        diagnostics: Array<{ kind: string; message: string }>;
+      };
+      modelSuitability: {
+        rationale: string[];
+      };
+    };
+    const paper = JSON.parse(await readFile(completedRun.artifacts.paperJsonPath, "utf8")) as {
+      readinessStatus: string;
+      scientificRoles: string[];
+      claims: unknown[];
+    };
+    const paperMarkdown = await readFile(completedRun.artifacts.paperPath, "utf8");
+    const synthesisArtifact = JSON.parse(await readFile(completedRun.artifacts.synthesisJsonPath, "utf8")) as {
+      status: string;
+      synthesis: {
+        claims: unknown[];
+      };
+    };
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.equal(qualityReport.agentControl.mode, "strict_json");
+    assert.equal(qualityReport.agentControl.invalidActionCount, 2);
+    assert.equal(qualityReport.agentControl.diagnostics[0]?.kind, "malformed_action");
+    assert.match(qualityReport.modelSuitability.rationale.join(" "), /action control/i);
+    assert.equal(backend.capturedPaperIds.length, 0);
+    assert.equal(paper.readinessStatus, "needs_more_evidence");
+    assert.deepEqual(paper.claims, []);
+    assert.ok(paper.scientificRoles.includes("status_report"));
+    assert.match(paperMarkdown, /No full review manuscript was released/i);
+    assert.equal(synthesisArtifact.status, "completed_with_fallback");
+    assert.deepEqual(synthesisArtifact.synthesis.claims, []);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("run worker autonomously reruns retrieval when manuscript checks need more evidence", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-evidence-recovery-"));
   const now = createNow();
@@ -1138,7 +1628,7 @@ test("run worker autonomously reruns retrieval when manuscript checks need more 
       referencedPaperIds: string[];
     };
     const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as {
-      autonomousEvidence: { pass: number; recoveryPasses: number };
+      autonomousEvidence: { pass: number; revisionPasses: number };
     };
     const planArtifact = JSON.parse(await readFile(completedRun.artifacts.planPath, "utf8")) as {
       searchQueries: string[];
@@ -1150,13 +1640,13 @@ test("run worker autonomously reruns retrieval when manuscript checks need more 
     assert.equal(sourceGatherer.requests.length, 2);
     assert.ok(sourceGatherer.requests[1]?.recoveryQueries?.some((query) => /benchmark evaluation/i.test(query)));
     assert.equal(sourcesArtifact.autonomousEvidence.pass, 2);
-    assert.equal(sourcesArtifact.autonomousEvidence.recoveryPasses, 1);
+    assert.equal(sourcesArtifact.autonomousEvidence.revisionPasses, 1);
     assert.ok(planArtifact.searchQueries.some((query) => /benchmark evaluation/i.test(query)));
     assert.equal(backend.capturedExtractionPaperIds.length, 3);
     assert.equal(backend.capturedPaperIds.length, 3);
     assert.equal(paper.readinessStatus, "needs_human_review");
     assert.equal(paper.referencedPaperIds.length, 0);
-    assert.match(stdout, /Evidence recovery pass 1/i);
+    assert.match(stdout, /Evidence revision pass 1/i);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -1870,6 +2360,317 @@ test("run worker writes a hold agenda when retrieval found papers but review ret
     assert.equal(agenda.selectedDirectionId, null);
     assert.equal(agenda.selectedWorkPackage, null);
     assert.ok(agenda.holdReasons.length > 0);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("protocol critic block records a warning and continues to source gathering", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-protocol-"));
+  const now = createNow();
+
+  class CapturingSourceGatherer implements ResearchSourceGatherer {
+    private readonly base = new StubSourceGatherer();
+    requests: ResearchSourceGatherRequest[] = [];
+
+    async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
+      this.requests.push(request);
+      return this.base.gather();
+    }
+  }
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "autonomous research agents",
+      researchQuestion: "How should evidence be reviewed?",
+      researchDirection: "Review the literature.",
+      successCriterion: "Produce a publication-style paper with citations."
+    }, ["clawresearch", "research-loop"]);
+
+    const gatherer = new CapturingSourceGatherer();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: new ProtocolBlockingBackend(),
+      sourceGatherer: gatherer
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const critic = JSON.parse(await readFile(completedRun.artifacts.criticProtocolReviewPath, "utf8")) as CriticReviewArtifact;
+    const checks = JSON.parse(await readFile(completedRun.artifacts.manuscriptChecksPath, "utf8")) as {
+      readinessStatus: string;
+      blockers: string[];
+      checks: Array<{ id: string; severity: string; status: string; message: string }>;
+    };
+    const qualityReport = JSON.parse(await readFile(completedRun.artifacts.qualityReportPath, "utf8")) as {
+      critic: {
+        finalSatisfaction: string;
+        iterations: Array<{ stage: string; finalReadiness: string }>;
+      };
+    };
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.equal(critic.readiness, "block");
+    assert.ok(gatherer.requests.length >= 1);
+    assert.ok(checks.checks.some((item) => item.id.includes("critic-protocol") && item.severity === "warning"));
+    assert.doesNotMatch(checks.blockers.join(" "), /output-style requirements/);
+    assert.equal(qualityReport.critic.finalSatisfaction, "unresolved");
+    assert.ok(qualityReport.critic.iterations.some((item) => item.stage === "protocol" && item.finalReadiness === "block"));
+    assert.match(stdout, /continuing to retrieval/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("protocol critic feedback revises the protocol and continues autonomously", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-protocol-recovery-"));
+  const now = createNow();
+
+  class CapturingSourceGatherer implements ResearchSourceGatherer {
+    private readonly base = new StubSourceGatherer();
+    requests: ResearchSourceGatherRequest[] = [];
+
+    async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
+      this.requests.push(request);
+      return this.base.gather();
+    }
+  }
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "autonomous research agents",
+      researchQuestion: "How should evidence be reviewed?",
+      researchDirection: "Review the literature.",
+      successCriterion: "Produce a publication-style paper with citations."
+    }, ["clawresearch", "research-loop"]);
+
+    const backend = new ProtocolRecoveryBackend();
+    const gatherer = new CapturingSourceGatherer();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer: gatherer
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const critic = JSON.parse(await readFile(completedRun.artifacts.criticProtocolReviewPath, "utf8")) as CriticReviewArtifact;
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.equal(backend.protocolCalls, 2);
+    assert.equal(critic.readiness, "pass");
+    assert.ok(gatherer.requests.length >= 1);
+    assert.ok(gatherer.requests[0]?.plan.searchQueries.some((query) => /direct protocol evidence/i.test(query)));
+    assert.match(stdout, /Protocol revision 1/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("persistent protocol critic revise continues to source gathering after bounded retries", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-protocol-revise-"));
+  const now = createNow();
+
+  class CapturingSourceGatherer implements ResearchSourceGatherer {
+    private readonly base = new StubSourceGatherer();
+    requests: ResearchSourceGatherRequest[] = [];
+
+    async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
+      this.requests.push(request);
+      return this.base.gather();
+    }
+  }
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "autonomous research agents",
+      researchQuestion: "How should evidence be reviewed?",
+      researchDirection: "Review the literature.",
+      successCriterion: "Produce a publication-style paper with citations."
+    }, ["clawresearch", "research-loop"]);
+
+    const backend = new ProtocolAlwaysReviseBackend();
+    const gatherer = new CapturingSourceGatherer();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer: gatherer
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const critic = JSON.parse(await readFile(completedRun.artifacts.criticProtocolReviewPath, "utf8")) as CriticReviewArtifact;
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.equal(critic.readiness, "revise");
+    assert.ok(backend.protocolCalls >= 2);
+    assert.ok(gatherer.requests.length >= 1);
+    assert.match(stdout, /continuing to retrieval/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("source-selection critic feedback triggers an autonomous revision pass", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-source-recovery-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "autonomous research agents",
+      researchQuestion: "What evidence supports benchmark evaluation?",
+      researchDirection: "Recover benchmark evaluation evidence.",
+      successCriterion: "Cover benchmark evaluation directly."
+    }, ["clawresearch", "research-loop"]);
+
+    const gatherer = new EvidenceRecoverySourceGatherer();
+    const backend = new SourceSelectionRecoveryBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer: gatherer
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const critic = JSON.parse(await readFile(completedRun.artifacts.criticSourceSelectionPath, "utf8")) as CriticReviewArtifact;
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.ok(gatherer.requests.length >= 2);
+    assert.equal(backend.sourceSelectionCalls, 2);
+    assert.equal(critic.readiness, "pass");
+    assert.match(stdout, /Source-selection critic requested evidence revision pass 1|Evidence revision pass 1/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("persistent source-selection critic concerns are reported without stopping synthesis", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-source-persistent-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "autonomous research-agent recovery",
+      researchQuestion: "Which recovery behaviors are reported in autonomous research-agent papers?",
+      researchDirection: "Review autonomous research-agent recovery behavior.",
+      successCriterion: "Produce a grounded review paper."
+    }, ["clawresearch", "research-loop"]);
+
+    const backend = new SourceSelectionAlwaysBlockBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer: new MultiPaperSourceGatherer(3)
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const critic = JSON.parse(await readFile(completedRun.artifacts.criticSourceSelectionPath, "utf8")) as CriticReviewArtifact;
+    const paperExtractions = JSON.parse(await readFile(completedRun.artifacts.paperExtractionsPath, "utf8")) as {
+      extractionCount: number;
+    };
+    const checks = JSON.parse(await readFile(completedRun.artifacts.manuscriptChecksPath, "utf8")) as {
+      readinessStatus: string;
+      blockerCount: number;
+      warningCount: number;
+      checks: Array<{ id: string; severity: string; status: string; message: string }>;
+    };
+    const qualityReport = JSON.parse(await readFile(completedRun.artifacts.qualityReportPath, "utf8")) as {
+      evidence: {
+        reviewedPapers: number;
+        extractedPapers: number;
+      };
+      critic: {
+        finalSatisfaction: string;
+        iterations: Array<{ stage: string; iterations: number; finalReadiness: string }>;
+      };
+    };
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.equal(critic.readiness, "block");
+    assert.ok(backend.sourceSelectionCalls >= 2);
+    assert.equal(paperExtractions.extractionCount, 3);
+    assert.equal(qualityReport.evidence.reviewedPapers, 3);
+    assert.equal(qualityReport.evidence.extractedPapers, 3);
+    assert.equal(qualityReport.critic.finalSatisfaction, "unresolved");
+    assert.ok(qualityReport.critic.iterations.some((item) => item.stage === "source_selection" && item.iterations === backend.sourceSelectionCalls && item.finalReadiness === "block"));
+    assert.ok(checks.warningCount > 0);
+    assert.ok(checks.checks.some((item) => item.id.includes("critic-source_selection") && item.severity === "warning"));
+    assert.ok(!checks.checks.some((item) => item.id.includes("critic-source_selection") && item.severity === "blocker"));
+    assert.notEqual(checks.readinessStatus, "blocked");
+    assert.match(stdout, /continuing so later evidence, synthesis, and final quality checks can complete/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("release critic block converts an otherwise ready manuscript to status-only", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-release-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "autonomous research-agent recovery",
+      researchQuestion: "Which recovery behaviors are reported in autonomous research-agent papers?",
+      researchDirection: "Review autonomous research-agent recovery behavior.",
+      successCriterion: "Produce a grounded review paper."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.localContext.projectFilesEnabled = false;
+    await projectConfigStore.save(projectConfig);
+
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: new ReleaseBlockingBackend(),
+      sourceGatherer: new MultiPaperSourceGatherer(3)
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const critic = JSON.parse(await readFile(completedRun.artifacts.criticReleaseReviewPath, "utf8")) as CriticReviewArtifact;
+    const checks = JSON.parse(await readFile(completedRun.artifacts.manuscriptChecksPath, "utf8")) as {
+      readinessStatus: string;
+      blockers: string[];
+    };
+    const paper = await readFile(completedRun.artifacts.paperPath, "utf8");
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.equal(critic.readiness, "block");
+    assert.equal(checks.readinessStatus, "needs_human_review");
+    assert.match(checks.blockers.join(" "), /unresolved review risk/);
+    assert.match(paper, /No full review manuscript was released/);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
