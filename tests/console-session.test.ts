@@ -1456,34 +1456,25 @@ test("phase two console can pause and resume the active detached run", async () 
   }
 });
 
-test("phase two console treats continue as resume for a paused active run", async () => {
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-continue-resumes-paused-"));
+test("phase console help does not expose removed continue command", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-no-continue-help-"));
 
   try {
     const io = createScriptedIo([
-      "I want to study AI job displacement in nursing homes",
-      "/go",
-      "/pause",
-      "/continue",
+      "/help",
       "/quit"
     ]);
-    const now = createNow();
 
     const code = await runPhaseOneConsole(io, {
       projectRoot,
       version: "0.6.0",
-      now,
+      now: createNow(),
       intakeBackend: new CompleteProposalBackend(),
       runController: new FakeRunController()
     });
-    const runStore = new RunStore(projectRoot, "0.6.0", now);
-    const latestRun = await runStore.latest();
 
     assert.equal(code, 0);
-    assert.match(io.output, /Paused run run-/);
-    assert.match(io.output, /Resumed paused run run-/);
-    assert.doesNotMatch(io.output, /Wait for it to finish or pause it before launching another work-package run/);
-    assert.equal(latestRun?.status, "running");
+    assert.doesNotMatch(io.output, /\/continue/);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

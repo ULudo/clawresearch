@@ -4,7 +4,6 @@ import {
 } from "./console-transcript.js";
 import {
   emitAssistantTurn,
-  handleContinueCommand,
   handleGoCommand,
   handlePauseCommand,
   handleResumeCommand,
@@ -20,18 +19,14 @@ import {
 } from "./console-app.js";
 import {
   createDefaultIntakeBackend,
+  createProjectIntakeBackend,
   type IntakeBackend
 } from "./intake-backend.js";
 import {
   createDefaultProjectAssistantBackend,
+  createProjectAssistantBackend,
   type ProjectAssistantBackend
 } from "./project-assistant-backend.js";
-import {
-  LiteratureStore
-} from "./literature-store.js";
-import {
-  MemoryStore
-} from "./memory-store.js";
 import {
   applyCredentialsToEnvironment,
   CredentialStore,
@@ -40,7 +35,9 @@ import {
 } from "./credential-store.js";
 import {
   authStatesForSelectedProviders,
+  resolveRuntimeModelConfig,
   ProjectConfigStore,
+  type RuntimeModelProvider,
   type ProjectConfigState
 } from "./project-config-store.js";
 import {
@@ -59,6 +56,12 @@ import {
   type SessionState
 } from "./session-store.js";
 import {
+  loadResearchWorkerState
+} from "./research-state.js";
+import {
+  loadResearchWorkStore
+} from "./research-work-store.js";
+import {
   parseRunEventLines,
   readRunEventChunk,
   type RunEventKind
@@ -69,6 +72,7 @@ import {
   buildSourceChecklistEntries,
   renderAuthPromptFrame,
   renderChatFrame,
+  renderModelSetupFrame,
   renderSourceChecklist,
   toggleSourceChecklistEntry,
   type CommandSuggestion,
@@ -79,6 +83,13 @@ import {
   createDefaultRunController,
   type RunController
 } from "./run-controller.js";
+import {
+  loginOpenAiCodexDeviceCode,
+  ModelCredentialStore,
+  setOpenAiApiKeyCredential,
+  setOpenAiCodexCredential,
+  type ModelCredentialState
+} from "./model-runtime.js";
 
 type TerminalInput = NodeJS.ReadStream & {
   setRawMode?: (mode: boolean) => void;
@@ -113,6 +124,14 @@ type AuthOverlayState = {
   initialSetup: boolean;
 };
 
+type ModelOverlayState = {
+  stage: "provider" | "model" | "openai-key" | "codex-login";
+  focusIndex: number;
+  provider: RuntimeModelProvider;
+  input: string;
+  progressLines: string[];
+};
+
 type ModalState = {
   title: string;
   lines: string[];
@@ -131,8 +150,7 @@ type SlashCommandDefinition = {
 };
 
 const slashCommands: SlashCommandDefinition[] = [
-  { command: "/go", description: "Start the detached research run" },
-  { command: "/continue", description: "Start the selected work package" },
+  { command: "/go", description: "Start or continue autonomous research" },
   { command: "/agenda", description: "Show the latest research agenda" },
   { command: "/paper", description: "Show review-paper status" },
   { command: "/paper open", description: "Print the latest paper draft" },
@@ -147,6 +165,49 @@ const slashCommands: SlashCommandDefinition[] = [
 
 function cloneConfig(config: ProjectConfigState): ProjectConfigState {
   return JSON.parse(JSON.stringify(config)) as ProjectConfigState;
+}
+
+function modelProviderLabel(provider: RuntimeModelProvider): string {
+  switch (provider) {
+    case "ollama":
+      return "Ollama local";
+    case "openai":
+      return "OpenAI API key";
+    case "openai-codex":
+      return "OpenAI Codex sign-in";
+  }
+}
+
+function defaultModelForProvider(provider: RuntimeModelProvider): string {
+  switch (provider) {
+    case "ollama":
+      return process.env.CLAWRESEARCH_OLLAMA_MODEL ?? "qwen3:14b";
+    case "openai":
+      return process.env.CLAWRESEARCH_OPENAI_MODEL ?? process.env.CLAWRESEARCH_MODEL ?? "gpt-5.5";
+    case "openai-codex":
+      return process.env.CLAWRESEARCH_OPENAI_CODEX_MODEL ?? process.env.CLAWRESEARCH_MODEL ?? "gpt-5.5";
+  }
+}
+
+function defaultHostForProvider(provider: RuntimeModelProvider): string | null {
+  return provider === "ollama"
+    ? process.env.OLLAMA_HOST ?? "127.0.0.1:11434"
+    : null;
+}
+
+function defaultBaseUrlForProvider(provider: RuntimeModelProvider): string | null {
+  switch (provider) {
+    case "ollama":
+      return null;
+    case "openai":
+      return process.env.OPENAI_BASE_URL ?? process.env.CLAWRESEARCH_OPENAI_BASE_URL ?? "https://api.openai.com/v1";
+    case "openai-codex":
+      return process.env.CLAWRESEARCH_OPENAI_CODEX_BASE_URL ?? "https://chatgpt.com/backend-api/codex";
+  }
+}
+
+function modelProviderFromIndex(index: number): RuntimeModelProvider {
+  return (["ollama", "openai", "openai-codex"] as const)[index] ?? "ollama";
 }
 
 function conversationTag(entry: ConversationEntry): string {
@@ -250,7 +311,7 @@ function sourceCommandLike(input: string): boolean {
 }
 
 function footerHint(pendingLabel: string | null): string {
-  return pendingLabel ?? "/help  /sources  /status  /agenda  /go  /continue  /pause  /resume  /quit";
+  return pendingLabel ?? "/help  /sources  /status  /agenda  /go  /pause  /resume  /quit";
 }
 
 function isSubmitKey(key: readline.Key): boolean {
@@ -389,23 +450,24 @@ export class ClawResearchTerminalUi {
   private readonly now: () => string;
   private readonly store: SessionStore;
   private readonly runStore: RunStore;
-  private readonly memoryStore: MemoryStore;
-  private readonly literatureStore: LiteratureStore;
   private readonly projectConfigStore: ProjectConfigStore;
   private readonly credentialStore: CredentialStore;
+  private readonly modelCredentialStore: ModelCredentialStore;
   private readonly runController: RunController;
-  private readonly backend: IntakeBackend;
-  private readonly projectAssistantBackend: ProjectAssistantBackend;
+  private backend!: IntakeBackend;
+  private projectAssistantBackend!: ProjectAssistantBackend;
   private readonly transcript: ConsoleTranscript;
 
   private session!: SessionState;
   private projectConfig!: ProjectConfigState;
   private credentials!: CredentialStoreState;
+  private modelCredentials!: ModelCredentialState;
   private currentRun: RunRecord | null = null;
   private logEntries: ScreenLogEntry[] = [];
   private composer = "";
   private commandSuggestionIndex = 0;
   private modal: ModalState | null = null;
+  private modelOverlay: ModelOverlayState | null = null;
   private sourceOverlay: SourceOverlayState | null = null;
   private authOverlay: AuthOverlayState | null = null;
   private pendingLabel: string | null = null;
@@ -424,13 +486,10 @@ export class ClawResearchTerminalUi {
     this.now = options.now ?? (() => new Date().toISOString());
     this.store = new SessionStore(options.projectRoot, options.version, this.now);
     this.runStore = new RunStore(options.projectRoot, options.version, this.now);
-    this.memoryStore = new MemoryStore(options.projectRoot, this.now);
-    this.literatureStore = new LiteratureStore(options.projectRoot, this.now);
     this.projectConfigStore = new ProjectConfigStore(options.projectRoot, this.now);
     this.credentialStore = new CredentialStore(options.projectRoot, this.now);
+    this.modelCredentialStore = new ModelCredentialStore(options.projectRoot, this.now);
     this.runController = options.runController ?? createDefaultRunController();
-    this.backend = options.intakeBackend ?? createDefaultIntakeBackend();
-    this.projectAssistantBackend = options.projectAssistantBackend ?? createDefaultProjectAssistantBackend();
     this.transcript = new ConsoleTranscript(options.projectRoot);
   }
 
@@ -438,10 +497,20 @@ export class ClawResearchTerminalUi {
     this.session = await this.store.load();
     this.projectConfig = await this.projectConfigStore.load();
     this.credentials = await this.credentialStore.load();
+    this.modelCredentials = await this.modelCredentialStore.load();
     applyCredentialsToEnvironment(this.credentials);
 
-    this.session.intake.backendLabel = this.backend.label;
-    await this.store.save(this.session);
+    if (!this.projectConfig.runtime.model.configured && this.projectConfig.sources.explicitlyConfigured) {
+      this.projectConfig.runtime.model = {
+        provider: "ollama",
+        model: defaultModelForProvider("ollama"),
+        host: defaultHostForProvider("ollama"),
+        baseUrl: null,
+        configured: true
+      };
+      this.projectConfig = await this.projectConfigStore.save(this.projectConfig);
+    }
+
     this.currentRun = await reconcileRelevantRun(
       this.session,
       this.store,
@@ -461,14 +530,26 @@ export class ClawResearchTerminalUi {
 
     this.logEntries = this.session.conversation.map(mapConversationEntry);
 
-    if (!this.projectConfig.sources.explicitlyConfigured) {
+    if (!this.projectConfig.runtime.model.configured) {
+      this.modelOverlay = {
+        stage: "provider",
+        focusIndex: 0,
+        provider: "ollama",
+        input: "",
+        progressLines: []
+      };
+    } else {
+      await this.initializeBackends();
+    }
+
+    if (this.modelOverlay === null && !this.projectConfig.sources.explicitlyConfigured) {
       this.sourceOverlay = {
         draft: cloneConfig(this.projectConfig),
         original: cloneConfig(this.projectConfig),
         focusIndex: 0,
         initialSetup: true
       };
-    } else {
+    } else if (this.modelOverlay === null) {
       await this.ensureOpeningAssistantTurn();
     }
 
@@ -516,6 +597,21 @@ export class ClawResearchTerminalUi {
   private async shutdown(code = 0): Promise<void> {
     this.cleanup();
     this.resolveRun?.(code);
+  }
+
+  private async initializeBackends(): Promise<void> {
+    this.backend = this.options.intakeBackend ?? await createProjectIntakeBackend({
+      projectRoot: this.options.projectRoot,
+      projectConfig: this.projectConfig,
+      timestampFactory: this.now
+    }).catch(() => createDefaultIntakeBackend());
+    this.projectAssistantBackend = this.options.projectAssistantBackend ?? await createProjectAssistantBackend({
+      projectRoot: this.options.projectRoot,
+      projectConfig: this.projectConfig,
+      timestampFactory: this.now
+    }).catch(() => createDefaultProjectAssistantBackend());
+    this.session.intake.backendLabel = this.backend.label;
+    await this.store.save(this.session);
   }
 
   private readonly onResize = (): void => {
@@ -727,7 +823,18 @@ export class ClawResearchTerminalUi {
     const { width, height } = this.currentScreenSize();
     let content: string;
 
-    if (this.sourceOverlay !== null) {
+    if (this.modelOverlay !== null) {
+      content = renderModelSetupFrame({
+        width,
+        height,
+        stage: this.modelOverlay.stage,
+        focusIndex: this.modelOverlay.focusIndex,
+        provider: this.modelOverlay.provider,
+        inputValue: `${this.modelOverlay.input}_`,
+        progressLines: this.modelOverlay.progressLines,
+        defaultModel: defaultModelForProvider(this.modelOverlay.provider)
+      });
+    } else if (this.sourceOverlay !== null) {
       content = renderSourceChecklist(
         this.sourceOverlay.draft,
         this.sourceOverlay.focusIndex,
@@ -799,6 +906,11 @@ export class ClawResearchTerminalUi {
       return;
     }
 
+    if (this.modelOverlay !== null) {
+      void this.handleModelOverlayKey(value, key);
+      return;
+    }
+
     if (this.sourceOverlay !== null) {
       void this.handleSourceOverlayKey(key);
       return;
@@ -861,6 +973,150 @@ export class ClawResearchTerminalUi {
       this.render();
     }
   };
+
+  private async handleModelOverlayKey(value: string, key: readline.Key): Promise<void> {
+    const overlay = this.modelOverlay;
+
+    if (overlay === null || overlay.stage === "codex-login") {
+      return;
+    }
+
+    if (overlay.stage === "provider") {
+      if (key.name === "up") {
+        overlay.focusIndex = (overlay.focusIndex + 2) % 3;
+        overlay.provider = modelProviderFromIndex(overlay.focusIndex);
+        this.render();
+        return;
+      }
+
+      if (key.name === "down") {
+        overlay.focusIndex = (overlay.focusIndex + 1) % 3;
+        overlay.provider = modelProviderFromIndex(overlay.focusIndex);
+        this.render();
+        return;
+      }
+
+      if (isSubmitKey(key)) {
+        overlay.stage = "model";
+        overlay.input = "";
+        this.render();
+        return;
+      }
+    } else {
+      if (key.name === "backspace") {
+        overlay.input = Array.from(overlay.input).slice(0, -1).join("");
+        this.render();
+        return;
+      }
+
+      if (isSubmitKey(key)) {
+        if (overlay.stage === "model") {
+          const selectedModel = overlay.input.trim().length === 0
+            ? defaultModelForProvider(overlay.provider)
+            : overlay.input.trim();
+          this.projectConfig.runtime.model = {
+            provider: overlay.provider,
+            model: selectedModel,
+            host: defaultHostForProvider(overlay.provider),
+            baseUrl: defaultBaseUrlForProvider(overlay.provider),
+            configured: true
+          };
+
+          if (overlay.provider === "openai" && (process.env.OPENAI_API_KEY === undefined || process.env.OPENAI_API_KEY.trim().length === 0)) {
+            overlay.stage = "openai-key";
+            overlay.input = "";
+            this.render();
+            return;
+          }
+
+          await this.commitModelSelection();
+          return;
+        }
+
+        if (overlay.stage === "openai-key") {
+          setOpenAiApiKeyCredential(
+            this.modelCredentials,
+            overlay.input.trim().length === 0 ? null : overlay.input
+          );
+          await this.commitModelSelection();
+          return;
+        }
+      }
+
+      if (typeof value === "string" && value.length > 0 && !key.ctrl && !key.meta) {
+        overlay.input += value;
+        this.render();
+        return;
+      }
+    }
+
+    if (key.name === "escape") {
+      this.projectConfig.runtime.model = {
+        provider: "ollama",
+        model: defaultModelForProvider("ollama"),
+        host: defaultHostForProvider("ollama"),
+        baseUrl: null,
+        configured: true
+      };
+      await this.commitModelSelection();
+    }
+  }
+
+  private async commitModelSelection(): Promise<void> {
+    const overlay = this.modelOverlay;
+    const provider = this.projectConfig.runtime.model.provider;
+
+    if (overlay !== null && provider === "openai-codex") {
+      overlay.stage = "codex-login";
+      overlay.progressLines = ["Starting OpenAI Codex device-code sign-in..."];
+      this.render();
+
+      try {
+        const credential = await loginOpenAiCodexDeviceCode({
+          onProgress: (message) => {
+            overlay.progressLines = [...overlay.progressLines.slice(-4), message];
+            this.render();
+          },
+          onVerification: ({ verificationUrl, userCode, expiresInMs }) => {
+            const expiresInMinutes = Math.max(1, Math.round(expiresInMs / 60_000));
+            overlay.progressLines = [
+              `Open this URL in your browser: ${verificationUrl}`,
+              `Code: ${userCode}`,
+              `Code expires in ${expiresInMinutes} minutes.`
+            ];
+            this.render();
+          }
+        });
+        setOpenAiCodexCredential(this.modelCredentials, credential);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        overlay.progressLines = [`OpenAI Codex sign-in failed: ${message}`, "The route is saved; credentials can be fixed later."];
+        this.render();
+      }
+    }
+
+    this.projectConfig = await this.projectConfigStore.save(this.projectConfig);
+    this.modelCredentials = await this.modelCredentialStore.save(this.modelCredentials);
+    this.modelOverlay = null;
+    await this.initializeBackends();
+    this.appendActivityEntries([{
+      tag: "system",
+      text: `Saved model route: ${modelProviderLabel(provider)} using ${this.projectConfig.runtime.model.model}.`
+    }]);
+
+    if (!this.projectConfig.sources.explicitlyConfigured) {
+      this.sourceOverlay = {
+        draft: cloneConfig(this.projectConfig),
+        original: cloneConfig(this.projectConfig),
+        focusIndex: 0,
+        initialSetup: true
+      };
+    } else {
+      await this.ensureOpeningAssistantTurn();
+    }
+
+    this.render();
+  }
 
   private async handleSourceOverlayKey(key: readline.Key): Promise<void> {
     const overlay = this.sourceOverlay;
@@ -1090,23 +1346,6 @@ export class ClawResearchTerminalUi {
       return;
     }
 
-    if (input === "/continue") {
-      await this.runCommandAction("starting work package", async (writer) => {
-        await handleContinueCommand(
-          writer,
-          this.session,
-          this.store,
-          this.runStore,
-          this.runController,
-          this.projectConfig,
-          this.now,
-          false,
-          this.options.watchPollMs ?? 200
-        );
-      });
-      return;
-    }
-
     if (input === "/pause") {
       await this.runCommandAction("pausing run", async (writer) => {
         await handlePauseCommand(
@@ -1209,8 +1448,6 @@ export class ClawResearchTerminalUi {
   }
 
   private async buildStatusModal(): Promise<ModalState> {
-    const memory = await this.memoryStore.load();
-    const literature = await this.literatureStore.load();
     const currentProjectConfig = await this.projectConfigStore.load();
     const currentCredentials = await this.credentialStore.load();
     applyCredentialsToEnvironment(currentCredentials);
@@ -1224,6 +1461,12 @@ export class ClawResearchTerminalUi {
       this.now
     );
     const agendaSnapshot = await latestAgendaSnapshot(this.runStore);
+    const workerState = await loadResearchWorkerState(this.session.projectRoot);
+    const workStore = await loadResearchWorkStore({
+      projectRoot: this.session.projectRoot,
+      brief: this.session.brief,
+      now: this.now()
+    });
     const capture = createBufferWriter();
 
     renderStatus(
@@ -1231,11 +1474,11 @@ export class ClawResearchTerminalUi {
       this.session,
       this.currentRun,
       this.transcript.filePath,
-      memory,
       currentProjectConfig,
-      literature,
       currentCredentials,
-      agendaSnapshot
+      agendaSnapshot,
+      workerState,
+      workStore
     );
 
     return {

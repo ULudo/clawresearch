@@ -216,6 +216,109 @@ test("dynamic query expansion adds research-agent evaluation vocabulary from bri
   }
 });
 
+test("role-aware source classification separates primary systems from surveys and benchmarks", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-role-classification-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.openalex.org" && url.pathname === "/works") {
+        return new Response(JSON.stringify({
+          results: [
+            {
+              id: "https://openalex.org/W-agent-lab",
+              display_name: "Agent Laboratory: Using LLM Agents as Research Assistants",
+              publication_year: 2025,
+              authorships: [{ author: { display_name: "Agent Author" } }],
+              primary_location: { source: { display_name: "AI Research Systems" }, landing_page_url: "https://example.org/agent-lab" },
+              doi: "https://doi.org/10.1000/agent-lab",
+              best_oa_location: { pdf_url: "https://example.org/agent-lab.pdf" },
+              abstract_inverted_index: toAbstractIndex(
+                "This framework uses LLM agents as research assistants for literature review experiment execution critique and scientific paper writing."
+              )
+            },
+            {
+              id: "https://openalex.org/W-genxai",
+              display_name: "Explainable Generative AI (GenXAI): a survey, conceptualization, and research agenda",
+              publication_year: 2024,
+              authorships: [{ author: { display_name: "Survey Author" } }],
+              primary_location: { source: { display_name: "AI Survey Journal" }, landing_page_url: "https://example.org/genxai" },
+              doi: "https://doi.org/10.1000/genxai",
+              best_oa_location: { pdf_url: "https://example.org/genxai.pdf" },
+              abstract_inverted_index: toAbstractIndex(
+                "This survey and conceptualization reviews explainable generative AI for autonomous research agents and scientific workflows."
+              )
+            },
+            {
+              id: "https://openalex.org/W-paperarena",
+              display_name: "PaperArena: An Evaluation Benchmark for Tool-Augmented Agentic Reasoning on Scientific Literature",
+              publication_year: 2025,
+              authorships: [{ author: { display_name: "Benchmark Author" } }],
+              primary_location: { source: { display_name: "Agent Evaluation" }, landing_page_url: "https://example.org/paperarena" },
+              doi: "https://doi.org/10.1000/paperarena",
+              best_oa_location: { pdf_url: "https://example.org/paperarena.pdf" },
+              abstract_inverted_index: toAbstractIndex(
+                "This benchmark evaluates autonomous research agents and tool-augmented agentic reasoning on scientific literature and retrieval tasks."
+              )
+            },
+            {
+              id: "https://openalex.org/W-legomem",
+              display_name: "LEGOMem: Modular Procedural Memory for Multi-agent LLM Systems for Workflow Automation",
+              publication_year: 2025,
+              authorships: [{ author: { display_name: "Memory Author" } }],
+              primary_location: { source: { display_name: "Workflow Automation" }, landing_page_url: "https://example.org/legomem" },
+              doi: "https://doi.org/10.1000/legomem",
+              best_oa_location: { pdf_url: "https://example.org/legomem.pdf" },
+              abstract_inverted_index: toAbstractIndex(
+                "This modular procedural memory method supports multi-agent LLM systems for autonomous research agents and workflow automation."
+              )
+            }
+          ]
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "LLM-based autonomous research agents",
+        researchQuestion: "How should autonomous research agents be designed and evaluated?",
+        researchDirection: "Compare existing research-agent systems and frameworks.",
+        successCriterion: "Compare at least five existing research-agent systems or frameworks."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Compare autonomous research-agent systems.",
+        rationale: "The review needs primary system/framework evidence rather than only surveys or benchmarks.",
+        searchQueries: ["autonomous research agents systems frameworks"],
+        localFocus: ["planning", "tool use", "evaluation"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: ["openalex"]
+    });
+
+    const assessments = gathered.relevanceAssessments ?? [];
+    const byTitle = (title: string) => assessments.find((assessment) => assessment.title.includes(title));
+
+    assert.equal(byTitle("Agent Laboratory")?.sourceRole, "primary_system");
+    assert.equal(byTitle("GenXAI")?.sourceRole, "survey");
+    assert.notEqual(byTitle("GenXAI")?.selectionDecision, "selected_primary");
+    assert.equal(byTitle("PaperArena")?.sourceRole, "benchmark");
+    assert.notEqual(byTitle("PaperArena")?.selectionDecision, "selected_primary");
+    assert.equal(byTitle("LEGOMem")?.sourceRole, "method_component");
+    assert.notEqual(gathered.selectionQuality?.adequacy, "strong");
+    assert.ok(gathered.selectionQuality?.selectionRationale.some((line) => /Role-aware source gate/i.test(line)));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("provider routing biases openalex, arxiv, and dblp for CS/AI briefs", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-routing-cs-"));
   const originalFetch = globalThis.fetch;
@@ -890,6 +993,108 @@ test("provider retrieval pages beyond the old five-result ceiling", async () => 
     assert.ok(seenPages.includes(1));
     assert.ok(seenPages.includes(2));
     assert.ok(gathered.canonicalPapers.length >= 50, `Expected a broader canonical set, saw ${gathered.canonicalPapers.length}`);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("source gathering emits progress and resolves access only for promising papers", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-incremental-"));
+  const originalFetch = globalThis.fetch;
+  const progressPhases: string[] = [];
+  let unpaywallCalls = 0;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.openalex.org" && url.pathname === "/works") {
+        const page = Number(url.searchParams.get("page") ?? "1");
+
+        if (page > 3) {
+          return new Response(JSON.stringify({ results: [] }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+
+        const results = Array.from({ length: 25 }, (_, index) => {
+          const id = (page - 1) * 25 + index + 1;
+          return {
+            id: `https://openalex.org/W${id}`,
+            display_name: `Autonomous research agent harness architecture and evaluation ${id}`,
+            publication_year: 2025,
+            authorships: [
+              { author: { display_name: "Example Author" } }
+            ],
+            primary_location: {
+              source: {
+                display_name: "AI Systems Review"
+              },
+              landing_page_url: `https://example.org/agents/${id}`
+            },
+            doi: `https://doi.org/10.1000/agent-harness-${id}`,
+            abstract_inverted_index: toAbstractIndex(
+              "Autonomous research agent harness architecture planning tool use retrieval code execution verification reproducibility evaluation benchmark workflow."
+            )
+          };
+        });
+
+        return new Response(JSON.stringify({ results }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      if (url.hostname === "api.unpaywall.org") {
+        unpaywallCalls += 1;
+        return new Response(JSON.stringify({
+          best_oa_location: {
+            url_for_pdf: `https://example.org/fulltext/${unpaywallCalls}.pdf`
+          }
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const gatherer = new DefaultResearchSourceGatherer();
+    const gathered = await gatherer.gather({
+      projectRoot,
+      brief: {
+        topic: "autonomous research agent harnesses",
+        researchQuestion: "How should autonomous research agent harnesses be designed for digital scientific workflows?",
+        researchDirection: "Review architectures, planning, tool use, retrieval, verification, reproducibility, and evaluation.",
+        successCriterion: "Produce design principles grounded in research-agent harness architecture and evaluation evidence."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review autonomous research agent harness architectures and evaluation practices.",
+        rationale: "The run needs a broad metadata pass but should not resolve every paper before source selection.",
+        searchQueries: ["autonomous research agent harness architecture evaluation"],
+        localFocus: ["planning", "tool use", "verification", "reproducibility"]
+      },
+      memoryContext: emptyMemoryContext(),
+      scholarlyProviderIds: ["openalex", "unpaywall"],
+      credentials: {
+        schemaVersion: 1,
+        projectRoot,
+        runtimeDirectory: path.join(projectRoot, ".clawresearch"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        providers: {
+          unpaywall: {
+            email: "researcher@example.org"
+          }
+        }
+      },
+      progress: (event) => {
+        progressPhases.push(`${event.phase}:${event.status}`);
+      }
+    });
+
+    assert.ok(gathered.canonicalPapers.length > 32, `Expected a broad metadata set, saw ${gathered.canonicalPapers.length}`);
+    assert.ok(unpaywallCalls > 0, "Expected targeted OA resolution calls.");
+    assert.ok(unpaywallCalls <= 32, `Expected targeted access resolution, saw ${unpaywallCalls} Unpaywall calls.`);
+    assert.ok(progressPhases.some((phase) => phase.startsWith("provider_query:")));
+    assert.ok(progressPhases.includes("access_resolution:started"));
+    assert.ok(progressPhases.includes("completed:completed"));
+    assert.ok((gathered.retrievalDiagnostics?.providerAttempts[0]?.providerCalls ?? 0) > 0);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });

@@ -1,6 +1,7 @@
 import type {
   ConfigurableProviderCategory,
-  ProjectConfigState
+  ProjectConfigState,
+  RuntimeModelProvider
 } from "./project-config-store.js";
 import {
   getSourceProviderDefinition,
@@ -58,6 +59,17 @@ type AuthPromptFrameOptions = {
   inputLabel: string;
   inputValue: string;
   footerHint: string;
+};
+
+type ModelSetupFrameOptions = {
+  width: number;
+  height: number;
+  stage: "provider" | "model" | "openai-key" | "codex-login";
+  focusIndex: number;
+  provider: RuntimeModelProvider;
+  inputValue: string;
+  progressLines: string[];
+  defaultModel: string;
 };
 
 const minimumWidth = 60;
@@ -551,6 +563,63 @@ export function renderSourceChecklist(
   }
 
   return body.slice(0, normalizedHeight - 1).join("\n");
+}
+
+function modelProviderChoiceLines(focusIndex: number, width: number): string[] {
+  const choices = [
+    ["Ollama local", "Use a model running on your machine."],
+    ["OpenAI API key", "Use direct OpenAI Platform API billing."],
+    ["OpenAI Codex sign-in", "Use ChatGPT/Codex account sign-in."]
+  ] as const;
+
+  return choices.map(([label, description], index) =>
+    truncate(`${index === focusIndex ? ">" : " "} ${index + 1}. ${label} - ${description}`, width)
+  );
+}
+
+function modelProviderName(provider: RuntimeModelProvider): string {
+  switch (provider) {
+    case "ollama":
+      return "Ollama local";
+    case "openai":
+      return "OpenAI API key";
+    case "openai-codex":
+      return "OpenAI Codex sign-in";
+  }
+}
+
+export function renderModelSetupFrame(options: ModelSetupFrameOptions): string {
+  const width = contentWidth(options.width);
+  const height = clampHeight(options.height);
+  const lines: string[] = [
+    "ClawResearch model setup",
+    "",
+    "Choose the model route for this project.",
+    ""
+  ];
+
+  if (options.stage === "provider") {
+    lines.push(...modelProviderChoiceLines(options.focusIndex, width));
+    lines.push("");
+    lines.push("Up/Down chooses, Enter continues, Esc keeps Ollama.");
+  } else if (options.stage === "model") {
+    lines.push(sectionHeader("Model", width));
+    lines.push(...wrapText(`Route: ${modelProviderName(options.provider)}`, width));
+    lines.push(...wrapText(`Model [${options.defaultModel}]: ${options.inputValue}`, width));
+    lines.push("");
+    lines.push("Enter saves this model, blank keeps the default.");
+  } else if (options.stage === "openai-key") {
+    lines.push(sectionHeader("OpenAI API key", width));
+    lines.push(...wrapText("Paste an API key for direct OpenAI Platform access, or leave blank to use OPENAI_API_KEY later.", width));
+    lines.push("");
+    lines.push(...wrapText(`Key: ${options.inputValue.length > 1 ? "*".repeat(Math.max(0, options.inputValue.length - 1)) + "_" : options.inputValue}`, width));
+  } else {
+    lines.push(sectionHeader("OpenAI Codex sign-in", width));
+    lines.push(...(options.progressLines.length === 0 ? ["Waiting for device-code sign-in..."] : options.progressLines)
+      .flatMap((line) => wrapText(line, width)));
+  }
+
+  return lines.slice(0, height - 1).map((line) => pad(line, width)).join("\n");
 }
 
 export function renderAuthPromptFrame(options: AuthPromptFrameOptions): string {

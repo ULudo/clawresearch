@@ -15,9 +15,7 @@ export type RunStatus =
   | "completed"
   | "failed";
 
-export type RunStage =
-  | "literature_review"
-  | "work_package";
+export type RunStage = "literature_review";
 
 export type RunJobRecord = {
   command: string[];
@@ -52,7 +50,6 @@ export type RunArtifactRecord = {
   evidenceMatrixPath: string;
   synthesisPath: string;
   synthesisJsonPath: string;
-  synthesisClusterDirectory: string;
   claimsPath: string;
   verificationPath: string;
   paperOutlinePath: string;
@@ -64,11 +61,6 @@ export type RunArtifactRecord = {
   nextQuestionsPath: string;
   agendaPath: string;
   agendaMarkdownPath: string;
-  workPackagePath: string;
-  methodPlanPath: string;
-  executionChecklistPath: string;
-  findingsPath: string;
-  decisionPath: string;
   summaryPath: string;
   memoryPath: string;
 };
@@ -85,8 +77,6 @@ export type RunRecord = {
   status: RunStatus;
   stage: RunStage;
   statusMessage: string | null;
-  parentRunId: string | null;
-  derivedFromWorkPackageId: string | null;
   brief: ResearchBrief;
   workerPid: number | null;
   job: RunJobRecord;
@@ -211,7 +201,6 @@ function createRunArtifacts(projectRoot: string, runId: string): RunArtifactReco
     evidenceMatrixPath: path.join(runDirectory, "evidence-matrix.json"),
     synthesisPath: path.join(runDirectory, "synthesis.md"),
     synthesisJsonPath: path.join(runDirectory, "synthesis.json"),
-    synthesisClusterDirectory: path.join(runDirectory, "synthesis-clusters"),
     claimsPath: path.join(runDirectory, "claims.json"),
     verificationPath: path.join(runDirectory, "verification.json"),
     paperOutlinePath: path.join(runDirectory, "paper-outline.json"),
@@ -223,11 +212,6 @@ function createRunArtifacts(projectRoot: string, runId: string): RunArtifactReco
     nextQuestionsPath: path.join(runDirectory, "next-questions.json"),
     agendaPath: path.join(runDirectory, "agenda.json"),
     agendaMarkdownPath: path.join(runDirectory, "agenda.md"),
-    workPackagePath: path.join(runDirectory, "work-package.json"),
-    methodPlanPath: path.join(runDirectory, "method-plan.json"),
-    executionChecklistPath: path.join(runDirectory, "execution-checklist.json"),
-    findingsPath: path.join(runDirectory, "findings.json"),
-    decisionPath: path.join(runDirectory, "decision.json"),
     summaryPath: path.join(runDirectory, "summary.md"),
     memoryPath: path.join(runDirectory, "research-journal.json")
   };
@@ -259,7 +243,6 @@ function mergeRunArtifacts(raw: unknown, projectRoot: string, runId: string): Ru
     evidenceMatrixPath: readString(artifacts.evidenceMatrixPath) ?? defaults.evidenceMatrixPath,
     synthesisPath: readString(artifacts.synthesisPath) ?? defaults.synthesisPath,
     synthesisJsonPath: readString(artifacts.synthesisJsonPath) ?? defaults.synthesisJsonPath,
-    synthesisClusterDirectory: readString(artifacts.synthesisClusterDirectory) ?? defaults.synthesisClusterDirectory,
     claimsPath: readString(artifacts.claimsPath) ?? defaults.claimsPath,
     verificationPath: readString(artifacts.verificationPath) ?? defaults.verificationPath,
     paperOutlinePath: readString(artifacts.paperOutlinePath) ?? defaults.paperOutlinePath,
@@ -271,11 +254,6 @@ function mergeRunArtifacts(raw: unknown, projectRoot: string, runId: string): Ru
     nextQuestionsPath: readString(artifacts.nextQuestionsPath) ?? defaults.nextQuestionsPath,
     agendaPath: readString(artifacts.agendaPath) ?? defaults.agendaPath,
     agendaMarkdownPath: readString(artifacts.agendaMarkdownPath) ?? defaults.agendaMarkdownPath,
-    workPackagePath: readString(artifacts.workPackagePath) ?? defaults.workPackagePath,
-    methodPlanPath: readString(artifacts.methodPlanPath) ?? defaults.methodPlanPath,
-    executionChecklistPath: readString(artifacts.executionChecklistPath) ?? defaults.executionChecklistPath,
-    findingsPath: readString(artifacts.findingsPath) ?? defaults.findingsPath,
-    decisionPath: readString(artifacts.decisionPath) ?? defaults.decisionPath,
     summaryPath: readString(artifacts.summaryPath) ?? defaults.summaryPath,
     memoryPath: readString(artifacts.memoryPath) ?? defaults.memoryPath
   };
@@ -294,14 +272,8 @@ function normalizeRunStatus(value: unknown): RunStatus {
   }
 }
 
-function normalizeRunStage(value: unknown): RunStage {
-  switch (value) {
-    case "work_package":
-      return "work_package";
-    case "literature_review":
-    default:
-      return "literature_review";
-  }
+function normalizeRunStage(_value: unknown): RunStage {
+  return "literature_review";
 }
 
 function createRunRecord(
@@ -312,8 +284,6 @@ function createRunRecord(
   timestamp: string,
   options: {
     stage?: RunStage;
-    parentRunId?: string | null;
-    derivedFromWorkPackageId?: string | null;
   } = {}
 ): RunRecord {
   const id = createRunId(timestamp);
@@ -330,8 +300,6 @@ function createRunRecord(
     status: "queued",
     stage: options.stage ?? "literature_review",
     statusMessage: "Detached run launched. Waiting for the run worker to start.",
-    parentRunId: options.parentRunId ?? null,
-    derivedFromWorkPackageId: options.derivedFromWorkPackageId ?? null,
     brief,
     workerPid: null,
     job: {
@@ -370,8 +338,6 @@ function mergeRunRecord(
     status: normalizeRunStatus(record.status),
     stage: normalizeRunStage(record.stage),
     statusMessage: readString(record.statusMessage),
-    parentRunId: readString(record.parentRunId),
-    derivedFromWorkPackageId: readString(record.derivedFromWorkPackageId),
     brief: normalizeBrief(record.brief),
     workerPid: readInteger(record.workerPid),
     job: {
@@ -415,8 +381,6 @@ export class RunStore {
     command: string[],
     options: {
       stage?: RunStage;
-      parentRunId?: string | null;
-      derivedFromWorkPackageId?: string | null;
     }
   ): Promise<RunRecord> {
     const run = createRunRecord(

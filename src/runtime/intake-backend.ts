@@ -1,4 +1,14 @@
 import type { ConversationRole, ResearchBrief } from "./session-store.js";
+import {
+  ModelCredentialStore,
+  type ModelCredentialState,
+  ModelRuntimeError,
+  RuntimeModelClient
+} from "./model-runtime.js";
+import {
+  resolveRuntimeModelConfig,
+  type ProjectConfigState
+} from "./project-config-store.js";
 
 export type IntakeConversationMessage = {
   role: ConversationRole;
@@ -294,6 +304,80 @@ export class OllamaIntakeBackend implements IntakeBackend {
   }
 }
 
+export class OpenAIResponsesIntakeBackend implements IntakeBackend {
+  readonly label: string;
+
+  constructor(private readonly client: RuntimeModelClient) {
+    this.label = client.label;
+  }
+
+  async respond(request: IntakeRequest): Promise<IntakeResponse> {
+    try {
+      const raw = await this.client.jsonCall(
+        [
+          buildInstruction(request),
+          "",
+          ...request.conversation.map((message) => `${message.role}: ${message.content}`)
+        ].join("\n"),
+        {
+          operation: "intake",
+          timeoutMs: 90_000
+        }
+      );
+
+      return normalizeResponse(raw);
+    } catch (error) {
+      if (error instanceof ModelRuntimeError) {
+        throw new Error(error.message);
+      }
+
+      throw error;
+    }
+  }
+
+  async completeBrief(request: IntakeRequest): Promise<ResearchBrief> {
+    try {
+      const raw = await this.client.jsonCall(
+        [
+          buildBriefCompletionInstruction(request),
+          "",
+          ...request.conversation.map((message) => `${message.role}: ${message.content}`)
+        ].join("\n"),
+        {
+          operation: "intake",
+          timeoutMs: 90_000
+        }
+      );
+
+      return normalizeBrief(raw);
+    } catch (error) {
+      if (error instanceof ModelRuntimeError) {
+        throw new Error(error.message);
+      }
+
+      throw error;
+    }
+  }
+}
+
 export function createDefaultIntakeBackend(): IntakeBackend {
   return new OllamaIntakeBackend();
+}
+
+export async function createProjectIntakeBackend(params: {
+  projectRoot: string;
+  projectConfig: ProjectConfigState;
+  timestampFactory?: () => string;
+}): Promise<IntakeBackend> {
+  const runtimeModel = resolveRuntimeModelConfig(params.projectConfig);
+
+  if (runtimeModel.provider === "ollama") {
+    return new OllamaIntakeBackend(runtimeModel.host ?? defaultHost, runtimeModel.model);
+  }
+
+  const credentialStore = new ModelCredentialStore(params.projectRoot, params.timestampFactory);
+  const credentials: ModelCredentialState = await credentialStore.load();
+  return new OpenAIResponsesIntakeBackend(
+    new RuntimeModelClient(runtimeModel, credentials, credentialStore)
+  );
 }

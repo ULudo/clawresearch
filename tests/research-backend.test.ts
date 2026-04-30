@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { OllamaResearchBackend } from "../src/runtime/research-backend.js";
+import {
+  OllamaResearchBackend,
+  OpenAIResponsesResearchBackend
+} from "../src/runtime/research-backend.js";
+import { RuntimeModelClient, type ModelCredentialState } from "../src/runtime/model-runtime.js";
 import type { ProjectMemoryContext } from "../src/runtime/memory-store.js";
 import type { EvidenceMatrix, PaperExtraction } from "../src/runtime/research-evidence.js";
 
@@ -116,6 +120,20 @@ function emptyMemoryContext(): ProjectMemoryContext {
       "Follow the mollifier thread"
     ],
     localFileHints: []
+  };
+}
+
+function modelCredentials(apiKey = "test-openai-key"): ModelCredentialState {
+  return {
+    schemaVersion: 1,
+    projectRoot: "/tmp/project",
+    runtimeDirectory: "/tmp/project/.clawresearch",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    openai: {
+      apiKey
+    },
+    openaiCodex: null
   };
 }
 
@@ -244,8 +262,8 @@ test("research-agent backend uses native tool calls by default", async () => {
             function: {
               name: "choose_research_action",
               arguments: {
-                action: "synthesize_clustered",
-                rationale: "The selected evidence is ready for clustered synthesis.",
+                action: "claim.create",
+                rationale: "The selected evidence is ready for a claim-led synthesis step.",
                 confidence: 0.88,
                 inputs: {
                   searchQueries: [],
@@ -254,8 +272,8 @@ test("research-agent backend uses native tool calls by default", async () => {
                   criticStage: null,
                   reason: null
                 },
-                expectedOutcome: "A synthesis checkpoint is written.",
-                stopCondition: "Stop after synthesis artifacts are checkpointed."
+                expectedOutcome: "A claim object is written to the work store.",
+                stopCondition: "Stop after the claim tool persists the object."
               }
             }
           }]
@@ -275,7 +293,7 @@ test("research-agent backend uses native tool calls by default", async () => {
       phase: "synthesis",
       attempt: 1,
       maxAttempts: 2,
-      allowedActions: ["revise_search_strategy", "synthesize_clustered", "finalize_status_report"],
+      allowedActions: ["source.search", "claim.create", "manuscript.status"],
       brief: {
         topic: "autonomous research agents",
         researchQuestion: "How should the runtime continue?",
@@ -302,14 +320,14 @@ test("research-agent backend uses native tool calls by default", async () => {
       criticReports: []
     });
 
-    assert.equal(decision.action, "synthesize_clustered");
+    assert.equal(decision.action, "claim.create");
     assert.equal(decision.transport, "native_tool_call");
     assert.equal(decision.inputs.paperIds[0], "paper-1");
     assert.equal(capturedBody.tools?.[0]?.function?.name, "choose_research_action");
     assert.deepEqual(capturedBody.tools?.[0]?.function?.parameters?.properties?.action?.enum, [
-      "revise_search_strategy",
-      "synthesize_clustered",
-      "finalize_status_report"
+      "source.search",
+      "claim.create",
+      "manuscript.status"
     ]);
     assert.match(capturedBody.messages?.[0]?.content ?? "", /Call choose_research_action exactly once/);
   } finally {
@@ -346,8 +364,8 @@ test("research-agent backend falls back to strict JSON when native tool calls ar
       return new Response(JSON.stringify({
         message: {
           content: JSON.stringify({
-            action: "synthesize_clustered",
-            rationale: "The strict JSON fallback selected synthesis.",
+            action: "claim.create",
+            rationale: "The strict JSON fallback selected claim creation.",
             confidence: 0.72,
             inputs: {
               searchQueries: [],
@@ -356,8 +374,8 @@ test("research-agent backend falls back to strict JSON when native tool calls ar
               criticStage: null,
               reason: null
             },
-            expectedOutcome: "A synthesis checkpoint is written.",
-            stopCondition: "Stop after synthesis artifacts are checkpointed."
+            expectedOutcome: "A claim object is written to the work store.",
+            stopCondition: "Stop after the claim tool persists the object."
           })
         }
       }), {
@@ -375,7 +393,7 @@ test("research-agent backend falls back to strict JSON when native tool calls ar
       phase: "synthesis",
       attempt: 1,
       maxAttempts: 2,
-      allowedActions: ["revise_search_strategy", "synthesize_clustered", "finalize_status_report"],
+      allowedActions: ["source.search", "claim.create", "manuscript.status"],
       brief: {
         topic: "autonomous research agents",
         researchQuestion: "How should the runtime continue?",
@@ -402,12 +420,112 @@ test("research-agent backend falls back to strict JSON when native tool calls ar
       criticReports: []
     });
 
-    assert.equal(decision.action, "synthesize_clustered");
+    assert.equal(decision.action, "claim.create");
     assert.equal(decision.transport, "strict_json");
+    assert.equal(decision.transportFallback?.from, "native_tool_call");
+    assert.equal(decision.transportFallback?.to, "strict_json");
+    assert.equal(decision.transportFallback?.kind, "malformed_json");
     assert.equal(capturedBodies.length, 2);
     assert.ok(Array.isArray(capturedBodies[0]?.tools));
     assert.equal(capturedBodies[1]?.format, "json");
     assert.equal(capturedBodies[1]?.tools, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("OpenAI Responses backend uses native function tools for research actions", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedUrl = "";
+  let capturedAuth = "";
+  let capturedBody: {
+    model?: string;
+    tools?: Array<Record<string, unknown>>;
+    tool_choice?: Record<string, unknown>;
+    instructions?: string;
+  } = {};
+
+  try {
+    globalThis.fetch = async (input, init): Promise<Response> => {
+      capturedUrl = String(input);
+      capturedAuth = new Headers(init?.headers as Record<string, string>).get("authorization") ?? "";
+      capturedBody = JSON.parse(String(init?.body)) as typeof capturedBody;
+      return new Response(JSON.stringify({
+        output: [{
+          type: "function_call",
+          name: "choose_research_action",
+          arguments: JSON.stringify({
+            action: "claim.create",
+            rationale: "The selected evidence is ready for claim creation.",
+            confidence: 0.86,
+            inputs: {
+              searchQueries: [],
+              evidenceTargets: [],
+              paperIds: ["paper-1"],
+              criticStage: null,
+              reason: null
+            },
+            expectedOutcome: "A claim object is written to the work store.",
+            stopCondition: "Stop after the claim tool persists the object."
+          })
+        }]
+      }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json"
+        }
+      });
+    };
+
+    const backend = new OpenAIResponsesResearchBackend(new RuntimeModelClient({
+      provider: "openai",
+      model: "gpt-test",
+      host: null,
+      baseUrl: "https://api.openai.test/v1",
+      configured: true,
+      label: "openai:gpt-test"
+    }, modelCredentials()));
+    const decision = await backend.chooseResearchAction({
+      projectRoot: "/tmp/project",
+      runId: "run-agent-step",
+      phase: "synthesis",
+      attempt: 1,
+      maxAttempts: 2,
+      allowedActions: ["source.search", "claim.create", "manuscript.status"],
+      brief: {
+        topic: "autonomous research agents",
+        researchQuestion: "How should the runtime continue?",
+        researchDirection: "Use an action loop.",
+        successCriterion: "Choose the next validated action."
+      },
+      plan: {
+        researchMode: "literature_synthesis",
+        objective: "Review action-loop designs.",
+        rationale: "The brief asks for autonomous research behavior.",
+        searchQueries: ["autonomous research agents tool use"],
+        localFocus: ["action loop"]
+      },
+      observations: {
+        canonicalPapers: 5,
+        selectedPapers: 4,
+        extractedPapers: 4,
+        evidenceRows: 4,
+        evidenceInsights: 2,
+        manuscriptReadiness: null,
+        revisionPassesUsed: 0,
+        revisionPassesRemaining: 3
+      },
+      criticReports: []
+    });
+
+    assert.equal(decision.action, "claim.create");
+    assert.equal(decision.transport, "native_tool_call");
+    assert.equal(capturedUrl, "https://api.openai.test/v1/responses");
+    assert.equal(capturedAuth, "Bearer test-openai-key");
+    assert.equal(capturedBody.model, "gpt-test");
+    assert.equal(capturedBody.tools?.[0]?.name, "choose_research_action");
+    assert.equal(capturedBody.tool_choice?.name, "choose_research_action");
+    assert.match(capturedBody.instructions ?? "", /Call choose_research_action exactly once/);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -436,6 +554,7 @@ test("critic backend uses the separate critic model and excludes research memory
               searchQueries: [],
               evidenceTargets: [],
               papersToExclude: [],
+              papersToPromote: [],
               claimsToSoften: []
             }
           })
@@ -477,7 +596,7 @@ test("critic backend uses the separate critic model and excludes research memory
   }
 });
 
-test("synthesis backend uses canonical papers in the specialized literature-review prompt", async () => {
+test("agent-step backend exposes first-class claim and manuscript-section tools", async () => {
   const originalFetch = globalThis.fetch;
   let capturedPrompt = "";
 
@@ -491,10 +610,31 @@ test("synthesis backend uses canonical papers in the specialized literature-revi
       return new Response(JSON.stringify({
         message: {
           content: JSON.stringify({
-            executiveSummary: "A literature-grounded summary.",
-            themes: [],
-            claims: [],
-            nextQuestions: []
+            action: "claim.create",
+            rationale: "Create the next evidence-backed claim from the work store.",
+            confidence: 0.83,
+            inputs: {
+              searchQueries: [],
+              evidenceTargets: [],
+              paperIds: ["paper-1"],
+              criticStage: null,
+              reason: null,
+              workStore: {
+                collection: "claims",
+                entityId: null,
+                filters: {},
+                semanticQuery: null,
+                limit: null,
+                changes: {},
+                entity: {
+                  text: "The reviewed papers support a bounded claim.",
+                  evidence: "The evidence cell and source screening support this claim.",
+                  sourceIds: ["paper-1"]
+                }
+              }
+            },
+            expectedOutcome: "A claim object is persisted.",
+            stopCondition: "The claim exists in the work store."
           })
         }
       }), {
@@ -506,8 +646,13 @@ test("synthesis backend uses canonical papers in the specialized literature-revi
     };
 
     const backend = new OllamaResearchBackend("127.0.0.1:11434", "stub-model");
-    await backend.synthesizeResearch({
+    const decision = await backend.chooseResearchAction({
       projectRoot: "/tmp/project",
+      runId: "run-agent-step",
+      phase: "synthesis",
+      attempt: 1,
+      maxAttempts: 2,
+      allowedActions: ["work_store.query", "claim.create", "evidence.update_cell", "manuscript.add_paragraph", "manuscript.check_section_claims", "manuscript.status"],
       brief: {
         topic: "autonomous research agents",
         researchQuestion: "What best practices in the literature matter most?",
@@ -521,111 +666,54 @@ test("synthesis backend uses canonical papers in the specialized literature-revi
         searchQueries: ["autonomous research agents literature review"],
         localFocus: ["evaluation practices"]
       },
-      papers: [
-        {
+      observations: {
+        canonicalPapers: 4,
+        selectedPapers: 3,
+        extractedPapers: 3,
+        evidenceRows: 3,
+        evidenceInsights: 2,
+        manuscriptReadiness: "needs_human_review",
+        revisionPassesUsed: 0,
+        revisionPassesRemaining: 2
+      },
+      workStore: {
+        path: "/tmp/project/.clawresearch/research-state.json",
+        summary: {
+          canonicalSources: 3,
+          extractions: 3,
+          evidenceCells: 6,
+          claims: 0,
+          openWorkItems: 1,
+          releaseChecks: 0
+        },
+        worker: {
+          status: "working",
+          statusReason: "Testing the agent tool loop.",
+          paperReadiness: "needs_human_review",
+          nextInternalActions: ["Create claim-led synthesis objects."],
+          userBlockers: []
+        },
+        openWorkItems: [],
+        recentSources: [{
           id: "paper-1",
-          key: "doi:10.1000/agents",
           title: "Design Patterns for Autonomous Research Agents",
-          citation: "Example Author (2026). Design Patterns for Autonomous Research Agents.",
-          abstract: "This review compares architecture choices and evaluation practices.",
-          year: 2026,
-          authors: ["Example Author"],
-          venue: "AI Systems Review",
-          discoveredVia: ["openalex"],
-          identifiers: {
-            doi: "10.1000/agents",
-            pmid: null,
-            pmcid: null,
-            arxivId: null
-          },
-          discoveryRecords: [],
-          accessCandidates: [],
-          bestAccessUrl: "https://example.org/agents.pdf",
-          bestAccessProvider: "openalex",
-          accessMode: "fulltext_open",
-          fulltextFormat: "pdf",
-          license: null,
-          tdmAllowed: true,
-          contentStatus: {
-            abstractAvailable: true,
-            fulltextAvailable: true,
-            fulltextFetched: false,
-            fulltextExtracted: false
-          },
-          screeningHistory: [{
-            stage: "title",
-            decision: "uncertain",
-            rationale: "Retained after title screening for deeper review."
-          }, {
-            stage: "abstract",
-            decision: "include",
-            rationale: "Abstract-level screening supported deeper review."
-          }, {
-            stage: "fulltext",
-            decision: "include",
-            rationale: "Highly relevant."
-          }],
-          screeningStage: "fulltext",
           screeningDecision: "include",
-          screeningRationale: "Highly relevant.",
-          accessErrors: [],
-          tags: ["quality:high", "quality-signal:journal-like-venue"],
-          runIds: [],
-          linkedThemeIds: [],
-          linkedClaimIds: [],
-          createdAt: "2026-01-01T00:00:00.000Z",
-          updatedAt: "2026-01-01T00:00:00.000Z"
-        }
-      ],
-      paperExtractions: [extractionForPaper("paper-1")],
-      evidenceMatrix: matrixForPaper("paper-1"),
-      selectionQuality: {
-        schemaVersion: 1,
-        requiredFacets: [{
-          id: "facet-1",
-          label: "agent evaluation",
-          kind: "evaluation",
-          required: true,
-          terms: ["agent evaluation"],
-          source: "success_criterion",
-          rationale: "Test facet."
+          accessMode: "fulltext_open"
         }],
-        optionalFacets: [],
-        paperFacetCoverage: [{
-          paperId: "paper-1",
-          coveredFacetIds: ["facet-1"],
-          missingRequiredFacetIds: [],
-          coverageScore: 4,
-          matchedTerms: ["agent evaluation"],
-          rationale: "Covered."
-        }],
-        selectedSetCoverage: [{
-          facetId: "facet-1",
-          label: "agent evaluation",
-          required: true,
-          coveredByPaperIds: ["paper-1"],
-          count: 1
-        }],
-        missingRequiredFacets: [],
-        backgroundOnlyFacets: [],
-        adequacy: "partial",
-        selectionRationale: ["Selected set covers the test facet."]
-      }
+        recentClaims: [],
+        recentSections: [],
+        recentCitations: []
+      },
+      criticReports: []
     });
 
-    assert.match(capturedPrompt, /dedicated literature-review synthesis module/i);
-    assert.match(capturedPrompt, /Treat this as a literature review subsystem/i);
-    assert.match(capturedPrompt, /Sources:/);
-    assert.match(capturedPrompt, /canonical_paper/);
-    assert.match(capturedPrompt, /agents\.pdf/);
-    assert.match(capturedPrompt, /Paper extractions:/);
-    assert.match(capturedPrompt, /Evidence matrix:/);
-    assert.match(capturedPrompt, /Use only exact sourceIds from the provided reviewed paper set/i);
-    assert.match(capturedPrompt, /quality:low/i);
-    assert.match(capturedPrompt, /Do not treat a loosely related background source as direct evidence/i);
-    assert.match(capturedPrompt, /Review selection quality:/);
-    assert.match(capturedPrompt, /agent evaluation/);
-    assert.match(capturedPrompt, /evidence-boundary report/i);
+    assert.equal(decision.action, "claim.create");
+    assert.match(capturedPrompt, /work_store\.query/i);
+    assert.match(capturedPrompt, /claim\.create/i);
+    assert.match(capturedPrompt, /evidence\.update_cell/i);
+    assert.match(capturedPrompt, /manuscript\.add_paragraph/i);
+    assert.match(capturedPrompt, /manuscript\.check_section_claims/i);
+    assert.doesNotMatch(capturedPrompt, /synthesize_clustered|finalize_status_report|write_final_report/i);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -744,123 +832,6 @@ test("extraction backend normalizes paper-by-paper extraction records", async ()
     assert.equal(extractions[0]?.paperId, "paper-1");
     assert.equal(extractions[0]?.confidence, "medium");
     assert.deepEqual(extractions[0]?.successSignals, ["bounded autonomy"]);
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test("synthesis backend reconciles near-miss source ids to the reviewed paper set", async () => {
-  const originalFetch = globalThis.fetch;
-
-  try {
-    globalThis.fetch = async (): Promise<Response> => {
-      return new Response(JSON.stringify({
-        message: {
-          content: JSON.stringify({
-            executiveSummary: "A literature-grounded summary.",
-            themes: [
-              {
-                title: "Technique families",
-                summary: "The literature clusters around a few families.",
-                sourceIds: ["paper-pv8531"]
-              }
-            ],
-            claims: [
-              {
-                claim: "Mollifier methods remain central.",
-                evidence: "Reviewed papers emphasize mollifier limitations.",
-                sourceIds: ["paper-pv8531"]
-              }
-            ],
-            nextQuestions: ["Which obstacle matters most next?"]
-          })
-        }
-      }), {
-        status: 200,
-        headers: {
-          "content-type": "application/json"
-        }
-      });
-    };
-
-    const backend = new OllamaResearchBackend("127.0.0.1:11434", "stub-model");
-    const synthesis = await backend.synthesizeResearch({
-      projectRoot: "/tmp/project",
-      brief: {
-        topic: "Riemann Hypothesis",
-        researchQuestion: "Which technique families matter most?",
-        researchDirection: "Review proof-technique families.",
-        successCriterion: "Produce a grounded technique map."
-      },
-      plan: {
-        researchMode: "literature_synthesis",
-        objective: "Synthesize proof-technique families.",
-        rationale: "This is a literature review task.",
-        searchQueries: ["Riemann Hypothesis proof techniques"],
-        localFocus: ["mollifier methods"]
-      },
-      papers: [
-        {
-          id: "paper-pv8536",
-          key: "doi:10.1000/mollifier",
-          title: "Mollifier Methods for the Riemann Hypothesis",
-          citation: "Example Author (2025). Mollifier Methods for the Riemann Hypothesis.",
-          abstract: "Survey of mollifier methods and known limitations.",
-          year: 2025,
-          authors: ["Example Author"],
-          venue: "Journal of Number Theory",
-          discoveredVia: ["openalex"],
-          identifiers: {
-            doi: "10.1000/mollifier",
-            pmid: null,
-            pmcid: null,
-            arxivId: null
-          },
-          discoveryRecords: [],
-          accessCandidates: [],
-          bestAccessUrl: "https://example.org/mollifier.pdf",
-          bestAccessProvider: "openalex",
-          accessMode: "fulltext_open",
-          fulltextFormat: "pdf",
-          license: null,
-          tdmAllowed: true,
-          contentStatus: {
-            abstractAvailable: true,
-            fulltextAvailable: true,
-            fulltextFetched: false,
-            fulltextExtracted: false
-          },
-          screeningHistory: [{
-            stage: "title",
-            decision: "uncertain",
-            rationale: "Retained after title screening for deeper review."
-          }, {
-            stage: "abstract",
-            decision: "include",
-            rationale: "Abstract-level screening supported deeper review."
-          }, {
-            stage: "fulltext",
-            decision: "include",
-            rationale: "Highly relevant."
-          }],
-          screeningStage: "fulltext",
-          screeningDecision: "include",
-          screeningRationale: "Highly relevant.",
-          accessErrors: [],
-          tags: ["quality:high", "quality-signal:journal-like-venue"],
-          runIds: [],
-          linkedThemeIds: [],
-          linkedClaimIds: [],
-          createdAt: "2026-01-01T00:00:00.000Z",
-          updatedAt: "2026-01-01T00:00:00.000Z"
-        }
-      ],
-      paperExtractions: [extractionForPaper("paper-pv8536")],
-      evidenceMatrix: matrixForPaper("paper-pv8536")
-    });
-
-    assert.deepEqual(synthesis.themes[0]?.sourceIds, ["paper-pv8536"]);
-    assert.deepEqual(synthesis.claims[0]?.sourceIds, ["paper-pv8536"]);
   } finally {
     globalThis.fetch = originalFetch;
   }

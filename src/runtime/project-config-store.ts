@@ -19,7 +19,7 @@ import {
 import { runtimeDirectoryPath } from "./session-store.js";
 import type { ResearchAgentControlMode } from "./research-agent.js";
 
-const projectConfigSchemaVersion = 7;
+const projectConfigSchemaVersion = 8;
 const projectConfigFileName = "project-config.json";
 const selectableProviderCategories = [
   "scholarlyDiscovery",
@@ -50,19 +50,25 @@ export type ProjectConfigSourcesState = {
   explicitlyConfigured: boolean;
 };
 
+export type RuntimeModelProvider = "ollama" | "openai" | "openai-codex";
+
+export type RuntimeModelConfig = {
+  provider: RuntimeModelProvider;
+  model: string;
+  host: string | null;
+  baseUrl: string | null;
+  configured: boolean;
+};
+
 export type RuntimeLlmConfig = {
   planningTimeoutMs: number;
   extractionTimeoutMs: number;
-  synthesisTimeoutMs: number;
   agendaTimeoutMs: number;
   criticTimeoutMs: number;
   agentStepTimeoutMs: number;
   extractionInitialBatchSize: number;
   extractionMinBatchSize: number;
   extractionRetryBudget: number;
-  synthesisInitialClusterSize: number;
-  synthesisMinClusterSize: number;
-  synthesisRetryBudget: number;
   agentControlMode: ResearchAgentControlMode;
   agentInvalidActionBudget: number;
   totalRecoveryBudgetMs: number;
@@ -77,7 +83,7 @@ export type ProjectConfigState = {
   updatedAt: string;
   sources: ProjectConfigSourcesState;
   runtime: {
-    postReviewBehavior: "confirm" | "auto_continue";
+    model: RuntimeModelConfig;
     llm: RuntimeLlmConfig;
   };
 };
@@ -98,6 +104,17 @@ function readString(value: unknown): string | null {
 
 function readBoolean(value: unknown): boolean | null {
   return typeof value === "boolean" ? value : null;
+}
+
+function readRuntimeModelProvider(value: unknown): RuntimeModelProvider | null {
+  switch (value) {
+    case "ollama":
+    case "openai":
+    case "openai-codex":
+      return value;
+    default:
+      return null;
+  }
 }
 
 function readAgentControlMode(value: unknown): ResearchAgentControlMode | null {
@@ -144,21 +161,141 @@ function readStringArray(value: unknown): string[] {
 export const defaultRuntimeLlmConfig: RuntimeLlmConfig = {
   planningTimeoutMs: 300_000,
   extractionTimeoutMs: 300_000,
-  synthesisTimeoutMs: 300_000,
   agendaTimeoutMs: 300_000,
   criticTimeoutMs: 300_000,
   agentStepTimeoutMs: 300_000,
   extractionInitialBatchSize: 6,
   extractionMinBatchSize: 1,
   extractionRetryBudget: 24,
-  synthesisInitialClusterSize: 6,
-  synthesisMinClusterSize: 1,
-  synthesisRetryBudget: 12,
   agentControlMode: "auto",
   agentInvalidActionBudget: 2,
   totalRecoveryBudgetMs: 1_800_000,
   evidenceRecoveryMaxPasses: 3
 };
+
+export const defaultRuntimeModelConfig: RuntimeModelConfig = {
+  provider: "ollama",
+  model: "qwen3:14b",
+  host: "127.0.0.1:11434",
+  baseUrl: null,
+  configured: false
+};
+
+const defaultOpenAiModel = "gpt-5.5";
+const defaultOpenAiCodexModel = "gpt-5.5";
+const defaultOpenAiBaseUrl = "https://api.openai.com/v1";
+const defaultOpenAiCodexBaseUrl = "https://chatgpt.com/backend-api/codex";
+
+function defaultRuntimeModelForProvider(provider: RuntimeModelProvider): RuntimeModelConfig {
+  switch (provider) {
+    case "openai":
+      return {
+        provider,
+        model: defaultOpenAiModel,
+        host: null,
+        baseUrl: defaultOpenAiBaseUrl,
+        configured: false
+      };
+    case "openai-codex":
+      return {
+        provider,
+        model: defaultOpenAiCodexModel,
+        host: null,
+        baseUrl: defaultOpenAiCodexBaseUrl,
+        configured: false
+      };
+    case "ollama":
+      return { ...defaultRuntimeModelConfig };
+  }
+}
+
+function normalizeRuntimeModelConfig(raw: unknown): RuntimeModelConfig {
+  const record = asObject(raw);
+  const provider = readRuntimeModelProvider(record.provider) ?? defaultRuntimeModelConfig.provider;
+  const base = defaultRuntimeModelForProvider(provider);
+  const configured = readBoolean(record.configured) ?? base.configured;
+
+  return {
+    provider,
+    model: readString(record.model) ?? base.model,
+    host: readString(record.host) ?? base.host,
+    baseUrl: readString(record.baseUrl) ?? base.baseUrl,
+    configured
+  };
+}
+
+export type ResolvedRuntimeModelConfig = RuntimeModelConfig & {
+  label: string;
+};
+
+function providerDefaultEnvModel(provider: RuntimeModelProvider, env: NodeJS.ProcessEnv): string | null {
+  switch (provider) {
+    case "ollama":
+      return readString(env.CLAWRESEARCH_OLLAMA_MODEL);
+    case "openai":
+      return readString(env.CLAWRESEARCH_OPENAI_MODEL);
+    case "openai-codex":
+      return readString(env.CLAWRESEARCH_OPENAI_CODEX_MODEL);
+  }
+}
+
+function providerDefaultEnvHost(provider: RuntimeModelProvider, env: NodeJS.ProcessEnv): string | null {
+  switch (provider) {
+    case "ollama":
+      return readString(env.OLLAMA_HOST);
+    case "openai":
+      return null;
+    case "openai-codex":
+      return null;
+  }
+}
+
+function providerDefaultEnvBaseUrl(provider: RuntimeModelProvider, env: NodeJS.ProcessEnv): string | null {
+  switch (provider) {
+    case "ollama":
+      return null;
+    case "openai":
+      return readString(env.OPENAI_BASE_URL) ?? readString(env.CLAWRESEARCH_OPENAI_BASE_URL);
+    case "openai-codex":
+      return readString(env.CLAWRESEARCH_OPENAI_CODEX_BASE_URL);
+  }
+}
+
+export function resolveRuntimeModelConfig(
+  config: ProjectConfigState,
+  env: NodeJS.ProcessEnv = process.env
+): ResolvedRuntimeModelConfig {
+  const configured = normalizeRuntimeModelConfig(config.runtime.model);
+  const provider = readRuntimeModelProvider(env.CLAWRESEARCH_MODEL_PROVIDER)
+    ?? configured.provider;
+  const base = provider === configured.provider
+    ? configured
+    : defaultRuntimeModelForProvider(provider);
+  const model = readString(env.CLAWRESEARCH_MODEL)
+    ?? providerDefaultEnvModel(provider, env)
+    ?? base.model;
+  const host = providerDefaultEnvHost(provider, env)
+    ?? base.host;
+  const baseUrl = providerDefaultEnvBaseUrl(provider, env)
+    ?? base.baseUrl;
+  const envConfigured = readString(env.CLAWRESEARCH_MODEL_PROVIDER) !== null
+    || readString(env.CLAWRESEARCH_MODEL) !== null
+    || providerDefaultEnvModel(provider, env) !== null;
+  const resolved: RuntimeModelConfig = {
+    provider,
+    model,
+    host,
+    baseUrl,
+    configured: base.configured || envConfigured
+  };
+
+  return {
+    ...resolved,
+    label: provider === "ollama"
+      ? `ollama:${model}`
+      : `${provider}:${model}`
+  };
+}
 
 function normalizeRuntimeLlmConfig(raw: unknown): RuntimeLlmConfig {
   const record = asObject(raw);
@@ -170,27 +307,16 @@ function normalizeRuntimeLlmConfig(raw: unknown): RuntimeLlmConfig {
     readPositiveInteger(record.extractionInitialBatchSize)
       ?? base.extractionInitialBatchSize
   );
-  const synthesisMinClusterSize = readPositiveInteger(record.synthesisMinClusterSize)
-    ?? base.synthesisMinClusterSize;
-  const synthesisInitialClusterSize = Math.max(
-    synthesisMinClusterSize,
-    readPositiveInteger(record.synthesisInitialClusterSize)
-      ?? base.synthesisInitialClusterSize
-  );
 
   return {
     planningTimeoutMs: readPositiveInteger(record.planningTimeoutMs) ?? base.planningTimeoutMs,
     extractionTimeoutMs: readPositiveInteger(record.extractionTimeoutMs) ?? base.extractionTimeoutMs,
-    synthesisTimeoutMs: readPositiveInteger(record.synthesisTimeoutMs) ?? base.synthesisTimeoutMs,
     agendaTimeoutMs: readPositiveInteger(record.agendaTimeoutMs) ?? base.agendaTimeoutMs,
     criticTimeoutMs: readPositiveInteger(record.criticTimeoutMs) ?? base.criticTimeoutMs,
     agentStepTimeoutMs: readPositiveInteger(record.agentStepTimeoutMs) ?? base.agentStepTimeoutMs,
     extractionInitialBatchSize,
     extractionMinBatchSize,
     extractionRetryBudget: readPositiveInteger(record.extractionRetryBudget) ?? base.extractionRetryBudget,
-    synthesisInitialClusterSize,
-    synthesisMinClusterSize,
-    synthesisRetryBudget: readPositiveInteger(record.synthesisRetryBudget) ?? base.synthesisRetryBudget,
     agentControlMode: readAgentControlMode(record.agentControlMode) ?? base.agentControlMode,
     agentInvalidActionBudget: readPositiveInteger(record.agentInvalidActionBudget) ?? base.agentInvalidActionBudget,
     totalRecoveryBudgetMs: readPositiveInteger(record.totalRevisionBudgetMs)
@@ -215,13 +341,6 @@ export function resolveRuntimeLlmConfig(
     readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_EXTRACTION_BATCH_SIZE")
       ?? configured.extractionInitialBatchSize
   );
-  const synthesisMinClusterSize = readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_SYNTHESIS_MIN_CLUSTER_SIZE")
-    ?? configured.synthesisMinClusterSize;
-  const synthesisInitialClusterSize = Math.max(
-    synthesisMinClusterSize,
-    readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_SYNTHESIS_CLUSTER_SIZE")
-      ?? configured.synthesisInitialClusterSize
-  );
 
   return {
     planningTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_PLANNING_TIMEOUT_MS")
@@ -230,9 +349,6 @@ export function resolveRuntimeLlmConfig(
     extractionTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_EXTRACTION_TIMEOUT_MS")
       ?? baseTimeout
       ?? configured.extractionTimeoutMs,
-    synthesisTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_SYNTHESIS_TIMEOUT_MS")
-      ?? baseTimeout
-      ?? configured.synthesisTimeoutMs,
     agendaTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_AGENDA_TIMEOUT_MS")
       ?? baseTimeout
       ?? configured.agendaTimeoutMs,
@@ -246,10 +362,6 @@ export function resolveRuntimeLlmConfig(
     extractionMinBatchSize,
     extractionRetryBudget: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_EXTRACTION_RETRY_BUDGET")
       ?? configured.extractionRetryBudget,
-    synthesisInitialClusterSize,
-    synthesisMinClusterSize,
-    synthesisRetryBudget: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_SYNTHESIS_RETRY_BUDGET")
-      ?? configured.synthesisRetryBudget,
     agentControlMode: readAgentControlMode(env.CLAWRESEARCH_AGENT_CONTROL_MODE)
       ?? configured.agentControlMode,
     agentInvalidActionBudget: readEnvPositiveInteger(env, "CLAWRESEARCH_AGENT_INVALID_ACTION_BUDGET")
@@ -302,7 +414,7 @@ function emptyConfig(projectRoot: string, timestamp: string): ProjectConfigState
       explicitlyConfigured: false
     },
     runtime: {
-      postReviewBehavior: "confirm",
+      model: { ...defaultRuntimeModelConfig },
       llm: { ...defaultRuntimeLlmConfig }
     }
   };
@@ -358,9 +470,7 @@ function mergeProjectConfig(
         ?? base.sources.explicitlyConfigured
     },
     runtime: {
-      postReviewBehavior: readString(asObject(record.runtime).postReviewBehavior) === "auto_continue"
-        ? "auto_continue"
-        : "confirm",
+      model: normalizeRuntimeModelConfig(asObject(record.runtime).model),
       llm: normalizeRuntimeLlmConfig(asObject(record.runtime).llm)
     }
   };
@@ -518,9 +628,7 @@ export class ProjectConfigStore {
         explicitlyConfigured: config.sources.explicitlyConfigured
       },
       runtime: {
-        postReviewBehavior: config.runtime.postReviewBehavior === "auto_continue"
-          ? "auto_continue"
-          : "confirm",
+        model: normalizeRuntimeModelConfig(config.runtime.model),
         llm: normalizeRuntimeLlmConfig(config.runtime.llm)
       }
     };

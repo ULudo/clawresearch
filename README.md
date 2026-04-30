@@ -105,7 +105,7 @@ The intake chat gradually clarifies and captures:
 - research direction
 - success criterion
 
-If the consultant proposes a concrete first-pass brief, `/go` can accept that draft directly, start a detached literature-review run, stream live progress in the terminal, and persist the run artifacts under the project runtime directory. A successful literature run now also writes a ranked research agenda and, when possible, a selected next work package. By default ClawResearch stops after agenda generation and waits for `/continue` before launching that next bounded work package.
+If the consultant proposes a concrete first-pass brief, `/go` can accept that draft directly, start a detached literature-review run, stream live progress in the terminal, and persist the run artifacts under the project runtime directory. A successful literature run now writes a ranked research agenda and, when possible, a selected next research focus. If you revise the brief after reading the outcome, run `/go` again so ClawResearch continues from the updated project state instead of switching to a separate continuation command.
 
 After a run exists, the chat shifts from pure intake into a project-aware research assistant. It can summarize the latest run, explain the current blocker or next step, answer questions about the active project state, and react to requested changes in the research direction. When you materially change the brief after a saved run, ClawResearch will keep the updated brief and nudge you to run `/go` again so the artifacts catch up with the new direction.
 
@@ -116,7 +116,6 @@ Useful slash commands inside the console:
 - `/agenda`
 - `/sources`
 - `/go`
-- `/continue`
 - `/pause`
 - `/resume`
 - `/quit`
@@ -163,10 +162,10 @@ Run artifacts now include:
 - `agenda.json`
 - `agenda.md`
 - `work-package.json`
-- `method-plan.json`
-- `execution-checklist.json`
-- `findings.json`
-- `decision.json`
+- `paper.md`
+- `paper.json`
+- `manuscript-checks.json`
+- `quality-report.json`
 
 Project-level literature configuration is persisted in:
 
@@ -180,16 +179,10 @@ Project-level credentials are persisted locally in:
 .clawresearch/credentials.json
 ```
 
-The runtime now also keeps a structured research journal in:
+The runtime keeps the canonical agent-accessible research work store in:
 
 ```text
-.clawresearch/research-journal.json
-```
-
-The canonical paper library now lives in:
-
-```text
-.clawresearch/library.json
+.clawresearch/research-work-store.json
 ```
 
 The current accepted research direction lives in:
@@ -229,40 +222,23 @@ Each run keeps a small set of debuggable local artifacts, including:
 - `next-questions.json`
 - `agenda.json`
 - `summary.md`
-- `research-journal.json`
+- `research-journal.json` (now a run-local work-store checkpoint)
 
 `events.jsonl` is the structured event stream the console watches while a run is active. It currently emits small, readable steps such as `plan`, `source`, `claim`, `next`, `exec`, `summary`, and terminal `run` updates.
 
-The project-level research journal is intentionally simple rather than graph-heavy. It stores typed records such as:
+The project-level work store is the durable research memory. It stores typed research objects such as:
 
-- `claim`
-- `finding`
-- `question`
-- `idea`
-- `summary`
-- `artifact`
-- `direction`
-- `hypothesis`
-- `method_plan`
+- provider runs
+- sources and canonical sources
+- screening decisions and full-text/access records
+- extractions and evidence cells
+- claims, citations, and manuscript sections
+- critic/check work items
+- release checks and worker state
 
-Each record has a stable id, lightweight links to related records, and enough metadata to debug how a run's outputs connect without introducing a large orchestration system. The journal is focused on agent-derived working knowledge rather than duplicating canonical papers.
+Each object has a stable id and enough metadata for the agent to query, read, patch, and extend the research state without treating per-run artifacts as long-term memory.
 
-The research journal is now also used actively by later runs. The planner and source gatherer receive a summarized project memory context so the next pass can build on prior findings, questions, ideas, and artifacts instead of starting cold each time.
-
-ClawResearch now also keeps a separate literature-oriented store instead of flattening papers into generic memory only. That store currently maintains:
-
-- canonical paper cards
-- theme boards
-- review notebooks
-
-In practice:
-
-- `research-journal.json` stores the agent's derived findings, questions, hypotheses, ideas, directions, and plans
-- `library.json` stores the canonical paper graph and literature review structure
-- `research-direction.json` stores the current accepted research direction / agenda
-- `runs/<run-id>/literature-review.json` stores the literature snapshot for one `/go` run
-
-This keeps the literature review path easier to inspect and easier for an LLM to reuse as a compact working context on later runs.
+The planner and source gatherer receive compact contexts derived from this work store, so later `/go` segments build on prior sources, unresolved work items, evidence cells, claims, and manuscript state instead of starting cold each time.
 
 The detached worker now runs a minimal explicit research loop. It is still intentionally small, but it no longer just boots and exits. The current loop does this:
 
@@ -331,13 +307,13 @@ run        Sources: .clawresearch/runs/run-.../sources.json
 run        Literature review: .clawresearch/runs/run-.../literature-review.json
 run        Synthesis: .clawresearch/runs/run-.../synthesis.md
 run        Verification: .clawresearch/runs/run-.../verification.json
-run        Research journal snapshot: .clawresearch/runs/run-.../research-journal.json
+run        Work-store checkpoint: .clawresearch/runs/run-.../research-journal.json
 watch      Streaming live run activity from .clawresearch/runs/run-.../events.jsonl.
 plan       Plan the research mode and generate initial search queries.
 source     web-1: ...
 claim      ...
 verify     Verified 1 claims against 2 sources. 1 supported, 0 partially supported, 0 unverified, 0 explicit unknown.
-memory     Recorded 15 research journal records (15 new, 0 updated).
+memory     Research work store updated: 15 sources, 4 open work items.
 next       ...
 done       Run run-... completed.
 ```

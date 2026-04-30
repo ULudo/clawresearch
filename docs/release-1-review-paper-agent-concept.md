@@ -44,7 +44,7 @@ Out of scope:
 - multi-user collaboration
 - heavy governance layers
 
-The `/continue` work-package path can remain, but the polished release path should be the review-paper path.
+Release 1 should keep `/go` as the autonomous research path. The old `/continue` work-package path has been removed so the polished review/report path is not split across hidden execution modes.
 
 ## User Experience
 
@@ -298,10 +298,6 @@ Show manuscript readiness checks.
 `/go`
 
 For literature-review tasks, `/go` should now produce the manuscript artifacts in addition to current artifacts.
-
-`/continue`
-
-Still launches selected work packages, but Release 1 should not depend on this path for its main success story.
 
 ## Backend Responsibilities
 

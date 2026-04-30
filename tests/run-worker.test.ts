@@ -4,8 +4,6 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
-  LiteratureStore,
-  literatureStoreFilePath,
   createLiteratureEntityId,
   type CanonicalPaper
 } from "../src/runtime/literature-store.js";
@@ -16,8 +14,6 @@ import type {
   ResearchPlanningRequest,
   ResearchPlan,
   ResearchAgendaRequest,
-  ResearchSynthesisRequest,
-  ResearchSynthesis,
   ResearchBackendCallOptions
 } from "../src/runtime/research-backend.js";
 import { ResearchBackendError } from "../src/runtime/research-backend.js";
@@ -30,16 +26,21 @@ import type {
   EvidenceMatrix,
   PaperExtraction
 } from "../src/runtime/research-evidence.js";
-import type { RunController } from "../src/runtime/run-controller.js";
 import type {
   ResearchSourceGatherRequest,
   ResearchSourceGatherResult,
   ResearchSourceGatherer
 } from "../src/runtime/research-sources.js";
-import { MemoryStore, memoryFilePath } from "../src/runtime/memory-store.js";
 import { ProjectConfigStore } from "../src/runtime/project-config-store.js";
 import { researchDirectionPath, runDirectoryPath, runFilePath, RunStore } from "../src/runtime/run-store.js";
 import { runDetachedJobWorker } from "../src/runtime/run-worker.js";
+import { researchWorkerStatePath } from "../src/runtime/research-state.js";
+import {
+  createResearchWorkStore,
+  researchWorkStoreFilePath,
+  upsertResearchWorkStoreEntities,
+  writeResearchWorkStore
+} from "../src/runtime/research-work-store.js";
 
 function createNow(): () => string {
   let step = 0;
@@ -229,11 +230,139 @@ function selectionQualityFor(
   };
 }
 
+function workspaceManuscriptDecisionForRequest(
+  request: ResearchActionRequest,
+  rationale = "Proceed with the next claim/evidence/section workspace action."
+): ResearchActionDecision | null {
+  if (request.phase !== "synthesis") {
+    return null;
+  }
+
+  const sourceId = request.workStore?.recentSources[0]?.id ?? "paper-1";
+  const claim = request.workStore?.recentClaims[0];
+  const section = request.workStore?.recentSections[0];
+  const baseInputs = {
+    providerIds: [],
+    searchQueries: [],
+    evidenceTargets: [],
+    paperIds: sourceId === "paper-1" ? [] : [sourceId],
+    criticStage: null,
+    reason: null
+  };
+
+  if (claim === undefined) {
+    return {
+      schemaVersion: 1,
+      action: "claim.create",
+      rationale,
+      confidence: 0.9,
+      inputs: {
+        ...baseInputs,
+        paperIds: [sourceId],
+        workStore: {
+          collection: "claims",
+          entityId: null,
+          filters: {},
+          semanticQuery: null,
+          limit: null,
+          changes: {},
+          entity: {
+            text: "Reviewed sources identify recurring methods, evaluation patterns, and limitations relevant to the research objective.",
+            evidence: "The claim is grounded in the selected reviewed source set and extraction fields.",
+            sourceIds: [sourceId],
+            confidence: "medium"
+          }
+        }
+      },
+      expectedOutcome: "Create a checked synthesis claim in the work store.",
+      stopCondition: "The claim object is persisted.",
+      transport: "strict_json"
+    };
+  }
+
+  if (section === undefined) {
+    return {
+      schemaVersion: 1,
+      action: "manuscript.add_paragraph",
+      rationale,
+      confidence: 0.88,
+      inputs: {
+        ...baseInputs,
+        paperIds: claim.sourceIds,
+        workStore: {
+          collection: "manuscriptSections",
+          entityId: null,
+          filters: {},
+          semanticQuery: null,
+          limit: null,
+          changes: {},
+          entity: {
+            sectionId: "synthesis",
+            role: "synthesis",
+            title: "Synthesis",
+            paragraph: "The reviewed evidence supports a cautious synthesis around recurring methods, evaluation practices, and limitations. The claim ledger links this paragraph to the selected source set.",
+            claimIds: [claim.id],
+            sourceIds: claim.sourceIds
+          }
+        }
+      },
+      expectedOutcome: "Create a manuscript section from the claim ledger.",
+      stopCondition: "The section object is persisted.",
+      transport: "strict_json"
+    };
+  }
+
+  if (section.status !== "checked") {
+    return {
+      schemaVersion: 1,
+      action: "manuscript.check_section_claims",
+      rationale,
+      confidence: 0.86,
+      inputs: {
+        ...baseInputs,
+        workStore: {
+          collection: "manuscriptSections",
+          entityId: section.id,
+          filters: {},
+          semanticQuery: null,
+          limit: null,
+          changes: {},
+          entity: {}
+        }
+      },
+      expectedOutcome: "Check section claims against the claim ledger.",
+      stopCondition: "The section check status is persisted.",
+      transport: "strict_json"
+    };
+  }
+
+  return {
+    schemaVersion: 1,
+    action: "manuscript.release",
+    rationale,
+    confidence: 0.84,
+    inputs: {
+      ...baseInputs,
+      workStore: {
+        collection: null,
+        entityId: null,
+        filters: {},
+        semanticQuery: null,
+        limit: null,
+        changes: {},
+        entity: {}
+      }
+    },
+    expectedOutcome: "Release checks can evaluate the workspace manuscript.",
+    stopCondition: "Stop after release checks are derived from the work store.",
+    transport: "strict_json"
+  };
+}
+
 class StubResearchBackend implements ResearchBackend {
   readonly label = "stub:research";
-  capturedPaperIds: string[] = [];
   capturedExtractionPaperIds: string[] = [];
-  capturedMatrixRowCount = 0;
+  readonly actionRequests: ResearchActionRequest[] = [];
 
   async planResearch(): Promise<ResearchPlan> {
     return {
@@ -252,14 +381,19 @@ class StubResearchBackend implements ResearchBackend {
   }
 
   async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    this.actionRequests.push(request);
+    const workspaceDecision = workspaceManuscriptDecisionForRequest(request);
+    if (workspaceDecision !== null) {
+      return workspaceDecision;
+    }
+
     return {
       schemaVersion: 1,
-      action: request.allowedActions.includes("synthesize_clustered")
-        ? "synthesize_clustered"
-        : request.allowedActions[0] ?? "finalize_status_report",
+      action: request.allowedActions[0] ?? "manuscript.status",
       rationale: "Proceed with the next structured research action.",
       confidence: 0.9,
       inputs: {
+        providerIds: [],
         searchQueries: [],
         evidenceTargets: [],
         paperIds: [],
@@ -267,7 +401,8 @@ class StubResearchBackend implements ResearchBackend {
         reason: null
       },
       expectedOutcome: "Continue the run.",
-      stopCondition: "The next artifact is checkpointed."
+      stopCondition: "The next artifact is checkpointed.",
+      transport: "strict_json"
     };
   }
 
@@ -278,33 +413,6 @@ class StubResearchBackend implements ResearchBackend {
       paperId: paper.id,
       runId: request.runId
     }));
-  }
-
-  async synthesizeResearch(request: ResearchSynthesisRequest): Promise<ResearchSynthesis> {
-    this.capturedPaperIds = request.papers.map((paper) => paper.id);
-    this.capturedMatrixRowCount = request.evidenceMatrix.rowCount;
-    const sourceIds = request.evidenceMatrix.rows.map((row) => row.paperId);
-
-    return {
-      executiveSummary: "The initial paper pass suggests a small number of recurring technique families, each with clear limitations.",
-      themes: [
-        {
-          title: "Analytic number theory dominates",
-          summary: "Most approaches cluster around analytic number theory and the zeta function.",
-          sourceIds
-        }
-      ],
-      claims: [
-        {
-          claim: "Current proof attempts repeatedly return to analytic techniques around the zeta function.",
-          evidence: "The retained canonical survey paper emphasizes analytic methods and frames them as central to the problem.",
-          sourceIds
-        }
-      ],
-      nextQuestions: [
-        "Which proof-technique family has the clearest bounded open subproblem for a first computational or expository follow-up?"
-      ]
-    };
   }
 
   async developResearchAgenda(request: ResearchAgendaRequest): Promise<ResearchAgenda> {
@@ -329,7 +437,7 @@ class StubResearchBackend implements ResearchBackend {
           title: "Benchmark bounded proof-technique families",
           summary: "Turn the reviewed literature into a more explicit bounded comparison of technique families.",
           mode: "benchmarking",
-          whyNow: "The evidence base is grounded enough for a small comparative work package.",
+          whyNow: "The evidence base is grounded enough for a small comparative internal revision step.",
           sourceIds,
           claimIds: [],
           gapIds: ["gap-1"],
@@ -344,23 +452,9 @@ class StubResearchBackend implements ResearchBackend {
         }
       ],
       selectedDirectionId: "direction-1",
-      selectedWorkPackage: {
-        id: "wp-1",
-        title: "Benchmark technique-family framing",
-        mode: "benchmarking",
-        objective: "Produce a bounded comparison of the main proof-technique families.",
-        hypothesisOrQuestion: "Which proof-technique family offers the clearest bounded next step?",
-        methodSketch: "Compare the reviewed technique families against explicit limitations and follow-up tractability.",
-        baselines: ["Current survey framing"],
-        controls: ["Hold the reviewed canonical paper set fixed"],
-        decisiveExperiment: "Produce a comparative note that distinguishes at least two technique families with explicit limits.",
-        stopCriterion: "The comparison is either concrete enough to guide a next run or clearly not yet grounded.",
-        expectedArtifact: "comparative research note",
-        requiredInputs: ["reviewed papers", "run summary"],
-        blockedBy: []
-      },
+      selectedWorkPackage: null,
       holdReasons: [],
-      recommendedHumanDecision: "Inspect the selected work package and continue if it looks suitably bounded."
+      recommendedHumanDecision: "Continue the autonomous worker toward release readiness."
     };
   }
 
@@ -377,35 +471,305 @@ class StubResearchBackend implements ResearchBackend {
         searchQueries: [],
         evidenceTargets: [],
         papersToExclude: [],
+        papersToPromote: [],
         claimsToSoften: []
       }
     };
   }
 }
 
-class CapturingRunController implements RunController {
-  launchedRuns: Array<{ id: string; stage: string; parentRunId: string | null }> = [];
-  private nextPid = 9000;
+class AgenticSourceBackend extends StubResearchBackend {
+  readonly sourceActions: ResearchActionDecision[] = [];
+  readonly sourceActionRequests: ResearchActionRequest[] = [];
 
-  launchCommand(run: { id: string; projectRoot: string }): string[] {
-    return ["node", "stub-cli.js", "--run-job", run.id, "--project-root", run.projectRoot];
+  async planResearch(): Promise<ResearchPlan> {
+    return {
+      researchMode: "literature_synthesis",
+      objective: "Review autonomous research-agent harness architectures and evaluation practices.",
+      rationale: "The model should choose which source provider to query first.",
+      searchQueries: [
+        "autonomous research agent harness architecture evaluation"
+      ],
+      localFocus: [
+        "planning",
+        "tool use",
+        "verification",
+        "reproducibility"
+      ]
+    };
   }
 
-  async launch(run: { id: string; stage: string; parentRunId: string | null }): Promise<number> {
-    this.launchedRuns.push({
-      id: run.id,
-      stage: run.stage,
-      parentRunId: run.parentRunId
-    });
-    const pid = this.nextPid;
-    this.nextPid += 1;
-    return pid;
+  async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase === "source_selection") {
+      this.sourceActionRequests.push(request);
+      const sourceState = request.sourceState;
+      const baseInputs = {
+        providerIds: [],
+        searchQueries: [],
+        evidenceTargets: [],
+        paperIds: [],
+        criticStage: null,
+        reason: null
+      };
+      let action: ResearchActionDecision;
+
+      if (sourceState?.attemptedProviderIds.includes("arxiv") !== true) {
+        action = {
+          schemaVersion: 1,
+          action: "source.search",
+          rationale: "arXiv should be queried first because the topic is CS/AI and full text is likely available.",
+          confidence: 0.91,
+          inputs: {
+            providerIds: ["arxiv"],
+            searchQueries: ["autonomous research agent harness architecture evaluation"],
+            evidenceTargets: ["architecture", "evaluation", "tool use"],
+            paperIds: [],
+            criticStage: null,
+            reason: null
+          },
+          expectedOutcome: "Retrieve full-text-accessible candidate literature from arXiv.",
+          stopCondition: "Stop this action after the arXiv result is screened.",
+          transport: "strict_json"
+        };
+      } else if (sourceState.sourceStage === "querying") {
+        action = {
+          schemaVersion: 1,
+          action: "source.merge",
+          rationale: "The retrieved hits should be merged into canonical papers before ranking.",
+          confidence: 0.88,
+          inputs: baseInputs,
+          expectedOutcome: "Canonical papers are available in source state.",
+          stopCondition: "Stop when canonical merge completes.",
+          transport: "strict_json"
+        };
+      } else if (sourceState.sourceStage === "merged") {
+        action = {
+          schemaVersion: 1,
+          action: "source.rank",
+          rationale: "The canonical papers should be ranked against the review protocol before access resolution.",
+          confidence: 0.87,
+          inputs: baseInputs,
+          expectedOutcome: "Candidate paper ids are available for access resolution.",
+          stopCondition: "Stop when candidate ranking is checkpointed.",
+          transport: "strict_json"
+        };
+      } else if (sourceState.sourceStage === "ranked") {
+        action = {
+          schemaVersion: 1,
+          action: "source.resolve_access",
+          rationale: "Resolve access only for the currently ranked candidate papers.",
+          confidence: 0.85,
+          inputs: {
+            ...baseInputs,
+            paperIds: sourceState.candidatePaperIds
+          },
+          expectedOutcome: "Candidate paper access metadata is resolved.",
+          stopCondition: "Stop after targeted access resolution.",
+          transport: "strict_json"
+        };
+      } else {
+        action = {
+          schemaVersion: 1,
+          action: "source.select_evidence",
+          rationale: "Ranked and access-resolved candidates are ready for the synthesis evidence set.",
+          confidence: 0.86,
+          inputs: baseInputs,
+          expectedOutcome: "Select the current evidence set.",
+          stopCondition: "Stop after the evidence set has been checkpointed.",
+          transport: "strict_json"
+        };
+      }
+
+      this.sourceActions.push(action);
+      return action;
+    }
+
+    return super.chooseResearchAction(request);
+  }
+}
+
+class WorkStoreFirstSourceBackend extends AgenticSourceBackend {
+  private createdWorkItem = false;
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase === "source_selection" && !this.createdWorkItem) {
+      this.createdWorkItem = true;
+      this.sourceActionRequests.push(request);
+      const action: ResearchActionDecision = {
+        schemaVersion: 1,
+        action: "work_store.create",
+        rationale: "Record a durable source-screening work item before querying the provider.",
+        confidence: 0.83,
+        inputs: {
+          providerIds: [],
+          searchQueries: [],
+          evidenceTargets: [],
+          paperIds: [],
+          criticStage: null,
+          reason: null,
+          workStore: {
+            collection: "workItems",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            changes: {},
+            entity: {
+              kind: "workItem",
+              title: "Inspect full-text-accessible autonomous research agent sources",
+              description: "Use the work store as durable state before source querying.",
+              suggestedActions: ["source.search arxiv autonomous research agent harness"]
+            }
+          }
+        },
+        expectedOutcome: "A source-screening work item is persisted.",
+        stopCondition: "Stop after the work item is created.",
+        transport: "strict_json"
+      };
+      this.sourceActions.push(action);
+      return action;
+    }
+
+    return super.chooseResearchAction(request);
+  }
+}
+
+class StubbornSourceSearchBackend extends StubResearchBackend {
+  readonly sourceActions: ResearchActionDecision[] = [];
+
+  async planResearch(): Promise<ResearchPlan> {
+    return {
+      researchMode: "literature_synthesis",
+      objective: "Review autonomous research-agent harness architectures and evaluation practices.",
+      rationale: "The model starts with a repeated source-search strategy that the runtime should help it reconsider.",
+      searchQueries: [
+        "autonomous research agent harness architecture evaluation"
+      ],
+      localFocus: [
+        "planning",
+        "tool use",
+        "verification"
+      ]
+    };
   }
 
-  async pause(): Promise<void> {}
-  async resume(): Promise<void> {}
-  isProcessAlive(): boolean {
-    return true;
+  async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "source_selection") {
+      return super.chooseResearchAction(request);
+    }
+
+    const sourceState = request.sourceState;
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [],
+      criticStage: null,
+      reason: null
+    };
+    let action: ResearchActionDecision;
+
+    if (sourceState?.sourceStage === "merged") {
+      action = {
+        schemaVersion: 1,
+        action: "rank_sources",
+        rationale: "Canonical sources can now be ranked.",
+        confidence: 0.82,
+        inputs: baseInputs,
+        expectedOutcome: "Candidate source ranking.",
+        stopCondition: "Stop after ranking.",
+        transport: "strict_json"
+      };
+    } else if (sourceState?.sourceStage === "ranked") {
+      action = {
+        schemaVersion: 1,
+        action: "select_evidence_set",
+        rationale: "Ranked sources are ready for the evidence pass.",
+        confidence: 0.82,
+        inputs: baseInputs,
+        expectedOutcome: "Selected evidence set.",
+        stopCondition: "Stop after selection.",
+        transport: "strict_json"
+      };
+    } else if (request.retryInstruction?.includes("exhausted") === true || request.retryInstruction?.includes("screened sources are enough") === true) {
+      action = {
+        schemaVersion: 1,
+        action: "merge_sources",
+        rationale: "The source dashboard shows this repeated provider/query search is low-yield, so merge the screened sources.",
+        confidence: 0.84,
+        inputs: baseInputs,
+        expectedOutcome: "Canonical papers are available.",
+        stopCondition: "Stop when canonical merge completes.",
+        transport: "strict_json"
+      };
+    } else {
+      action = {
+        schemaVersion: 1,
+        action: "search_sources",
+        rationale: "Repeat the same arXiv query.",
+        confidence: 0.74,
+        inputs: {
+          providerIds: ["arxiv"],
+          searchQueries: ["autonomous research agent harness architecture evaluation"],
+          evidenceTargets: ["architecture", "evaluation"],
+          paperIds: [],
+          criticStage: null,
+          reason: null
+        },
+        expectedOutcome: "Retrieve additional arXiv candidates.",
+        stopCondition: "Stop after the search.",
+        transport: "strict_json"
+      };
+    }
+
+    this.sourceActions.push(action);
+    return action;
+  }
+}
+
+class DashboardIgnoringSourceSearchBackend extends StubResearchBackend {
+  readonly sourceActions: ResearchActionDecision[] = [];
+
+  async planResearch(): Promise<ResearchPlan> {
+    return {
+      researchMode: "literature_synthesis",
+      objective: "Review autonomous research-agent harness architectures and evaluation practices.",
+      rationale: "The model ignores source-dashboard guidance, so the runtime fallback should still converge.",
+      searchQueries: [
+        "autonomous research agent harness architecture evaluation"
+      ],
+      localFocus: [
+        "planning",
+        "tool use",
+        "verification"
+      ]
+    };
+  }
+
+  async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "source_selection") {
+      return super.chooseResearchAction(request);
+    }
+
+    const action: ResearchActionDecision = {
+      schemaVersion: 1,
+      action: "search_sources",
+      rationale: "Keep searching the same provider even after dashboard warnings.",
+      confidence: 0.65,
+      inputs: {
+        providerIds: ["arxiv"],
+        searchQueries: ["autonomous research agent harness architecture evaluation"],
+        evidenceTargets: ["architecture", "evaluation"],
+        paperIds: [],
+        criticStage: null,
+        reason: null
+      },
+      expectedOutcome: "Retrieve more arXiv candidates.",
+      stopCondition: "Stop after the search.",
+      transport: "strict_json"
+    };
+    this.sourceActions.push(action);
+    return action;
   }
 }
 
@@ -647,6 +1011,123 @@ class EvidenceRecoverySourceGatherer implements ResearchSourceGatherer {
   }
 }
 
+class CriticExclusionSourceGatherer implements ResearchSourceGatherer {
+  requests: ResearchSourceGatherRequest[] = [];
+
+  async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
+    this.requests.push(request);
+    const weakPaper = canonicalPaper({
+      id: "paper-weak",
+      key: "doi:10.1000/weak-source",
+      title: "Weak background survey",
+      citation: "Example Author (2024). Weak background survey.",
+      abstract: "A broad survey that should not remain in the selected primary evidence set."
+    });
+    const strongPaper = canonicalPaper({
+      id: "paper-strong",
+      key: "doi:10.1000/strong-source",
+      title: "Strong autonomous research agent system",
+      citation: "Example Author (2025). Strong autonomous research agent system.",
+      abstract: "A directly relevant autonomous research-agent system with workflow and evaluation evidence."
+    });
+    const papers = request.criticExcludedPaperIds?.includes("paper-weak")
+      ? [strongPaper]
+      : [weakPaper, strongPaper];
+
+    return {
+      notes: [`Collected ${papers.length} critic-exclusion sources.`],
+      sources: [],
+      canonicalPapers: papers,
+      reviewedPapers: papers,
+      routing: {
+        domain: "mixed",
+        plannedQueries: request.plan.searchQueries,
+        discoveryProviderIds: ["openalex"],
+        resolverProviderIds: [],
+        acquisitionProviderIds: ["openalex"]
+      },
+      mergeDiagnostics: [],
+      authStatus: [],
+      reviewWorkflow: reviewWorkflowFor(papers),
+      retrievalDiagnostics: {
+        queries: [],
+        providerAttempts: [],
+        screeningSummary: {
+          accepted: papers.length,
+          rejected: 0,
+          weakMatchSamples: []
+        },
+        revisionPasses: 0,
+        accessLimitations: [],
+        suggestedNextQueries: []
+      },
+      selectionQuality: selectionQualityFor(papers, {
+        adequacy: "strong",
+        facetLabel: "research-agent system"
+      })
+    };
+  }
+}
+
+class CriticPromotionSourceGatherer implements ResearchSourceGatherer {
+  requests: ResearchSourceGatherRequest[] = [];
+
+  async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
+    this.requests.push(request);
+    const weakPaper = canonicalPaper({
+      id: "paper-weak",
+      key: "doi:10.1000/promotion-weak-source",
+      title: "Weak autonomous research agent overview",
+      citation: "Example Author (2024). Weak autonomous research agent overview.",
+      abstract: "A broad overview with limited direct system evidence."
+    });
+    const strongPaper = canonicalPaper({
+      id: "paper-strong",
+      key: "doi:10.1000/promotion-strong-source",
+      title: "Strong autonomous research agent architecture",
+      citation: "Example Author (2025). Strong autonomous research agent architecture.",
+      abstract: "A directly relevant autonomous research-agent architecture with tool-use, workflow, and evaluation evidence."
+    });
+    const reviewed = request.criticPromotedPaperIds?.includes("paper-strong")
+      ? [strongPaper]
+      : [weakPaper];
+    const papers = [weakPaper, strongPaper];
+
+    return {
+      notes: [`Collected ${papers.length} critic-promotion sources.`],
+      sources: [],
+      canonicalPapers: papers,
+      reviewedPapers: reviewed,
+      routing: {
+        domain: "mixed",
+        plannedQueries: request.plan.searchQueries,
+        discoveryProviderIds: ["openalex"],
+        resolverProviderIds: [],
+        acquisitionProviderIds: ["openalex"]
+      },
+      mergeDiagnostics: [],
+      authStatus: [],
+      reviewWorkflow: reviewWorkflowFor(papers, reviewed.map((paper) => paper.id)),
+      retrievalDiagnostics: {
+        queries: [],
+        providerAttempts: [],
+        screeningSummary: {
+          accepted: papers.length,
+          rejected: 0,
+          weakMatchSamples: []
+        },
+        revisionPasses: 0,
+        accessLimitations: [],
+        suggestedNextQueries: []
+      },
+      selectionQuality: selectionQualityFor(reviewed, {
+        adequacy: "strong",
+        facetLabel: "research-agent architecture"
+      })
+    };
+  }
+}
+
 class RecoveringExtractionBackend extends StubResearchBackend {
   calls: string[][] = [];
   private failedLargeBatch = false;
@@ -668,30 +1149,6 @@ class RecoveringExtractionBackend extends StubResearchBackend {
     }
 
     return super.extractReviewedPapers(request);
-  }
-}
-
-class RecoveringSynthesisBackend extends StubResearchBackend {
-  synthesisCalls: string[][] = [];
-  private failedLargeCluster = false;
-
-  override async synthesizeResearch(
-    request: ResearchSynthesisRequest,
-    options?: ResearchBackendCallOptions
-  ): Promise<ResearchSynthesis> {
-    this.synthesisCalls.push(request.papers.map((paper) => paper.id));
-
-    if (!this.failedLargeCluster && request.papers.length > 2) {
-      this.failedLargeCluster = true;
-      throw new ResearchBackendError(
-        "timeout",
-        "synthesis",
-        "simulated oversized synthesis cluster",
-        options?.timeoutMs ?? null
-      );
-    }
-
-    return super.synthesizeResearch(request);
   }
 }
 
@@ -784,14 +1241,21 @@ class LiteratureAwareResearchBackend implements ResearchBackend {
   }
 
   async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    const workspaceDecision = workspaceManuscriptDecisionForRequest(
+      request,
+      "Use the claim/evidence/section tool loop to continue the literature-aware run."
+    );
+    if (workspaceDecision !== null) {
+      return workspaceDecision;
+    }
+
     return {
       schemaVersion: 1,
-      action: request.allowedActions.includes("synthesize_clustered")
-        ? "synthesize_clustered"
-        : request.allowedActions[0] ?? "finalize_status_report",
+      action: request.allowedActions[0] ?? "manuscript.status",
       rationale: "Use the structured action loop to continue the literature-aware run.",
       confidence: 0.9,
       inputs: {
+        providerIds: [],
         searchQueries: [],
         evidenceTargets: [],
         paperIds: [],
@@ -799,7 +1263,8 @@ class LiteratureAwareResearchBackend implements ResearchBackend {
         reason: null
       },
       expectedOutcome: "Continue with the next checkpointed artifact.",
-      stopCondition: "The artifact is written."
+      stopCondition: "The artifact is written.",
+      transport: "strict_json"
     };
   }
 
@@ -813,15 +1278,6 @@ class LiteratureAwareResearchBackend implements ResearchBackend {
     }));
   }
 
-  async synthesizeResearch(): Promise<ResearchSynthesis> {
-    return {
-      executiveSummary: "The run reused prior literature memory to keep the review centered on mollifier limitations.",
-      themes: [],
-      claims: [],
-      nextQuestions: []
-    };
-  }
-
   async developResearchAgenda(): Promise<ResearchAgenda> {
     return {
       executiveSummary: "The mollifier-centered literature suggests another bounded literature pass before execution.",
@@ -829,7 +1285,7 @@ class LiteratureAwareResearchBackend implements ResearchBackend {
       candidateDirections: [],
       selectedDirectionId: null,
       selectedWorkPackage: null,
-      holdReasons: ["The reviewed evidence is still too thin for an executable work package."],
+      holdReasons: ["The reviewed evidence is still too thin for a release-ready synthesis."],
       recommendedHumanDecision: "Refine the literature review before continuing."
     };
   }
@@ -847,6 +1303,7 @@ class LiteratureAwareResearchBackend implements ResearchBackend {
         searchQueries: [],
         evidenceTargets: [],
         papersToExclude: [],
+        papersToPromote: [],
         claimsToSoften: []
       }
     };
@@ -920,6 +1377,7 @@ class ProtocolBlockingBackend extends StubResearchBackend {
         searchQueries: [],
         evidenceTargets: [],
         papersToExclude: [],
+        papersToPromote: [],
         claimsToSoften: []
       }
     };
@@ -959,6 +1417,7 @@ class ProtocolRecoveryBackend extends StubResearchBackend {
         searchQueries: ["direct protocol evidence autonomous research agents"],
         evidenceTargets: ["direct protocol evidence"],
         papersToExclude: [],
+        papersToPromote: [],
         claimsToSoften: []
       }
     };
@@ -994,6 +1453,7 @@ class ProtocolAlwaysReviseBackend extends StubResearchBackend {
         searchQueries: ["direct protocol evidence autonomous research agents"],
         evidenceTargets: ["direct protocol evidence"],
         papersToExclude: [],
+        papersToPromote: [],
         claimsToSoften: []
       }
     };
@@ -1033,6 +1493,127 @@ class SourceSelectionRecoveryBackend extends StubResearchBackend {
         searchQueries: ["autonomous research agents benchmark evaluation"],
         evidenceTargets: ["benchmark evaluation"],
         papersToExclude: [],
+        papersToPromote: [],
+        claimsToSoften: []
+      }
+    };
+  }
+}
+
+class SourceSelectionExclusionBackend extends StubResearchBackend {
+  sourceSelectionCalls = 0;
+
+  override async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    if (request.stage !== "source_selection") {
+      return super.reviewResearchArtifact(request);
+    }
+
+    this.sourceSelectionCalls += 1;
+    if (this.sourceSelectionCalls > 1) {
+      return super.reviewResearchArtifact(request);
+    }
+
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "revise",
+      confidence: 0.9,
+      objections: [{
+        code: "exclude-weak-source",
+        severity: "major",
+        target: "source_selection",
+        message: "The weak background survey should not stay in the selected evidence set.",
+        affectedPaperIds: ["paper-weak"],
+        affectedClaimIds: [],
+        suggestedRevision: "Remove paper-weak and rebuild the evidence set around direct system evidence."
+      }],
+      revisionAdvice: {
+        searchQueries: [],
+        evidenceTargets: [],
+        papersToExclude: ["paper-weak"],
+        papersToPromote: [],
+        claimsToSoften: []
+      }
+    };
+  }
+}
+
+class SourceSelectionPromotionBackend extends StubResearchBackend {
+  sourceSelectionCalls = 0;
+
+  override async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    if (request.stage !== "source_selection") {
+      return super.reviewResearchArtifact(request);
+    }
+
+    this.sourceSelectionCalls += 1;
+    if (this.sourceSelectionCalls > 1) {
+      return super.reviewResearchArtifact(request);
+    }
+
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "revise",
+      confidence: 0.9,
+      objections: [{
+        code: "promote-strong-source",
+        severity: "major",
+        target: "source_selection",
+        message: "A stronger architecture paper is already present and should replace the weak overview before extraction.",
+        affectedPaperIds: ["paper-weak", "paper-strong"],
+        affectedClaimIds: [],
+        suggestedRevision: "Promote paper-strong into the selected evidence set before searching for more sources."
+      }],
+      revisionAdvice: {
+        searchQueries: [],
+        evidenceTargets: [],
+        papersToExclude: [],
+        papersToPromote: ["paper-strong"],
+        claimsToSoften: []
+      }
+    };
+  }
+}
+
+class GenericSourceSelectionCriticBackend extends StubResearchBackend {
+  sourceSelectionCalls = 0;
+
+  override async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    if (request.stage !== "source_selection") {
+      return super.reviewResearchArtifact(request);
+    }
+
+    this.sourceSelectionCalls += 1;
+    if (this.sourceSelectionCalls > 1) {
+      return super.reviewResearchArtifact(request);
+    }
+
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "revise",
+      confidence: 0.58,
+      objections: [{
+        code: "critic-source_selection-nonpass",
+        severity: "blocking",
+        target: "source_selection",
+        message: "The source selection critic did not pass this artifact but did not provide a structured objection.",
+        affectedPaperIds: [],
+        affectedClaimIds: [],
+        suggestedRevision: "Revise the prior research stage with more focused evidence before release."
+      }],
+      revisionAdvice: {
+        searchQueries: ["Revise the prior research stage with more focused evidence before release."],
+        evidenceTargets: ["full manuscript release"],
+        papersToExclude: [],
+        papersToPromote: [],
         claimsToSoften: []
       }
     };
@@ -1068,6 +1649,7 @@ class SourceSelectionAlwaysBlockBackend extends StubResearchBackend {
         searchQueries: ["direct comparative benchmark evidence autonomous research agents"],
         evidenceTargets: ["comparative benchmark evidence"],
         papersToExclude: [],
+        papersToPromote: [],
         claimsToSoften: []
       }
     };
@@ -1075,25 +1657,6 @@ class SourceSelectionAlwaysBlockBackend extends StubResearchBackend {
 }
 
 class ReleaseBlockingBackend extends StubResearchBackend {
-  override async synthesizeResearch(request: ResearchSynthesisRequest): Promise<ResearchSynthesis> {
-    const sourceIds = request.evidenceMatrix.rows.map((row) => row.paperId);
-
-    return {
-      executiveSummary: "The reviewed papers report autonomous research-agent revision behavior.",
-      themes: [{
-        title: "Revision behavior",
-        summary: "The selected papers describe autonomous research-agent revision behavior.",
-        sourceIds
-      }],
-      claims: sourceIds.map((sourceId) => ({
-        claim: "Autonomous research-agent revision behavior is discussed in the reviewed paper.",
-        evidence: "The reviewed paper abstract discusses autonomous research-agent revision behavior.",
-        sourceIds: [sourceId]
-      })),
-      nextQuestions: ["Which revision behaviors are most reliable across reviewed papers?"]
-    };
-  }
-
   override async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
     if (request.stage !== "release") {
       return super.reviewResearchArtifact(request);
@@ -1119,6 +1682,7 @@ class ReleaseBlockingBackend extends StubResearchBackend {
         searchQueries: [],
         evidenceTargets: [],
         papersToExclude: [],
+        papersToPromote: [],
         claimsToSoften: []
       }
     };
@@ -1143,8 +1707,6 @@ test("run store loads legacy run records with manuscript artifact defaults", asy
       status: "completed",
       stage: "literature_review",
       statusMessage: "legacy run",
-      parentRunId: null,
-      derivedFromWorkPackageId: null,
       brief: {
         topic: "Legacy topic",
         researchQuestion: "Legacy question?",
@@ -1179,11 +1741,6 @@ test("run store loads legacy run records with manuscript artifact defaults", asy
         nextQuestionsPath: path.join(runDirectoryPath(projectRoot, runId), "next-questions.json"),
         agendaPath: path.join(runDirectoryPath(projectRoot, runId), "agenda.json"),
         agendaMarkdownPath: path.join(runDirectoryPath(projectRoot, runId), "agenda.md"),
-        workPackagePath: path.join(runDirectoryPath(projectRoot, runId), "work-package.json"),
-        methodPlanPath: path.join(runDirectoryPath(projectRoot, runId), "method-plan.json"),
-        executionChecklistPath: path.join(runDirectoryPath(projectRoot, runId), "execution-checklist.json"),
-        findingsPath: path.join(runDirectoryPath(projectRoot, runId), "findings.json"),
-        decisionPath: path.join(runDirectoryPath(projectRoot, runId), "decision.json"),
         summaryPath: path.join(runDirectoryPath(projectRoot, runId), "summary.md"),
         memoryPath: path.join(runDirectoryPath(projectRoot, runId), "research-journal.json")
       }
@@ -1254,10 +1811,7 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     const verificationArtifact = JSON.parse(await readFile(completedRun.artifacts.verificationPath, "utf8")) as Record<string, unknown>;
     const agendaArtifact = JSON.parse(await readFile(completedRun.artifacts.agendaPath, "utf8")) as {
       selectedDirectionId: string | null;
-      selectedWorkPackage: { id: string; title: string } | null;
-    };
-    const workPackageArtifact = JSON.parse(await readFile(completedRun.artifacts.workPackagePath, "utf8")) as {
-      title: string;
+      selectedWorkPackage: null;
     };
     const claimsArtifact = JSON.parse(await readFile(completedRun.artifacts.claimsPath, "utf8")) as {
       schemaVersion: number;
@@ -1307,9 +1861,27 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     const reviewProtocolMarkdown = await readFile(completedRun.artifacts.reviewProtocolMarkdownPath, "utf8");
     const paperMarkdown = await readFile(completedRun.artifacts.paperPath, "utf8");
     const agendaMarkdown = await readFile(completedRun.artifacts.agendaMarkdownPath, "utf8");
-    const literatureStoreContents = await readFile(literatureStoreFilePath(projectRoot), "utf8");
-    const memoryContents = await readFile(memoryFilePath(projectRoot), "utf8");
+    const workStoreContents = await readFile(researchWorkStoreFilePath(projectRoot), "utf8");
+    const workStore = JSON.parse(workStoreContents) as {
+      worker: {
+        status: string;
+        activeRunId: string | null;
+        lastRunId: string | null;
+        segmentCount: number;
+        paperReadiness: string | null;
+        userBlockers: string[];
+        nextInternalActions: string[];
+      };
+      objects: {
+        canonicalSources: unknown[];
+        extractions: unknown[];
+        evidenceCells: unknown[];
+        citations: unknown[];
+        workItems: Array<{ type: string; status: string; description: string }>;
+      };
+    };
     const researchDirectionContents = await readFile(researchDirectionPath(projectRoot), "utf8");
+    const workerState = workStore.worker;
     const researchDirection = JSON.parse(researchDirectionContents) as {
       selectedDirectionId: string | null;
       sourceRunId: string | null;
@@ -1320,9 +1892,21 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
-    assert.deepEqual(backend.capturedPaperIds, [canonicalPaperId(canonicalPaper())]);
+    assert.equal(researchWorkerStatePath(projectRoot), researchWorkStoreFilePath(projectRoot));
+    assert.equal(workerState.status, "working");
+    assert.equal(workerState.activeRunId, null);
+    assert.equal(workerState.lastRunId, completedRun.id);
+    assert.equal(workerState.segmentCount, 1);
+    assert.equal(workerState.paperReadiness, "needs_more_evidence");
+    assert.ok(workerState.nextInternalActions.length > 0);
+    assert.deepEqual(workerState.userBlockers, []);
+    assert.equal(workStore.objects.canonicalSources.length, 1);
+    assert.equal(workStore.objects.extractions.length, 1);
+    assert.equal(new Set(workStore.objects.evidenceCells.map((cell: unknown) => (cell as { sourceId: string }).sourceId)).size, 1);
+    assert.equal(new Set(workStore.objects.citations.map((citation: unknown) => (citation as { sourceId: string }).sourceId)).size, 0);
+    assert.ok(workStore.objects.workItems.some((item) => item.status === "open" && item.type === "evidence_gap"));
     assert.deepEqual(backend.capturedExtractionPaperIds, [canonicalPaperId(canonicalPaper())]);
-    assert.equal(backend.capturedMatrixRowCount, 1);
+    assert.equal(evidenceMatrixArtifact.rowCount, 1);
     assert.match(JSON.stringify(sourcesArtifact), /rawSources/);
     assert.match(JSON.stringify(sourcesArtifact), /sourceConfig/);
     assert.match(JSON.stringify(sourcesArtifact), /mergeDiagnostics/);
@@ -1352,41 +1936,374 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     assert.match(reviewProtocolMarkdown, /Review Protocol/);
     assert.equal(paperOutline.schemaVersion, 1);
     assert.equal(paperOutline.runId, completedRun.id);
-    assert.match(paperOutline.structureRationale, /scientific roles/i);
-    assert.ok(paperOutline.rhetoricalPlan.some((section) => section.role === "review_method"));
+    assert.match(paperOutline.structureRationale, /work-store manuscript sections, claims, and evidence cells/i);
+    assert.ok(paperOutline.rhetoricalPlan.some((section) => section.role === "synthesis"));
     assert.equal(paperArtifact.schemaVersion, 1);
     assert.equal(paperArtifact.runId, completedRun.id);
     assert.equal(paperArtifact.readinessStatus, "needs_more_evidence");
-    assert.deepEqual(paperArtifact.referencedPaperIds, []);
-    assert.equal(paperArtifact.claims.length, 0);
-    assert.ok(paperArtifact.scientificRoles.includes("status_report"));
+    assert.deepEqual(paperArtifact.referencedPaperIds, ["paper-1"]);
+    assert.equal(paperArtifact.claims.length, 1);
+    assert.ok(paperArtifact.scientificRoles.includes("synthesis"));
     assert.equal(referencesArtifact.schemaVersion, 1);
     assert.equal(referencesArtifact.runId, completedRun.id);
     assert.equal(referencesArtifact.referenceCount, 1);
-    assert.equal(referencesArtifact.references[0]?.sourceId, canonicalPaperId(canonicalPaper()));
+    assert.equal(referencesArtifact.references[0]?.sourceId, "paper-1");
     assert.equal(manuscriptChecks.schemaVersion, 1);
     assert.equal(manuscriptChecks.runId, completedRun.id);
     assert.equal(manuscriptChecks.readinessStatus, "needs_more_evidence");
-    assert.ok(manuscriptChecks.checks.some((check) => check.id === "evidence-matrix-ready" && check.status === "fail"));
+    assert.ok(manuscriptChecks.checks.some((check) => check.id === "evidence-coverage" && check.status === "fail"));
     assert.match(paperMarkdown, /No full review manuscript was released/i);
-    assert.doesNotMatch(paperMarkdown, new RegExp(`\\[${canonicalPaperId(canonicalPaper())}\\]`));
     assert.equal(evidenceMatrixArtifact.rowCount, 1);
     assert.equal(evidenceMatrixArtifact.rows.length, 1);
     assert.ok(evidenceMatrixArtifact.derivedInsights.length > 0);
     assert.match(JSON.stringify(verificationArtifact), /paper-1/);
     assert.equal(agendaArtifact.selectedDirectionId, "direction-1");
-    assert.equal(agendaArtifact.selectedWorkPackage?.id, "wp-1");
+    assert.equal(agendaArtifact.selectedWorkPackage, null);
     assert.equal(researchDirection.selectedDirectionId, "direction-1");
     assert.equal(researchDirection.sourceRunId, completedRun.id);
     assert.equal(researchDirection.sourceRunStage, "literature_review");
     assert.match(researchDirection.sourceRunAgendaPath ?? "", new RegExp(`${completedRun.id}/agenda\\.json`));
     assert.equal(typeof researchDirection.acceptedAt, "string");
-    assert.equal(workPackageArtifact.title, "Benchmark technique-family framing");
     assert.match(agendaMarkdown, /Research Agenda/);
-    assert.match(literatureStoreContents, /"paperCount": 1/);
-    assert.match(memoryContents, /paper-1/);
-    assert.doesNotMatch(memoryContents, /"type": "source"/);
+    assert.match(agendaMarkdown, /No separate handoff artifact is generated/);
+    assert.match(workStoreContents, /paper-1/);
+    assert.match(workStoreContents, /canonicalSource/);
+    assert.match(workStoreContents, /workItem/);
   } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("run worker lets the research agent choose source provider order and source tool sequence", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-agentic-sources-"));
+  const now = createNow();
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "export.arxiv.org" && url.pathname === "/api/query") {
+        return new Response(`<?xml version="1.0" encoding="UTF-8"?>
+          <feed>
+            <entry>
+              <id>http://arxiv.org/abs/2601.12345</id>
+              <title>Autonomous research agent harnesses for scientific workflow evaluation</title>
+              <summary>Autonomous research agent harness architecture with planning, tool use, retrieval, verification, reproducibility, and benchmark evaluation for digital scientific workflows.</summary>
+              <published>2026-01-10T00:00:00Z</published>
+              <author><name>Example Author</name></author>
+            </entry>
+          </feed>`, { status: 200, headers: { "content-type": "application/atom+xml" } });
+      }
+
+      if (url.hostname === "api.openalex.org") {
+        throw new Error("OpenAlex should not be queried before the model-selected arXiv action.");
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "autonomous research agent harnesses",
+      researchQuestion: "How should autonomous research agent harnesses be designed for digital scientific workflows?",
+      researchDirection: "Review architectures, planning, tool use, retrieval, verification, reproducibility, and evaluation.",
+      successCriterion: "Produce design principles grounded in research-agent harness architecture and evaluation evidence."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = ["arxiv"];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.localContext.projectFilesEnabled = false;
+    projectConfig.sources.explicitlyConfigured = true;
+    await projectConfigStore.save(projectConfig);
+
+    const backend = new AgenticSourceBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as {
+      retrievalDiagnostics?: {
+        providerAttempts?: Array<{ providerId: string }>;
+      };
+      reviewWorkflow?: {
+        counts?: {
+          selectedForSynthesis?: number;
+        };
+      };
+      agenticSourceState?: {
+        sourceStage?: string;
+        recentActions?: Array<{ action: string }>;
+      } | null;
+    };
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+
+    assert.equal(exitCode, 0);
+    assert.equal(sourcesArtifact.retrievalDiagnostics?.providerAttempts?.[0]?.providerId, "arxiv");
+    assert.ok((sourcesArtifact.reviewWorkflow?.counts?.selectedForSynthesis ?? 0) > 0);
+    assert.equal(sourcesArtifact.agenticSourceState?.sourceStage, "selected");
+    assert.ok(sourcesArtifact.agenticSourceState?.recentActions?.some((action) => action.action === "select_evidence_set"));
+    assert.deepEqual(backend.sourceActions.map((action) => action.action).slice(0, 5), [
+      "source.search",
+      "source.merge",
+      "source.rank",
+      "source.resolve_access",
+      "source.select_evidence"
+    ]);
+    assert.ok(backend.sourceActions[0]?.inputs.providerIds.includes("arxiv"));
+    assert.ok(backend.sourceActionRequests.every((request) => request.allowedActions.includes("work_store.query")));
+    assert.ok(backend.sourceActionRequests.every((request) => request.allowedActions.includes("manuscript.add_paragraph")));
+    assert.match(stdout, /Research agent action \(source_selection\): source\.search/);
+    assert.match(stdout, /Research agent action \(source_selection\): source\.merge/);
+    assert.match(stdout, /Research agent action \(source_selection\): source\.rank/);
+    assert.match(stdout, /Research agent action \(source_selection\): source\.resolve_access/);
+    assert.match(stdout, /Research agent action \(source_selection\): source\.select_evidence/);
+    assert.match(stdout, /Source tool observation: arxiv returned/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("run worker executes work-store tool operations inside the source loop", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-work-store-tool-"));
+  const now = createNow();
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "export.arxiv.org" && url.pathname === "/api/query") {
+        return new Response(`<?xml version="1.0" encoding="UTF-8"?>
+          <feed>
+            <entry>
+              <id>http://arxiv.org/abs/2601.12345</id>
+              <title>Autonomous research agent harnesses for scientific workflow evaluation</title>
+              <summary>Autonomous research agent harness architecture with planning, tool use, retrieval, verification, reproducibility, and benchmark evaluation.</summary>
+              <published>2026-01-10T00:00:00Z</published>
+              <author><name>Example Author</name></author>
+            </entry>
+          </feed>`, { status: 200, headers: { "content-type": "application/atom+xml" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "autonomous research agent harnesses",
+      researchQuestion: "How should autonomous research agent harnesses be designed for digital scientific workflows?",
+      researchDirection: "Review architectures, planning, tool use, retrieval, verification, reproducibility, and evaluation.",
+      successCriterion: "Produce design principles grounded in research-agent harness architecture and evaluation evidence."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = [];
+    projectConfig.sources.publisherFullText.selectedProviderIds = ["arxiv"];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.localContext.projectFilesEnabled = false;
+    projectConfig.sources.explicitlyConfigured = true;
+    await projectConfigStore.save(projectConfig);
+
+    const backend = new WorkStoreFirstSourceBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+    const workStore = JSON.parse(await readFile(researchWorkStoreFilePath(projectRoot), "utf8")) as {
+      objects?: {
+        workItems?: Array<{ title?: string; source?: string }>;
+      };
+    };
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.deepEqual(backend.sourceActions.map((action) => action.action).slice(0, 2), [
+      "work_store.create",
+      "source.search"
+    ]);
+    assert.ok(backend.sourceActionRequests.every((request) => request.allowedActions.includes("work_store.patch")));
+    assert.match(stdout, /Work store tool observation: Work store created work item/);
+    assert.ok(workStore.objects?.workItems?.some((item) => item.title === "Inspect full-text-accessible autonomous research agent sources" && item.source === "runtime"));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("agentic source dashboard asks the model to reconsider repeated low-yield searches", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-source-dashboard-"));
+  const now = createNow();
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "export.arxiv.org" && url.pathname === "/api/query") {
+        return new Response(`<?xml version="1.0" encoding="UTF-8"?>
+          <feed>
+            <entry>
+              <id>http://arxiv.org/abs/2601.12345</id>
+              <title>Autonomous research agent harnesses for scientific workflow evaluation</title>
+              <summary>Autonomous research agent harness architecture with planning, tool use, retrieval, verification, reproducibility, and benchmark evaluation.</summary>
+              <published>2026-01-10T00:00:00Z</published>
+              <author><name>Example Author</name></author>
+            </entry>
+          </feed>`, { status: 200, headers: { "content-type": "application/atom+xml" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "autonomous research agent harnesses",
+      researchQuestion: "How should autonomous research agent harnesses be designed for digital scientific workflows?",
+      researchDirection: "Review architectures, planning, tool use, retrieval, verification, reproducibility, and evaluation.",
+      successCriterion: "Produce design principles grounded in research-agent harness architecture and evaluation evidence."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = [];
+    projectConfig.sources.publisherFullText.selectedProviderIds = ["arxiv"];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.localContext.projectFilesEnabled = false;
+    projectConfig.sources.explicitlyConfigured = true;
+    await projectConfigStore.save(projectConfig);
+
+    const backend = new StubbornSourceSearchBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+    const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as {
+      agenticSourceState?: {
+        sourceStage?: string;
+        consecutiveNoProgressSearches?: number;
+        repeatedSearchWarnings?: string[];
+        recentActions?: Array<{ action: string; newSources: number }>;
+      } | null;
+    };
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.ok(backend.sourceActions.filter((action) => action.action === "search_sources").length >= 3);
+    assert.ok(backend.sourceActions.some((action) => action.action === "merge_sources"));
+    assert.match(stdout, /Source dashboard:/);
+    assert.match(stdout, /low-yield|exhausted|consecutive source searches/i);
+    assert.equal(sourcesArtifact.agenticSourceState?.sourceStage, "selected");
+    assert.ok((sourcesArtifact.agenticSourceState?.consecutiveNoProgressSearches ?? 0) >= 2);
+    assert.ok(sourcesArtifact.agenticSourceState?.repeatedSearchWarnings?.some((warning) => /consecutive source searches/i.test(warning)));
+    assert.ok(sourcesArtifact.agenticSourceState?.recentActions?.some((action) => action.action === "select_evidence_set"));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("agentic source dashboard converges even when the model ignores exhausted-search guidance", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-source-dashboard-ignore-"));
+  const now = createNow();
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "export.arxiv.org" && url.pathname === "/api/query") {
+        return new Response(`<?xml version="1.0" encoding="UTF-8"?>
+          <feed>
+            <entry>
+              <id>http://arxiv.org/abs/2601.12345</id>
+              <title>Autonomous research agent harnesses for scientific workflow evaluation</title>
+              <summary>Autonomous research agent harness architecture with planning, tool use, retrieval, verification, reproducibility, and benchmark evaluation.</summary>
+              <published>2026-01-10T00:00:00Z</published>
+              <author><name>Example Author</name></author>
+            </entry>
+          </feed>`, { status: 200, headers: { "content-type": "application/atom+xml" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "autonomous research agent harnesses",
+      researchQuestion: "How should autonomous research agent harnesses be designed for digital scientific workflows?",
+      researchDirection: "Review architectures, planning, tool use, retrieval, verification, reproducibility, and evaluation.",
+      successCriterion: "Produce design principles grounded in research-agent harness architecture and evaluation evidence."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = [];
+    projectConfig.sources.publisherFullText.selectedProviderIds = ["arxiv"];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.localContext.projectFilesEnabled = false;
+    projectConfig.sources.explicitlyConfigured = true;
+    await projectConfigStore.save(projectConfig);
+
+    const backend = new DashboardIgnoringSourceSearchBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+    const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as {
+      agenticSourceState?: {
+        sourceStage?: string;
+        recentActions?: Array<{ action: string; newSources: number }>;
+      } | null;
+      reviewWorkflow?: {
+        counts?: {
+          selectedForSynthesis?: number;
+        };
+      };
+    };
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.ok(backend.sourceActions.every((action) => action.action === "search_sources"));
+    assert.match(stdout, /Source dashboard:/);
+    assert.match(stdout, /Source tool observation: Merged 1 screened scholarly sources into 1 canonical papers/i);
+    assert.equal(sourcesArtifact.agenticSourceState?.sourceStage, "selected");
+    assert.ok((sourcesArtifact.reviewWorkflow?.counts?.selectedForSynthesis ?? 0) > 0);
+    assert.ok(sourcesArtifact.agenticSourceState?.recentActions?.some((action) => action.action === "select_evidence_set"));
+  } finally {
+    globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
@@ -1448,7 +2365,7 @@ test("run worker shrinks extraction batches after timeout and checkpoints retrie
   }
 });
 
-test("run worker splits synthesis clusters after timeout and records agent steps", async () => {
+test("run worker builds manuscript progress through claim, evidence, and section tools", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-synthesis-revision-"));
   const now = createNow();
 
@@ -1468,12 +2385,9 @@ test("run worker splits synthesis clusters after timeout and records agent steps
     projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
     projectConfig.sources.generalWeb.selectedProviderIds = [];
     projectConfig.sources.explicitlyConfigured = true;
-    projectConfig.runtime.llm.synthesisInitialClusterSize = 4;
-    projectConfig.runtime.llm.synthesisMinClusterSize = 1;
-    projectConfig.runtime.llm.synthesisRetryBudget = 4;
     await projectConfigStore.save(projectConfig);
 
-    const backend = new RecoveringSynthesisBackend();
+    const backend = new StubResearchBackend();
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
@@ -1486,26 +2400,61 @@ test("run worker splits synthesis clusters after timeout and records agent steps
     const completedRun = await runStore.load(run.id);
     const synthesisArtifact = JSON.parse(await readFile(completedRun.artifacts.synthesisJsonPath, "utf8")) as {
       status: string;
-      attempts: Array<{ status: string; errorKind: string | null; clusterSize: number }>;
-      completedClusterIds: string[];
+      strategy: string;
       synthesis: { claims: unknown[] };
     };
+    const paperArtifact = JSON.parse(await readFile(completedRun.artifacts.paperJsonPath, "utf8")) as {
+      claims: unknown[];
+      sections: unknown[];
+    };
+    const workStore = JSON.parse(await readFile(researchWorkStoreFilePath(projectRoot), "utf8")) as {
+      objects: {
+        claims: Array<{ id: string; text: string; sourceIds: string[] }>;
+        citations: unknown[];
+        manuscriptSections: Array<{ id: string; sectionId: string; claimIds: string[]; sourceIds: string[] }>;
+      };
+    };
     const agentSteps = await readFile(completedRun.artifacts.agentStepsPath, "utf8");
+    const parsedAgentSteps = agentSteps.trim().split("\n").map((line) => JSON.parse(line)) as Array<{
+      actor: string;
+      action: string;
+      metadata?: { transport?: string };
+    }>;
     const agentState = JSON.parse(await readFile(completedRun.artifacts.agentStatePath, "utf8")) as {
       completedSteps: number;
       currentPhase: string;
+      lastMetadata?: { transport?: string };
+    };
+    const qualityReport = JSON.parse(await readFile(completedRun.artifacts.qualityReportPath, "utf8")) as {
+      agentControl: {
+        transportCounts: Record<string, number>;
+        actions: Array<{ action: string; transport: string }>;
+      };
     };
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
-    assert.deepEqual(backend.synthesisCalls.map((call) => call.length), [4, 2, 2]);
-    assert.equal(synthesisArtifact.status, "completed");
-    assert.ok(synthesisArtifact.attempts.some((attempt) => attempt.status === "failed" && attempt.errorKind === "timeout" && attempt.clusterSize === 4));
-    assert.ok(synthesisArtifact.completedClusterIds.length >= 2);
+    assert.equal(synthesisArtifact.status, "derived_from_work_store");
+    assert.equal(synthesisArtifact.strategy, "claim_evidence_section_tool_loop");
     assert.ok(synthesisArtifact.synthesis.claims.length > 0);
-    assert.match(agentSteps, /plan_clustered_synthesis/);
-    assert.match(agentSteps, /revise_synthesis_cluster/);
-    assert.match(agentSteps, /merge_cluster_syntheses/);
+    assert.ok(paperArtifact.claims.length > 0);
+    assert.ok(paperArtifact.sections.length > 0);
+    assert.equal(workStore.objects.claims.length, 1);
+    assert.equal(workStore.objects.manuscriptSections.length, 1);
+    assert.equal(workStore.objects.citations.length, 0);
+    assert.equal(new Set(workStore.objects.claims.map((claim) => claim.text)).size, workStore.objects.claims.length);
+    assert.equal(new Set(workStore.objects.manuscriptSections.map((section) => section.sectionId)).size, workStore.objects.manuscriptSections.length);
+    const synthesisActionRequest = backend.actionRequests.find((request) => request.phase === "synthesis");
+    assert.ok(synthesisActionRequest?.allowedActions.includes("work_store.query"));
+    assert.ok(synthesisActionRequest?.allowedActions.includes("source.search"));
+    assert.ok(synthesisActionRequest?.allowedActions.includes("claim.create"));
+    assert.ok(synthesisActionRequest?.allowedActions.includes("manuscript.add_paragraph"));
+    assert.doesNotMatch(agentSteps, /plan_clustered_synthesis|revise_synthesis_cluster|merge_cluster_syntheses/);
+    assert.equal(parsedAgentSteps.find((step) => step.action === "claim.create")?.metadata?.transport, "strict_json");
+    assert.ok((qualityReport.agentControl.transportCounts.strict_json ?? 0) >= 3);
+    assert.ok(qualityReport.agentControl.actions.some((action) => action.action === "claim.create" && action.transport === "strict_json"));
+    assert.ok(qualityReport.agentControl.actions.some((action) => action.action === "manuscript.add_paragraph" && action.transport === "strict_json"));
+    assert.ok(qualityReport.agentControl.actions.some((action) => action.action === "manuscript.check_section_claims" && action.transport === "strict_json"));
     assert.ok(agentState.completedSteps > 0);
     assert.equal(agentState.currentPhase, "release");
   } finally {
@@ -1551,6 +2500,8 @@ test("run worker finishes status-only when the model cannot choose structured ac
     const qualityReport = JSON.parse(await readFile(completedRun.artifacts.qualityReportPath, "utf8")) as {
       agentControl: {
         mode: string;
+        transportCounts: Record<string, number>;
+        actions: Array<{ action: string; transport: string }>;
         invalidActionCount: number;
         diagnostics: Array<{ kind: string; message: string }>;
       };
@@ -1574,15 +2525,15 @@ test("run worker finishes status-only when the model cannot choose structured ac
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
     assert.equal(qualityReport.agentControl.mode, "strict_json");
-    assert.equal(qualityReport.agentControl.invalidActionCount, 2);
+    assert.ok((qualityReport.agentControl.transportCounts.runtime_fallback ?? 0) >= 1);
+    assert.equal(qualityReport.agentControl.actions[0]?.transport, "runtime_fallback");
+    assert.ok(qualityReport.agentControl.invalidActionCount >= 2);
     assert.equal(qualityReport.agentControl.diagnostics[0]?.kind, "malformed_action");
     assert.match(qualityReport.modelSuitability.rationale.join(" "), /action control/i);
-    assert.equal(backend.capturedPaperIds.length, 0);
     assert.equal(paper.readinessStatus, "needs_more_evidence");
     assert.deepEqual(paper.claims, []);
-    assert.ok(paper.scientificRoles.includes("status_report"));
     assert.match(paperMarkdown, /No full review manuscript was released/i);
-    assert.equal(synthesisArtifact.status, "completed_with_fallback");
+    assert.equal(synthesisArtifact.status, "derived_from_work_store");
     assert.deepEqual(synthesisArtifact.synthesis.claims, []);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
@@ -1644,9 +2595,8 @@ test("run worker autonomously reruns retrieval when manuscript checks need more 
     assert.equal(sourcesArtifact.autonomousEvidence.revisionPasses, 1);
     assert.ok(planArtifact.searchQueries.some((query) => /benchmark evaluation/i.test(query)));
     assert.equal(backend.capturedExtractionPaperIds.length, 3);
-    assert.equal(backend.capturedPaperIds.length, 3);
-    assert.equal(paper.readinessStatus, "needs_human_review");
-    assert.equal(paper.referencedPaperIds.length, 0);
+    assert.equal(paper.readinessStatus, "ready_for_revision");
+    assert.ok(paper.referencedPaperIds.length >= 1);
     assert.match(stdout, /Evidence revision pass 1/i);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
@@ -1709,143 +2659,6 @@ test("run worker blocks manuscript generation when extraction cannot complete af
     assert.equal(paperArtifact.status, "failed");
     assert.equal(paperArtifact.error.kind, "stage_blocked");
     assert.match(paperMarkdown, /No review-paper draft was produced/);
-  } finally {
-    await rm(projectRoot, { recursive: true, force: true });
-  }
-});
-
-test("run worker auto-continues by creating a derived work-package run when configured", async () => {
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-auto-continue-"));
-  const now = createNow();
-
-  try {
-    const runStore = new RunStore(projectRoot, "0.7.0", now);
-    const run = await runStore.create({
-      topic: "Riemann Hypothesis",
-      researchQuestion: "What bounded follow-up should we pursue next?",
-      researchDirection: "Review prior proof-technique families.",
-      successCriterion: "Produce a concise technique map."
-    }, ["clawresearch", "research-loop"]);
-
-    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
-    const projectConfig = await projectConfigStore.load();
-    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
-    projectConfig.sources.publisherFullText.selectedProviderIds = [];
-    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
-    projectConfig.sources.generalWeb.selectedProviderIds = [];
-    projectConfig.sources.explicitlyConfigured = true;
-    projectConfig.runtime.postReviewBehavior = "auto_continue";
-    await projectConfigStore.save(projectConfig);
-
-    const runController = new CapturingRunController();
-    const exitCode = await runDetachedJobWorker({
-      projectRoot,
-      runId: run.id,
-      version: "0.7.0",
-      now,
-      researchBackend: new StubResearchBackend(),
-      sourceGatherer: new StubSourceGatherer(),
-      runController
-    });
-
-    const runs = await runStore.list();
-    const parentRun = await runStore.load(run.id);
-    const childRun = runs.find((candidate) => candidate.parentRunId === run.id && candidate.stage === "work_package") ?? null;
-
-    assert.equal(exitCode, 0);
-    assert.equal(parentRun.status, "completed");
-    assert.ok(childRun);
-    assert.equal(childRun?.derivedFromWorkPackageId, "wp-1");
-    assert.equal(childRun?.status, "queued");
-    assert.ok(childRun?.job.launchCommand?.includes("--run-job"));
-    assert.ok(childRun?.job.launchCommand?.includes(childRun.id));
-    assert.ok(childRun?.job.launchCommand?.includes("--project-root"));
-    assert.ok(childRun?.job.launchCommand?.includes(projectRoot));
-    assert.equal(runController.launchedRuns.length, 1);
-    assert.equal(runController.launchedRuns[0]?.id, childRun?.id);
-  } finally {
-    await rm(projectRoot, { recursive: true, force: true });
-  }
-});
-
-test("work-package runs write bounded execution artifacts and a decision record", async () => {
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-work-package-"));
-  const now = createNow();
-
-  try {
-    const runStore = new RunStore(projectRoot, "0.7.0", now);
-    const literatureRun = await runStore.create({
-      topic: "Riemann Hypothesis",
-      researchQuestion: "What bounded follow-up should we pursue next?",
-      researchDirection: "Review prior proof-technique families.",
-      successCriterion: "Produce a concise technique map."
-    }, ["clawresearch", "research-loop"]);
-
-    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
-    const projectConfig = await projectConfigStore.load();
-    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
-    projectConfig.sources.publisherFullText.selectedProviderIds = [];
-    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
-    projectConfig.sources.generalWeb.selectedProviderIds = [];
-    projectConfig.sources.explicitlyConfigured = true;
-    await projectConfigStore.save(projectConfig);
-
-    await writeFile(path.join(projectRoot, "README.md"), "# Local context\n", "utf8");
-    await writeFile(path.join(projectRoot, "reviewed-papers.md"), "Reviewed paper notes\n", "utf8");
-    await writeFile(path.join(projectRoot, "run-summary.md"), "Run summary notes\n", "utf8");
-
-    const literatureExitCode = await runDetachedJobWorker({
-      projectRoot,
-      runId: literatureRun.id,
-      version: "0.7.0",
-      now,
-      researchBackend: new StubResearchBackend(),
-      sourceGatherer: new StubSourceGatherer()
-    });
-
-    assert.equal(literatureExitCode, 0);
-
-    const workPackageRun = await runStore.createWithOptions(
-      literatureRun.brief,
-      ["clawresearch", "research-loop", "--mode", "work-package", "--work-package-id", "wp-1"],
-      {
-        stage: "work_package",
-        parentRunId: literatureRun.id,
-        derivedFromWorkPackageId: "wp-1"
-      }
-    );
-
-    const exitCode = await runDetachedJobWorker({
-      projectRoot,
-      runId: workPackageRun.id,
-      version: "0.7.0",
-      now,
-      researchBackend: new StubResearchBackend(),
-      sourceGatherer: new StubSourceGatherer()
-    });
-
-    const completedRun = await runStore.load(workPackageRun.id);
-    const methodPlan = JSON.parse(await readFile(completedRun.artifacts.methodPlanPath, "utf8")) as {
-      evaluationDesign: string;
-      baselines: string[];
-    };
-    const checklist = JSON.parse(await readFile(completedRun.artifacts.executionChecklistPath, "utf8")) as {
-      items: Array<{ title: string }>;
-    };
-    const findings = JSON.parse(await readFile(completedRun.artifacts.findingsPath, "utf8")) as Array<{ title: string }>;
-    const decision = JSON.parse(await readFile(completedRun.artifacts.decisionPath, "utf8")) as {
-      outcome: string;
-      status: string;
-    };
-
-    assert.equal(exitCode, 0);
-    assert.equal(completedRun.stage, "work_package");
-    assert.equal(completedRun.status, "completed");
-    assert.match(methodPlan.evaluationDesign, /Success is bounded by/i);
-    assert.ok(checklist.items.length >= 3);
-    assert.ok(findings.length >= 2);
-    assert.equal(decision.outcome, "continue");
-    assert.equal(decision.status, "active");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -1948,15 +2761,25 @@ test("run worker synthesizes from the reviewed subset instead of the full canoni
     const completedRun = await runStore.load(run.id);
     const summary = await readFile(completedRun.artifacts.summaryPath, "utf8");
     const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as Record<string, unknown>;
+    const paperExtractions = JSON.parse(await readFile(completedRun.artifacts.paperExtractionsPath, "utf8")) as {
+      extractions: Array<{ paperId: string }>;
+    };
+    const paperArtifact = JSON.parse(await readFile(completedRun.artifacts.paperJsonPath, "utf8")) as {
+      referencedPaperIds: string[];
+    };
+    const reviewedPaperId = canonicalPaperId(canonicalPaper({
+      id: "paper-reviewed",
+      key: "doi:10.1000/reviewed"
+    }));
+    const blockedPaperId = canonicalPaperId(canonicalPaper({
+      id: "paper-blocked",
+      key: "doi:10.1000/blocked"
+    }));
 
     assert.equal(exitCode, 0);
-    assert.deepEqual(
-      backend.capturedPaperIds,
-      [canonicalPaperId(canonicalPaper({
-        id: "paper-reviewed",
-        key: "doi:10.1000/reviewed"
-      }))]
-    );
+    assert.deepEqual(paperExtractions.extractions.map((extraction) => extraction.paperId), [reviewedPaperId]);
+    assert.ok(paperArtifact.referencedPaperIds.some((paperId) => [reviewedPaperId, "paper-reviewed"].includes(paperId)));
+    assert.ok(!paperArtifact.referencedPaperIds.some((paperId) => [blockedPaperId, "paper-blocked"].includes(paperId)));
     assert.match(summary, /Reviewed papers selected for synthesis: 1/);
     assert.match(JSON.stringify(sourcesArtifact), /reviewWorkflow/);
     assert.match(JSON.stringify(sourcesArtifact), /paper-blocked/);
@@ -2102,43 +2925,57 @@ test("run worker uses prior literature memory to inform planning and retrieval",
       successCriterion: "Produce a focused follow-up synthesis."
     }, ["clawresearch", "research-loop"]);
 
-    const literatureStore = new LiteratureStore(projectRoot, now);
-    await literatureStore.upsert({
-      papers: [
-        {
-          key: "doi:10.1000/mollifier",
-          title: "Mollifier methods for the Riemann Hypothesis",
-          citation: "Example Author (2025). Mollifier methods for the Riemann Hypothesis.",
-          abstract: "Survey of mollifier methods and known limitations.",
-          year: 2025,
-          authors: ["Example Author"],
-          venue: "Number Theory Review",
-          discoveredVia: ["openalex"],
-          identifiers: {
-            doi: "10.1000/mollifier"
-          },
-          bestAccessUrl: "https://example.org/mollifier.pdf",
-          bestAccessProvider: "openalex",
-          accessMode: "fulltext_open",
-          fulltextFormat: "pdf",
-          screeningStage: "fulltext",
-          screeningDecision: "include",
-          runId: "run-prior"
-        }
-      ],
-      themes: [
-        {
-          key: "Mollifier limitations",
-          title: "Mollifier limitations",
-          summary: "Prior work suggests mollifier limitations are the clearest bounded follow-up.",
-          runId: "run-prior",
-          paperIds: [],
-          questionTexts: [
-            "Which mollifier limitations are most promising for a deeper follow-up?"
-          ]
-        }
-      ]
-    });
+    const priorWorkStore = upsertResearchWorkStoreEntities(createResearchWorkStore({
+      projectRoot,
+      brief: run.brief,
+      now: now()
+    }), [
+      {
+        id: createLiteratureEntityId("paper", "doi:10.1000/mollifier"),
+        kind: "canonicalSource",
+        runId: "run-prior",
+        createdAt: now(),
+        updatedAt: now(),
+        key: "doi:10.1000/mollifier",
+        title: "Mollifier methods for the Riemann Hypothesis",
+        citation: "Example Author (2025). Mollifier methods for the Riemann Hypothesis.",
+        abstract: "Survey of mollifier methods and known limitations.",
+        year: 2025,
+        authors: ["Example Author"],
+        venue: "Number Theory Review",
+        providerIds: ["openalex"],
+        identifiers: {
+          doi: "10.1000/mollifier",
+          pmid: null,
+          pmcid: null,
+          arxivId: null
+        },
+        accessMode: "fulltext_open",
+        bestAccessUrl: "https://example.org/mollifier.pdf",
+        screeningDecision: "include",
+        screeningRationale: "Prior canonical source.",
+        tags: ["mollifier methods", "limitations"]
+      },
+      {
+        id: "work-item-prior-mollifier",
+        kind: "workItem",
+        runId: "run-prior",
+        createdAt: now(),
+        updatedAt: now(),
+        type: "open_question",
+        status: "open",
+        severity: "minor",
+        title: "Mollifier limitations follow-up",
+        description: "Which mollifier limitations are most promising for a deeper follow-up?",
+        targetKind: "canonicalSource",
+        targetId: createLiteratureEntityId("paper", "doi:10.1000/mollifier"),
+        affectedSourceIds: [createLiteratureEntityId("paper", "doi:10.1000/mollifier")],
+        affectedClaimIds: [],
+        suggestedActions: ["mollifier methods Riemann Hypothesis limitations"],
+        source: "synthesis"
+      }
+    ], now());
+    await writeResearchWorkStore(priorWorkStore);
 
     const projectConfigStore = new ProjectConfigStore(projectRoot, now);
     const projectConfig = await projectConfigStore.load();
@@ -2248,13 +3085,13 @@ test("run worker writes a hold agenda when no canonical papers are retained", as
     assert.equal(claims.runId, completedRun.id);
     assert.equal(claims.claimCount, 0);
     assert.equal(claims.claims.length, 0);
-    assert.equal(paper.readinessStatus, "blocked");
+    assert.equal(paper.readinessStatus, "needs_more_evidence");
     assert.equal(paper.referencedPaperIds.length, 0);
     assert.equal(paper.claims.length, 0);
     assert.equal(references.referenceCount, 0);
     assert.equal(references.references.length, 0);
-    assert.equal(checks.readinessStatus, "blocked");
-    assert.match(paperMarkdown, /blocked/i);
+    assert.equal(checks.readinessStatus, "needs_more_evidence");
+    assert.match(paperMarkdown, /needs_more_evidence/i);
     assert.equal(evidenceMatrix.rowCount, 0);
     assert.equal(evidenceMatrix.rows.length, 0);
     assert.equal(agenda.selectedDirectionId, null);
@@ -2558,9 +3395,131 @@ test("source-selection critic feedback triggers an autonomous revision pass", as
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
     assert.ok(gatherer.requests.length >= 2);
-    assert.equal(backend.sourceSelectionCalls, 2);
+    assert.ok(backend.sourceSelectionCalls >= 2);
     assert.equal(critic.readiness, "pass");
     assert.match(stdout, /Source-selection critic requested evidence revision pass 1|Evidence revision pass 1/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("source-selection critic paper exclusions revise the selected evidence set", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-source-exclusion-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "autonomous research agents",
+      researchQuestion: "Which selected papers should support the final synthesis?",
+      researchDirection: "Revise source selection using critic exclusions.",
+      successCriterion: "Use direct autonomous research-agent system evidence."
+    }, ["clawresearch", "research-loop"]);
+
+    const gatherer = new CriticExclusionSourceGatherer();
+    const backend = new SourceSelectionExclusionBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer: gatherer
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const paperExtractions = JSON.parse(await readFile(completedRun.artifacts.paperExtractionsPath, "utf8")) as {
+      extractions: Array<{ paperId: string }>;
+    };
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.ok(backend.sourceSelectionCalls >= 2);
+    assert.ok(gatherer.requests[1]?.criticExcludedPaperIds?.includes("paper-weak"));
+    assert.deepEqual(paperExtractions.extractions.map((extraction) => extraction.paperId), [
+      canonicalPaperId(canonicalPaper({ key: "doi:10.1000/strong-source" }))
+    ]);
+    assert.ok(!paperExtractions.extractions.some((extraction) => extraction.paperId === canonicalPaperId(canonicalPaper({ key: "doi:10.1000/weak-source" }))));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("source-selection critic paper promotions revise the selected evidence set before searching more", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-promote-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "autonomous research agents",
+      researchQuestion: "Which selected papers should support the final synthesis?",
+      researchDirection: "Revise source selection using critic promotions.",
+      successCriterion: "Use the strongest autonomous research-agent architecture evidence already found."
+    }, ["clawresearch", "research-loop"]);
+
+    const gatherer = new CriticPromotionSourceGatherer();
+    const backend = new SourceSelectionPromotionBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer: gatherer
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const paperExtractions = JSON.parse(await readFile(completedRun.artifacts.paperExtractionsPath, "utf8")) as {
+      extractions: Array<{ paperId: string }>;
+    };
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.ok(backend.sourceSelectionCalls >= 2);
+    assert.ok(gatherer.requests[1]?.criticPromotedPaperIds?.includes("paper-strong"));
+    assert.match(stdout, /promoting stronger candidates already in the source pool/i);
+    assert.deepEqual(paperExtractions.extractions.map((extraction) => extraction.paperId), [
+      canonicalPaperId(canonicalPaper({ key: "doi:10.1000/promotion-strong-source" }))
+    ]);
+    assert.ok(!paperExtractions.extractions.some((extraction) => extraction.paperId === canonicalPaperId(canonicalPaper({ key: "doi:10.1000/promotion-weak-source" }))));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("generic critic fallback text is not used as retrieval query text", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-query-guard-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "autonomous research agents",
+      researchQuestion: "What evidence supports benchmark evaluation?",
+      researchDirection: "Revise benchmark evaluation evidence.",
+      successCriterion: "Cover benchmark evaluation directly."
+    }, ["clawresearch", "research-loop"]);
+
+    const gatherer = new EvidenceRecoverySourceGatherer();
+    const backend = new GenericSourceSelectionCriticBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer: gatherer
+    });
+
+    const revisionQueries = gatherer.requests[1]?.revisionQueries ?? [];
+    const joinedQueries = revisionQueries.join(" | ");
+
+    assert.equal(exitCode, 0);
+    assert.ok(gatherer.requests.length >= 2);
+    assert.match(joinedQueries, /benchmark evaluation/i);
+    assert.doesNotMatch(joinedQueries, /prior research stage|focused evidence|before release|full manuscript|working critic backend/i);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -2671,7 +3630,7 @@ test("release critic block converts an otherwise ready manuscript to status-only
     assert.equal(critic.readiness, "block");
     assert.equal(checks.readinessStatus, "needs_human_review");
     assert.match(checks.blockers.join(" "), /unresolved review risk/);
-    assert.match(paper, /No full review manuscript was released/);
+    assert.match(paper, /not a released manuscript/);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

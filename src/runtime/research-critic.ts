@@ -52,6 +52,7 @@ export type CriticRevisionAdvice = {
   searchQueries: string[];
   evidenceTargets: string[];
   papersToExclude: string[];
+  papersToPromote: string[];
   claimsToSoften: string[];
 };
 
@@ -191,7 +192,10 @@ function normalizeConfidence(value: unknown, readiness: CriticReadiness): number
 }
 
 function allowedPaperIdsFor(request: CriticReviewRequest): Set<string> {
-  return new Set((request.selectedPapers ?? []).map((paper) => paper.id));
+  return new Set([
+    ...(request.selectedPapers ?? []).map((paper) => paper.id),
+    ...(request.relevanceAssessments ?? []).map((assessment) => assessment.paperId)
+  ]);
 }
 
 function allowedClaimIdsFor(request: CriticReviewRequest): Set<string> {
@@ -263,6 +267,7 @@ function normalizeRevisionAdvice(raw: unknown, request: CriticReviewRequest): Cr
     searchQueries: uniqueStrings(readStringArray(record.searchQueries)),
     evidenceTargets: uniqueStrings(readStringArray(record.evidenceTargets)),
     papersToExclude: filterKnownIds(record.papersToExclude, allowedPaperIds),
+    papersToPromote: filterKnownIds(record.papersToPromote, allowedPaperIds),
     claimsToSoften: filterKnownIds(record.claimsToSoften, allowedClaimIds)
   };
 }
@@ -336,6 +341,7 @@ export function criticUnavailableReview(
       searchQueries: [],
       evidenceTargets: [],
       papersToExclude: [],
+      papersToPromote: [],
       claimsToSoften: []
     }
   };
@@ -350,6 +356,8 @@ export function criticReviewNeedsRevision(report: CriticReviewArtifact): boolean
   return report.readiness === "revise"
     || report.revisionAdvice.searchQueries.length > 0
     || report.revisionAdvice.evidenceTargets.length > 0
+    || report.revisionAdvice.papersToExclude.length > 0
+    || report.revisionAdvice.papersToPromote.length > 0
     || report.objections.some((objection) => objection.suggestedRevision !== null);
 }
 

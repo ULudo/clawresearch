@@ -105,6 +105,7 @@ test("critic output normalization filters invented IDs and caps revision advice"
       searchQueries: Array.from({ length: 20 }, (_, index) => `query ${index}`),
       evidenceTargets: ["direct evaluation"],
       papersToExclude: ["paper-1", "invented-paper"],
+      papersToPromote: ["paper-1", "invented-paper"],
       claimsToSoften: ["claim-1", "invented-claim"]
     }
   }, request());
@@ -115,6 +116,7 @@ test("critic output normalization filters invented IDs and caps revision advice"
   assert.deepEqual(normalized.objections[0].affectedClaimIds, ["claim-1"]);
   assert.equal(normalized.revisionAdvice.searchQueries.length, 12);
   assert.deepEqual(normalized.revisionAdvice.papersToExclude, ["paper-1"]);
+  assert.deepEqual(normalized.revisionAdvice.papersToPromote, ["paper-1"]);
   assert.deepEqual(normalized.revisionAdvice.claimsToSoften, ["claim-1"]);
 });
 
@@ -143,6 +145,7 @@ test("protocol critic normalization drops premature missing-source objections", 
       searchQueries: ["autonomous research agents literature review"],
       evidenceTargets: ["literature review automation"],
       papersToExclude: [],
+      papersToPromote: [],
       claimsToSoften: []
     }
   }, {

@@ -65,7 +65,7 @@ function renderHelp(writer: OutputWriter): void {
   writeLine(writer, "  clawresearch --help");
   writeLine(writer);
   writeLine(writer, "Default behavior:");
-  writeLine(writer, "  Starts the TUI research console in the current directory, launches detached runs from `/go`, and streams their saved progress events in the terminal.");
+  writeLine(writer, "  Starts the TUI research console in the current directory. `/go` starts or continues the autonomous research worker and streams saved progress events in the terminal.");
   writeLine(writer, "  Use `--plain` to force the older line-oriented console for scripts, pipes, or debugging.");
   writeLine(writer);
   writeLine(writer, "Slash commands inside the console:");
@@ -77,7 +77,6 @@ function renderHelp(writer: OutputWriter): void {
   writeLine(writer, "  /paper open");
   writeLine(writer, "  /paper checks");
   writeLine(writer, "  /go");
-  writeLine(writer, "  /continue");
   writeLine(writer, "  /pause");
   writeLine(writer, "  /resume");
   writeLine(writer, "  /quit");
@@ -131,6 +130,7 @@ function createConsoleIo(input = process.stdin, output = process.stdout): Consol
 
     return {
       writer: output,
+      interactive: false,
       async prompt(promptText: string): Promise<string | null> {
         output.write(promptText);
 
@@ -154,6 +154,7 @@ function createConsoleIo(input = process.stdin, output = process.stdout): Consol
 
   return {
     writer: output,
+    interactive: true,
     async prompt(promptText: string): Promise<string | null> {
       try {
         return await rl.question(promptText);

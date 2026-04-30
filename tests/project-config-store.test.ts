@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   defaultRuntimeLlmConfig,
+  defaultRuntimeModelConfig,
   ProjectConfigStore,
   projectConfigPath,
   resolveRuntimeLlmConfig
@@ -27,7 +28,7 @@ test("project config store loads the current grouped source model and drops inva
   try {
     await mkdir(path.dirname(projectConfigPath(projectRoot)), { recursive: true });
     await writeFile(projectConfigPath(projectRoot), `${JSON.stringify({
-      schemaVersion: 7,
+      schemaVersion: 8,
       projectRoot,
       runtimeDirectory: `${projectRoot}/.clawresearch`,
       createdAt: "2026-01-01T00:00:00.000Z",
@@ -51,7 +52,6 @@ test("project config store loads the current grouped source model and drops inva
         explicitlyConfigured: true
       },
       runtime: {
-        postReviewBehavior: "confirm",
         llm: {
           ...defaultRuntimeLlmConfig,
           extractionInitialBatchSize: 4
@@ -62,14 +62,13 @@ test("project config store loads the current grouped source model and drops inva
     const store = new ProjectConfigStore(projectRoot, now);
     const config = await store.load();
 
-    assert.equal(config.schemaVersion, 7);
+    assert.equal(config.schemaVersion, 8);
     assert.deepEqual(config.sources.scholarlyDiscovery.selectedProviderIds, ["openalex", "elsevier"]);
     assert.deepEqual(config.sources.publisherFullText.selectedProviderIds, ["arxiv", "springer_nature"]);
     assert.deepEqual(config.sources.oaRetrievalHelpers.selectedProviderIds, ["core", "unpaywall"]);
     assert.deepEqual(config.sources.generalWeb.selectedProviderIds, ["wikipedia"]);
     assert.equal(config.sources.localContext.projectFilesEnabled, false);
     assert.equal(config.sources.explicitlyConfigured, true);
-    assert.equal(config.runtime.postReviewBehavior, "confirm");
     assert.equal(config.runtime.llm.extractionInitialBatchSize, 4);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
@@ -83,7 +82,7 @@ test("project config store saves only providers that belong to each category", a
   try {
     const store = new ProjectConfigStore(projectRoot, now);
     const config = await store.save({
-      schemaVersion: 7,
+      schemaVersion: 8,
       projectRoot,
       runtimeDirectory: `${projectRoot}/.clawresearch`,
       createdAt: "2026-01-01T00:00:00.000Z",
@@ -107,7 +106,10 @@ test("project config store saves only providers that belong to each category", a
         explicitlyConfigured: true
       },
       runtime: {
-        postReviewBehavior: "auto_continue",
+        model: {
+          ...defaultRuntimeModelConfig,
+          configured: true
+        },
         llm: {
           ...defaultRuntimeLlmConfig,
           planningTimeoutMs: 123_000
@@ -115,12 +117,11 @@ test("project config store saves only providers that belong to each category", a
       }
     });
 
-    assert.equal(config.schemaVersion, 7);
+    assert.equal(config.schemaVersion, 8);
     assert.deepEqual(config.sources.scholarlyDiscovery.selectedProviderIds, ["openalex", "elsevier"]);
     assert.deepEqual(config.sources.publisherFullText.selectedProviderIds, ["arxiv", "springer_nature"]);
     assert.deepEqual(config.sources.oaRetrievalHelpers.selectedProviderIds, ["core", "unpaywall"]);
     assert.deepEqual(config.sources.generalWeb.selectedProviderIds, ["wikipedia"]);
-    assert.equal(config.runtime.postReviewBehavior, "auto_continue");
     assert.equal(config.runtime.llm.planningTimeoutMs, 123_000);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
@@ -140,14 +141,10 @@ test("runtime llm config resolves env overrides over project defaults", async ()
 
     const resolved = resolveRuntimeLlmConfig(config, {
       CLAWRESEARCH_LLM_TIMEOUT_MS: "222000",
-      CLAWRESEARCH_LLM_SYNTHESIS_TIMEOUT_MS: "333000",
       CLAWRESEARCH_LLM_CRITIC_TIMEOUT_MS: "444000",
       CLAWRESEARCH_LLM_EXTRACTION_BATCH_SIZE: "5",
       CLAWRESEARCH_LLM_EXTRACTION_MIN_BATCH_SIZE: "3",
       CLAWRESEARCH_LLM_EXTRACTION_RETRY_BUDGET: "9",
-      CLAWRESEARCH_LLM_SYNTHESIS_CLUSTER_SIZE: "7",
-      CLAWRESEARCH_LLM_SYNTHESIS_MIN_CLUSTER_SIZE: "2",
-      CLAWRESEARCH_LLM_SYNTHESIS_RETRY_BUDGET: "11",
       CLAWRESEARCH_LLM_AGENT_STEP_TIMEOUT_MS: "555000",
       CLAWRESEARCH_AGENT_CONTROL_MODE: "native_tool_calls",
       CLAWRESEARCH_AGENT_INVALID_ACTION_BUDGET: "3",
@@ -156,14 +153,10 @@ test("runtime llm config resolves env overrides over project defaults", async ()
 
     assert.equal(resolved.planningTimeoutMs, 222_000);
     assert.equal(resolved.extractionTimeoutMs, 222_000);
-    assert.equal(resolved.synthesisTimeoutMs, 333_000);
     assert.equal(resolved.criticTimeoutMs, 444_000);
     assert.equal(resolved.extractionInitialBatchSize, 5);
     assert.equal(resolved.extractionMinBatchSize, 3);
     assert.equal(resolved.extractionRetryBudget, 9);
-    assert.equal(resolved.synthesisInitialClusterSize, 7);
-    assert.equal(resolved.synthesisMinClusterSize, 2);
-    assert.equal(resolved.synthesisRetryBudget, 11);
     assert.equal(resolved.agentStepTimeoutMs, 555_000);
     assert.equal(resolved.agentControlMode, "native_tool_calls");
     assert.equal(resolved.agentInvalidActionBudget, 3);

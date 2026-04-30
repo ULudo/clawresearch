@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { OllamaProjectAssistantBackend } from "../src/runtime/project-assistant-backend.js";
 
-test("project assistant backend includes current run, agenda, and decision context in its prompt", async () => {
+test("project assistant backend includes current run and agenda context in its prompt", async () => {
   const originalFetch = globalThis.fetch;
   let capturedPrompt = "";
   let capturedUserMessage = "";
@@ -18,7 +18,7 @@ test("project assistant backend includes current run, agenda, and decision conte
       return new Response(JSON.stringify({
         message: {
           content: JSON.stringify({
-            assistantMessage: "The latest work package is blocked by missing local inputs.",
+            assistantMessage: "The latest research segment is blocked by missing local inputs.",
             brief: {
               topic: "Riemann Hypothesis",
               researchQuestion: "How can we optimize existing algorithms for verifying zeros of the zeta function?",
@@ -28,7 +28,7 @@ test("project assistant backend includes current run, agenda, and decision conte
             readiness: "ready",
             readinessRationale: "The project brief remains usable.",
             openQuestions: [],
-            summary: "The project is currently blocked at the work-package stage."
+            summary: "The project is currently blocked at the local-input stage."
           })
         }
       }), {
@@ -58,78 +58,33 @@ test("project assistant backend includes current run, agenda, and decision conte
       ],
       currentRun: {
         id: "run-1",
-        stage: "work_package",
+        stage: "literature_review",
         status: "completed",
-        statusMessage: "Work-package run completed with decision revise.",
+        statusMessage: "Provider-aware literature run completed successfully.",
         briefMatchesCurrent: true,
         recentEvents: [
-          "exec: Checked local context",
-          "run: Work-package run completed with decision revise."
+          "summary: Literature review completed.",
+          "run: Provider-aware literature run completed successfully."
         ],
-        summaryMarkdown: "# Work Package Summary\n\nBlocked by missing inputs."
+        summaryMarkdown: "# Research Summary\n\nThe agenda selected a next research focus."
       },
       latestAgenda: {
         executiveSummary: "The best next direction is to optimize fast algorithms.",
         gaps: [],
         candidateDirections: [],
         selectedDirectionId: "direction-1",
-        selectedWorkPackage: {
-          id: "wp-1",
-          title: "Optimizing Fast Algorithms for Zeta Function Evaluation",
-          mode: "method_improvement",
-          objective: "Improve fast algorithms for zeta function evaluation.",
-          hypothesisOrQuestion: "Can we reduce computation further?",
-          methodSketch: "Start from Riemann-Siegel and FFT methods.",
-          baselines: ["Odlyzko et al. (1988)"],
-          controls: ["runtime", "accuracy"],
-          decisiveExperiment: "Benchmark the optimized method against the baseline.",
-          stopCriterion: "Reach a 20% runtime improvement without accuracy loss.",
-          expectedArtifact: "An optimized algorithm and benchmark note.",
-          requiredInputs: ["Baseline implementation"],
-          blockedBy: ["Missing local implementation"]
-        },
+        selectedWorkPackage: null,
         holdReasons: [],
         recommendedHumanDecision: "Resolve the missing local inputs before continuing."
-      },
-      latestWorkPackage: {
-        id: "wp-1",
-        title: "Optimizing Fast Algorithms for Zeta Function Evaluation",
-        mode: "method_improvement",
-        objective: "Improve fast algorithms for zeta function evaluation.",
-        hypothesisOrQuestion: "Can we reduce computation further?",
-        methodSketch: "Start from Riemann-Siegel and FFT methods.",
-        baselines: ["Odlyzko et al. (1988)"],
-        controls: ["runtime", "accuracy"],
-        decisiveExperiment: "Benchmark the optimized method against the baseline.",
-        stopCriterion: "Reach a 20% runtime improvement without accuracy loss.",
-        expectedArtifact: "An optimized algorithm and benchmark note.",
-        requiredInputs: ["Baseline implementation"],
-        blockedBy: ["Missing local implementation"]
-      },
-      latestDecision: {
-        outcome: "revise",
-        rationale: "The work package is promising but blocked by missing inputs.",
-        nextActions: ["Add or locate the baseline implementation."],
-        blockedBy: ["Missing local implementation"],
-        status: "blocked"
-      },
-      latestFindings: [
-        {
-          id: "finding-1",
-          title: "Required input availability",
-          summary: "The baseline implementation is missing.",
-          evidence: ["No matching local files found."],
-          status: "blocked"
-        }
-      ]
+      }
     });
 
     assert.equal(response.readiness, "ready");
     assert.match(capturedPrompt, /ongoing research assistant/i);
     assert.match(capturedPrompt, /Current run:/);
     assert.match(capturedPrompt, /run-1/);
-    assert.match(capturedPrompt, /Optimizing Fast Algorithms for Zeta Function Evaluation/);
-    assert.match(capturedPrompt, /Missing local implementation/);
+    assert.match(capturedPrompt, /direction-1/);
+    assert.match(capturedPrompt, /Resolve the missing local inputs before continuing/);
     assert.match(capturedUserMessage, /What was the result of the research\?/);
   } finally {
     globalThis.fetch = originalFetch;

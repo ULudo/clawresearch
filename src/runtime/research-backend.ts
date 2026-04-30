@@ -1,4 +1,5 @@
 import type { ResearchBrief } from "./session-store.js";
+import type { ResearchWorkerState } from "./research-state.js";
 import {
   createMemoryRecordId,
   type ProjectMemoryContext
@@ -8,7 +9,6 @@ import type {
   LiteratureContext
 } from "./literature-store.js";
 import {
-  evidenceMatrixNextQuestions,
   type EvidenceMatrix,
   type PaperClaimSupportStrength,
   type PaperExtraction,
@@ -22,8 +22,6 @@ import {
 } from "./research-critic.js";
 import type { VerificationReport } from "./verifier.js";
 import {
-  buildLiteratureSynthesisInstruction,
-  shouldUseLiteratureReviewSubsystem,
   type ReviewSelectionQuality
 } from "./literature-review.js";
 import {
@@ -32,6 +30,16 @@ import {
   type ResearchActionDecision,
   type ResearchActionRequest
 } from "./research-agent.js";
+import {
+  ModelCredentialStore,
+  type ModelCredentialState,
+  ModelRuntimeError,
+  RuntimeModelClient
+} from "./model-runtime.js";
+import {
+  resolveRuntimeModelConfig,
+  type ProjectConfigState
+} from "./project-config-store.js";
 
 export type {
   EvidenceMatrix,
@@ -119,28 +127,12 @@ export type ResearchDirectionCandidate = {
   scores: DirectionScores;
 };
 
-export type WorkPackage = {
-  id: string;
-  title: string;
-  mode: ResearchMode;
-  objective: string;
-  hypothesisOrQuestion: string;
-  methodSketch: string;
-  baselines: string[];
-  controls: string[];
-  decisiveExperiment: string;
-  stopCriterion: string;
-  expectedArtifact: string;
-  requiredInputs: string[];
-  blockedBy: string[];
-};
-
 export type ResearchAgenda = {
   executiveSummary: string;
   gaps: ResearchGap[];
   candidateDirections: ResearchDirectionCandidate[];
   selectedDirectionId: string | null;
-  selectedWorkPackage: WorkPackage | null;
+  selectedWorkPackage: null;
   holdReasons: string[];
   recommendedHumanDecision: string;
 };
@@ -158,17 +150,7 @@ export type ResearchPlanningRequest = {
   localFiles: string[];
   memoryContext: ProjectMemoryContext;
   literatureContext?: LiteratureContext;
-};
-
-export type ResearchSynthesisRequest = {
-  projectRoot: string;
-  brief: ResearchBrief;
-  plan: ResearchPlan;
-  papers: CanonicalPaper[];
-  paperExtractions: PaperExtraction[];
-  evidenceMatrix: EvidenceMatrix;
-  selectionQuality?: ReviewSelectionQuality | null;
-  literatureContext?: LiteratureContext;
+  workerState?: ResearchWorkerState | null;
 };
 
 export type ResearchAgendaRequest = {
@@ -234,13 +216,38 @@ export class ResearchBackendError extends Error {
   }
 }
 
+function researchBackendErrorFromModelError(error: ModelRuntimeError): ResearchBackendError {
+  const kind = error.kind === "auth" ? "http" : error.kind;
+  return new ResearchBackendError(
+    kind,
+    error.operation as ResearchBackendOperation,
+    error.message,
+    error.timeoutMs
+  );
+}
+
+async function modelJsonCall<T>(
+  client: RuntimeModelClient,
+  systemPrompt: string,
+  options: ResearchBackendCallOptions
+): Promise<T> {
+  try {
+    return await client.jsonCall(systemPrompt, options) as T;
+  } catch (error) {
+    if (error instanceof ModelRuntimeError) {
+      throw researchBackendErrorFromModelError(error);
+    }
+
+    throw error;
+  }
+}
+
 export interface ResearchBackend {
   readonly label: string;
   readonly capabilities?: ResearchBackendCapabilities;
   planResearch(request: ResearchPlanningRequest, options?: ResearchBackendCallOptions): Promise<ResearchPlan>;
   chooseResearchAction(request: ResearchActionRequest, options?: ResearchBackendCallOptions): Promise<ResearchActionDecision>;
   extractReviewedPapers(request: PaperExtractionRequest, options?: ResearchBackendCallOptions): Promise<PaperExtraction[]>;
-  synthesizeResearch(request: ResearchSynthesisRequest, options?: ResearchBackendCallOptions): Promise<ResearchSynthesis>;
   developResearchAgenda(request: ResearchAgendaRequest, options?: ResearchBackendCallOptions): Promise<ResearchAgenda>;
   reviewResearchArtifact(request: CriticReviewRequest, options?: ResearchBackendCallOptions): Promise<CriticReviewArtifact>;
 }
@@ -562,129 +569,6 @@ function normalizePaperExtractions(raw: unknown, request: PaperExtractionRequest
   });
 }
 
-function normalizeThemes(value: unknown, allowedSourceIds: string[] = []): ResearchTheme[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value.flatMap((entry) => {
-    const record = typeof entry === "object" && entry !== null
-      ? entry as Record<string, unknown>
-      : {};
-    const title = safeString(record.title);
-    const summary = safeString(record.summary);
-
-    if (title === null || summary === null) {
-      return [];
-    }
-
-    return [{
-      title,
-      summary,
-      sourceIds: reconcileSourceIds(safeSourceIdArray(record.sourceIds), allowedSourceIds)
-    }];
-  }).slice(0, 6);
-}
-
-function normalizeClaims(value: unknown, allowedSourceIds: string[] = []): ResearchClaim[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value.flatMap((entry) => {
-    const record = typeof entry === "object" && entry !== null
-      ? entry as Record<string, unknown>
-      : {};
-    const claim = safeString(record.claim);
-    const evidence = safeString(record.evidence);
-
-    if (claim === null || evidence === null) {
-      return [];
-    }
-
-    return [{
-      claim,
-      evidence,
-      sourceIds: reconcileSourceIds(safeSourceIdArray(record.sourceIds), allowedSourceIds)
-    }];
-  }).slice(0, 8);
-}
-
-function fallbackThemesFromEvidence(
-  request: ResearchSynthesisRequest,
-  allowedSourceIds: string[]
-): ResearchTheme[] {
-  const insightThemes = request.evidenceMatrix.derivedInsights.flatMap((insight) => {
-    const sourceIds = reconcileSourceIds(insight.paperIds, allowedSourceIds);
-
-    if (sourceIds.length === 0) {
-      return [];
-    }
-
-    return [{
-      title: insight.title,
-      summary: insight.summary,
-      sourceIds
-    }];
-  });
-
-  if (insightThemes.length > 0) {
-    return insightThemes.slice(0, 6);
-  }
-
-  const rowsWithClaims = request.evidenceMatrix.rows
-    .filter((row) => row.claimCount > 0)
-    .slice(0, 6);
-
-  if (rowsWithClaims.length === 0) {
-    return [];
-  }
-
-  return [{
-    title: "Reviewed system evidence",
-    summary: `The reviewed set contains ${rowsWithClaims.length} papers with extractable paper-level claims, but the synthesis backend did not return stable cross-paper themes.`,
-    sourceIds: reconcileSourceIds(rowsWithClaims.map((row) => row.paperId), allowedSourceIds)
-  }];
-}
-
-function fallbackClaimsFromPaperExtractions(
-  request: ResearchSynthesisRequest,
-  allowedSourceIds: string[]
-): ResearchClaim[] {
-  return request.paperExtractions.flatMap((extraction) => {
-    if (extraction.confidence === "low" || !allowedSourceIds.includes(extraction.paperId)) {
-      return [];
-    }
-
-    return extraction.supportedClaims
-      .filter((claim) => claim.support === "explicit" || claim.support === "partial")
-      .map((claim) => ({
-        claim: claim.claim,
-        evidence: extraction.evidenceNotes[0]
-          ?? `Extracted from reviewed paper ${extraction.paperId} in the ${extraction.problemSetting} setting.`,
-        sourceIds: [extraction.paperId]
-      }));
-  }).slice(0, 8);
-}
-
-function normalizeSynthesis(raw: unknown, request: ResearchSynthesisRequest, allowedSourceIds: string[] = []): ResearchSynthesis {
-  const record = typeof raw === "object" && raw !== null
-    ? raw as Record<string, unknown>
-    : {};
-  const nextQuestions = safeStringArray(record.nextQuestions, 6);
-  const matrixBackedQuestions = evidenceMatrixNextQuestions(request.evidenceMatrix);
-  const themes = normalizeThemes(record.themes, allowedSourceIds);
-  const claims = normalizeClaims(record.claims, allowedSourceIds);
-
-  return {
-    executiveSummary: safeString(record.executiveSummary)
-      ?? `This first-pass run synthesized the available sources around ${request.brief.topic ?? "the requested topic"}.`,
-    themes: themes.length > 0 ? themes : fallbackThemesFromEvidence(request, allowedSourceIds),
-    claims: claims.length > 0 ? claims : fallbackClaimsFromPaperExtractions(request, allowedSourceIds),
-    nextQuestions: nextQuestions.length > 0 ? nextQuestions : matrixBackedQuestions
-  };
-}
-
 function claimRecordIdFromClaimText(text: string): string {
   return createMemoryRecordId("claim", text);
 }
@@ -816,58 +700,6 @@ function normalizeCandidateDirections(
   }).slice(0, 5);
 }
 
-function normalizeWorkPackage(
-  value: unknown,
-  candidateDirections: ResearchDirectionCandidate[],
-  brief: ResearchBrief
-): WorkPackage | null {
-  if (typeof value !== "object" || value === null) {
-    return null;
-  }
-
-  const record = value as Record<string, unknown>;
-  const title = safeString(record.title);
-  const objective = safeString(record.objective);
-  const hypothesisOrQuestion = safeString(record.hypothesisOrQuestion);
-  const methodSketch = safeString(record.methodSketch);
-  const decisiveExperiment = safeString(record.decisiveExperiment);
-  const stopCriterion = safeString(record.stopCriterion);
-  const expectedArtifact = safeString(record.expectedArtifact);
-
-  if (
-    title === null
-    || objective === null
-    || hypothesisOrQuestion === null
-    || methodSketch === null
-    || decisiveExperiment === null
-    || stopCriterion === null
-    || expectedArtifact === null
-  ) {
-    return null;
-  }
-
-  const directionId = safeString(record.directionId);
-  const selectedDirection = directionId === null
-    ? null
-    : candidateDirections.find((direction) => direction.id === directionId) ?? null;
-
-  return {
-    id: safeString(record.id) ?? `work-package-${hashString(`${title}:${objective}`)}`,
-    title,
-    mode: safeResearchMode(record.mode) ?? selectedDirection?.mode ?? "literature_synthesis",
-    objective,
-    hypothesisOrQuestion,
-    methodSketch,
-    baselines: safeStringArray(record.baselines, 6),
-    controls: safeStringArray(record.controls, 6),
-    decisiveExperiment,
-    stopCriterion,
-    expectedArtifact,
-    requiredInputs: safeStringArray(record.requiredInputs, 8),
-    blockedBy: safeStringArray(record.blockedBy, 8)
-  };
-}
-
 function normalizeAgenda(raw: unknown, request: ResearchAgendaRequest): ResearchAgenda {
   const record = typeof raw === "object" && raw !== null
     ? raw as Record<string, unknown>
@@ -888,15 +720,11 @@ function normalizeAgenda(raw: unknown, request: ResearchAgendaRequest): Research
     selectedDirectionId = null;
   }
 
-  const selectedWorkPackage = normalizeWorkPackage(record.selectedWorkPackage, candidateDirections, request.brief);
-  const effectiveSelectedDirectionId = selectedDirectionId
-    ?? (selectedWorkPackage === null
-      ? null
-      : candidateDirections.find((direction) => direction.mode === selectedWorkPackage.mode)?.id ?? candidateDirections[0]?.id ?? null);
+  const effectiveSelectedDirectionId = selectedDirectionId ?? candidateDirections[0]?.id ?? null;
   const holdReasons = safeStringArray(record.holdReasons, 6);
   const verifiedSignals = request.verification.verifiedClaims.filter((claim) => claim.supportStatus === "supported").length;
   const evidenceThin = request.evidenceMatrix.rowCount < 3 || verifiedSignals === 0;
-  const missingSelection = effectiveSelectedDirectionId === null || selectedWorkPackage === null;
+  const missingSelection = effectiveSelectedDirectionId === null;
   const matrixHolds = request.evidenceMatrix.derivedInsights
     .filter((insight) => insight.kind === "gap" || insight.kind === "conflict")
     .map((insight) => insight.summary)
@@ -908,18 +736,18 @@ function normalizeAgenda(raw: unknown, request: ResearchAgendaRequest): Research
     gaps,
     candidateDirections,
     selectedDirectionId: evidenceThin || missingSelection ? null : effectiveSelectedDirectionId,
-    selectedWorkPackage: evidenceThin || missingSelection ? null : selectedWorkPackage,
+    selectedWorkPackage: null,
     holdReasons: evidenceThin || missingSelection
       ? holdReasons.length > 0
         ? [...holdReasons, ...matrixHolds].slice(0, 6)
         : matrixHolds.length > 0
           ? matrixHolds
-          : ["The reviewed evidence is still too thin or inconclusive to justify an executable next work package."]
+          : ["The reviewed evidence is still too thin or inconclusive to justify release readiness."]
       : holdReasons,
     recommendedHumanDecision: safeString(record.recommendedHumanDecision)
       ?? (evidenceThin || missingSelection
-        ? "Review the agenda, refine the brief or retrieval strategy, and run another literature pass before continuing."
-        : "Inspect the selected work package, then confirm `/continue` if the scope and evidence base look acceptable.")
+        ? "Continue autonomous evidence gathering unless a concrete external blocker requires user input."
+        : "Continue the autonomous research worker toward release readiness; candidate directions are internal planning context, not a user handoff.")
   };
 }
 
@@ -967,7 +795,9 @@ function planningInstruction(request: ResearchPlanningRequest): string {
     `Brief: ${JSON.stringify(request.brief)}`,
     `Local files: ${JSON.stringify(request.localFiles.slice(0, 20))}`,
     `Project memory context: ${JSON.stringify(request.memoryContext)}`,
-    `Literature memory context: ${JSON.stringify(literatureContext)}`
+    `Literature memory context: ${JSON.stringify(literatureContext)}`,
+    `Autonomous worker state: ${JSON.stringify(request.workerState ?? null)}`,
+    "If autonomous worker state contains nextInternalActions, continue those machine-actionable research actions unless the brief has materially changed or an external blocker prevents progress."
   ].join("\n");
 }
 
@@ -988,11 +818,17 @@ function agentStepInstruction(request: ResearchActionRequest): string {
 
   return [
     "You are ClawResearch's research-agent controller.",
-    "Choose exactly one next action from the allowed action list.",
+    "Choose exactly one next tool operation from the allowed tool list.",
     "Do not invent tool names. Do not execute the action yourself. The runtime will validate and execute the chosen action.",
-    "If evidence is not ready and useful revision budget remains, choose revise_search_strategy with concrete searchQueries.",
-    "If the selected evidence is ready for synthesis, choose synthesize_clustered.",
-    "If the model cannot justify another useful step or action control is unsafe, choose finalize_status_report.",
+    "The phase value is only a milestone/progress label. It must not limit your tool choice.",
+    "Use work_store.query/read/create/patch to inspect or update durable research state.",
+    "Use source.search/merge/rank/resolve_access/select_evidence for source discovery and evidence-set construction.",
+    "Use evidence.revise_strategy/extract/build_matrix/update_cell/find_support/find_contradictions for evidence work.",
+    "Use claim.create/revise/check_support/attach_citation for claim-led synthesis.",
+    "Use manuscript.read_section/patch_section/add_paragraph/check_section_claims for section-level writing.",
+    "Use critic.review/create_work_item/resolve_work_item when a fresh review or critic work-item update is needed.",
+    "Critic objections and checks are normal work-store work items. Prefer concrete tool steps over stopping.",
+    "Use manuscript.status only when the next step is genuinely external to the agent, unsafe, or impossible with the configured tools.",
     "",
     "Return JSON only with this exact shape:",
     "{",
@@ -1000,11 +836,21 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     '  "rationale": "why this is the best next action",',
     '  "confidence": 0.0,',
     '  "inputs": {',
+    '    "providerIds": ["provider ids to query next, e.g. openalex, arxiv"],',
     '    "searchQueries": ["only if revising/searching"],',
     '    "evidenceTargets": ["missing evidence targets"],',
     '    "paperIds": ["known paper ids only"],',
     '    "criticStage": "protocol|source_selection|evidence|release|null",',
-    '    "reason": "short status reason or null"',
+    '    "reason": "short status reason or null",',
+    '    "workStore": {',
+    '      "collection": "workItems|canonicalSources|claims|evidenceCells|manuscriptSections|releaseChecks|null",',
+    '      "entityId": "known entity id or null",',
+    '      "filters": { "field": "simple exact match value" },',
+    '      "semanticQuery": "short query or null",',
+    '      "limit": 12,',
+    '      "changes": { "field": "patch value" },',
+    '      "entity": { "kind": "workItem", "title": "optional new work item" }',
+    "    }",
     "  },",
     '  "expectedOutcome": "checkpoint/result expected from the action",',
     '  "stopCondition": "when the runtime should stop this action"',
@@ -1018,6 +864,8 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     `Brief: ${JSON.stringify(request.brief)}`,
     `Plan: ${JSON.stringify(request.plan)}`,
     `Observations: ${JSON.stringify(request.observations)}`,
+    `Source state: ${JSON.stringify(request.sourceState ?? null)}`,
+    `Work store: ${JSON.stringify(request.workStore ?? null)}`,
     `Critic reports: ${JSON.stringify(criticSummaries)}`,
     request.retryInstruction === undefined ? "Retry instruction: null" : `Retry instruction: ${request.retryInstruction}`
   ].join("\n");
@@ -1101,95 +949,6 @@ function extractionInstruction(request: PaperExtractionRequest): string {
   ].join("\n");
 }
 
-function synthesisInstruction(request: ResearchSynthesisRequest): string {
-  const literatureContext = request.literatureContext ?? {
-    available: false,
-    paperCount: 0,
-    themeCount: 0,
-    notebookCount: 0,
-    papers: [],
-    themes: [],
-    notebooks: [],
-    queryHints: []
-  };
-  const condensedPapers = request.papers.map((paper) => ({
-    id: paper.id,
-    title: paper.title,
-    citation: paper.citation,
-    year: paper.year,
-    authors: paper.authors,
-    venue: paper.venue,
-    abstract: paper.abstract,
-    bestAccessUrl: paper.bestAccessUrl,
-    bestAccessProvider: paper.bestAccessProvider,
-    accessMode: paper.accessMode,
-    fulltextFormat: paper.fulltextFormat,
-    screeningStage: paper.screeningStage,
-    screeningDecision: paper.screeningDecision,
-    screeningRationale: paper.screeningRationale,
-    tags: paper.tags,
-    identifiers: paper.identifiers
-  }));
-
-  if (shouldUseLiteratureReviewSubsystem(request.plan, request.brief)) {
-    return [
-      buildLiteratureSynthesisInstruction({
-        projectRoot: request.projectRoot,
-        brief: request.brief,
-        plan: request.plan,
-        sources: condensedPapers.map((paper) => ({
-          id: paper.id,
-          kind: "canonical_paper",
-          title: paper.title,
-          locator: paper.bestAccessUrl,
-          citation: paper.citation,
-          excerpt: paper.abstract ?? `${paper.accessMode} via ${paper.bestAccessProvider ?? "unknown"}`,
-          screeningDecision: paper.screeningDecision,
-          screeningRationale: paper.screeningRationale,
-          tags: paper.tags
-        })),
-        literatureContext,
-        selectionQuality: request.selectionQuality ?? null
-      }),
-      "",
-      "Evidence-backed extraction layer:",
-      `Paper extractions: ${JSON.stringify(request.paperExtractions)}`,
-      `Evidence matrix: ${JSON.stringify(request.evidenceMatrix)}`,
-      "Ground themes, claims, and open questions in the evidence matrix derivedInsights and the extraction records, not only the raw paper list."
-    ].join("\n");
-  }
-
-  return [
-    "You are ClawResearch's synthesis module for a console-first autonomous research runtime.",
-    "Work only from the provided sources. Do not invent papers, evidence, or claims.",
-    "Produce a bounded first-pass synthesis that remains honest about uncertainty.",
-    "Every claim must be explicitly grounded in the cited sourceIds.",
-    "Prefer claims about patterns, limitations, methods, and open questions over grand conclusions.",
-    "Next questions should be concrete follow-up research questions, not generic brainstorming.",
-    "",
-    "Return JSON only with this exact shape:",
-    "{",
-    '  "executiveSummary": "string",',
-    '  "themes": [',
-    '    { "title": "string", "summary": "string", "sourceIds": ["string"] }',
-    "  ],",
-    '  "claims": [',
-    '    { "claim": "string", "evidence": "string", "sourceIds": ["string"] }',
-    "  ],",
-    '  "nextQuestions": ["string"]',
-    "}",
-    "",
-    `Project root: ${request.projectRoot}`,
-    `Brief: ${JSON.stringify(request.brief)}`,
-    `Plan: ${JSON.stringify(request.plan)}`,
-    `Canonical papers: ${JSON.stringify(condensedPapers)}`,
-    `Review selection quality: ${JSON.stringify(request.selectionQuality ?? null)}`,
-    `Paper extractions: ${JSON.stringify(request.paperExtractions)}`,
-    `Evidence matrix: ${JSON.stringify(request.evidenceMatrix)}`,
-    `Literature memory context: ${JSON.stringify(literatureContext)}`
-  ].join("\n");
-}
-
 function agendaInstruction(request: ResearchAgendaRequest): string {
   const literatureContext = request.literatureContext ?? {
     available: false,
@@ -1221,14 +980,14 @@ function agendaInstruction(request: ResearchAgendaRequest): string {
 
   return [
     "You are ClawResearch's research-agenda module for a console-first autonomous research runtime.",
-    "Convert the reviewed literature, verified claims, open questions, and project memory into a bounded research agenda.",
+    "Convert the reviewed literature, verified claims, open questions, and project memory into an internal research agenda for a persistent autonomous research worker.",
     "This is proposal ranking, not scientific proof. Do not treat polished text as evidence.",
     "Use only the reviewed papers and verified-claim context provided here.",
-    "Use review selection quality as a boundary condition: do not select a work package whose core objective depends on missing required facets.",
-    "If selection adequacy is thin or required facets are missing, either choose a literature-retrieval/refinement package or leave the agenda on hold with explicit missing-facet reasons.",
+    "Use review selection quality as a boundary condition: do not claim release readiness when required evidence is missing.",
+    "If selection adequacy is thin or required facets are missing, record internal evidence-gathering or revision needs in gaps and holdReasons.",
     "Prefer 2 to 5 concrete candidate directions.",
-    "If the evidence base is weak, conflicting, or too theory-heavy for a bounded next step, leave selectedDirectionId null, selectedWorkPackage null, and explain holdReasons honestly.",
-    "Do not generate manuscript-writing tasks.",
+    "Do not generate a selectedWorkPackage object. The worker continues internally through research actions rather than handing execution back to the user.",
+    "Always return selectedWorkPackage as null.",
     "",
     "Scoring guidance:",
     "- strong evidence and replicated signals increase evidenceBase",
@@ -1293,22 +1052,7 @@ function agendaInstruction(request: ResearchAgendaRequest): string {
     "    }",
     "  ],",
     '  "selectedDirectionId": "string or null",',
-    '  "selectedWorkPackage": {',
-    '    "id": "string",',
-    '    "directionId": "string",',
-    '    "title": "string",',
-    '    "mode": "literature_synthesis|replication|benchmarking|ablation|method_improvement|new_hypothesis",',
-    '    "objective": "string",',
-    '    "hypothesisOrQuestion": "string",',
-    '    "methodSketch": "string",',
-    '    "baselines": ["string"],',
-    '    "controls": ["string"],',
-    '    "decisiveExperiment": "string",',
-    '    "stopCriterion": "string",',
-    '    "expectedArtifact": "string",',
-    '    "requiredInputs": ["string"],',
-    '    "blockedBy": ["string"]',
-    '  } or null,',
+    '  "selectedWorkPackage": null,',
     '  "holdReasons": ["string"],',
     '  "recommendedHumanDecision": "string"',
     "}",
@@ -1383,6 +1127,7 @@ function criticInstruction(request: CriticReviewRequest): string {
     '    "searchQueries": ["concrete query suggestions"],',
     '    "evidenceTargets": ["missing evidence targets"],',
     '    "papersToExclude": ["known selected paper id only"],',
+    '    "papersToPromote": ["known paper id from selected papers or relevance assessments"],',
     '    "claimsToSoften": ["known claim id only"]',
     "  }",
     "}",
@@ -1677,7 +1422,7 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
     type: "function",
     function: {
       name: researchActionToolName,
-      description: "Choose exactly one validated next action for the ClawResearch runtime. The runtime executes the action after validating it.",
+      description: "Choose exactly one validated next workspace tool operation for the ClawResearch runtime. The runtime executes the operation after validating it.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -1685,7 +1430,7 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
           action: {
             type: "string",
             enum: request.allowedActions,
-            description: "The single next action the runtime should execute."
+            description: "The single next workspace tool operation the runtime should execute."
           },
           rationale: {
             type: "string",
@@ -1706,6 +1451,15 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
                   type: "string"
                 }
               },
+              providerIds: {
+                type: "array",
+                items: request.sourceState?.availableProviderIds === undefined
+                  ? { type: "string" }
+                  : {
+                    type: "string",
+                    enum: request.sourceState.availableProviderIds
+                  }
+              },
               evidenceTargets: {
                 type: "array",
                 items: {
@@ -1724,9 +1478,57 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
               },
               reason: {
                 type: ["string", "null"]
+              },
+              workStore: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                  collection: {
+                    type: ["string", "null"],
+                    enum: [
+                      "providerRuns",
+                      "sources",
+                      "canonicalSources",
+                      "screeningDecisions",
+                      "fullTextRecords",
+                      "extractions",
+                      "evidenceCells",
+                      "claims",
+                      "citations",
+                      "workItems",
+                      "manuscriptSections",
+                      "releaseChecks",
+                      null
+                    ]
+                  },
+                  entityId: {
+                    type: ["string", "null"]
+                  },
+                  filters: {
+                    type: "object",
+                    additionalProperties: {
+                      type: ["string", "number", "boolean", "null"]
+                    }
+                  },
+                  semanticQuery: {
+                    type: ["string", "null"]
+                  },
+                  limit: {
+                    type: ["number", "null"]
+                  },
+                  changes: {
+                    type: "object",
+                    additionalProperties: true
+                  },
+                  entity: {
+                    type: "object",
+                    additionalProperties: true
+                  }
+                },
+                required: ["collection", "entityId", "filters", "semanticQuery", "limit", "changes", "entity"]
               }
             },
-            required: ["searchQueries", "evidenceTargets", "paperIds", "criticStage", "reason"]
+            required: ["providerIds", "searchQueries", "evidenceTargets", "paperIds", "criticStage", "reason"]
           },
           expectedOutcome: {
             type: "string"
@@ -1741,14 +1543,43 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
   };
 }
 
+function responseResearchActionToolDefinition(request: ResearchActionRequest): {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+} {
+  const definition = researchActionToolDefinition(request);
+  const fn = typeof definition.function === "object" && definition.function !== null
+    ? definition.function as Record<string, unknown>
+    : {};
+  const name = safeString(fn.name) ?? researchActionToolName;
+  const description = safeString(fn.description)
+    ?? "Choose exactly one validated next action for the ClawResearch runtime.";
+  const parameters = typeof fn.parameters === "object" && fn.parameters !== null
+    ? fn.parameters as Record<string, unknown>
+    : {};
+
+  return {
+    name,
+    description,
+    parameters
+  };
+}
+
 function nativeAgentStepInstruction(request: ResearchActionRequest): string {
   return [
     "You are ClawResearch's research-agent controller.",
     `Call ${researchActionToolName} exactly once.`,
     "Do not answer in prose. Do not invent tools. The runtime validates and executes the chosen action.",
-    "If evidence is not ready and useful revision budget remains, choose revise_search_strategy with concrete searchQueries.",
-    "If the selected evidence is ready for synthesis, choose synthesize_clustered.",
-    "If the model cannot justify another useful step or action control is unsafe, choose finalize_status_report.",
+    "The phase value is only a milestone/progress label. It must not limit your tool choice.",
+    "Use work_store.query/read/create/patch to inspect or update durable research state.",
+    "Use source.search/merge/rank/resolve_access/select_evidence for source discovery and evidence-set construction.",
+    "Use evidence.revise_strategy/extract/build_matrix/update_cell/find_support/find_contradictions for evidence work.",
+    "Use claim.create/revise/check_support/attach_citation for claim-led synthesis.",
+    "Use manuscript.read_section/patch_section/add_paragraph/check_section_claims for section-level writing.",
+    "Use critic.review/create_work_item/resolve_work_item when a fresh review or critic work-item update is needed.",
+    "Critic objections and checks are normal work-store work items. Prefer concrete tool steps over stopping.",
+    "Use manuscript.status only when the next step is genuinely external to the agent, unsafe, or impossible with the configured tools.",
     "",
     `Project root: ${request.projectRoot}`,
     `Run id: ${request.runId}`,
@@ -1758,6 +1589,8 @@ function nativeAgentStepInstruction(request: ResearchActionRequest): string {
     `Brief: ${JSON.stringify(request.brief)}`,
     `Plan: ${JSON.stringify(request.plan)}`,
     `Observations: ${JSON.stringify(request.observations)}`,
+    `Source state: ${JSON.stringify(request.sourceState ?? null)}`,
+    `Work store: ${JSON.stringify(request.workStore ?? null)}`,
     `Critic reports: ${JSON.stringify(request.criticReports.map((report) => ({
       stage: report.stage,
       readiness: report.readiness,
@@ -1900,6 +1733,7 @@ export class OllamaResearchBackend implements ResearchBackend {
     timeoutMs: 300_000
   }): Promise<ResearchActionDecision> {
     const agentControlMode = options.agentControlMode ?? "auto";
+    let transportFallback: ResearchActionDecision["transportFallback"];
 
     if (agentControlMode === "native_tool_calls") {
       return ollamaResearchActionToolCall(this.host, this.model, request, options);
@@ -1916,6 +1750,13 @@ export class OllamaResearchBackend implements ResearchBackend {
         if (error.kind === "timeout") {
           throw error;
         }
+
+        transportFallback = {
+          from: "native_tool_call",
+          to: "strict_json",
+          kind: error.kind,
+          message: error.message
+        };
       }
     }
 
@@ -1929,7 +1770,8 @@ export class OllamaResearchBackend implements ResearchBackend {
     try {
       return {
         ...normalizeResearchActionDecision(raw, request),
-        transport: "strict_json"
+        transport: "strict_json",
+        ...(transportFallback === undefined ? {} : { transportFallback })
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1954,20 +1796,6 @@ export class OllamaResearchBackend implements ResearchBackend {
     );
 
     return normalizePaperExtractions(raw, request);
-  }
-
-  async synthesizeResearch(request: ResearchSynthesisRequest, options: ResearchBackendCallOptions = {
-    operation: "synthesis",
-    timeoutMs: 300_000
-  }): Promise<ResearchSynthesis> {
-    const raw = await ollamaJsonCall<unknown>(
-      this.host,
-      this.model,
-      synthesisInstruction(request),
-      options
-    );
-
-    return normalizeSynthesis(raw, request, request.papers.map((paper) => paper.id));
   }
 
   async developResearchAgenda(request: ResearchAgendaRequest, options: ResearchBackendCallOptions = {
@@ -1999,6 +1827,195 @@ export class OllamaResearchBackend implements ResearchBackend {
   }
 }
 
+export class OpenAIResponsesResearchBackend implements ResearchBackend {
+  readonly label: string;
+  readonly capabilities: ResearchBackendCapabilities = {
+    actionControl: {
+      nativeToolCalls: true,
+      strictJsonFallback: true
+    }
+  };
+
+  constructor(private readonly client: RuntimeModelClient) {
+    this.label = client.label;
+  }
+
+  async planResearch(request: ResearchPlanningRequest, options: ResearchBackendCallOptions = {
+    operation: "planning",
+    timeoutMs: 300_000
+  }): Promise<ResearchPlan> {
+    const raw = await modelJsonCall<unknown>(
+      this.client,
+      planningInstruction(request),
+      options
+    );
+
+    return normalizePlan(raw, request.brief);
+  }
+
+  private async chooseResearchActionNative(
+    request: ResearchActionRequest,
+    options: ResearchBackendCallOptions
+  ): Promise<ResearchActionDecision> {
+    let toolArguments: unknown | null;
+
+    try {
+      toolArguments = await this.client.toolCall(
+        nativeAgentStepInstruction(request),
+        responseResearchActionToolDefinition(request),
+        options
+      );
+    } catch (error) {
+      if (error instanceof ModelRuntimeError) {
+        throw researchBackendErrorFromModelError(error);
+      }
+
+      throw error;
+    }
+
+    if (toolArguments === null) {
+      throw new ResearchBackendError(
+        "malformed_json",
+        "agent_step",
+        `${this.client.provider} agent_step response did not include a ${researchActionToolName} tool call.`,
+        options.timeoutMs
+      );
+    }
+
+    try {
+      return {
+        ...normalizeResearchActionDecision(toolArguments, request),
+        transport: "native_tool_call"
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new ResearchBackendError(
+        "malformed_json",
+        "agent_step",
+        `Research agent returned an invalid native tool call: ${message}`,
+        options.timeoutMs
+      );
+    }
+  }
+
+  async chooseResearchAction(request: ResearchActionRequest, options: ResearchBackendCallOptions = {
+    operation: "agent_step",
+    timeoutMs: 300_000
+  }): Promise<ResearchActionDecision> {
+    const agentControlMode = options.agentControlMode ?? "auto";
+    let transportFallback: ResearchActionDecision["transportFallback"];
+
+    if (agentControlMode === "native_tool_calls") {
+      return this.chooseResearchActionNative(request, options);
+    }
+
+    if (agentControlMode === "auto") {
+      try {
+        return await this.chooseResearchActionNative(request, options);
+      } catch (error) {
+        if (!(error instanceof ResearchBackendError)) {
+          throw error;
+        }
+
+        if (error.kind === "timeout") {
+          throw error;
+        }
+
+        transportFallback = {
+          from: "native_tool_call",
+          to: "strict_json",
+          kind: error.kind,
+          message: error.message
+        };
+      }
+    }
+
+    const raw = await modelJsonCall<unknown>(
+      this.client,
+      agentStepInstruction(request),
+      options
+    );
+
+    try {
+      return {
+        ...normalizeResearchActionDecision(raw, request),
+        transport: "strict_json",
+        ...(transportFallback === undefined ? {} : { transportFallback })
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new ResearchBackendError(
+        "malformed_json",
+        "agent_step",
+        `Research agent returned an invalid structured action: ${message}`,
+        options.timeoutMs
+      );
+    }
+  }
+
+  async extractReviewedPapers(request: PaperExtractionRequest, options: ResearchBackendCallOptions = {
+    operation: "extraction",
+    timeoutMs: 300_000
+  }): Promise<PaperExtraction[]> {
+    const raw = await modelJsonCall<unknown>(
+      this.client,
+      extractionInstruction(request),
+      options
+    );
+
+    return normalizePaperExtractions(raw, request);
+  }
+
+  async developResearchAgenda(request: ResearchAgendaRequest, options: ResearchBackendCallOptions = {
+    operation: "agenda",
+    timeoutMs: 300_000
+  }): Promise<ResearchAgenda> {
+    const raw = await modelJsonCall<unknown>(
+      this.client,
+      agendaInstruction(request),
+      options
+    );
+
+    return normalizeAgenda(raw, request);
+  }
+
+  async reviewResearchArtifact(request: CriticReviewRequest, options: ResearchBackendCallOptions = {
+    operation: "critic",
+    timeoutMs: 300_000
+  }): Promise<CriticReviewArtifact> {
+    const raw = await modelJsonCall<unknown>(
+      this.client,
+      criticInstruction(request),
+      options
+    );
+
+    return normalizeCriticReview(raw, request);
+  }
+}
+
 export function createDefaultResearchBackend(): ResearchBackend {
   return new OllamaResearchBackend();
+}
+
+export async function createProjectResearchBackend(params: {
+  projectRoot: string;
+  projectConfig: ProjectConfigState;
+  timestampFactory?: () => string;
+}): Promise<ResearchBackend> {
+  const runtimeModel = resolveRuntimeModelConfig(params.projectConfig);
+
+  if (runtimeModel.provider === "ollama") {
+    return new OllamaResearchBackend(
+      runtimeModel.host ?? defaultHost,
+      runtimeModel.model,
+      process.env.CLAWRESEARCH_OLLAMA_CRITIC_HOST ?? runtimeModel.host ?? defaultCriticHost,
+      process.env.CLAWRESEARCH_OLLAMA_CRITIC_MODEL ?? runtimeModel.model
+    );
+  }
+
+  const credentialStore = new ModelCredentialStore(params.projectRoot, params.timestampFactory);
+  const credentials: ModelCredentialState = await credentialStore.load();
+  return new OpenAIResponsesResearchBackend(
+    new RuntimeModelClient(runtimeModel, credentials, credentialStore)
+  );
 }

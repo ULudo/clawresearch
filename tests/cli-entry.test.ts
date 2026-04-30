@@ -164,7 +164,7 @@ test("help flag prints interactive usage and slash commands", async () => {
   const code = await main(["--help"], { writer: sink.writer });
 
   assert.equal(code, 0);
-  assert.match(sink.output, /Starts the TUI research console in the current directory, launches detached runs from `\/go`, and streams their saved progress events in the terminal\./);
+  assert.match(sink.output, /`\/go` starts or continues the autonomous research worker/);
   assert.match(sink.output, /Use `--plain` to force the older line-oriented console/);
   assert.match(sink.output, /--project-root PATH/);
   assert.match(sink.output, /\/go/);
@@ -307,7 +307,7 @@ test("compiled cli still runs when invoked through a symlinked path", async () =
       cwd: path.resolve(".")
     });
 
-    assert.match(stdout, /Starts the TUI research console in the current directory, launches detached runs from `\/go`, and streams their saved progress events in the terminal\./);
+    assert.match(stdout, /`\/go` starts or continues the autonomous research worker/);
     assert.match(stdout, /\/quit/);
   } finally {
     await rm(scratchRoot, { recursive: true, force: true });
