@@ -1,4 +1,5 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import type { CanonicalPaper, LiteratureContext } from "./literature-store.js";
 import type { ProjectMemoryContext, MemoryRecordType } from "./memory-store.js";
@@ -15,8 +16,11 @@ import { runtimeDirectoryPath as runtimeDir } from "./session-store.js";
 import type { RunRecord } from "./run-store.js";
 import type { VerificationReport } from "./verifier.js";
 
-const workStoreSchemaVersion = 1;
-const workStoreFileName = "research-work-store.json";
+const require = createRequire(import.meta.url);
+
+const workStoreSchemaVersion = 2;
+const workspaceDatabaseFileName = "workspace.sqlite";
+const legacyWorkStoreFileName = "research-work-store.json";
 
 export type WorkStoreEntityKind =
   | "providerRun"
@@ -186,6 +190,11 @@ export type WorkStoreClaim = WorkStoreBaseEntity & {
 export type WorkStoreCitation = WorkStoreBaseEntity & {
   kind: "citation";
   sourceId: string;
+  sourceTitle: string;
+  evidenceCellId: string | null;
+  supportSnippet: string;
+  confidence: string | null;
+  relevance: string | null;
   claimIds: string[];
   sectionIds: string[];
 };
@@ -267,7 +276,7 @@ export type ResearchWorkStoreObjects = {
 };
 
 export type ResearchWorkStore = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   projectRoot: string;
   runtimeDirectory: string;
   createdAt: string;
@@ -284,11 +293,16 @@ export type WorkStoreQuery = {
   filters?: WorkStoreFilter;
   semanticQuery?: string | null;
   limit?: number;
+  cursor?: string | null;
 };
 
 export type WorkStoreQueryResult<T extends WorkStoreEntity = WorkStoreEntity> = {
   collection: WorkStoreCollectionName;
   count: number;
+  totalCount: number;
+  cursor: string | null;
+  hasMore: boolean;
+  nextCursor: string | null;
   items: T[];
 };
 
@@ -302,6 +316,172 @@ export type WorkStorePatch = {
   id: string;
   changes: Record<string, unknown>;
 };
+
+type SqliteStatement = {
+  run: (...values: unknown[]) => unknown;
+  all: (...values: unknown[]) => Array<Record<string, unknown>>;
+  get: (...values: unknown[]) => Record<string, unknown> | undefined;
+};
+
+type SqliteDatabase = {
+  exec: (sql: string) => void;
+  prepare: (sql: string) => SqliteStatement;
+  close: () => void;
+};
+
+function databaseConstructor(): new (filename: string) => SqliteDatabase {
+  return (require("node:sqlite") as {
+    DatabaseSync: new (filename: string) => SqliteDatabase;
+  }).DatabaseSync;
+}
+
+function openWorkspaceDatabase(projectRoot: string): SqliteDatabase {
+  const DatabaseSync = databaseConstructor();
+  const database = new DatabaseSync(researchWorkStoreFilePath(projectRoot));
+  database.exec("PRAGMA foreign_keys = ON");
+  return database;
+}
+
+function jsonText(value: unknown): string {
+  return JSON.stringify(value);
+}
+
+function parseJsonRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== "string") {
+    return {};
+  }
+
+  try {
+    return asObject(JSON.parse(value) as unknown);
+  } catch {
+    return {};
+  }
+}
+
+function parseJsonValue<T>(value: unknown, fallback: T): T {
+  if (typeof value !== "string") {
+    return fallback;
+  }
+
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function ensureWorkspaceSchema(database: SqliteDatabase): void {
+  database.exec(`
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS worker_state (
+  id TEXT PRIMARY KEY CHECK (id = 'current'),
+  json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sources (
+  id TEXT PRIMARY KEY,
+  run_id TEXT,
+  title TEXT NOT NULL,
+  citation TEXT NOT NULL,
+  abstract TEXT,
+  year INTEGER,
+  venue TEXT,
+  screening_decision TEXT,
+  access_mode TEXT,
+  best_access_url TEXT,
+  json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS extractions (
+  id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL,
+  run_id TEXT,
+  json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS claims (
+  id TEXT PRIMARY KEY,
+  run_id TEXT,
+  text TEXT NOT NULL,
+  evidence TEXT NOT NULL,
+  support_status TEXT NOT NULL,
+  confidence TEXT NOT NULL,
+  risk TEXT,
+  json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS support_links (
+  id TEXT PRIMARY KEY,
+  run_id TEXT,
+  source_id TEXT NOT NULL,
+  json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS manuscript_sections (
+  id TEXT PRIMARY KEY,
+  run_id TEXT,
+  section_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  status TEXT NOT NULL,
+  json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS section_claims (
+  section_id TEXT NOT NULL,
+  claim_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (section_id, claim_id)
+);
+CREATE TABLE IF NOT EXISTS work_items (
+  id TEXT PRIMARY KEY,
+  run_id TEXT,
+  type TEXT NOT NULL,
+  status TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  title TEXT NOT NULL,
+  target_kind TEXT NOT NULL,
+  target_id TEXT,
+  json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS checks (
+  id TEXT PRIMARY KEY,
+  run_id TEXT,
+  check_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  title TEXT NOT NULL,
+  message TEXT NOT NULL,
+  json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT,
+  event_type TEXT NOT NULL,
+  entity_kind TEXT,
+  entity_id TEXT,
+  message TEXT NOT NULL,
+  json TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sources_search ON sources(title, citation, venue, screening_decision);
+CREATE INDEX IF NOT EXISTS idx_extractions_source ON extractions(source_id);
+CREATE INDEX IF NOT EXISTS idx_claims_status ON claims(support_status);
+CREATE INDEX IF NOT EXISTS idx_work_items_status ON work_items(status, severity);
+CREATE INDEX IF NOT EXISTS idx_section_claims_claim ON section_claims(claim_id);
+`);
+}
 
 function createEmptyBrief(): ResearchBrief {
   return {
@@ -516,6 +696,59 @@ function entityText(entity: WorkStoreEntity): string {
   return JSON.stringify(entity).toLowerCase();
 }
 
+const semanticStopWords = new Set([
+  "about",
+  "after",
+  "again",
+  "against",
+  "also",
+  "because",
+  "before",
+  "between",
+  "could",
+  "evidence",
+  "from",
+  "have",
+  "into",
+  "more",
+  "paper",
+  "papers",
+  "research",
+  "source",
+  "sources",
+  "that",
+  "their",
+  "there",
+  "these",
+  "this",
+  "through",
+  "with",
+  "work"
+]);
+
+function semanticTerms(semanticQuery: string | null | undefined): string[] {
+  const query = compactText(semanticQuery ?? "").toLowerCase();
+  if (query.length === 0) {
+    return [];
+  }
+
+  return uniqueStrings(
+    query.split(/[^a-z0-9]+/i)
+      .map((term) => term.toLowerCase())
+      .filter((term) => term.length >= 3 && !semanticStopWords.has(term)),
+    30
+  );
+}
+
+function semanticScore(entity: WorkStoreEntity, terms: string[]): number {
+  if (terms.length === 0) {
+    return 1;
+  }
+
+  const haystack = entityText(entity);
+  return terms.reduce((score, term) => score + (haystack.includes(term) ? 1 : 0), 0);
+}
+
 function valueAtPath(value: unknown, dottedPath: string): unknown {
   return dottedPath.split(".").reduce<unknown>((current, part) => (
     typeof current === "object" && current !== null
@@ -539,23 +772,21 @@ function matchesFilters(entity: WorkStoreEntity, filters: WorkStoreFilter | unde
   });
 }
 
-function matchesSemanticQuery(entity: WorkStoreEntity, semanticQuery: string | null | undefined): boolean {
-  const query = compactText(semanticQuery ?? "").toLowerCase();
-  if (query.length === 0) {
-    return true;
-  }
-
-  const terms = query.split(/\s+/).filter((term) => term.length >= 3);
-  if (terms.length === 0) {
-    return true;
-  }
-
-  const haystack = entityText(entity);
-  return terms.every((term) => haystack.includes(term));
+export function researchWorkStoreFilePath(projectRoot: string): string {
+  return path.join(runtimeDir(projectRoot), workspaceDatabaseFileName);
 }
 
-export function researchWorkStoreFilePath(projectRoot: string): string {
-  return path.join(runtimeDir(projectRoot), workStoreFileName);
+function legacyResearchWorkStoreFilePath(projectRoot: string): string {
+  return path.join(runtimeDir(projectRoot), legacyWorkStoreFileName);
+}
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function createResearchWorkStore(input: {
@@ -575,15 +806,295 @@ export function createResearchWorkStore(input: {
   };
 }
 
+function statementRows<T>(database: SqliteDatabase, sql: string, ...values: unknown[]): T[] {
+  return database.prepare(sql).all(...values) as T[];
+}
+
+function rowJsonEntity<T extends WorkStoreEntity>(row: Record<string, unknown>, fallbackKind: WorkStoreEntityKind): T | null {
+  const entity = parseJsonValue<WorkStoreEntity | null>(row.json, null);
+  if (entity === null || entity.kind !== fallbackKind || readString(entity.id) === null) {
+    return null;
+  }
+
+  return entity as T;
+}
+
+function generatedScreeningDecision(source: WorkStoreCanonicalSource): WorkStoreScreeningDecision | null {
+  if (source.screeningDecision.length === 0 && source.screeningRationale === null) {
+    return null;
+  }
+
+  return {
+    id: stableId("screening", [source.id, "current"]),
+    kind: "screeningDecision",
+    runId: source.runId,
+    createdAt: source.createdAt,
+    updatedAt: source.updatedAt,
+    sourceId: source.id,
+    stage: "current",
+    decision: source.screeningDecision,
+    rationale: source.screeningRationale
+  };
+}
+
+function generatedFullTextRecord(source: WorkStoreCanonicalSource): WorkStoreFullTextRecord {
+  return {
+    id: stableId("fulltext", [source.id]),
+    kind: "fullTextRecord",
+    runId: source.runId,
+    createdAt: source.createdAt,
+    updatedAt: source.updatedAt,
+    sourceId: source.id,
+    accessMode: source.accessMode,
+    format: "unknown",
+    url: source.bestAccessUrl,
+    providerId: source.providerIds[0] ?? null,
+    fulltextAvailable: source.accessMode === "fulltext" || source.bestAccessUrl !== null,
+    fulltextFetched: false,
+    fulltextExtracted: false,
+    errors: []
+  };
+}
+
+function evidenceCellsFromExtraction(entity: WorkStoreExtraction): WorkStoreEvidenceCell[] {
+  const fields: WorkStoreEvidenceCell["field"][] = [
+    "problemSetting",
+    "systemType",
+    "architecture",
+    "toolsAndMemory",
+    "planningStyle",
+    "evaluationSetup",
+    "successSignals",
+    "failureModes",
+    "limitations",
+    "confidence"
+  ];
+
+  return fields.map((field) => ({
+    id: stableId("evidence-cell", [entity.sourceId, entity.id, field]),
+    kind: "evidenceCell" as const,
+    runId: entity.runId,
+    createdAt: entity.createdAt,
+    updatedAt: entity.updatedAt,
+    sourceId: entity.sourceId,
+    extractionId: entity.id,
+    field,
+    value: entity.extraction[field],
+    confidence: entity.extraction.confidence
+  }));
+}
+
+function loadWorkspaceDatabase(input: {
+  projectRoot: string;
+  brief?: ResearchBrief | null;
+  now: string;
+}): ResearchWorkStore {
+  const database = openWorkspaceDatabase(input.projectRoot);
+  try {
+    ensureWorkspaceSchema(database);
+    const metaRows = statementRows<{ key: string; value: string }>(database, "SELECT key, value FROM meta");
+    const meta = new Map(metaRows.map((row) => [row.key, row.value]));
+    const workerRow = database.prepare("SELECT json FROM worker_state WHERE id = 'current'").get();
+    const sources = statementRows<Record<string, unknown>>(database, "SELECT json FROM sources ORDER BY updated_at, id")
+      .flatMap((row) => rowJsonEntity<WorkStoreCanonicalSource>(row, "canonicalSource") ?? []);
+    const extractions = statementRows<Record<string, unknown>>(database, "SELECT json FROM extractions ORDER BY updated_at, id")
+      .flatMap((row) => rowJsonEntity<WorkStoreExtraction>(row, "extraction") ?? []);
+    const claims = statementRows<Record<string, unknown>>(database, "SELECT json FROM claims ORDER BY updated_at, id")
+      .flatMap((row) => rowJsonEntity<WorkStoreClaim>(row, "claim") ?? []);
+    const citations = statementRows<Record<string, unknown>>(database, "SELECT json FROM support_links ORDER BY updated_at, id")
+      .flatMap((row) => rowJsonEntity<WorkStoreCitation>(row, "citation") ?? []);
+    const manuscriptSections = statementRows<Record<string, unknown>>(database, "SELECT json FROM manuscript_sections ORDER BY updated_at, id")
+      .flatMap((row) => rowJsonEntity<WorkStoreManuscriptSection>(row, "manuscriptSection") ?? []);
+    const workItems = statementRows<Record<string, unknown>>(database, "SELECT json FROM work_items ORDER BY updated_at, id")
+      .flatMap((row) => rowJsonEntity<WorkStoreWorkItem>(row, "workItem") ?? []);
+    const releaseChecks = statementRows<Record<string, unknown>>(database, "SELECT json FROM checks ORDER BY updated_at, id")
+      .flatMap((row) => rowJsonEntity<WorkStoreReleaseCheck>(row, "releaseCheck") ?? []);
+    const eventRows = statementRows<Record<string, unknown>>(database, "SELECT json FROM events WHERE entity_kind = 'providerRun' ORDER BY id");
+    const providerRuns = eventRows.flatMap((row) => rowJsonEntity<WorkStoreProviderRun>(row, "providerRun") ?? []);
+
+    return {
+      schemaVersion: workStoreSchemaVersion,
+      projectRoot: input.projectRoot,
+      runtimeDirectory: runtimeDir(input.projectRoot),
+      createdAt: normalizeTimestamp(meta.get("createdAt"), input.now),
+      updatedAt: normalizeTimestamp(meta.get("updatedAt"), input.now),
+      brief: input.brief ?? normalizeBrief(parseJsonRecord(meta.get("brief"))),
+      worker: normalizeWorker(workerRow?.json === undefined ? null : parseJsonValue(workerRow.json, null), input.now),
+      objects: {
+        providerRuns,
+        sources: [],
+        canonicalSources: sources,
+        screeningDecisions: sources.flatMap((source) => generatedScreeningDecision(source) ?? []),
+        fullTextRecords: sources.map((source) => generatedFullTextRecord(source)),
+        extractions,
+        evidenceCells: extractions.flatMap((extraction) => evidenceCellsFromExtraction(extraction)),
+        claims,
+        citations,
+        workItems,
+        manuscriptSections,
+        releaseChecks
+      }
+    };
+  } finally {
+    database.close();
+  }
+}
+
+function writeWorkspaceDatabase(store: ResearchWorkStore): void {
+  const database = openWorkspaceDatabase(store.projectRoot);
+  try {
+    ensureWorkspaceSchema(database);
+    database.exec("BEGIN");
+    try {
+      database.exec(`
+DELETE FROM meta;
+DELETE FROM worker_state;
+DELETE FROM sources;
+DELETE FROM extractions;
+DELETE FROM claims;
+DELETE FROM support_links;
+DELETE FROM manuscript_sections;
+DELETE FROM section_claims;
+DELETE FROM work_items;
+DELETE FROM checks;
+DELETE FROM events;
+`);
+      const insertMeta = database.prepare("INSERT INTO meta (key, value) VALUES (?, ?)");
+      insertMeta.run("schemaVersion", String(workStoreSchemaVersion));
+      insertMeta.run("createdAt", store.createdAt);
+      insertMeta.run("updatedAt", store.updatedAt);
+      insertMeta.run("brief", jsonText(store.brief));
+      database.prepare("INSERT INTO worker_state (id, json, updated_at) VALUES ('current', ?, ?)")
+        .run(jsonText(store.worker), store.worker.updatedAt);
+
+      const insertSource = database.prepare(`
+INSERT INTO sources (
+  id, run_id, title, citation, abstract, year, venue, screening_decision,
+  access_mode, best_access_url, json, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+      for (const source of store.objects.canonicalSources) {
+        insertSource.run(
+          source.id,
+          source.runId,
+          source.title,
+          source.citation,
+          source.abstract,
+          source.year,
+          source.venue,
+          source.screeningDecision,
+          source.accessMode,
+          source.bestAccessUrl,
+          jsonText(source),
+          source.createdAt,
+          source.updatedAt
+        );
+      }
+
+      const insertExtraction = database.prepare("INSERT INTO extractions (id, source_id, run_id, json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)");
+      for (const extraction of store.objects.extractions) {
+        insertExtraction.run(extraction.id, extraction.sourceId, extraction.runId, jsonText(extraction), extraction.createdAt, extraction.updatedAt);
+      }
+
+      const insertClaim = database.prepare("INSERT INTO claims (id, run_id, text, evidence, support_status, confidence, risk, json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const claim of store.objects.claims) {
+        insertClaim.run(
+          claim.id,
+          claim.runId,
+          claim.text,
+          claim.evidence,
+          claim.supportStatus,
+          claim.confidence,
+          claim.risk,
+          jsonText(claim),
+          claim.createdAt,
+          claim.updatedAt
+        );
+      }
+
+      const insertSupportLink = database.prepare("INSERT INTO support_links (id, run_id, source_id, json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)");
+      for (const citation of store.objects.citations) {
+        insertSupportLink.run(citation.id, citation.runId, citation.sourceId, jsonText(citation), citation.createdAt, citation.updatedAt);
+      }
+
+      const insertSection = database.prepare("INSERT INTO manuscript_sections (id, run_id, section_id, title, status, json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+      const insertSectionClaim = database.prepare("INSERT OR IGNORE INTO section_claims (section_id, claim_id, created_at) VALUES (?, ?, ?)");
+      for (const section of store.objects.manuscriptSections) {
+        insertSection.run(section.id, section.runId, section.sectionId, section.title, section.status, jsonText(section), section.createdAt, section.updatedAt);
+        for (const claimId of section.claimIds) {
+          insertSectionClaim.run(section.id, claimId, section.updatedAt);
+        }
+      }
+
+      const insertWorkItem = database.prepare("INSERT INTO work_items (id, run_id, type, status, severity, title, target_kind, target_id, json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const item of store.objects.workItems) {
+        insertWorkItem.run(
+          item.id,
+          item.runId,
+          item.type,
+          item.status,
+          item.severity,
+          item.title,
+          item.targetKind,
+          item.targetId,
+          jsonText(item),
+          item.createdAt,
+          item.updatedAt
+        );
+      }
+
+      const insertCheck = database.prepare("INSERT INTO checks (id, run_id, check_id, status, severity, title, message, json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const check of store.objects.releaseChecks) {
+        insertCheck.run(check.id, check.runId, check.checkId, check.status, check.severity, check.title, check.message, jsonText(check), check.createdAt, check.updatedAt);
+      }
+
+      const insertEvent = database.prepare("INSERT INTO events (run_id, event_type, entity_kind, entity_id, message, json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+      for (const providerRun of store.objects.providerRuns) {
+        insertEvent.run(
+          providerRun.runId,
+          "provider_run",
+          "providerRun",
+          providerRun.id,
+          `${providerRun.providerId} ${providerRun.phase}`,
+          jsonText(providerRun),
+          providerRun.updatedAt
+        );
+      }
+      for (const rawSource of store.objects.sources) {
+        insertEvent.run(
+          rawSource.runId,
+          "raw_source_hit",
+          "source",
+          rawSource.id,
+          rawSource.title,
+          jsonText(rawSource),
+          rawSource.updatedAt
+        );
+      }
+
+      database.exec("COMMIT");
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  } finally {
+    database.close();
+  }
+}
+
 export async function loadResearchWorkStore(input: {
   projectRoot: string;
   brief?: ResearchBrief | null;
   now: string;
 }): Promise<ResearchWorkStore> {
+  if (await fileExists(researchWorkStoreFilePath(input.projectRoot))) {
+    return loadWorkspaceDatabase(input);
+  }
+
   try {
-    const raw = JSON.parse(await readFile(researchWorkStoreFilePath(input.projectRoot), "utf8")) as unknown;
+    const raw = JSON.parse(await readFile(legacyResearchWorkStoreFilePath(input.projectRoot), "utf8")) as unknown;
     const record = asObject(raw);
-    return {
+    const migrated: ResearchWorkStore = {
       schemaVersion: workStoreSchemaVersion,
       projectRoot: input.projectRoot,
       runtimeDirectory: runtimeDir(input.projectRoot),
@@ -593,6 +1104,8 @@ export async function loadResearchWorkStore(input: {
       worker: normalizeWorker(record.worker, input.now),
       objects: normalizeObjects(record.objects)
     };
+    await writeResearchWorkStore(migrated);
+    return migrated;
   } catch {
     return createResearchWorkStore(input);
   }
@@ -600,7 +1113,7 @@ export async function loadResearchWorkStore(input: {
 
 export async function writeResearchWorkStore(store: ResearchWorkStore): Promise<void> {
   await mkdir(runtimeDir(store.projectRoot), { recursive: true });
-  await writeFile(researchWorkStoreFilePath(store.projectRoot), `${JSON.stringify(store, null, 2)}\n`, "utf8");
+  writeWorkspaceDatabase(store);
 }
 
 export function queryResearchWorkStore<T extends WorkStoreEntity = WorkStoreEntity>(
@@ -608,14 +1121,34 @@ export function queryResearchWorkStore<T extends WorkStoreEntity = WorkStoreEnti
   query: WorkStoreQuery
 ): WorkStoreQueryResult<T> {
   const limit = Math.max(1, Math.min(500, query.limit ?? 50));
-  const items = collectionFor(store, query.collection)
-    .filter((entity) => matchesFilters(entity, query.filters))
-    .filter((entity) => matchesSemanticQuery(entity, query.semanticQuery))
-    .slice(0, limit) as T[];
+  const cursorPrefix = `${query.collection}:`;
+  const offset = typeof query.cursor === "string" && query.cursor.startsWith(cursorPrefix)
+    ? Math.max(0, Number.parseInt(query.cursor.slice(cursorPrefix.length), 10) || 0)
+    : 0;
+  const filtered = collectionFor(store, query.collection)
+    .filter((entity) => matchesFilters(entity, query.filters));
+  const terms = semanticTerms(query.semanticQuery);
+  const scored = filtered
+    .map((entity) => ({
+      entity,
+      score: semanticScore(entity, terms)
+    }))
+    .filter((entry) => terms.length === 0 || entry.score > 0)
+    .sort((left, right) => right.score - left.score);
+  const fallback = terms.length > 0 && scored.length === 0
+    ? filtered.slice().reverse()
+    : scored.map((entry) => entry.entity);
+  const items = fallback.slice(offset, offset + limit) as T[];
+  const nextOffset = offset + items.length;
+  const hasMore = nextOffset < fallback.length;
 
   return {
     collection: query.collection,
     count: items.length,
+    totalCount: fallback.length,
+    cursor: query.cursor ?? null,
+    hasMore,
+    nextCursor: hasMore ? `${query.collection}:${nextOffset}` : null,
     items
   };
 }
@@ -674,20 +1207,26 @@ export function upsertResearchWorkStoreEntities(
   let next = store;
 
   for (const entity of entities) {
-    const collection = collectionNameForKind(entity.kind);
-    const items = collectionFor(next, collection);
-    const existingIndex = items.findIndex((item) => item.id === entity.id);
-    const nextEntity = {
-      ...entity,
-      createdAt: entity.createdAt || now,
-      updatedAt: now
-    } as WorkStoreEntity;
-    const nextItems = existingIndex === -1
-      ? [...items, nextEntity]
-      : items.map((item, index) => index === existingIndex
-        ? { ...item, ...nextEntity, createdAt: item.createdAt, updatedAt: now } as WorkStoreEntity
-        : item);
-    next = setCollection(next, collection, nextItems);
+    const entitiesToUpsert = entity.kind === "extraction"
+      ? [entity, ...evidenceCellsFromExtraction(entity)]
+      : [entity];
+
+    for (const entityToUpsert of entitiesToUpsert) {
+      const collection = collectionNameForKind(entityToUpsert.kind);
+      const items = collectionFor(next, collection);
+      const existingIndex = items.findIndex((item) => item.id === entityToUpsert.id);
+      const nextEntity = {
+        ...entityToUpsert,
+        createdAt: entityToUpsert.createdAt || now,
+        updatedAt: now
+      } as WorkStoreEntity;
+      const nextItems = existingIndex === -1
+        ? [...items, nextEntity]
+        : items.map((item, index) => index === existingIndex
+          ? { ...item, ...nextEntity, createdAt: item.createdAt, updatedAt: now } as WorkStoreEntity
+          : item);
+      next = setCollection(next, collection, nextItems);
+    }
   }
 
   return {
@@ -1025,7 +1564,6 @@ export function mergeRunSegmentIntoResearchWorkStore(
     ...canonicalPapers.flatMap((paper) => screeningDecisionsFromPaper(run, paper, now)),
     ...canonicalPapers.map((paper) => fullTextRecordFromPaper(run, paper, now)),
     ...paperExtractions.map((extraction) => extractionEntity(run, extraction, now)),
-    ...(evidenceMatrix === null ? [] : evidenceCellsFromMatrix(run, evidenceMatrix, now)),
     ...workItemsFromCriticReports(run, criticReports, now),
     ...workItemsFromChecks(run, manuscriptBundle, now),
     ...workItemsFromAgendaAndSynthesis(run, agenda, synthesis, now),

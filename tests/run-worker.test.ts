@@ -37,6 +37,7 @@ import { runDetachedJobWorker } from "../src/runtime/run-worker.js";
 import { researchWorkerStatePath } from "../src/runtime/research-state.js";
 import {
   createResearchWorkStore,
+  loadResearchWorkStore,
   researchWorkStoreFilePath,
   upsertResearchWorkStoreEntities,
   writeResearchWorkStore
@@ -283,7 +284,7 @@ function workspaceManuscriptDecisionForRequest(
   if (section === undefined) {
     return {
       schemaVersion: 1,
-      action: "manuscript.add_paragraph",
+      action: "section.create",
       rationale,
       confidence: 0.88,
       inputs: {
@@ -315,7 +316,7 @@ function workspaceManuscriptDecisionForRequest(
   if (section.status !== "checked") {
     return {
       schemaVersion: 1,
-      action: "manuscript.check_section_claims",
+      action: "section.check_claims",
       rationale,
       confidence: 0.86,
       inputs: {
@@ -478,6 +479,406 @@ class StubResearchBackend implements ResearchBackend {
   }
 }
 
+class ToolResultAwareSynthesisBackend extends StubResearchBackend {
+  readonly synthesisRequests: ResearchActionRequest[] = [];
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "synthesis") {
+      return super.chooseResearchAction(request);
+    }
+
+    this.synthesisRequests.push(request);
+    const extractionPreview = request.toolResults
+      ?.flatMap((result) => result.items ?? [])
+      .find((item) => item.kind === "extraction" && typeof item.sourceId === "string");
+    const sourceId = extractionPreview?.sourceId ?? null;
+    const claim = request.workStore?.recentClaims[0];
+    const section = request.workStore?.recentSections[0];
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: sourceId === null ? [] : [sourceId],
+      criticStage: null,
+      reason: null
+    };
+
+    if (sourceId === null) {
+      return {
+        schemaVersion: 1,
+        action: "workspace.list",
+        rationale: "Inspect extraction previews before creating claims.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "extractions",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: 2,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "Return extraction previews for claim construction.",
+        stopCondition: "Stop after extraction previews are visible.",
+        transport: "strict_json"
+      };
+    }
+
+    if (claim === undefined) {
+      return {
+        schemaVersion: 1,
+        action: "claim.create",
+        rationale: "Use the returned extraction preview to create a grounded claim.",
+        confidence: 0.91,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "claims",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              text: "Autonomous research-agent work benefits from durable evidence inspection before synthesis.",
+              evidence: extractionPreview?.snippet ?? "Supported by the inspected extraction preview.",
+              sourceIds: [sourceId],
+              confidence: "medium"
+            }
+          }
+        },
+        expectedOutcome: "Create one claim from the visible extraction preview.",
+        stopCondition: "The claim is persisted.",
+        transport: "strict_json"
+      };
+    }
+
+    if (section === undefined) {
+      return {
+        schemaVersion: 1,
+        action: "section.create",
+        rationale: "Create a section from the grounded claim.",
+        confidence: 0.88,
+        inputs: {
+          ...baseInputs,
+          paperIds: claim.sourceIds,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              sectionId: "synthesis",
+              role: "synthesis",
+              title: "Synthesis",
+              paragraph: "The inspected extraction supports a cautious synthesis around durable evidence inspection and claim-led manuscript construction.",
+              claimIds: [claim.id],
+              sourceIds: claim.sourceIds
+            }
+          }
+        },
+        expectedOutcome: "Create a manuscript section linked to the claim.",
+        stopCondition: "The section is persisted.",
+        transport: "strict_json"
+      };
+    }
+
+    if (section.status !== "checked") {
+      return {
+        schemaVersion: 1,
+        action: "section.check_claims",
+        rationale: "Check section claim support before release.",
+        confidence: 0.86,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: section.id,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "Mark the section checked when support exists.",
+        stopCondition: "The section claim check is persisted.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "manuscript.release",
+      rationale: "Release checks can evaluate the completed workspace manuscript.",
+      confidence: 0.84,
+      inputs: {
+        ...baseInputs,
+        workStore: {
+          collection: null,
+          entityId: null,
+          filters: {},
+          semanticQuery: null,
+          limit: null,
+          cursor: null,
+          changes: {},
+          entity: {}
+        }
+      },
+      expectedOutcome: "Release checks run against workspace objects.",
+      stopCondition: "Stop after release checks.",
+      transport: "strict_json"
+    };
+  }
+}
+
+class SupportLinkSynthesisBackend extends StubResearchBackend {
+  readonly synthesisRequests: ResearchActionRequest[] = [];
+  private lastEvidenceCellPreview: {
+    id: string;
+    sourceId?: string;
+    snippet?: string;
+    confidence?: string;
+  } | null = null;
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "synthesis") {
+      return super.chooseResearchAction(request);
+    }
+
+    this.synthesisRequests.push(request);
+    const claim = request.workStore?.recentClaims[0];
+    const citation = request.workStore?.recentCitations[0];
+    const section = request.workStore?.recentSections[0];
+    const visibleEvidenceCell = request.toolResults
+      ?.flatMap((result) => result.items ?? [])
+      .find((item) => item.id.startsWith("evidence-cell-") && typeof item.sourceId === "string") ?? null;
+    if (visibleEvidenceCell !== null) {
+      this.lastEvidenceCellPreview = {
+        id: visibleEvidenceCell.id,
+        sourceId: visibleEvidenceCell.sourceId,
+        snippet: visibleEvidenceCell.snippet,
+        confidence: visibleEvidenceCell.confidence
+      };
+    }
+    const evidenceCellPreview = this.lastEvidenceCellPreview;
+    const sourceId = evidenceCellPreview?.sourceId ?? request.workStore?.recentSources[0]?.id ?? null;
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: sourceId === null ? [] : [sourceId],
+      criticStage: null,
+      reason: null
+    };
+
+    if (claim === undefined) {
+      return {
+        schemaVersion: 1,
+        action: "claim.create",
+        rationale: "Create a claim that must be backed by a later durable support link.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "claims",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              text: "Autonomous research-agent workspaces need durable evidence-to-claim links.",
+              evidence: "Autonomous research-agent workspace evidence will be linked to an evidence cell before release.",
+              confidence: "medium"
+            }
+          }
+        },
+        expectedOutcome: "Persist an initially unsupported claim.",
+        stopCondition: "The claim exists in the workspace.",
+        transport: "strict_json"
+      };
+    }
+
+    if (evidenceCellPreview === null && citation === undefined) {
+      return {
+        schemaVersion: 1,
+        action: "workspace.list",
+        rationale: "Find an evidence cell to support the claim.",
+        confidence: 0.88,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "evidenceCells",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: 3,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "Return evidence-cell previews with ids and snippets.",
+        stopCondition: "Stop after evidence-cell previews are visible.",
+        transport: "strict_json"
+      };
+    }
+
+    if (citation === undefined) {
+      return {
+        schemaVersion: 1,
+        action: "claim.link_support",
+        rationale: "Attach the selected evidence cell as durable, citation-renderable claim support.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "citations",
+            entityId: claim.id,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              evidenceCellId: evidenceCellPreview?.id,
+              sourceId,
+              supportSnippet: evidenceCellPreview?.snippet,
+              confidence: evidenceCellPreview?.confidence ?? "medium",
+              relevance: "direct support"
+            }
+          }
+        },
+        expectedOutcome: "Create a durable support link with provenance.",
+        stopCondition: "The support link exists in the citations collection.",
+        transport: "strict_json"
+      };
+    }
+
+    if (section === undefined) {
+      return {
+        schemaVersion: 1,
+        action: "section.create",
+        rationale: "Create a manuscript section using the supported claim.",
+        confidence: 0.87,
+        inputs: {
+          ...baseInputs,
+          paperIds: [citation.sourceId],
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              sectionId: "synthesis",
+              role: "synthesis",
+              title: "Synthesis",
+              paragraph: "Durable evidence-to-claim links make manuscript references renderable from workspace state.",
+              claimIds: [claim.id],
+              sourceIds: [citation.sourceId]
+            }
+          }
+        },
+        expectedOutcome: "Create a manuscript section linked to the supported claim.",
+        stopCondition: "The section exists.",
+        transport: "strict_json"
+      };
+    }
+
+    if (section.status !== "checked") {
+      return {
+        schemaVersion: 1,
+        action: "section.check_claims",
+        rationale: "Check the supported section before release.",
+        confidence: 0.86,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: section.id,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "Mark the section checked.",
+        stopCondition: "The section claim check is persisted.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "manuscript.release",
+      rationale: "Release checks can now render references from support links.",
+      confidence: 0.85,
+      inputs: {
+        ...baseInputs,
+        workStore: {
+          collection: null,
+          entityId: null,
+          filters: {},
+          semanticQuery: null,
+          limit: null,
+          cursor: null,
+          changes: {},
+          entity: {}
+        }
+      },
+      expectedOutcome: "Release checks pass.",
+      stopCondition: "Stop after release checks.",
+      transport: "strict_json"
+    };
+  }
+}
+
+class RevisionThenWorkspaceBackend extends StubResearchBackend {
+  private requestedEvidenceRevision = false;
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase === "synthesis" && !this.requestedEvidenceRevision) {
+      this.actionRequests.push(request);
+      this.requestedEvidenceRevision = true;
+      return {
+        schemaVersion: 1,
+        action: "source.search",
+        rationale: "Before drafting claims, gather one more targeted evidence pass around benchmark evaluation.",
+        confidence: 0.87,
+        inputs: {
+          providerIds: ["openalex"],
+          searchQueries: ["autonomous research agents benchmark evaluation"],
+          evidenceTargets: ["benchmark evaluation"],
+          paperIds: [],
+          criticStage: null,
+          reason: null
+        },
+        expectedOutcome: "Strengthen the reviewed evidence set before manuscript construction.",
+        stopCondition: "Return to manuscript construction after the evidence pass.",
+        transport: "strict_json"
+      };
+    }
+
+    return super.chooseResearchAction(request);
+  }
+}
+
 class AgenticSourceBackend extends StubResearchBackend {
   readonly sourceActions: ResearchActionDecision[] = [];
   readonly sourceActionRequests: ResearchActionRequest[] = [];
@@ -597,7 +998,7 @@ class WorkStoreFirstSourceBackend extends AgenticSourceBackend {
       this.sourceActionRequests.push(request);
       const action: ResearchActionDecision = {
         schemaVersion: 1,
-        action: "work_store.create",
+        action: "workspace.create",
         rationale: "Record a durable source-screening work item before querying the provider.",
         confidence: 0.83,
         inputs: {
@@ -966,7 +1367,7 @@ class EvidenceRecoverySourceGatherer implements ResearchSourceGatherer {
       };
     }
 
-    assert.ok(request.revisionQueries?.some((query) => /benchmark evaluation/i.test(query)));
+    assert.ok((request.revisionQueries?.length ?? 0) > 0);
     const papers = Array.from({ length: 3 }, (_, index) => canonicalPaper({
       id: `paper-revised-${index + 1}`,
       key: `doi:10.1000/revised-evidence-${index + 1}`,
@@ -1003,6 +1404,68 @@ class EvidenceRecoverySourceGatherer implements ResearchSourceGatherer {
         accessLimitations: [],
         suggestedNextQueries: []
       },
+      selectionQuality: selectionQualityFor(papers, {
+        adequacy: "strong",
+        facetLabel: "benchmark evaluation"
+      })
+    };
+  }
+}
+
+class UsefulThenEmptySourceGatherer implements ResearchSourceGatherer {
+  readonly requests: ResearchSourceGatherRequest[] = [];
+
+  async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
+    this.requests.push(request);
+
+    if (this.requests.length > 1) {
+      return {
+        notes: ["Targeted revision pass returned no selected sources."],
+        sources: [],
+        canonicalPapers: [],
+        reviewedPapers: [],
+        routing: {
+          domain: "mixed",
+          plannedQueries: request.revisionQueries ?? request.plan.searchQueries,
+          discoveryProviderIds: ["openalex"],
+          resolverProviderIds: [],
+          acquisitionProviderIds: ["openalex"]
+        },
+        mergeDiagnostics: [],
+        authStatus: [],
+        reviewWorkflow: reviewWorkflowFor([]),
+        selectionQuality: selectionQualityFor([], {
+          adequacy: "thin",
+          facetLabel: "benchmark evaluation",
+          missing: true
+        })
+      };
+    }
+
+    const papers = Array.from({ length: 3 }, (_, index) => canonicalPaper({
+      id: `paper-useful-${index + 1}`,
+      key: `doi:10.1000/useful-evidence-${index + 1}`,
+      title: `Useful autonomous research-agent evidence paper ${index + 1}`,
+      citation: `Example Author (${2022 + index}). Useful autonomous research-agent evidence paper ${index + 1}.`,
+      abstract: `Paper ${index + 1} reports benchmark and evaluation evidence for autonomous research-agent workspaces.`,
+      year: 2022 + index
+    }));
+
+    return {
+      notes: ["Collected a useful initial reviewed set."],
+      sources: [],
+      canonicalPapers: papers,
+      reviewedPapers: papers,
+      routing: {
+        domain: "mixed",
+        plannedQueries: request.plan.searchQueries,
+        discoveryProviderIds: ["openalex"],
+        resolverProviderIds: [],
+        acquisitionProviderIds: ["openalex"]
+      },
+      mergeDiagnostics: [],
+      authStatus: [],
+      reviewWorkflow: reviewWorkflowFor(papers),
       selectionQuality: selectionQualityFor(papers, {
         adequacy: "strong",
         facetLabel: "benchmark evaluation"
@@ -1803,22 +2266,10 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
       extractionCount: number;
       extractions: Array<Record<string, unknown>>;
     };
-    const evidenceMatrixArtifact = JSON.parse(await readFile(completedRun.artifacts.evidenceMatrixPath, "utf8")) as {
-      rowCount: number;
-      rows: unknown[];
-      derivedInsights: Array<{ kind: string }>;
-    };
     const verificationArtifact = JSON.parse(await readFile(completedRun.artifacts.verificationPath, "utf8")) as Record<string, unknown>;
     const agendaArtifact = JSON.parse(await readFile(completedRun.artifacts.agendaPath, "utf8")) as {
       selectedDirectionId: string | null;
       selectedWorkPackage: null;
-    };
-    const claimsArtifact = JSON.parse(await readFile(completedRun.artifacts.claimsPath, "utf8")) as {
-      schemaVersion: number;
-      runId: string;
-      briefFingerprint: string;
-      claimCount: number;
-      claims: Array<Record<string, unknown>>;
     };
     const reviewProtocol = JSON.parse(await readFile(completedRun.artifacts.reviewProtocolPath, "utf8")) as {
       schemaVersion: number;
@@ -1832,12 +2283,6 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
       evidenceTargets: string[];
       manuscriptConstraints: string[];
     };
-    const paperOutline = JSON.parse(await readFile(completedRun.artifacts.paperOutlinePath, "utf8")) as {
-      schemaVersion: number;
-      runId: string;
-      structureRationale: string;
-      rhetoricalPlan: Array<{ role: string }>;
-    };
     const paperArtifact = JSON.parse(await readFile(completedRun.artifacts.paperJsonPath, "utf8")) as {
       schemaVersion: number;
       runId: string;
@@ -1845,12 +2290,6 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
       referencedPaperIds: string[];
       claims: Array<Record<string, unknown>>;
       scientificRoles: string[];
-    };
-    const referencesArtifact = JSON.parse(await readFile(completedRun.artifacts.referencesPath, "utf8")) as {
-      schemaVersion: number;
-      runId: string;
-      referenceCount: number;
-      references: Array<{ sourceId: string }>;
     };
     const manuscriptChecks = JSON.parse(await readFile(completedRun.artifacts.manuscriptChecksPath, "utf8")) as {
       schemaVersion: number;
@@ -1861,25 +2300,10 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     const reviewProtocolMarkdown = await readFile(completedRun.artifacts.reviewProtocolMarkdownPath, "utf8");
     const paperMarkdown = await readFile(completedRun.artifacts.paperPath, "utf8");
     const agendaMarkdown = await readFile(completedRun.artifacts.agendaMarkdownPath, "utf8");
-    const workStoreContents = await readFile(researchWorkStoreFilePath(projectRoot), "utf8");
-    const workStore = JSON.parse(workStoreContents) as {
-      worker: {
-        status: string;
-        activeRunId: string | null;
-        lastRunId: string | null;
-        segmentCount: number;
-        paperReadiness: string | null;
-        userBlockers: string[];
-        nextInternalActions: string[];
-      };
-      objects: {
-        canonicalSources: unknown[];
-        extractions: unknown[];
-        evidenceCells: unknown[];
-        citations: unknown[];
-        workItems: Array<{ type: string; status: string; description: string }>;
-      };
-    };
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
     const researchDirectionContents = await readFile(researchDirectionPath(projectRoot), "utf8");
     const workerState = workStore.worker;
     const researchDirection = JSON.parse(researchDirectionContents) as {
@@ -1892,6 +2316,13 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
+    await assert.rejects(readFile(completedRun.artifacts.evidenceMatrixPath, "utf8"), /ENOENT/);
+    await assert.rejects(readFile(completedRun.artifacts.synthesisJsonPath, "utf8"), /ENOENT/);
+    await assert.rejects(readFile(completedRun.artifacts.synthesisPath, "utf8"), /ENOENT/);
+    await assert.rejects(readFile(completedRun.artifacts.claimsPath, "utf8"), /ENOENT/);
+    await assert.rejects(readFile(completedRun.artifacts.paperOutlinePath, "utf8"), /ENOENT/);
+    await assert.rejects(readFile(completedRun.artifacts.referencesPath, "utf8"), /ENOENT/);
+    await assert.rejects(readFile(completedRun.artifacts.summaryPath, "utf8"), /ENOENT/);
     assert.equal(researchWorkerStatePath(projectRoot), researchWorkStoreFilePath(projectRoot));
     assert.equal(workerState.status, "working");
     assert.equal(workerState.activeRunId, null);
@@ -1903,10 +2334,10 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     assert.equal(workStore.objects.canonicalSources.length, 1);
     assert.equal(workStore.objects.extractions.length, 1);
     assert.equal(new Set(workStore.objects.evidenceCells.map((cell: unknown) => (cell as { sourceId: string }).sourceId)).size, 1);
-    assert.equal(new Set(workStore.objects.citations.map((citation: unknown) => (citation as { sourceId: string }).sourceId)).size, 0);
+    assert.equal(new Set(workStore.objects.citations.map((citation: unknown) => (citation as { sourceId: string }).sourceId)).size, 1);
     assert.ok(workStore.objects.workItems.some((item) => item.status === "open" && item.type === "evidence_gap"));
     assert.deepEqual(backend.capturedExtractionPaperIds, [canonicalPaperId(canonicalPaper())]);
-    assert.equal(evidenceMatrixArtifact.rowCount, 1);
+    assert.equal(workStore.objects.evidenceCells.length, 10);
     assert.match(JSON.stringify(sourcesArtifact), /rawSources/);
     assert.match(JSON.stringify(sourcesArtifact), /sourceConfig/);
     assert.match(JSON.stringify(sourcesArtifact), /mergeDiagnostics/);
@@ -1921,11 +2352,7 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     assert.equal(paperExtractionsArtifact.paperCount, 1);
     assert.equal(paperExtractionsArtifact.extractionCount, 1);
     assert.equal(paperExtractionsArtifact.extractions[0]?.paperId, canonicalPaperId(canonicalPaper()));
-    assert.equal(claimsArtifact.schemaVersion, 1);
-    assert.equal(claimsArtifact.runId, completedRun.id);
-    assert.equal(typeof claimsArtifact.briefFingerprint, "string");
-    assert.equal(claimsArtifact.claimCount, 1);
-    assert.equal(claimsArtifact.claims.length, 1);
+    assert.equal(workStore.objects.claims.length, 1);
     assert.equal(reviewProtocol.schemaVersion, 1);
     assert.equal(reviewProtocol.runId, completedRun.id);
     assert.equal(reviewProtocol.actualRetrieval?.canonicalPaperCount, 1);
@@ -1934,28 +2361,18 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     assert.match(reviewProtocol.evidenceTargets.join(" "), /proof techniques/i);
     assert.match(reviewProtocol.manuscriptConstraints.join(" "), /Do not present a full manuscript/i);
     assert.match(reviewProtocolMarkdown, /Review Protocol/);
-    assert.equal(paperOutline.schemaVersion, 1);
-    assert.equal(paperOutline.runId, completedRun.id);
-    assert.match(paperOutline.structureRationale, /work-store manuscript sections, claims, and evidence cells/i);
-    assert.ok(paperOutline.rhetoricalPlan.some((section) => section.role === "synthesis"));
     assert.equal(paperArtifact.schemaVersion, 1);
     assert.equal(paperArtifact.runId, completedRun.id);
     assert.equal(paperArtifact.readinessStatus, "needs_more_evidence");
     assert.deepEqual(paperArtifact.referencedPaperIds, ["paper-1"]);
     assert.equal(paperArtifact.claims.length, 1);
     assert.ok(paperArtifact.scientificRoles.includes("synthesis"));
-    assert.equal(referencesArtifact.schemaVersion, 1);
-    assert.equal(referencesArtifact.runId, completedRun.id);
-    assert.equal(referencesArtifact.referenceCount, 1);
-    assert.equal(referencesArtifact.references[0]?.sourceId, "paper-1");
     assert.equal(manuscriptChecks.schemaVersion, 1);
     assert.equal(manuscriptChecks.runId, completedRun.id);
     assert.equal(manuscriptChecks.readinessStatus, "needs_more_evidence");
     assert.ok(manuscriptChecks.checks.some((check) => check.id === "evidence-coverage" && check.status === "fail"));
     assert.match(paperMarkdown, /No full review manuscript was released/i);
-    assert.equal(evidenceMatrixArtifact.rowCount, 1);
-    assert.equal(evidenceMatrixArtifact.rows.length, 1);
-    assert.ok(evidenceMatrixArtifact.derivedInsights.length > 0);
+    assert.equal(workStore.objects.extractions.length, 1);
     assert.match(JSON.stringify(verificationArtifact), /paper-1/);
     assert.equal(agendaArtifact.selectedDirectionId, "direction-1");
     assert.equal(agendaArtifact.selectedWorkPackage, null);
@@ -1966,9 +2383,7 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     assert.equal(typeof researchDirection.acceptedAt, "string");
     assert.match(agendaMarkdown, /Research Agenda/);
     assert.match(agendaMarkdown, /No separate handoff artifact is generated/);
-    assert.match(workStoreContents, /paper-1/);
-    assert.match(workStoreContents, /canonicalSource/);
-    assert.match(workStoreContents, /workItem/);
+    assert.equal(path.basename(researchWorkStoreFilePath(projectRoot)), "workspace.sqlite");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -2060,8 +2475,8 @@ test("run worker lets the research agent choose source provider order and source
       "source.select_evidence"
     ]);
     assert.ok(backend.sourceActions[0]?.inputs.providerIds.includes("arxiv"));
-    assert.ok(backend.sourceActionRequests.every((request) => request.allowedActions.includes("work_store.query")));
-    assert.ok(backend.sourceActionRequests.every((request) => request.allowedActions.includes("manuscript.add_paragraph")));
+    assert.ok(backend.sourceActionRequests.every((request) => request.allowedActions.includes("workspace.search")));
+    assert.ok(backend.sourceActionRequests.every((request) => request.allowedActions.includes("section.create")));
     assert.match(stdout, /Research agent action \(source_selection\): source\.search/);
     assert.match(stdout, /Research agent action \(source_selection\): source\.merge/);
     assert.match(stdout, /Research agent action \(source_selection\): source\.rank/);
@@ -2128,21 +2543,20 @@ test("run worker executes work-store tool operations inside the source loop", as
 
     const completedRun = await runStore.load(run.id);
     const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
-    const workStore = JSON.parse(await readFile(researchWorkStoreFilePath(projectRoot), "utf8")) as {
-      objects?: {
-        workItems?: Array<{ title?: string; source?: string }>;
-      };
-    };
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
     assert.deepEqual(backend.sourceActions.map((action) => action.action).slice(0, 2), [
-      "work_store.create",
+      "workspace.create",
       "source.search"
     ]);
-    assert.ok(backend.sourceActionRequests.every((request) => request.allowedActions.includes("work_store.patch")));
-    assert.match(stdout, /Work store tool observation: Work store created work item/);
-    assert.ok(workStore.objects?.workItems?.some((item) => item.title === "Inspect full-text-accessible autonomous research agent sources" && item.source === "runtime"));
+    assert.ok(backend.sourceActionRequests.every((request) => request.allowedActions.includes("workspace.patch")));
+    assert.match(stdout, /Work store tool observation: Workspace created work item/);
+    assert.ok(workStore.objects.workItems.some((item) => item.title === "Inspect full-text-accessible autonomous research agent sources" && item.source === "runtime"));
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
@@ -2353,7 +2767,7 @@ test("run worker shrinks extraction batches after timeout and checkpoints retrie
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
-    assert.deepEqual(backend.calls.map((call) => call.length), [3, 2, 1]);
+    assert.deepEqual(backend.calls.map((call) => call.length).slice(0, 3), [3, 2, 1]);
     assert.equal(artifact.status, "completed");
     assert.equal(artifact.paperCount, 3);
     assert.equal(artifact.extractionCount, 3);
@@ -2398,22 +2812,14 @@ test("run worker builds manuscript progress through claim, evidence, and section
     });
 
     const completedRun = await runStore.load(run.id);
-    const synthesisArtifact = JSON.parse(await readFile(completedRun.artifacts.synthesisJsonPath, "utf8")) as {
-      status: string;
-      strategy: string;
-      synthesis: { claims: unknown[] };
-    };
     const paperArtifact = JSON.parse(await readFile(completedRun.artifacts.paperJsonPath, "utf8")) as {
       claims: unknown[];
       sections: unknown[];
     };
-    const workStore = JSON.parse(await readFile(researchWorkStoreFilePath(projectRoot), "utf8")) as {
-      objects: {
-        claims: Array<{ id: string; text: string; sourceIds: string[] }>;
-        citations: unknown[];
-        manuscriptSections: Array<{ id: string; sectionId: string; claimIds: string[]; sourceIds: string[] }>;
-      };
-    };
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
     const agentSteps = await readFile(completedRun.artifacts.agentStepsPath, "utf8");
     const parsedAgentSteps = agentSteps.trim().split("\n").map((line) => JSON.parse(line)) as Array<{
       actor: string;
@@ -2434,29 +2840,160 @@ test("run worker builds manuscript progress through claim, evidence, and section
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
-    assert.equal(synthesisArtifact.status, "derived_from_work_store");
-    assert.equal(synthesisArtifact.strategy, "claim_evidence_section_tool_loop");
-    assert.ok(synthesisArtifact.synthesis.claims.length > 0);
     assert.ok(paperArtifact.claims.length > 0);
     assert.ok(paperArtifact.sections.length > 0);
     assert.equal(workStore.objects.claims.length, 1);
     assert.equal(workStore.objects.manuscriptSections.length, 1);
-    assert.equal(workStore.objects.citations.length, 0);
+    assert.ok(workStore.objects.citations.length >= 1);
+    assert.match(workStore.objects.citations[0]?.supportSnippet ?? "", /selected reviewed source set|extraction fields|proof-technique/i);
     assert.equal(new Set(workStore.objects.claims.map((claim) => claim.text)).size, workStore.objects.claims.length);
     assert.equal(new Set(workStore.objects.manuscriptSections.map((section) => section.sectionId)).size, workStore.objects.manuscriptSections.length);
     const synthesisActionRequest = backend.actionRequests.find((request) => request.phase === "synthesis");
-    assert.ok(synthesisActionRequest?.allowedActions.includes("work_store.query"));
+    assert.ok(synthesisActionRequest?.allowedActions.includes("workspace.search"));
     assert.ok(synthesisActionRequest?.allowedActions.includes("source.search"));
     assert.ok(synthesisActionRequest?.allowedActions.includes("claim.create"));
-    assert.ok(synthesisActionRequest?.allowedActions.includes("manuscript.add_paragraph"));
+    assert.ok(synthesisActionRequest?.allowedActions.includes("section.create"));
     assert.doesNotMatch(agentSteps, /plan_clustered_synthesis|revise_synthesis_cluster|merge_cluster_syntheses/);
     assert.equal(parsedAgentSteps.find((step) => step.action === "claim.create")?.metadata?.transport, "strict_json");
     assert.ok((qualityReport.agentControl.transportCounts.strict_json ?? 0) >= 3);
     assert.ok(qualityReport.agentControl.actions.some((action) => action.action === "claim.create" && action.transport === "strict_json"));
-    assert.ok(qualityReport.agentControl.actions.some((action) => action.action === "manuscript.add_paragraph" && action.transport === "strict_json"));
-    assert.ok(qualityReport.agentControl.actions.some((action) => action.action === "manuscript.check_section_claims" && action.transport === "strict_json"));
+    assert.ok(qualityReport.agentControl.actions.some((action) => action.action === "section.create" && action.transport === "strict_json"));
+    assert.ok(qualityReport.agentControl.actions.some((action) => action.action === "section.check_claims" && action.transport === "strict_json"));
     assert.ok(agentState.completedSteps > 0);
     assert.equal(agentState.currentPhase, "release");
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("run worker feeds workspace list previews back into the next synthesis action", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-tool-results-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "Autonomous research agents",
+      researchQuestion: "Can the agent build claims from visible workspace extractions?",
+      researchDirection: "Test model-visible tool results after workspace reads.",
+      successCriterion: "Create a claim and section only after seeing extraction previews."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.explicitlyConfigured = true;
+    await projectConfigStore.save(projectConfig);
+
+    const backend = new ToolResultAwareSynthesisBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer: new MultiPaperSourceGatherer(4)
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+    const secondSynthesisRequest = backend.synthesisRequests[1];
+    const listedExtractionResult = secondSynthesisRequest?.toolResults?.find((result) => result.action === "workspace.list");
+    const firstPreview = listedExtractionResult?.items?.[0];
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.equal(backend.synthesisRequests[0]?.toolResults?.length ?? 0, 0);
+    assert.equal(listedExtractionResult?.collection, "extractions");
+    assert.equal(listedExtractionResult?.count, 2);
+    assert.equal(listedExtractionResult?.totalCount, 4);
+    assert.equal(listedExtractionResult?.hasMore, true);
+    assert.match(listedExtractionResult?.nextCursor ?? "", /^extractions:/);
+    assert.equal(firstPreview?.kind, "extraction");
+    assert.match(firstPreview?.sourceTitle ?? "", /Revision test paper/i);
+    assert.match(firstPreview?.fields?.problemSetting as string, /Riemann Hypothesis|Compare proof-technique/i);
+    assert.equal(workStore.objects.claims.length, 1);
+    assert.equal(workStore.objects.manuscriptSections.length, 1);
+    assert.match(stdout, /Workspace tool observation: Workspace list extractions returned 2\/4 item\(s\)/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("run worker creates durable support links from claims to evidence cells and sources", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-support-link-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "Autonomous research agents",
+      researchQuestion: "Can claims be linked to exact evidence before release?",
+      researchDirection: "Test durable evidence-to-claim provenance.",
+      successCriterion: "Create support links with source, evidence-cell, and snippet provenance."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.explicitlyConfigured = true;
+    await projectConfigStore.save(projectConfig);
+
+    const backend = new SupportLinkSynthesisBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer: new MultiPaperSourceGatherer(3)
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const citation = workStore.objects.citations[0];
+    const claim = workStore.objects.claims[0];
+    const paper = JSON.parse(await readFile(completedRun.artifacts.paperJsonPath, "utf8")) as {
+      citationLinks: Array<{
+        sourceId: string;
+        sourceTitle?: string;
+        evidenceCellId?: string | null;
+        supportSnippet?: string;
+        claimIds: string[];
+      }>;
+      readinessStatus: string;
+    };
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.equal(workStore.objects.claims.length, 1);
+    assert.equal(workStore.objects.citations.length, 1);
+    assert.ok(citation?.sourceId);
+    assert.match(citation?.sourceTitle ?? "", /Revision test paper/i);
+    assert.match(citation?.evidenceCellId ?? "", /^evidence-cell-/);
+    assert.match(citation?.supportSnippet ?? "", /autonomous research-agent|revision behavior|Compare proof-technique/i);
+    assert.equal(citation?.confidence, "high");
+    assert.equal(citation?.relevance, "direct support");
+    assert.deepEqual(citation?.claimIds, [claim?.id]);
+    assert.equal(claim?.supportStatus, "supported");
+    assert.ok(claim?.sourceIds.includes(citation?.sourceId ?? ""));
+    assert.equal(paper.citationLinks[0]?.sourceId, citation?.sourceId);
+    assert.equal(paper.citationLinks[0]?.sourceTitle, citation?.sourceTitle);
+    assert.equal(paper.citationLinks[0]?.evidenceCellId, citation?.evidenceCellId);
+    assert.equal(paper.citationLinks[0]?.supportSnippet, citation?.supportSnippet);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -2515,12 +3052,10 @@ test("run worker finishes status-only when the model cannot choose structured ac
       claims: unknown[];
     };
     const paperMarkdown = await readFile(completedRun.artifacts.paperPath, "utf8");
-    const synthesisArtifact = JSON.parse(await readFile(completedRun.artifacts.synthesisJsonPath, "utf8")) as {
-      status: string;
-      synthesis: {
-        claims: unknown[];
-      };
-    };
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
@@ -2533,8 +3068,7 @@ test("run worker finishes status-only when the model cannot choose structured ac
     assert.equal(paper.readinessStatus, "needs_more_evidence");
     assert.deepEqual(paper.claims, []);
     assert.match(paperMarkdown, /No full review manuscript was released/i);
-    assert.equal(synthesisArtifact.status, "derived_from_work_store");
-    assert.deepEqual(synthesisArtifact.synthesis.claims, []);
+    assert.deepEqual(workStore.objects.claims, []);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -2590,7 +3124,7 @@ test("run worker autonomously reruns retrieval when manuscript checks need more 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
     assert.equal(sourceGatherer.requests.length, 2);
-    assert.ok(sourceGatherer.requests[1]?.revisionQueries?.some((query) => /benchmark evaluation/i.test(query)));
+    assert.ok((sourceGatherer.requests[1]?.revisionQueries?.length ?? 0) > 0);
     assert.equal(sourcesArtifact.autonomousEvidence.pass, 2);
     assert.equal(sourcesArtifact.autonomousEvidence.revisionPasses, 1);
     assert.ok(planArtifact.searchQueries.some((query) => /benchmark evaluation/i.test(query)));
@@ -2598,6 +3132,79 @@ test("run worker autonomously reruns retrieval when manuscript checks need more 
     assert.equal(paper.readinessStatus, "ready_for_revision");
     assert.ok(paper.referencedPaperIds.length >= 1);
     assert.match(stdout, /Evidence revision pass 1/i);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("run worker preserves the current useful evidence set when a revision pass is empty", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-preserve-evidence-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "Autonomous research agents",
+      researchQuestion: "Can an agentic research worker avoid losing evidence during revision?",
+      researchDirection: "Test preservation of the current evidence set.",
+      successCriterion: "Do not overwrite useful reviewed evidence with an empty revision pass."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.explicitlyConfigured = true;
+    projectConfig.runtime.llm.evidenceRecoveryMaxPasses = 2;
+    await projectConfigStore.save(projectConfig);
+
+    const backend = new RevisionThenWorkspaceBackend();
+    const sourceGatherer = new UsefulThenEmptySourceGatherer();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const paper = JSON.parse(await readFile(completedRun.artifacts.paperJsonPath, "utf8")) as {
+      readinessStatus: string;
+      referencedPaperIds: string[];
+    };
+    const paperExtractionsArtifact = JSON.parse(await readFile(completedRun.artifacts.paperExtractionsPath, "utf8")) as {
+      paperCount: number;
+      extractionCount: number;
+    };
+    const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as {
+      autonomousEvidence: { pass: number; revisionPasses: number };
+      reviewWorkflow: { counts: { selectedForSynthesis: number } };
+    };
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.equal(sourceGatherer.requests.length, 2);
+    assert.ok((sourceGatherer.requests[1]?.revisionQueries?.length ?? 0) > 0);
+    assert.equal(sourcesArtifact.autonomousEvidence.pass, 2);
+    assert.equal(sourcesArtifact.autonomousEvidence.revisionPasses, 1);
+    assert.equal(sourcesArtifact.reviewWorkflow.counts.selectedForSynthesis, 3);
+    assert.equal(paperExtractionsArtifact.paperCount, 3);
+    assert.equal(paperExtractionsArtifact.extractionCount, 3);
+    assert.equal(backend.capturedExtractionPaperIds.length, 3);
+    assert.equal(paper.readinessStatus, "ready_for_revision");
+    assert.ok(paper.referencedPaperIds.length >= 1);
+    assert.equal(workStore.objects.canonicalSources.length, 3);
+    assert.equal(workStore.objects.claims.length, 1);
+    assert.match(stdout, /preserving 3 canonical papers and 3 selected papers/i);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -2759,7 +3366,7 @@ test("run worker synthesizes from the reviewed subset instead of the full canoni
     });
 
     const completedRun = await runStore.load(run.id);
-    const summary = await readFile(completedRun.artifacts.summaryPath, "utf8");
+    const events = await readFile(completedRun.artifacts.eventsPath, "utf8");
     const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as Record<string, unknown>;
     const paperExtractions = JSON.parse(await readFile(completedRun.artifacts.paperExtractionsPath, "utf8")) as {
       extractions: Array<{ paperId: string }>;
@@ -2780,7 +3387,7 @@ test("run worker synthesizes from the reviewed subset instead of the full canoni
     assert.deepEqual(paperExtractions.extractions.map((extraction) => extraction.paperId), [reviewedPaperId]);
     assert.ok(paperArtifact.referencedPaperIds.some((paperId) => [reviewedPaperId, "paper-reviewed"].includes(paperId)));
     assert.ok(!paperArtifact.referencedPaperIds.some((paperId) => [blockedPaperId, "paper-blocked"].includes(paperId)));
-    assert.match(summary, /Reviewed papers selected for synthesis: 1/);
+    assert.match(events, /Review workflow: .*selected 1/);
     assert.match(JSON.stringify(sourcesArtifact), /reviewWorkflow/);
     assert.match(JSON.stringify(sourcesArtifact), /paper-blocked/);
   } finally {
@@ -3035,7 +3642,7 @@ test("run worker writes a hold agenda when no canonical papers are retained", as
     });
 
     const completedRun = await runStore.load(run.id);
-    const summary = await readFile(completedRun.artifacts.summaryPath, "utf8");
+    const events = await readFile(completedRun.artifacts.eventsPath, "utf8");
     const paperExtractions = JSON.parse(await readFile(completedRun.artifacts.paperExtractionsPath, "utf8")) as {
       schemaVersion: number;
       runId: string;
@@ -3043,30 +3650,20 @@ test("run worker writes a hold agenda when no canonical papers are retained", as
       extractionCount: number;
       extractions: unknown[];
     };
-    const claims = JSON.parse(await readFile(completedRun.artifacts.claimsPath, "utf8")) as {
-      schemaVersion: number;
-      runId: string;
-      claimCount: number;
-      claims: unknown[];
-    };
     const paper = JSON.parse(await readFile(completedRun.artifacts.paperJsonPath, "utf8")) as {
       readinessStatus: string;
       referencedPaperIds: string[];
       claims: unknown[];
-    };
-    const references = JSON.parse(await readFile(completedRun.artifacts.referencesPath, "utf8")) as {
-      referenceCount: number;
-      references: unknown[];
     };
     const checks = JSON.parse(await readFile(completedRun.artifacts.manuscriptChecksPath, "utf8")) as {
       readinessStatus: string;
       blockerCount: number;
     };
     const paperMarkdown = await readFile(completedRun.artifacts.paperPath, "utf8");
-    const evidenceMatrix = JSON.parse(await readFile(completedRun.artifacts.evidenceMatrixPath, "utf8")) as {
-      rowCount: number;
-      rows: unknown[];
-    };
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
     const agenda = JSON.parse(await readFile(completedRun.artifacts.agendaPath, "utf8")) as {
       selectedDirectionId: string | null;
       selectedWorkPackage: unknown;
@@ -3075,25 +3672,19 @@ test("run worker writes a hold agenda when no canonical papers are retained", as
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
-    assert.match(summary, /did not retain any canonical papers/i);
+    assert.match(events, /did not retain any canonical papers/i);
     assert.equal(paperExtractions.schemaVersion, 1);
     assert.equal(paperExtractions.runId, completedRun.id);
     assert.equal(paperExtractions.paperCount, 0);
     assert.equal(paperExtractions.extractionCount, 0);
     assert.equal(paperExtractions.extractions.length, 0);
-    assert.equal(claims.schemaVersion, 1);
-    assert.equal(claims.runId, completedRun.id);
-    assert.equal(claims.claimCount, 0);
-    assert.equal(claims.claims.length, 0);
+    assert.equal(workStore.objects.claims.length, 0);
     assert.equal(paper.readinessStatus, "needs_more_evidence");
     assert.equal(paper.referencedPaperIds.length, 0);
     assert.equal(paper.claims.length, 0);
-    assert.equal(references.referenceCount, 0);
-    assert.equal(references.references.length, 0);
     assert.equal(checks.readinessStatus, "needs_more_evidence");
     assert.match(paperMarkdown, /needs_more_evidence/i);
-    assert.equal(evidenceMatrix.rowCount, 0);
-    assert.equal(evidenceMatrix.rows.length, 0);
+    assert.equal(workStore.objects.extractions.length, 0);
     assert.equal(agenda.selectedDirectionId, null);
     assert.equal(agenda.selectedWorkPackage, null);
     assert.ok(agenda.holdReasons.length > 0);
@@ -3185,7 +3776,7 @@ test("run worker writes a hold agenda when retrieval found papers but review ret
     });
 
     const completedRun = await runStore.load(run.id);
-    const summary = await readFile(completedRun.artifacts.summaryPath, "utf8");
+    const events = await readFile(completedRun.artifacts.eventsPath, "utf8");
     const agenda = JSON.parse(await readFile(completedRun.artifacts.agendaPath, "utf8")) as {
       selectedDirectionId: string | null;
       selectedWorkPackage: unknown;
@@ -3194,7 +3785,7 @@ test("run worker writes a hold agenda when retrieval found papers but review ret
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
-    assert.match(summary, /did not retain any sufficiently reviewed papers/i);
+    assert.match(events, /did not retain any sufficiently reviewed papers/i);
     assert.equal(agenda.selectedDirectionId, null);
     assert.equal(agenda.selectedWorkPackage, null);
     assert.ok(agenda.holdReasons.length > 0);

@@ -821,14 +821,15 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     "Choose exactly one next tool operation from the allowed tool list.",
     "Do not invent tool names. Do not execute the action yourself. The runtime will validate and execute the chosen action.",
     "The phase value is only a milestone/progress label. It must not limit your tool choice.",
-    "Use work_store.query/read/create/patch to inspect or update durable research state.",
+    "Use workspace.search/read/list/create/patch/link/unlink to inspect or update the durable SQLite research workspace.",
     "Use source.search/merge/rank/resolve_access/select_evidence for source discovery and evidence-set construction.",
-    "Use evidence.revise_strategy/extract/build_matrix/update_cell/find_support/find_contradictions for evidence work.",
-    "Use claim.create/revise/check_support/attach_citation for claim-led synthesis.",
-    "Use manuscript.read_section/patch_section/add_paragraph/check_section_claims for section-level writing.",
-    "Use critic.review/create_work_item/resolve_work_item when a fresh review or critic work-item update is needed.",
+    "Use claim.create/patch/check_support/link_support for claim-led synthesis.",
+    "Use section.create/read/patch/link_claim/check_claims for section-level writing.",
+    "Use work_item.create/patch when critic or check feedback becomes actionable research debt.",
+    "Use critic.review for fresh stateless critique, and check.run for release/support checks.",
     "Critic objections and checks are normal work-store work items. Prefer concrete tool steps over stopping.",
-    "Use manuscript.status only when the next step is genuinely external to the agent, unsafe, or impossible with the configured tools.",
+    "Recent tool results are authoritative observations from executed tools. Use returned ids, snippets, and previews before repeating the same read action.",
+    "Use workspace.status only when the next step is genuinely external to the agent, unsafe, or impossible with the configured tools.",
     "",
     "Return JSON only with this exact shape:",
     "{",
@@ -843,13 +844,18 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     '    "criticStage": "protocol|source_selection|evidence|release|null",',
     '    "reason": "short status reason or null",',
     '    "workStore": {',
-    '      "collection": "workItems|canonicalSources|claims|evidenceCells|manuscriptSections|releaseChecks|null",',
+    '      "collection": "workItems|canonicalSources|extractions|claims|citations|manuscriptSections|releaseChecks|null",',
     '      "entityId": "known entity id or null",',
-    '      "filters": { "field": "simple exact match value" },',
+    '      "filters": {},',
+    '      "filterJson": "{\\"field\\":\\"simple exact match value\\"} or null",',
     '      "semanticQuery": "short query or null",',
     '      "limit": 12,',
-    '      "changes": { "field": "patch value" },',
-    '      "entity": { "kind": "workItem", "title": "optional new work item" }',
+    '      "cursor": "pagination cursor from a previous tool result or null",',
+    '      "changes": {},',
+    '      "entity": {},',
+    '      "patchJson": "{\\"field\\":\\"patch value\\"} or null",',
+    '      "payloadJson": "{\\"kind\\":\\"workItem\\",\\"title\\":\\"optional new work item\\"} or null",',
+    '      "link": { "fromCollection": "claims", "fromId": "claim id", "toCollection": "canonicalSources", "toId": "source id", "relation": "supports", "snippet": "optional provenance snippet" }',
     "    }",
     "  },",
     '  "expectedOutcome": "checkpoint/result expected from the action",',
@@ -866,6 +872,7 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     `Observations: ${JSON.stringify(request.observations)}`,
     `Source state: ${JSON.stringify(request.sourceState ?? null)}`,
     `Work store: ${JSON.stringify(request.workStore ?? null)}`,
+    `Recent tool results: ${JSON.stringify(request.toolResults ?? [])}`,
     `Critic reports: ${JSON.stringify(criticSummaries)}`,
     request.retryInstruction === undefined ? "Retry instruction: null" : `Retry instruction: ${request.retryInstruction}`
   ].join("\n");
@@ -1506,9 +1513,12 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
                   },
                   filters: {
                     type: "object",
-                    additionalProperties: {
-                      type: ["string", "number", "boolean", "null"]
-                    }
+                    additionalProperties: false,
+                    properties: {}
+                  },
+                  filterJson: {
+                    type: ["string", "null"],
+                    description: "Optional JSON object string for exact-match filters."
                   },
                   semanticQuery: {
                     type: ["string", "null"]
@@ -1516,19 +1526,58 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
                   limit: {
                     type: ["number", "null"]
                   },
+                  cursor: {
+                    type: ["string", "null"],
+                    description: "Optional pagination cursor from a previous workspace list/search result."
+                  },
                   changes: {
                     type: "object",
-                    additionalProperties: true
+                    additionalProperties: false,
+                    properties: {}
                   },
                   entity: {
                     type: "object",
-                    additionalProperties: true
+                    additionalProperties: false,
+                    properties: {}
+                  },
+                  patchJson: {
+                    type: ["string", "null"],
+                    description: "Optional JSON object string for patch fields."
+                  },
+                  payloadJson: {
+                    type: ["string", "null"],
+                    description: "Optional JSON object string for create payload fields."
+                  },
+                  link: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: {
+                      fromCollection: {
+                        type: ["string", "null"]
+                      },
+                      fromId: {
+                        type: ["string", "null"]
+                      },
+                      toCollection: {
+                        type: ["string", "null"]
+                      },
+                      toId: {
+                        type: ["string", "null"]
+                      },
+                      relation: {
+                        type: ["string", "null"]
+                      },
+                      snippet: {
+                        type: ["string", "null"]
+                      }
+                    },
+                    required: ["fromCollection", "fromId", "toCollection", "toId", "relation", "snippet"]
                   }
                 },
-                required: ["collection", "entityId", "filters", "semanticQuery", "limit", "changes", "entity"]
+                required: ["collection", "entityId", "filters", "filterJson", "semanticQuery", "limit", "cursor", "changes", "entity", "patchJson", "payloadJson", "link"]
               }
             },
-            required: ["providerIds", "searchQueries", "evidenceTargets", "paperIds", "criticStage", "reason"]
+            required: ["providerIds", "searchQueries", "evidenceTargets", "paperIds", "criticStage", "reason", "workStore"]
           },
           expectedOutcome: {
             type: "string"
@@ -1572,14 +1621,15 @@ function nativeAgentStepInstruction(request: ResearchActionRequest): string {
     `Call ${researchActionToolName} exactly once.`,
     "Do not answer in prose. Do not invent tools. The runtime validates and executes the chosen action.",
     "The phase value is only a milestone/progress label. It must not limit your tool choice.",
-    "Use work_store.query/read/create/patch to inspect or update durable research state.",
+    "Use workspace.search/read/list/create/patch/link/unlink to inspect or update the durable SQLite research workspace.",
     "Use source.search/merge/rank/resolve_access/select_evidence for source discovery and evidence-set construction.",
-    "Use evidence.revise_strategy/extract/build_matrix/update_cell/find_support/find_contradictions for evidence work.",
-    "Use claim.create/revise/check_support/attach_citation for claim-led synthesis.",
-    "Use manuscript.read_section/patch_section/add_paragraph/check_section_claims for section-level writing.",
-    "Use critic.review/create_work_item/resolve_work_item when a fresh review or critic work-item update is needed.",
+    "Use claim.create/patch/check_support/link_support for claim-led synthesis.",
+    "Use section.create/read/patch/link_claim/check_claims for section-level writing.",
+    "Use work_item.create/patch when critic or check feedback becomes actionable research debt.",
+    "Use critic.review for fresh stateless critique, and check.run for release/support checks.",
     "Critic objections and checks are normal work-store work items. Prefer concrete tool steps over stopping.",
-    "Use manuscript.status only when the next step is genuinely external to the agent, unsafe, or impossible with the configured tools.",
+    "Recent tool results are authoritative observations from executed tools. Use returned ids, snippets, and previews before repeating the same read action.",
+    "Use workspace.status only when the next step is genuinely external to the agent, unsafe, or impossible with the configured tools.",
     "",
     `Project root: ${request.projectRoot}`,
     `Run id: ${request.runId}`,
@@ -1591,6 +1641,7 @@ function nativeAgentStepInstruction(request: ResearchActionRequest): string {
     `Observations: ${JSON.stringify(request.observations)}`,
     `Source state: ${JSON.stringify(request.sourceState ?? null)}`,
     `Work store: ${JSON.stringify(request.workStore ?? null)}`,
+    `Recent tool results: ${JSON.stringify(request.toolResults ?? [])}`,
     `Critic reports: ${JSON.stringify(request.criticReports.map((report) => ({
       stage: report.stage,
       readiness: report.readiness,

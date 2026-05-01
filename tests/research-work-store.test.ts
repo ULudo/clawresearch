@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -97,20 +97,15 @@ test("research work store supports create, query, read, and patch operations", a
     }).count, 0);
 
     await writeResearchWorkStore(store);
-    const persisted = JSON.parse(await readFile(researchWorkStoreFilePath(projectRoot), "utf8")) as {
-      objects: {
-        claims: unknown[];
-        workItems: Array<{ status: string }>;
-      };
-    };
-    assert.equal(persisted.objects.claims.length, 1);
-    assert.equal(persisted.objects.workItems[0]?.status, "resolved");
+    const persistedFile = await stat(researchWorkStoreFilePath(projectRoot));
+    assert.ok(persistedFile.size > 0);
 
     const loaded = await loadResearchWorkStore({
       projectRoot,
       now: "2026-01-01T00:00:02.000Z"
     });
     assert.equal(loaded.objects.claims[0]?.text, "Persistent work stores improve long-horizon research.");
+    assert.equal(loaded.objects.workItems[0]?.status, "resolved");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -149,6 +144,11 @@ test("work store segment merge does not re-import rendered manuscript views as c
       kind: "citation",
       runId: "run-merge",
       sourceId: "paper-canonical-1",
+      sourceTitle: "Canonical workspace source",
+      evidenceCellId: "evidence-cell-1",
+      supportSnippet: "A durable support link keeps the source and evidence snippet available.",
+      confidence: "medium",
+      relevance: "supports",
       claimIds: ["claim-tool-1"],
       sectionIds: ["section-tool-1"]
     } satisfies WorkStoreCreateInput<WorkStoreCitation>, now);

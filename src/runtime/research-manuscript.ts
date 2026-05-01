@@ -132,6 +132,11 @@ export type ReferencesArtifact = {
 
 export type PaperCitationLink = {
   sourceId: string;
+  sourceTitle?: string;
+  evidenceCellId?: string | null;
+  supportSnippet?: string;
+  confidence?: string | null;
+  relevance?: string | null;
   claimIds: string[];
   sectionIds: string[];
 };

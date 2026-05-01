@@ -213,7 +213,7 @@ function createRunArtifacts(projectRoot: string, runId: string): RunArtifactReco
     agendaPath: path.join(runDirectory, "agenda.json"),
     agendaMarkdownPath: path.join(runDirectory, "agenda.md"),
     summaryPath: path.join(runDirectory, "summary.md"),
-    memoryPath: path.join(runDirectory, "research-journal.json")
+    memoryPath: path.join(runtimeDirectoryPath(projectRoot), "workspace.sqlite")
   };
 }
 

@@ -652,7 +652,7 @@ test("agent-step backend exposes first-class claim and manuscript-section tools"
       phase: "synthesis",
       attempt: 1,
       maxAttempts: 2,
-      allowedActions: ["work_store.query", "claim.create", "evidence.update_cell", "manuscript.add_paragraph", "manuscript.check_section_claims", "manuscript.status"],
+      allowedActions: ["workspace.search", "claim.create", "section.create", "section.check_claims", "workspace.status"],
       brief: {
         topic: "autonomous research agents",
         researchQuestion: "What best practices in the literature matter most?",
@@ -677,7 +677,7 @@ test("agent-step backend exposes first-class claim and manuscript-section tools"
         revisionPassesRemaining: 2
       },
       workStore: {
-        path: "/tmp/project/.clawresearch/research-state.json",
+        path: "/tmp/project/.clawresearch/workspace.sqlite",
         summary: {
           canonicalSources: 3,
           extractions: 3,
@@ -708,11 +708,10 @@ test("agent-step backend exposes first-class claim and manuscript-section tools"
     });
 
     assert.equal(decision.action, "claim.create");
-    assert.match(capturedPrompt, /work_store\.query/i);
+    assert.match(capturedPrompt, /workspace\.search/i);
     assert.match(capturedPrompt, /claim\.create/i);
-    assert.match(capturedPrompt, /evidence\.update_cell/i);
-    assert.match(capturedPrompt, /manuscript\.add_paragraph/i);
-    assert.match(capturedPrompt, /manuscript\.check_section_claims/i);
+    assert.match(capturedPrompt, /section\.create/i);
+    assert.match(capturedPrompt, /section\.check_claims/i);
     assert.doesNotMatch(capturedPrompt, /synthesize_clustered|finalize_status_report|write_final_report/i);
   } finally {
     globalThis.fetch = originalFetch;

@@ -813,16 +813,13 @@ export function renderStatus(
     writeLine(writer, `  sources: ${relativeProjectPath(session.projectRoot, run.artifacts.sourcesPath)}`);
     writeLine(writer, `  literature: ${relativeProjectPath(session.projectRoot, run.artifacts.literaturePath)}`);
     writeLine(writer, `  review protocol: ${relativeProjectPath(session.projectRoot, run.artifacts.reviewProtocolPath)}`);
-    writeLine(writer, `  synthesis: ${relativeProjectPath(session.projectRoot, run.artifacts.synthesisPath)}`);
-    writeLine(writer, `  claims: ${relativeProjectPath(session.projectRoot, run.artifacts.claimsPath)}`);
     writeLine(writer, `  verification: ${relativeProjectPath(session.projectRoot, run.artifacts.verificationPath)}`);
     writeLine(writer, `  paper: ${relativeProjectPath(session.projectRoot, run.artifacts.paperPath)}`);
     writeLine(writer, `  paper checks: ${relativeProjectPath(session.projectRoot, run.artifacts.manuscriptChecksPath)}`);
     writeLine(writer, `  next questions: ${relativeProjectPath(session.projectRoot, run.artifacts.nextQuestionsPath)}`);
     writeLine(writer, `  agenda: ${relativeProjectPath(session.projectRoot, run.artifacts.agendaPath)}`);
     writeLine(writer, `  agenda summary: ${relativeProjectPath(session.projectRoot, run.artifacts.agendaMarkdownPath)}`);
-    writeLine(writer, `  work store: ${relativeProjectPath(session.projectRoot, researchWorkStoreFilePath(session.projectRoot))}`);
-    writeLine(writer, `  work-store checkpoint: ${relativeProjectPath(session.projectRoot, run.artifacts.memoryPath)}`);
+    writeLine(writer, `  workspace db: ${relativeProjectPath(session.projectRoot, researchWorkStoreFilePath(session.projectRoot))}`);
   }
 
   writeLine(writer);
@@ -2920,11 +2917,10 @@ export async function handleGoCommand(
     `Sources: ${relativeProjectPath(session.projectRoot, run.artifacts.sourcesPath)}`,
     `Literature review: ${relativeProjectPath(session.projectRoot, run.artifacts.literaturePath)}`,
     `Review protocol: ${relativeProjectPath(session.projectRoot, run.artifacts.reviewProtocolPath)}`,
-    `Synthesis: ${relativeProjectPath(session.projectRoot, run.artifacts.synthesisPath)}`,
     `Verification: ${relativeProjectPath(session.projectRoot, run.artifacts.verificationPath)}`,
     `Paper: ${relativeProjectPath(session.projectRoot, run.artifacts.paperPath)}`,
     `Paper checks: ${relativeProjectPath(session.projectRoot, run.artifacts.manuscriptChecksPath)}`,
-    `Work-store checkpoint: ${relativeProjectPath(session.projectRoot, run.artifacts.memoryPath)}`,
+    `Workspace db: ${relativeProjectPath(session.projectRoot, researchWorkStoreFilePath(session.projectRoot))}`,
     watchRuns
       ? "The detached run is working in the current project directory, and the console will stream live progress until the current run reaches a terminal state."
       : "The detached run is working in the current project directory. Use `/status` to inspect it, `/pause` to stop it temporarily, or `/resume` to continue a paused run."
