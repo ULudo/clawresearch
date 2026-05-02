@@ -1056,7 +1056,7 @@ export function buildReviewFacets(input: {
   addFacetsFromField(facets, input.brief.topic, "topic", true, 3);
   addFacetsFromField(facets, input.brief.researchQuestion, "research_question", true, 6);
   addFacetsFromField(facets, input.brief.researchDirection, "research_direction", false, 4);
-  addFacetsFromField(facets, input.brief.successCriterion, "success_criterion", true, 6);
+  addFacetsFromField(facets, input.brief.successCriterion, "success_criterion", false, 6);
   addFacetsFromField(facets, input.plan.objective, "plan_objective", false, 4);
 
   for (const focus of input.plan.localFocus.slice(0, 6)) {

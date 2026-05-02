@@ -316,7 +316,7 @@ export type LiteratureRelevanceAssessment = {
   selectionReason: string;
   criticConcerns: string[];
   requiredForManuscript: boolean;
-  reviewer: "hybrid_protocol_gate";
+  reviewer: "advisory_protocol_review";
   matchedCriteria: string[];
   missingCriteria: string[];
   reason: string;
@@ -3078,8 +3078,8 @@ function screeningDecision(
 ): { decision: "include" | "background" | "exclude" | "uncertain"; rationale: string | null } {
   if (assessment !== null && !assessment.accepted) {
     return {
-      decision: "exclude",
-      rationale: assessment.rationale
+      decision: "uncertain",
+      rationale: `${assessment.rationale} Retained as an advisory screening concern for researcher review.`
     };
   }
 
@@ -3103,7 +3103,7 @@ function screeningDecision(
     if (relaxedRetained) {
       return {
         decision: "uncertain",
-        rationale: `${assessment?.rationale ?? "Directly readable at full text."} Retained as a cautious candidate because it did not satisfy the stricter domain-anchor gate.`
+        rationale: `${assessment?.rationale ?? "Directly readable at full text."} Retained as a cautious candidate because advisory domain-anchor diagnostics were incomplete.`
       };
     }
 
@@ -3116,7 +3116,7 @@ function screeningDecision(
   if (stage === "abstract") {
     if (quality.severeConcern) {
       return {
-        decision: "exclude",
+        decision: "uncertain",
         rationale: `${assessment?.rationale ?? "The paper can be screened at the abstract level."} Source-quality concerns (${quality.signals.join(", ")}) outweighed the current evidence.`
       };
     }
@@ -3131,7 +3131,7 @@ function screeningDecision(
     if (relaxedRetained) {
       return {
         decision: "uncertain",
-        rationale: `${assessment?.rationale ?? "The paper can be screened at the abstract level."} Retained as a cautious candidate because it did not satisfy the stricter domain-anchor gate.`
+        rationale: `${assessment?.rationale ?? "The paper can be screened at the abstract level."} Retained as a cautious candidate because advisory domain-anchor diagnostics were incomplete.`
       };
     }
 
@@ -3482,7 +3482,7 @@ function selectionReasonForAssessment(
       return `Selected as supporting ${role.replace(/_/g, " ")} evidence, not as a primary system comparison source.`;
     case "excluded":
       return status === "excluded"
-        ? "Excluded because the protocol relevance gate marked it outside scope."
+        ? "Marked as advisory out-of-scope diagnostic by protocol review."
         : "Excluded because its source role is not suitable for the current synthesis.";
     case "deferred":
       return `Deferred from the current synthesis set after role-aware selection (${role.replace(/_/g, " ")}).`;
@@ -3534,7 +3534,7 @@ function roleAwareSelectionQuality(
       ...selectionQuality,
       selectionRationale: [
         ...selectionQuality.selectionRationale,
-        `Role-aware source gate passed with ${selectedPrimaryCount} selected primary system/framework sources.`
+        `Role-aware source diagnostic passed with ${selectedPrimaryCount} selected primary system/framework sources.`
       ]
     };
   }
@@ -3546,7 +3546,7 @@ function roleAwareSelectionQuality(
     adequacy,
     selectionRationale: [
       ...selectionQuality.selectionRationale,
-      `Role-aware source gate requires ${requiredPrimarySystemCount} primary system/framework sources but found only ${selectedPrimaryCount} selected; ${availablePrimaryCount} primary candidates were available in the current source pool. Supporting benchmarks, surveys, and component papers do not satisfy primary system-comparison slots.`
+      `Role-aware source diagnostic expected ${requiredPrimarySystemCount} primary system/framework sources but found only ${selectedPrimaryCount} selected; ${availablePrimaryCount} primary candidates were available in the current source pool. Supporting benchmarks, surveys, and component papers do not satisfy primary system-comparison slots.`
     ]
   };
 }
@@ -3637,10 +3637,10 @@ function reviewRelevanceAssessmentForPaper(
       selectionReason: selectionReasonForAssessment(status, sourceRole, selectionDecision),
       criticConcerns: [],
       requiredForManuscript: false,
-      reviewer: "hybrid_protocol_gate",
+      reviewer: "advisory_protocol_review",
       matchedCriteria: ["No protocol criteria were available; source was retained by the ordinary screening workflow."],
       missingCriteria: [],
-      reason: "No protocol criteria were available, so the relevance gate deferred to screening state."
+      reason: "No protocol criteria were available, so advisory relevance review deferred to screening state."
     };
   }
 
@@ -3680,14 +3680,14 @@ function reviewRelevanceAssessmentForPaper(
     selectionReason: selectionReasonForAssessment(status, sourceRole, selectionDecision),
     criticConcerns: [],
     requiredForManuscript: false,
-    reviewer: "hybrid_protocol_gate",
+    reviewer: "advisory_protocol_review",
     matchedCriteria,
     missingCriteria,
     reason: status === "in_scope"
       ? "The paper matched the protocol core scope and at least one required evidence target."
       : status === "borderline"
-        ? "The paper matched only part of the protocol scope/evidence gate and was kept out of final synthesis."
-        : "The paper did not match the protocol core scope or required evidence targets closely enough for synthesis."
+        ? "The paper matched only part of the protocol scope/evidence diagnostic."
+        : "The paper did not closely match the advisory protocol scope or required evidence targets."
   };
 }
 
@@ -3697,37 +3697,6 @@ function buildLiteratureRelevanceAssessments(
   coverageByPaperId: Map<string, PaperFacetCoverage>
 ): LiteratureRelevanceAssessment[] {
   return papers.map((paper) => reviewRelevanceAssessmentForPaper(paper, facets, coverageByPaperId.get(paper.id) ?? null));
-}
-
-function paperPassesSynthesisRelevanceGate(
-  paper: CanonicalPaper,
-  facets: ReviewFacet[],
-  coverage: PaperFacetCoverage | null = null,
-  relevanceAssessment: LiteratureRelevanceAssessment | null = null
-): boolean {
-  if (relevanceAssessment !== null) {
-    return relevanceAssessment.status === "in_scope";
-  }
-
-  if (facets.length === 0) {
-    return true;
-  }
-
-  const coveredFacetIds = new Set(coverage?.coveredFacetIds ?? []);
-  const coreFacetIds = new Set(facets.filter(isCoreTopicReviewFacet).map((facet) => facet.id));
-  const substantiveFacetIds = new Set(facets.filter(isSubstantiveReviewFacet).map((facet) => facet.id));
-  const topicAnchorTagCount = paper.tags.filter((tag) => tag.startsWith("topic-anchor:")).length;
-  const focusTagCount = paper.tags.filter((tag) => tag.startsWith("focus:")).length;
-  const taskTagCount = paper.tags.filter((tag) => tag.startsWith("task:")).length;
-  const coreMatched = coreFacetIds.size === 0
-    || topicAnchorTagCount > 0
-    || [...coreFacetIds].some((facetId) => coveredFacetIds.has(facetId));
-  const substantiveMatched = substantiveFacetIds.size === 0
-    || focusTagCount > 0
-    || taskTagCount > 0
-    || [...substantiveFacetIds].some((facetId) => coveredFacetIds.has(facetId));
-
-  return coreMatched && substantiveMatched;
 }
 
 function selectPapersForFacetCoverage(input: {
@@ -3793,7 +3762,6 @@ function buildReviewWorkflow(
     canonicalPapers.map((paper) => [paper.id, assessPaperFacetCoverage(facets, paper)])
   );
   const relevanceAssessments = buildLiteratureRelevanceAssessments(canonicalPapers, facets, coverageByPaperId);
-  const relevanceByPaperId = new Map(relevanceAssessments.map((assessment) => [assessment.paperId, assessment]));
   const criticExcludedIds = new Set(criticExcludedPaperIds);
   const criticPromotedIds = new Set(criticPromotedPaperIds.filter((paperId) => !criticExcludedIds.has(paperId)));
   const ordered = sortPapersForReview(canonicalPapers, coverageByPaperId);
@@ -3833,20 +3801,8 @@ function buildReviewWorkflow(
     paper.screeningDecision !== "exclude"
     && paper.screeningDecision !== "background"
     && !criticExcludedIds.has(paper.id)
-    && paperPassesSynthesisRelevanceGate(
-      paper,
-      facets,
-      coverageByPaperId.get(paper.id) ?? null,
-      relevanceByPaperId.get(paper.id) ?? null
-    )
   ));
   const synthesisEligiblePaperIds = new Set(synthesisEligiblePapers.map((paper) => paper.id));
-  const heldBackForRelevancePapers = ordered.filter((paper) => (
-    paper.screeningDecision !== "exclude"
-    && paper.screeningDecision !== "background"
-    && !criticExcludedIds.has(paper.id)
-    && !synthesisEligiblePaperIds.has(paper.id)
-  ));
   const qualityEligibleIncludedPapers = includedPapers.filter((paper) => (
     sourceQualityAssessmentForPaper(paper).tier !== "low"
     && synthesisEligiblePaperIds.has(paper.id)
@@ -3936,13 +3892,10 @@ function buildReviewWorkflow(
     `Abstract screened ${abstractScreenedPaperIds.length} papers and full-text screened ${fulltextScreenedPaperIds.length}.`,
     `Included ${includedPaperIds.length} papers after screening, with ${blockedPaperIds.length} still blocked or credential-limited.`,
     `Source-quality tiers: ${qualityCounts.high} high, ${qualityCounts.medium} medium, ${qualityCounts.low} low.`,
-    heldBackForRelevancePapers.length > 0
-      ? `Held back ${heldBackForRelevancePapers.length} otherwise retained papers because the hybrid protocol relevance gate did not mark them in scope.`
-      : null,
     relevanceAssessments.some((assessment) => assessment.status !== "in_scope")
-      ? `Hybrid relevance gate: ${relevanceAssessments.filter((assessment) => assessment.status === "in_scope").length} in scope, ${relevanceAssessments.filter((assessment) => assessment.status === "borderline").length} borderline, ${relevanceAssessments.filter((assessment) => assessment.status === "excluded").length} excluded.`
+      ? `Advisory relevance diagnostics: ${relevanceAssessments.filter((assessment) => assessment.status === "in_scope").length} in scope, ${relevanceAssessments.filter((assessment) => assessment.status === "borderline").length} borderline, ${relevanceAssessments.filter((assessment) => assessment.status === "excluded").length} excluded. These diagnostics do not override researcher source selection.`
       : null,
-    `Source-role gate: ${sourceRoleSummary}. Selected ${selectedPrimaryCount} primary system sources and ${selectedSupportingCount} supporting sources.`,
+    `Advisory source-role diagnostics: ${sourceRoleSummary}. Selected ${selectedPrimaryCount} primary system sources and ${selectedSupportingCount} supporting sources.`,
     criticPromotedIds.size > 0
       ? `Critic promotion applied to ${criticPromotedIds.size} candidate paper(s) already present in the source pool before searching for more.`
       : "",
@@ -4152,7 +4105,7 @@ function filterCandidates(
   const anchorTokens = topicAnchorTokens(request);
   const topicTokens = coreTopicTokens(request);
   const minimumTopicMatches = minimumCoreTopicMatches(topicTokens);
-  let filtered = 0;
+  let weaklyMatched = 0;
 
   for (const candidate of rawCandidates) {
     const source = toResearchSource(candidate);
@@ -4196,7 +4149,7 @@ function filterCandidates(
     const accepted = strongTopicAccepted && profileAccepted;
 
     if (!accepted) {
-      filtered += 1;
+      weaklyMatched += 1;
       if (rejectedSamples.length < 12) {
         rejectedSamples.push({
           title: source.title,
@@ -4205,14 +4158,13 @@ function filterCandidates(
             ?? `Weak overlap with the scoped brief (anchor score ${anchorScore}, heuristic score ${heuristicScore}).`
         });
       }
-      continue;
     }
 
     acceptedSources.push(source);
   }
 
-  if (filtered > 0) {
-    notes.push(`Filtered ${filtered} weakly matched scholarly candidates during screening.`);
+  if (weaklyMatched > 0) {
+    notes.push(`Flagged ${weaklyMatched} weakly matched scholarly candidates during advisory screening; retained them for researcher-visible screening instead of excluding them.`);
   }
 
   return {
@@ -4221,7 +4173,7 @@ function filterCandidates(
     assessments,
     rejectedSamples,
     acceptedCount: acceptedSources.length,
-    rejectedCount: filtered
+    rejectedCount: weaklyMatched
   };
 }
 
@@ -4229,11 +4181,9 @@ function backgroundFilter(
   candidates: RawCandidate[],
   request: ResearchSourceGatherRequest
 ): ResearchSource[] {
-  const referenceTokens = sourceTokensForBrief(request);
-
+  void request;
   return candidates
     .map(toResearchSource)
-    .filter((source) => overlapScore(`${source.title} ${source.excerpt}`, referenceTokens) >= 2)
     .slice(0, 3);
 }
 
@@ -5371,14 +5321,70 @@ export class AgenticSourceGatherSession {
     return observation;
   }
 
-  async selectEvidenceSet(): Promise<SourceToolObservation> {
+  async selectEvidenceSet(paperIds: string[] = []): Promise<SourceToolObservation> {
     if (this.canonicalReview === null) {
       await this.mergeSources();
     }
 
-    const canonicalReview = this.canonicalReview!;
+    let canonicalReview = this.canonicalReview!;
+    const requestedPaperIds = uniqueStrings(paperIds);
+    if (requestedPaperIds.length > 0) {
+      const knownPaperIds = new Set(canonicalReview.canonicalPapers.map((paper) => paper.id));
+      const selectedPaperIds = requestedPaperIds.filter((paperId) => knownPaperIds.has(paperId));
+      const unknownPaperIds = requestedPaperIds.filter((paperId) => !knownPaperIds.has(paperId));
+      const selectedPaperIdSet = new Set(selectedPaperIds);
+      const reviewedPapers = canonicalReview.canonicalPapers.filter((paper) => selectedPaperIdSet.has(paper.id));
+      const deferredPaperIds = canonicalReview.reviewWorkflow.includedPaperIds.filter((paperId) => !selectedPaperIdSet.has(paperId));
+      let selectionQuality = this.reviewFacets.length === 0
+        ? null
+        : buildReviewSelectionQuality({
+          facets: this.reviewFacets,
+          papers: canonicalReview.canonicalPapers,
+          selectedPaperIds
+        });
+      selectionQuality = selectionQuality === null
+        ? null
+        : roleAwareSelectionQuality(
+          selectionQuality,
+          finalizeRelevanceAssessments(canonicalReview.relevanceAssessments, selectedPaperIdSet, new Set(canonicalReview.reviewWorkflow.excludedPaperIds)),
+          0
+        );
+      canonicalReview = {
+        ...canonicalReview,
+        reviewedPapers,
+        selectionQuality,
+        relevanceAssessments: finalizeRelevanceAssessments(
+          canonicalReview.relevanceAssessments,
+          selectedPaperIdSet,
+          new Set(canonicalReview.reviewWorkflow.excludedPaperIds)
+        ),
+        reviewWorkflow: {
+          ...canonicalReview.reviewWorkflow,
+          synthesisPaperIds: selectedPaperIds,
+          deferredPaperIds,
+          counts: {
+            ...canonicalReview.reviewWorkflow.counts,
+            selectedForSynthesis: selectedPaperIds.length,
+            deferred: deferredPaperIds.length
+          },
+          notes: [
+            ...canonicalReview.reviewWorkflow.notes,
+            selectedPaperIds.length > 0
+              ? `Researcher-selected evidence set honored ${selectedPaperIds.length} known paper id(s).`
+              : "Researcher-selected evidence set contained no known paper ids; no fallback semantic selection was substituted.",
+            unknownPaperIds.length > 0
+              ? `Unknown requested paper id(s) were ignored visibly: ${unknownPaperIds.slice(0, 12).join(", ")}.`
+              : null
+          ].filter((note): note is string => note !== null)
+        }
+      };
+      this.canonicalReview = canonicalReview;
+    }
+
     this.sourceStage = "selected";
-    this.lastObservation = `Selected ${canonicalReview.reviewedPapers.length} papers for synthesis from ${canonicalReview.canonicalPapers.length} canonical papers.`;
+    this.lastObservation = requestedPaperIds.length > 0
+      ? `Selected ${canonicalReview.reviewedPapers.length} researcher-requested papers for synthesis from ${canonicalReview.canonicalPapers.length} canonical papers.`
+      : `Selected ${canonicalReview.reviewedPapers.length} papers for synthesis from ${canonicalReview.canonicalPapers.length} canonical papers.`;
     await emitSourceProgress(this.request.progress, {
       phase: "review_selection",
       status: "completed",

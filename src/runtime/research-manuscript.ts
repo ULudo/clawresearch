@@ -568,26 +568,21 @@ function readinessAfterChecks(
 }
 
 function criticCheckSeverity(report: CriticReviewArtifact, objectionSeverity: string): "warning" | "blocker" {
-  if (report.stage === "release" && report.readiness !== "pass") {
-    return "blocker";
-  }
-
-  return objectionSeverity === "blocking" && report.stage === "release" ? "blocker" : "warning";
+  void report;
+  void objectionSeverity;
+  return "warning";
 }
 
 function criticReportsToChecks(reports: CriticReviewArtifact[]): ManuscriptCheck[] {
   return reports.flatMap((report) => {
     if (report.objections.length === 0) {
-      const severity = report.stage === "release" && report.readiness !== "pass"
-        ? "blocker" as const
-        : "warning" as const;
       return report.readiness === "pass"
         ? []
         : [{
           id: `critic-${report.stage}`,
-          title: `${report.stage.replace(/_/g, " ")} critic passed release gate`,
-          status: severity === "blocker" ? "fail" as const : "warning" as const,
-          severity,
+          title: `${report.stage.replace(/_/g, " ")} critic diagnostic`,
+          status: "warning" as const,
+          severity: "warning" as const,
           message: `The ${report.stage.replace(/_/g, " ")} critic returned ${report.readiness}.`
         }];
     }
@@ -619,10 +614,7 @@ function readinessWithCriticReports(
   current: ManuscriptReadinessState,
   reports: CriticReviewArtifact[]
 ): ManuscriptReadinessState {
-  if (reports.some((report) => report.stage === "release" && report.readiness !== "pass")) {
-    return current === "ready_for_revision" ? "needs_human_review" : current;
-  }
-
+  void reports;
   return current;
 }
 

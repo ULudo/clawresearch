@@ -5,7 +5,8 @@ import type { CanonicalPaper, LiteratureContext } from "./literature-store.js";
 import type { ProjectMemoryContext, MemoryRecordType } from "./memory-store.js";
 import type {
   ManuscriptBundle,
-  ManuscriptCheck
+  ManuscriptCheck,
+  ReviewProtocol
 } from "./research-manuscript.js";
 import type { ResearchAgenda, ResearchPlan, ResearchSynthesis } from "./research-backend.js";
 import type { CriticReviewArtifact, CriticReviewStage } from "./research-critic.js";
@@ -32,6 +33,7 @@ export type WorkStoreEntityKind =
   | "evidenceCell"
   | "claim"
   | "citation"
+  | "protocol"
   | "workItem"
   | "manuscriptSection"
   | "releaseCheck";
@@ -46,6 +48,7 @@ export type WorkStoreCollectionName =
   | "evidenceCells"
   | "claims"
   | "citations"
+  | "protocols"
   | "workItems"
   | "manuscriptSections"
   | "releaseChecks";
@@ -199,6 +202,22 @@ export type WorkStoreCitation = WorkStoreBaseEntity & {
   sectionIds: string[];
 };
 
+export type WorkStoreProtocol = WorkStoreBaseEntity & {
+  kind: "protocol";
+  protocolId: string;
+  title: string;
+  objective: string;
+  researchQuestion: string | null;
+  scope: string[];
+  inclusionCriteria: string[];
+  exclusionCriteria: string[];
+  evidenceTargets: string[];
+  manuscriptConstraints: string[];
+  notes: string[];
+  protocol: ReviewProtocol | Record<string, unknown> | null;
+  author: "researcher" | "runtime";
+};
+
 export type WorkStoreWorkItem = WorkStoreBaseEntity & {
   kind: "workItem";
   type: WorkItemType;
@@ -244,6 +263,7 @@ export type WorkStoreEntity =
   | WorkStoreEvidenceCell
   | WorkStoreClaim
   | WorkStoreCitation
+  | WorkStoreProtocol
   | WorkStoreWorkItem
   | WorkStoreManuscriptSection
   | WorkStoreReleaseCheck;
@@ -270,6 +290,7 @@ export type ResearchWorkStoreObjects = {
   evidenceCells: WorkStoreEvidenceCell[];
   claims: WorkStoreClaim[];
   citations: WorkStoreCitation[];
+  protocols: WorkStoreProtocol[];
   workItems: WorkStoreWorkItem[];
   manuscriptSections: WorkStoreManuscriptSection[];
   releaseChecks: WorkStoreReleaseCheck[];
@@ -424,6 +445,16 @@ CREATE TABLE IF NOT EXISTS support_links (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS protocols (
+  id TEXT PRIMARY KEY,
+  run_id TEXT,
+  protocol_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  objective TEXT NOT NULL,
+  json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS manuscript_sections (
   id TEXT PRIMARY KEY,
   run_id TEXT,
@@ -478,6 +509,7 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_sources_search ON sources(title, citation, venue, screening_decision);
 CREATE INDEX IF NOT EXISTS idx_extractions_source ON extractions(source_id);
 CREATE INDEX IF NOT EXISTS idx_claims_status ON claims(support_status);
+CREATE INDEX IF NOT EXISTS idx_protocols_protocol_id ON protocols(protocol_id);
 CREATE INDEX IF NOT EXISTS idx_work_items_status ON work_items(status, severity);
 CREATE INDEX IF NOT EXISTS idx_section_claims_claim ON section_claims(claim_id);
 `);
@@ -503,6 +535,7 @@ function createEmptyObjects(): ResearchWorkStoreObjects {
     evidenceCells: [],
     claims: [],
     citations: [],
+    protocols: [],
     workItems: [],
     manuscriptSections: [],
     releaseChecks: []
@@ -616,6 +649,7 @@ function normalizeObjects(value: unknown): ResearchWorkStoreObjects {
     evidenceCells: normalizeEntityArray(record.evidenceCells, "evidenceCell"),
     claims: normalizeEntityArray(record.claims, "claim"),
     citations: normalizeEntityArray(record.citations, "citation"),
+    protocols: normalizeEntityArray(record.protocols, "protocol"),
     workItems: normalizeEntityArray(record.workItems, "workItem"),
     manuscriptSections: normalizeEntityArray(record.manuscriptSections, "manuscriptSection"),
     releaseChecks: normalizeEntityArray(record.releaseChecks, "releaseCheck")
@@ -683,6 +717,8 @@ function collectionNameForKind(kind: WorkStoreEntityKind): WorkStoreCollectionNa
       return "claims";
     case "citation":
       return "citations";
+    case "protocol":
+      return "protocols";
     case "workItem":
       return "workItems";
     case "manuscriptSection":
@@ -903,6 +939,8 @@ function loadWorkspaceDatabase(input: {
       .flatMap((row) => rowJsonEntity<WorkStoreClaim>(row, "claim") ?? []);
     const citations = statementRows<Record<string, unknown>>(database, "SELECT json FROM support_links ORDER BY updated_at, id")
       .flatMap((row) => rowJsonEntity<WorkStoreCitation>(row, "citation") ?? []);
+    const protocols = statementRows<Record<string, unknown>>(database, "SELECT json FROM protocols ORDER BY updated_at, id")
+      .flatMap((row) => rowJsonEntity<WorkStoreProtocol>(row, "protocol") ?? []);
     const manuscriptSections = statementRows<Record<string, unknown>>(database, "SELECT json FROM manuscript_sections ORDER BY updated_at, id")
       .flatMap((row) => rowJsonEntity<WorkStoreManuscriptSection>(row, "manuscriptSection") ?? []);
     const workItems = statementRows<Record<string, unknown>>(database, "SELECT json FROM work_items ORDER BY updated_at, id")
@@ -930,6 +968,7 @@ function loadWorkspaceDatabase(input: {
         evidenceCells: extractions.flatMap((extraction) => evidenceCellsFromExtraction(extraction)),
         claims,
         citations,
+        protocols,
         workItems,
         manuscriptSections,
         releaseChecks
@@ -953,6 +992,7 @@ DELETE FROM sources;
 DELETE FROM extractions;
 DELETE FROM claims;
 DELETE FROM support_links;
+DELETE FROM protocols;
 DELETE FROM manuscript_sections;
 DELETE FROM section_claims;
 DELETE FROM work_items;
@@ -1015,6 +1055,11 @@ INSERT INTO sources (
       const insertSupportLink = database.prepare("INSERT INTO support_links (id, run_id, source_id, json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)");
       for (const citation of store.objects.citations) {
         insertSupportLink.run(citation.id, citation.runId, citation.sourceId, jsonText(citation), citation.createdAt, citation.updatedAt);
+      }
+
+      const insertProtocol = database.prepare("INSERT INTO protocols (id, run_id, protocol_id, title, objective, json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const protocol of store.objects.protocols) {
+        insertProtocol.run(protocol.id, protocol.runId, protocol.protocolId, protocol.title, protocol.objective, jsonText(protocol), protocol.createdAt, protocol.updatedAt);
       }
 
       const insertSection = database.prepare("INSERT INTO manuscript_sections (id, run_id, section_id, title, status, json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
@@ -1403,7 +1448,7 @@ function targetKindFromCriticTarget(target: string): WorkStoreWorkItem["targetKi
   }
 }
 
-function workItemsFromCriticReports(run: RunRecord, reports: CriticReviewArtifact[], now: string): WorkStoreWorkItem[] {
+export function workItemsFromCriticReports(run: RunRecord, reports: CriticReviewArtifact[], now: string): WorkStoreWorkItem[] {
   return reports.flatMap((report) => report.objections.map((objection, index) => ({
     id: stableId("work-item", [run.id, "critic", report.stage, objection.code, index]),
     kind: "workItem",
@@ -1714,6 +1759,7 @@ export function buildLiteratureContextFromWorkStore(store: ResearchWorkStore): L
 }
 
 export type ResearchWorkStoreSummary = {
+  protocols: number;
   canonicalSources: number;
   extractions: number;
   evidenceCells: number;
@@ -1724,6 +1770,7 @@ export type ResearchWorkStoreSummary = {
 
 export function summarizeResearchWorkStore(store: ResearchWorkStore): ResearchWorkStoreSummary {
   return {
+    protocols: store.objects.protocols.length,
     canonicalSources: store.objects.canonicalSources.length,
     extractions: store.objects.extractions.length,
     evidenceCells: store.objects.evidenceCells.length,

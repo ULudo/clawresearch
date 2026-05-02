@@ -127,7 +127,7 @@ test("verifier records provenance, evidence links, and supported claims from can
   assert.equal(report.verifiedClaims[0]?.evidenceLinks.length, 1);
 });
 
-test("verifier does not treat off-topic cited papers as support for scoped claims", () => {
+test("verifier keeps source relevance as diagnostics instead of removing cited support", () => {
   const report = verifyResearchClaims({
     brief: {
       topic: "autonomous research agents",
@@ -156,11 +156,10 @@ test("verifier does not treat off-topic cited papers as support for scoped claim
   });
 
   assert.equal(report.overallStatus, "mixed");
+  assert.equal(report.counts.supported, 1);
   assert.equal(report.counts.offTopicSources, 1);
-  assert.equal(report.counts.unverified, 1);
-  assert.equal(report.verifiedClaims[0]?.supportStatus, "unverified");
-  assert.deepEqual(report.verifiedClaims[0]?.offTopicSourceIds, ["paper-cmip6"]);
-  assert.match(report.unverifiedClaims[0]?.reason ?? "", /outside the scoped topic/i);
+  assert.equal(report.verifiedClaims[0]?.supportStatus, "supported");
+  assert.deepEqual(report.verifiedClaims[0]?.citedSourceIds, ["paper-cmip6"]);
 });
 
 test("verifier marks claims linked only to blocked papers as unverified", () => {
@@ -310,7 +309,7 @@ test("verifier emits explicit unknown when the claim itself states evidence is l
   assert.ok(report.unknowns.some((entry) => /Unknown: There is no direct evidence yet/i.test(entry)));
 });
 
-test("verifier rejects broad nursing AI sources outside nursing-home scope", () => {
+test("verifier does not contain nursing-home-specific relevance overrides", () => {
   const report = verifyResearchClaims({
     brief: {
       topic: "AI adoption in nursing homes",
@@ -330,11 +329,11 @@ test("verifier rejects broad nursing AI sources outside nursing-home scope", () 
     claims: []
   });
 
-  assert.equal(report.counts.offTopicSources, 1);
-  assert.equal(report.sourceRelevance[0]?.status, "off_topic");
+  assert.equal(report.counts.offTopicSources, 0);
+  assert.notEqual(report.sourceRelevance[0]?.rationale, "The source does not match the nursing-home or long-term-care scope required by the brief.");
 });
 
-test("verifier rejects generic rigorous numerics outside zeta-zero verification scope", () => {
+test("verifier does not contain zeta-specific relevance overrides", () => {
   const report = verifyResearchClaims({
     brief: {
       topic: "rigorous numerical verification of Riemann zeta zeros",
@@ -354,11 +353,11 @@ test("verifier rejects generic rigorous numerics outside zeta-zero verification 
     claims: []
   });
 
-  assert.equal(report.counts.offTopicSources, 1);
-  assert.equal(report.sourceRelevance[0]?.status, "off_topic");
+  assert.equal(report.counts.offTopicSources, 0);
+  assert.notEqual(report.sourceRelevance[0]?.rationale, "The source does not match the Riemann-zeta-zero scope required by the brief.");
 });
 
-test("verifier rejects unrelated AI/autonomous papers outside research-agent review scope", () => {
+test("verifier does not contain autonomous-agent-specific relevance overrides", () => {
   const report = verifyResearchClaims({
     brief: {
       topic: "autonomous research agents for literature review automation",
@@ -378,6 +377,6 @@ test("verifier rejects unrelated AI/autonomous papers outside research-agent rev
     claims: []
   });
 
-  assert.equal(report.counts.offTopicSources, 1);
-  assert.equal(report.sourceRelevance[0]?.status, "off_topic");
+  assert.equal(report.counts.offTopicSources, 0);
+  assert.notEqual(report.sourceRelevance[0]?.rationale, "The source does not match the autonomous research-agent review scope.");
 });

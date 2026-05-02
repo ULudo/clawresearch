@@ -479,6 +479,56 @@ class StubResearchBackend implements ResearchBackend {
   }
 }
 
+class ProtocolToolBackend extends StubResearchBackend {
+  private protocolCreated = false;
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase === "synthesis" && !this.protocolCreated && (request.workStore?.recentProtocols.length ?? 0) === 0) {
+      this.actionRequests.push(request);
+      this.protocolCreated = true;
+      return {
+        schemaVersion: 1,
+        action: "protocol.create_or_revise",
+        rationale: "Persist the researcher-owned review protocol before constructing claims.",
+        confidence: 0.91,
+        inputs: {
+          providerIds: [],
+          searchQueries: [],
+          evidenceTargets: ["agentic tool-loop evidence"],
+          paperIds: [],
+          criticStage: null,
+          reason: "The protocol should be visible as workspace state.",
+          workStore: {
+            collection: "protocols",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            changes: {},
+            entity: {
+              id: "protocol-current",
+              protocolId: "current-protocol",
+              title: "Agentic research protocol",
+              objective: "Review evidence for agentic research tool loops.",
+              researchQuestion: "How should ClawResearch structure autonomous research work?",
+              scope: ["autonomous research agents"],
+              inclusionCriteria: ["tool-loop architecture evidence"],
+              exclusionCriteria: ["pure output-style constraints"],
+              evidenceTargets: ["agentic tool-loop evidence"],
+              manuscriptConstraints: ["cite support links"]
+            }
+          }
+        },
+        expectedOutcome: "The protocol is persisted as a queryable workspace protocol object.",
+        stopCondition: "Continue after the protocol can be read through workspace tools.",
+        transport: "strict_json"
+      };
+    }
+
+    return super.chooseResearchAction(request);
+  }
+}
+
 class ToolResultAwareSynthesisBackend extends StubResearchBackend {
   readonly synthesisRequests: ResearchActionRequest[] = [];
 
@@ -843,6 +893,236 @@ class SupportLinkSynthesisBackend extends StubResearchBackend {
         }
       },
       expectedOutcome: "Release checks pass.",
+      stopCondition: "Stop after release checks.",
+      transport: "strict_json"
+    };
+  }
+}
+
+class MismatchedSupportSynthesisBackend extends StubResearchBackend {
+  private readonly evidencePreviews: Array<{ id: string; sourceId: string; snippet?: string; confidence?: string }> = [];
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "synthesis") {
+      return super.chooseResearchAction(request);
+    }
+
+    for (const item of request.toolResults?.flatMap((result) => result.items ?? []) ?? []) {
+      if (item.id.startsWith("evidence-cell-") && typeof item.sourceId === "string" && !this.evidencePreviews.some((preview) => preview.id === item.id)) {
+        this.evidencePreviews.push({
+          id: item.id,
+          sourceId: item.sourceId,
+          snippet: item.snippet,
+          confidence: item.confidence
+        });
+      }
+    }
+
+    const claim = request.workStore?.recentClaims[0];
+    const citation = request.workStore?.recentCitations[0];
+    const section = request.workStore?.recentSections[0];
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [],
+      criticStage: null,
+      reason: null
+    };
+
+    if (claim === undefined) {
+      return {
+        schemaVersion: 1,
+        action: "claim.create",
+        rationale: "Create a claim for support-readiness validation.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "claims",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              text: "Support readiness must reject mismatched evidence provenance.",
+              evidence: "This claim intentionally receives a mismatched support link for validation.",
+              confidence: "medium"
+            }
+          }
+        },
+        expectedOutcome: "Create a claim.",
+        stopCondition: "The claim exists.",
+        transport: "strict_json"
+      };
+    }
+
+    if (this.evidencePreviews.length < 12) {
+      return {
+        schemaVersion: 1,
+        action: "workspace.list",
+        rationale: "Inspect enough evidence cells to find cells from different sources.",
+        confidence: 0.88,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "evidenceCells",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: 20,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "Return evidence-cell previews.",
+        stopCondition: "Evidence-cell previews are visible.",
+        transport: "strict_json"
+      };
+    }
+
+    const first = this.evidencePreviews[0];
+    const mismatched = this.evidencePreviews.find((preview) => preview.sourceId !== first?.sourceId);
+    if (citation === undefined && first !== undefined) {
+      return {
+        schemaVersion: 1,
+        action: "claim.link_support",
+        rationale: "Create an initially valid support link.",
+        confidence: 0.88,
+        inputs: {
+          ...baseInputs,
+          paperIds: [first.sourceId],
+          workStore: {
+            collection: "citations",
+            entityId: claim.id,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              evidenceCellId: first.id,
+              sourceId: first.sourceId,
+              supportSnippet: first.snippet,
+              confidence: first.confidence ?? "medium",
+              relevance: "direct support"
+            }
+          }
+        },
+        expectedOutcome: "Create a support link.",
+        stopCondition: "Support link exists.",
+        transport: "strict_json"
+      };
+    }
+
+    if (citation !== undefined && mismatched !== undefined && citation.evidenceCellId !== mismatched.id) {
+      return {
+        schemaVersion: 1,
+        action: "workspace.patch",
+        rationale: "Corrupt the support link to simulate mismatched evidence provenance.",
+        confidence: 0.7,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "citations",
+            entityId: citation.id,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {
+              evidenceCellId: mismatched.id,
+              supportSnippet: mismatched.snippet ?? "Mismatched evidence snippet from another source."
+            },
+            entity: {}
+          }
+        },
+        expectedOutcome: "Persist a deliberately invalid support link.",
+        stopCondition: "The citation has mismatched evidence provenance.",
+        transport: "strict_json"
+      };
+    }
+
+    if (section === undefined && citation !== undefined) {
+      return {
+        schemaVersion: 1,
+        action: "section.create",
+        rationale: "Create a section using the claim with invalid support provenance.",
+        confidence: 0.82,
+        inputs: {
+          ...baseInputs,
+          paperIds: [citation.sourceId],
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              sectionId: "synthesis",
+              role: "synthesis",
+              title: "Synthesis",
+              paragraph: "This section should not pass release because support provenance is mismatched.",
+              claimIds: [claim.id],
+              sourceIds: [citation.sourceId]
+            }
+          }
+        },
+        expectedOutcome: "Create a section.",
+        stopCondition: "Section exists.",
+        transport: "strict_json"
+      };
+    }
+
+    if (section !== undefined && section.status !== "needs_revision") {
+      return {
+        schemaVersion: 1,
+        action: "section.check_claims",
+        rationale: "Run support-readiness checks on the section.",
+        confidence: 0.86,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: section.id,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "The section should need revision.",
+        stopCondition: "Section support state is updated.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "manuscript.release",
+      rationale: "Let release checks report the support-readiness blocker.",
+      confidence: 0.8,
+      inputs: {
+        ...baseInputs,
+        workStore: {
+          collection: null,
+          entityId: null,
+          filters: {},
+          semanticQuery: null,
+          limit: null,
+          cursor: null,
+          changes: {},
+          entity: {}
+        }
+      },
+      expectedOutcome: "Release remains blocked by invalid support.",
       stopCondition: "Stop after release checks.",
       transport: "strict_json"
     };
@@ -2324,12 +2604,12 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     await assert.rejects(readFile(completedRun.artifacts.referencesPath, "utf8"), /ENOENT/);
     await assert.rejects(readFile(completedRun.artifacts.summaryPath, "utf8"), /ENOENT/);
     assert.equal(researchWorkerStatePath(projectRoot), researchWorkStoreFilePath(projectRoot));
-    assert.equal(workerState.status, "working");
+    assert.equal(workerState.status, "release_ready");
     assert.equal(workerState.activeRunId, null);
     assert.equal(workerState.lastRunId, completedRun.id);
     assert.equal(workerState.segmentCount, 1);
-    assert.equal(workerState.paperReadiness, "needs_more_evidence");
-    assert.ok(workerState.nextInternalActions.length > 0);
+    assert.equal(workerState.paperReadiness, "ready_for_revision");
+    assert.deepEqual(workerState.nextInternalActions, []);
     assert.deepEqual(workerState.userBlockers, []);
     assert.equal(workStore.objects.canonicalSources.length, 1);
     assert.equal(workStore.objects.extractions.length, 1);
@@ -2363,15 +2643,15 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     assert.match(reviewProtocolMarkdown, /Review Protocol/);
     assert.equal(paperArtifact.schemaVersion, 1);
     assert.equal(paperArtifact.runId, completedRun.id);
-    assert.equal(paperArtifact.readinessStatus, "needs_more_evidence");
+    assert.equal(paperArtifact.readinessStatus, "ready_for_revision");
     assert.deepEqual(paperArtifact.referencedPaperIds, ["paper-1"]);
     assert.equal(paperArtifact.claims.length, 1);
     assert.ok(paperArtifact.scientificRoles.includes("synthesis"));
     assert.equal(manuscriptChecks.schemaVersion, 1);
     assert.equal(manuscriptChecks.runId, completedRun.id);
-    assert.equal(manuscriptChecks.readinessStatus, "needs_more_evidence");
-    assert.ok(manuscriptChecks.checks.some((check) => check.id === "evidence-coverage" && check.status === "fail"));
-    assert.match(paperMarkdown, /No full review manuscript was released/i);
+    assert.equal(manuscriptChecks.readinessStatus, "ready_for_revision");
+    assert.ok(manuscriptChecks.checks.some((check) => check.id === "evidence-coverage" && check.status === "warning"));
+    assert.doesNotMatch(paperMarkdown, /No full review manuscript was released/i);
     assert.equal(workStore.objects.extractions.length, 1);
     assert.match(JSON.stringify(verificationArtifact), /paper-1/);
     assert.equal(agendaArtifact.selectedDirectionId, "direction-1");
@@ -2461,6 +2741,10 @@ test("run worker lets the research agent choose source provider order and source
       } | null;
     };
     const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
 
     assert.equal(exitCode, 0);
     assert.equal(sourcesArtifact.retrievalDiagnostics?.providerAttempts?.[0]?.providerId, "arxiv");
@@ -2855,12 +3139,51 @@ test("run worker builds manuscript progress through claim, evidence, and section
     assert.ok(synthesisActionRequest?.allowedActions.includes("section.create"));
     assert.doesNotMatch(agentSteps, /plan_clustered_synthesis|revise_synthesis_cluster|merge_cluster_syntheses/);
     assert.equal(parsedAgentSteps.find((step) => step.action === "claim.create")?.metadata?.transport, "strict_json");
-    assert.ok((qualityReport.agentControl.transportCounts.strict_json ?? 0) >= 3);
+    assert.ok((qualityReport.agentControl.transportCounts.strict_json ?? 0) >= 2);
     assert.ok(qualityReport.agentControl.actions.some((action) => action.action === "claim.create" && action.transport === "strict_json"));
     assert.ok(qualityReport.agentControl.actions.some((action) => action.action === "section.create" && action.transport === "strict_json"));
-    assert.ok(qualityReport.agentControl.actions.some((action) => action.action === "section.check_claims" && action.transport === "strict_json"));
     assert.ok(agentState.completedSteps > 0);
     assert.equal(agentState.currentPhase, "release");
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("protocol.create_or_revise persists a researcher-owned protocol object", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-protocol-tool-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "Autonomous research agents",
+      researchQuestion: "How should autonomous research work be structured?",
+      researchDirection: "Test model-owned protocol persistence.",
+      successCriterion: "The protocol must be queryable as workspace state."
+    }, ["clawresearch", "research-loop"]);
+
+    const backend = new ProtocolToolBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer: new MultiPaperSourceGatherer(3)
+    });
+
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+
+    assert.equal(exitCode, 0);
+    assert.equal(workStore.objects.protocols.length, 1);
+    assert.equal(workStore.objects.protocols[0]?.author, "researcher");
+    assert.equal(workStore.objects.protocols[0]?.title, "Agentic research protocol");
+    assert.deepEqual(workStore.objects.protocols[0]?.evidenceTargets, ["agentic tool-loop evidence"]);
+    assert.ok(backend.actionRequests.some((request) => request.workStore?.recentProtocols.length === 1));
+    assert.ok(!workStore.objects.workItems.some((item) => item.targetKind === "protocol" && item.source === "runtime"));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -2999,6 +3322,67 @@ test("run worker creates durable support links from claims to evidence cells and
   }
 });
 
+test("run worker release checks reject mismatched support-link evidence provenance", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-support-readiness-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "Autonomous research agents",
+      researchQuestion: "Can release checks reject mismatched support provenance?",
+      researchDirection: "Test support-readiness invariants.",
+      successCriterion: "Do not release when a claim citation points to an evidence cell from another source."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.explicitlyConfigured = true;
+    await projectConfigStore.save(projectConfig);
+
+    const backend = new MismatchedSupportSynthesisBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer: new MultiPaperSourceGatherer(3)
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const paper = JSON.parse(await readFile(completedRun.artifacts.paperJsonPath, "utf8")) as {
+      readinessStatus: string;
+    };
+    const manuscriptChecks = JSON.parse(await readFile(completedRun.artifacts.manuscriptChecksPath, "utf8")) as {
+      readinessStatus: string;
+      checks: Array<{ id: string; status: string; message: string }>;
+      blockers: string[];
+    };
+    const supportCheck = manuscriptChecks.checks.find((check) => check.id === "claim-citation-support");
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.equal(workStore.objects.claims.length, 1);
+    assert.equal(workStore.objects.citations.length, 1);
+    assert.equal(workStore.objects.manuscriptSections[0]?.status, "needs_revision");
+    assert.equal(paper.readinessStatus, "needs_human_review");
+    assert.equal(manuscriptChecks.readinessStatus, "needs_human_review");
+    assert.equal(supportCheck?.status, "fail");
+    assert.match(supportCheck?.message ?? "", /belongs to source|Unsupported claim/i);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("run worker finishes status-only when the model cannot choose structured actions", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-agent-control-"));
   const now = createNow();
@@ -3062,10 +3446,11 @@ test("run worker finishes status-only when the model cannot choose structured ac
     assert.equal(qualityReport.agentControl.mode, "strict_json");
     assert.ok((qualityReport.agentControl.transportCounts.runtime_fallback ?? 0) >= 1);
     assert.equal(qualityReport.agentControl.actions[0]?.transport, "runtime_fallback");
+    assert.equal(qualityReport.agentControl.actions[0]?.action, "workspace.status");
     assert.ok(qualityReport.agentControl.invalidActionCount >= 2);
     assert.equal(qualityReport.agentControl.diagnostics[0]?.kind, "malformed_action");
     assert.match(qualityReport.modelSuitability.rationale.join(" "), /action control/i);
-    assert.equal(paper.readinessStatus, "needs_more_evidence");
+    assert.equal(paper.readinessStatus, "needs_human_review");
     assert.deepEqual(paper.claims, []);
     assert.match(paperMarkdown, /No full review manuscript was released/i);
     assert.deepEqual(workStore.objects.claims, []);
@@ -3074,7 +3459,7 @@ test("run worker finishes status-only when the model cannot choose structured ac
   }
 });
 
-test("run worker autonomously reruns retrieval when manuscript checks need more evidence", async () => {
+test("run worker does not turn semantic evidence warnings into hardcoded revision passes", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-evidence-revision-"));
   const now = createNow();
 
@@ -3120,18 +3505,21 @@ test("run worker autonomously reruns retrieval when manuscript checks need more 
       searchQueries: string[];
     };
     const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
-    assert.equal(sourceGatherer.requests.length, 2);
-    assert.ok((sourceGatherer.requests[1]?.revisionQueries?.length ?? 0) > 0);
-    assert.equal(sourcesArtifact.autonomousEvidence.pass, 2);
-    assert.equal(sourcesArtifact.autonomousEvidence.revisionPasses, 1);
-    assert.ok(planArtifact.searchQueries.some((query) => /benchmark evaluation/i.test(query)));
-    assert.equal(backend.capturedExtractionPaperIds.length, 3);
+    assert.equal(sourceGatherer.requests.length, 1);
+    assert.equal(sourcesArtifact.autonomousEvidence.pass, 1);
+    assert.equal(sourcesArtifact.autonomousEvidence.revisionPasses, 0);
+    assert.ok(planArtifact.searchQueries.length > 0);
+    assert.equal(backend.capturedExtractionPaperIds.length, 1);
     assert.equal(paper.readinessStatus, "ready_for_revision");
     assert.ok(paper.referencedPaperIds.length >= 1);
-    assert.match(stdout, /Evidence revision pass 1/i);
+    assert.doesNotMatch(stdout, /Evidence revision pass 1/i);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -3679,11 +4067,11 @@ test("run worker writes a hold agenda when no canonical papers are retained", as
     assert.equal(paperExtractions.extractionCount, 0);
     assert.equal(paperExtractions.extractions.length, 0);
     assert.equal(workStore.objects.claims.length, 0);
-    assert.equal(paper.readinessStatus, "needs_more_evidence");
+    assert.equal(paper.readinessStatus, "needs_human_review");
     assert.equal(paper.referencedPaperIds.length, 0);
     assert.equal(paper.claims.length, 0);
-    assert.equal(checks.readinessStatus, "needs_more_evidence");
-    assert.match(paperMarkdown, /needs_more_evidence/i);
+    assert.equal(checks.readinessStatus, "needs_human_review");
+    assert.match(paperMarkdown, /needs_human_review/i);
     assert.equal(workStore.objects.extractions.length, 0);
     assert.equal(agenda.selectedDirectionId, null);
     assert.equal(agenda.selectedWorkPackage, null);
@@ -3841,6 +4229,10 @@ test("protocol critic block records a warning and continues to source gathering"
       };
     };
     const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
@@ -3850,13 +4242,14 @@ test("protocol critic block records a warning and continues to source gathering"
     assert.doesNotMatch(checks.blockers.join(" "), /output-style requirements/);
     assert.equal(qualityReport.critic.finalSatisfaction, "unresolved");
     assert.ok(qualityReport.critic.iterations.some((item) => item.stage === "protocol" && item.finalReadiness === "block"));
-    assert.match(stdout, /continuing to retrieval/);
+    assert.ok(workStore.objects.workItems.some((item) => item.source === "critic" && item.targetKind === "protocol"));
+    assert.match(stdout, /no protocol search query was invented by the runtime/i);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("protocol critic feedback revises the protocol and continues autonomously", async () => {
+test("protocol critic feedback becomes work items instead of runtime protocol queries", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-protocol-revision-"));
   const now = createNow();
 
@@ -3893,14 +4286,19 @@ test("protocol critic feedback revises the protocol and continues autonomously",
     const completedRun = await runStore.load(run.id);
     const critic = JSON.parse(await readFile(completedRun.artifacts.criticProtocolReviewPath, "utf8")) as CriticReviewArtifact;
     const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
-    assert.equal(backend.protocolCalls, 2);
-    assert.equal(critic.readiness, "pass");
+    assert.equal(backend.protocolCalls, 1);
+    assert.equal(critic.readiness, "revise");
     assert.ok(gatherer.requests.length >= 1);
-    assert.ok(gatherer.requests[0]?.plan.searchQueries.some((query) => /direct protocol evidence/i.test(query)));
-    assert.match(stdout, /Protocol revision 1/);
+    assert.ok(!gatherer.requests[0]?.plan.searchQueries.some((query) => /direct protocol evidence/i.test(query)));
+    assert.ok(workStore.objects.workItems.some((item) => item.source === "critic" && item.targetKind === "protocol"));
+    assert.doesNotMatch(stdout, /Protocol revision 1/);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -3947,15 +4345,15 @@ test("persistent protocol critic revise continues to source gathering after boun
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
     assert.equal(critic.readiness, "revise");
-    assert.ok(backend.protocolCalls >= 2);
+    assert.equal(backend.protocolCalls, 1);
     assert.ok(gatherer.requests.length >= 1);
-    assert.match(stdout, /continuing to retrieval/);
+    assert.match(stdout, /no protocol search query was invented by the runtime/i);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("source-selection critic feedback triggers an autonomous revision pass", async () => {
+test("source-selection critic feedback becomes work items instead of runtime search queries", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-source-revision-"));
   const now = createNow();
 
@@ -3982,19 +4380,25 @@ test("source-selection critic feedback triggers an autonomous revision pass", as
     const completedRun = await runStore.load(run.id);
     const critic = JSON.parse(await readFile(completedRun.artifacts.criticSourceSelectionPath, "utf8")) as CriticReviewArtifact;
     const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const workItemText = JSON.stringify(workStore.objects.workItems);
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
-    assert.ok(gatherer.requests.length >= 2);
-    assert.ok(backend.sourceSelectionCalls >= 2);
-    assert.equal(critic.readiness, "pass");
-    assert.match(stdout, /Source-selection critic requested evidence revision pass 1|Evidence revision pass 1/);
+    assert.equal(gatherer.requests.length, 1);
+    assert.equal(backend.sourceSelectionCalls, 1);
+    assert.equal(critic.readiness, "revise");
+    assert.match(workItemText, /autonomous research agents benchmark evaluation/);
+    assert.doesNotMatch(stdout, /Source-selection critic requested evidence revision pass 1|Evidence revision pass 1/);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("source-selection critic paper exclusions revise the selected evidence set", async () => {
+test("source-selection critic paper exclusions become work items without mutating evidence", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-source-exclusion-"));
   const now = createNow();
 
@@ -4022,21 +4426,27 @@ test("source-selection critic paper exclusions revise the selected evidence set"
     const paperExtractions = JSON.parse(await readFile(completedRun.artifacts.paperExtractionsPath, "utf8")) as {
       extractions: Array<{ paperId: string }>;
     };
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const workItemText = JSON.stringify(workStore.objects.workItems);
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
-    assert.ok(backend.sourceSelectionCalls >= 2);
-    assert.ok(gatherer.requests[1]?.criticExcludedPaperIds?.includes("paper-weak"));
-    assert.deepEqual(paperExtractions.extractions.map((extraction) => extraction.paperId), [
-      canonicalPaperId(canonicalPaper({ key: "doi:10.1000/strong-source" }))
-    ]);
-    assert.ok(!paperExtractions.extractions.some((extraction) => extraction.paperId === canonicalPaperId(canonicalPaper({ key: "doi:10.1000/weak-source" }))));
+    assert.equal(backend.sourceSelectionCalls, 1);
+    assert.equal(gatherer.requests.length, 1);
+    assert.deepEqual(gatherer.requests[0]?.criticExcludedPaperIds, []);
+    assert.ok(paperExtractions.extractions.some((extraction) => extraction.paperId === canonicalPaperId(canonicalPaper({ key: "doi:10.1000/strong-source" }))));
+    assert.ok(paperExtractions.extractions.some((extraction) => extraction.paperId === canonicalPaperId(canonicalPaper({ key: "doi:10.1000/weak-source" }))));
+    assert.match(workItemText, /exclude source: paper-weak/);
+    assert.match(workItemText, /Weak background survey should not stay/i);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("source-selection critic paper promotions revise the selected evidence set before searching more", async () => {
+test("source-selection critic paper promotions become work items without mutating evidence", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-promote-"));
   const now = createNow();
 
@@ -4065,22 +4475,30 @@ test("source-selection critic paper promotions revise the selected evidence set 
       extractions: Array<{ paperId: string }>;
     };
     const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const workItemText = JSON.stringify(workStore.objects.workItems);
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
-    assert.ok(backend.sourceSelectionCalls >= 2);
-    assert.ok(gatherer.requests[1]?.criticPromotedPaperIds?.includes("paper-strong"));
-    assert.match(stdout, /promoting stronger candidates already in the source pool/i);
+    assert.equal(backend.sourceSelectionCalls, 1);
+    assert.equal(gatherer.requests.length, 1);
+    assert.deepEqual(gatherer.requests[0]?.criticPromotedPaperIds, []);
+    assert.doesNotMatch(stdout, /promoting stronger candidates already in the source pool/i);
     assert.deepEqual(paperExtractions.extractions.map((extraction) => extraction.paperId), [
-      canonicalPaperId(canonicalPaper({ key: "doi:10.1000/promotion-strong-source" }))
+      canonicalPaperId(canonicalPaper({ key: "doi:10.1000/promotion-weak-source" }))
     ]);
-    assert.ok(!paperExtractions.extractions.some((extraction) => extraction.paperId === canonicalPaperId(canonicalPaper({ key: "doi:10.1000/promotion-weak-source" }))));
+    assert.ok(!paperExtractions.extractions.some((extraction) => extraction.paperId === canonicalPaperId(canonicalPaper({ key: "doi:10.1000/promotion-strong-source" }))));
+    assert.match(workItemText, /promote source: paper-strong/);
+    assert.match(workItemText, /stronger architecture paper/i);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("generic critic fallback text is not used as retrieval query text", async () => {
+test("generic critic fallback text is recorded without becoming retrieval query text", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-query-guard-"));
   const now = createNow();
 
@@ -4108,8 +4526,8 @@ test("generic critic fallback text is not used as retrieval query text", async (
     const joinedQueries = revisionQueries.join(" | ");
 
     assert.equal(exitCode, 0);
-    assert.ok(gatherer.requests.length >= 2);
-    assert.match(joinedQueries, /benchmark evaluation/i);
+    assert.equal(gatherer.requests.length, 1);
+    assert.equal(joinedQueries, "");
     assert.doesNotMatch(joinedQueries, /prior research stage|focused evidence|before release|full manuscript|working critic backend/i);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
@@ -4161,27 +4579,32 @@ test("persistent source-selection critic concerns are reported without stopping 
       };
     };
     const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
     assert.equal(critic.readiness, "block");
-    assert.ok(backend.sourceSelectionCalls >= 2);
+    assert.equal(backend.sourceSelectionCalls, 1);
     assert.equal(paperExtractions.extractionCount, 3);
     assert.equal(qualityReport.evidence.reviewedPapers, 3);
     assert.equal(qualityReport.evidence.extractedPapers, 3);
     assert.equal(qualityReport.critic.finalSatisfaction, "unresolved");
-    assert.ok(qualityReport.critic.iterations.some((item) => item.stage === "source_selection" && item.iterations === backend.sourceSelectionCalls && item.finalReadiness === "block"));
+    assert.ok(qualityReport.critic.iterations.some((item) => item.stage === "source_selection" && item.iterations === 1 && item.finalReadiness === "block"));
     assert.ok(checks.warningCount > 0);
     assert.ok(checks.checks.some((item) => item.id.includes("critic-source_selection") && item.severity === "warning"));
     assert.ok(!checks.checks.some((item) => item.id.includes("critic-source_selection") && item.severity === "blocker"));
     assert.notEqual(checks.readinessStatus, "blocked");
-    assert.match(stdout, /continuing so later evidence, synthesis, and final quality checks can complete/);
+    assert.ok(workStore.objects.workItems.some((item) => item.source === "critic" && item.targetKind === "canonicalSource"));
+    assert.match(stdout, /no source set was mutated by the runtime/i);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("release critic block converts an otherwise ready manuscript to status-only", async () => {
+test("release critic block is recorded as diagnostics without replacing a valid manuscript", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-release-"));
   const now = createNow();
 
@@ -4213,15 +4636,17 @@ test("release critic block converts an otherwise ready manuscript to status-only
     const checks = JSON.parse(await readFile(completedRun.artifacts.manuscriptChecksPath, "utf8")) as {
       readinessStatus: string;
       blockers: string[];
+      checks: Array<{ id: string; status: string; severity: string; message: string }>;
     };
     const paper = await readFile(completedRun.artifacts.paperPath, "utf8");
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
     assert.equal(critic.readiness, "block");
-    assert.equal(checks.readinessStatus, "needs_human_review");
-    assert.match(checks.blockers.join(" "), /unresolved review risk/);
-    assert.match(paper, /not a released manuscript/);
+    assert.equal(checks.readinessStatus, "ready_for_revision");
+    assert.equal(checks.blockers.length, 0);
+    assert.ok(checks.checks.some((check) => check.id.includes("critic-release") && check.status === "warning" && check.severity === "warning"));
+    assert.doesNotMatch(paper, /not a released manuscript/);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

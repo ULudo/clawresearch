@@ -72,8 +72,6 @@ import {
   type ReviewPaperArtifact
 } from "./research-manuscript.js";
 import {
-  criticRevisionTexts,
-  criticReviewNeedsRevision,
   criticReviewPassed,
   criticUnavailableReview,
   type CriticReviewArtifact,
@@ -83,7 +81,6 @@ import {
 import {
   AgenticSourceGatherSession,
   collectResearchLocalFileHints,
-  createDefaultResearchSourceGatherer,
   type AgenticSourceState,
   type ResearchSource,
   type ResearchSourceGatherRequest,
@@ -127,21 +124,30 @@ import {
   researchWorkStoreFilePath,
   summarizeResearchWorkStore,
   upsertResearchWorkStoreEntities,
+  workItemsFromCriticReports,
   writeResearchWorkStore,
   type ResearchWorkStore,
   type WorkStoreCollectionName,
+  type WorkStoreCanonicalSource,
   type WorkStoreClaim,
   type WorkStoreCitation,
   type WorkStoreEvidenceCell,
   type WorkStoreEntity,
   type WorkStoreEntityKind,
   type WorkStoreManuscriptSection,
+  type WorkStoreProtocol,
+  type WorkStoreReleaseCheck,
   type WorkStoreWorkItem
 } from "./research-work-store.js";
 import {
-  isRetrievalQualityConstraintPhrase,
-  isSubstantiveReviewFacet
+  isRetrievalQualityConstraintPhrase
 } from "./literature-review.js";
+import {
+  guidanceContextForAgent,
+  readResearchGuidance,
+  recommendResearchGuidance,
+  searchResearchGuidance
+} from "./research-guidance.js";
 
 type WorkerOptions = {
   projectRoot: string;
@@ -382,6 +388,7 @@ const workStoreCollections: WorkStoreCollectionName[] = [
   "evidenceCells",
   "claims",
   "citations",
+  "protocols",
   "workItems",
   "manuscriptSections",
   "releaseChecks"
@@ -397,6 +404,7 @@ const workStoreEntityKinds: WorkStoreEntityKind[] = [
   "evidenceCell",
   "claim",
   "citation",
+  "protocol",
   "workItem",
   "manuscriptSection",
   "releaseCheck"
@@ -426,6 +434,13 @@ function workStoreContextForAgent(store: ResearchWorkStore): ResearchActionReque
         targetId: item.targetId,
         suggestedActions: item.suggestedActions.slice(0, 6)
       })),
+    recentProtocols: store.objects.protocols.slice(-4).map((protocol) => ({
+      id: protocol.id,
+      title: protocol.title,
+      objective: protocol.objective,
+      evidenceTargets: protocol.evidenceTargets.slice(0, 8),
+      author: protocol.author
+    })),
     recentSources: store.objects.canonicalSources.slice(-12).map((source) => ({
       id: source.id,
       title: source.title,
@@ -486,6 +501,12 @@ function isStatusAction(action: ResearchActionDecision["action"]): boolean {
   return action === "workspace.status" || action === "manuscript.status";
 }
 
+function isGuidanceToolAction(action: ResearchActionDecision["action"]): boolean {
+  return action === "guidance.search"
+    || action === "guidance.read"
+    || action === "guidance.recommend";
+}
+
 function isWorkStoreToolAction(action: ResearchActionDecision["action"]): boolean {
   return action === "workspace.search"
     || action === "workspace.read"
@@ -501,7 +522,8 @@ function isWorkStoreToolAction(action: ResearchActionDecision["action"]): boolea
 }
 
 function isResearchObjectToolAction(action: ResearchActionDecision["action"]): boolean {
-  return action === "claim.create"
+  return action === "protocol.create_or_revise"
+    || action === "claim.create"
     || action === "claim.patch"
     || action === "claim.revise"
     || action === "claim.check_support"
@@ -518,6 +540,7 @@ function isResearchObjectToolAction(action: ResearchActionDecision["action"]): b
     || action === "work_item.create"
     || action === "work_item.patch"
     || action === "check.run"
+    || action === "release.verify"
     || action === "manuscript.read_section"
     || action === "manuscript.patch_section"
     || action === "manuscript.add_paragraph"
@@ -535,7 +558,10 @@ function isReadOnlyWorkspaceAction(action: ResearchActionDecision["action"]): bo
     || action === "evidence.find_support"
     || action === "evidence.find_contradictions"
     || action === "section.read"
-    || action === "manuscript.read_section";
+    || action === "manuscript.read_section"
+    || action === "guidance.search"
+    || action === "guidance.read"
+    || action === "guidance.recommend";
 }
 
 function safeWorkStoreCollection(value: string | null | undefined): WorkStoreCollectionName | null {
@@ -558,6 +584,12 @@ function stringArrayInput(value: unknown, limit = 12): string[] {
   return Array.isArray(value)
     ? value.flatMap((entry) => typeof entry === "string" && entry.trim().length > 0 ? [entry.trim()] : []).slice(0, limit)
     : [];
+}
+
+function objectInput(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
 }
 
 function defaultWorkStoreArgs(): NonNullable<ResearchActionDecision["inputs"]["workStore"]> {
@@ -706,6 +738,20 @@ function entityPreviewForAgent(entity: WorkStoreEntity, store: ResearchWorkStore
         fields: {
           evidenceCellId: entity.evidenceCellId,
           relevance: entity.relevance
+        }
+      };
+    case "protocol":
+      return {
+        id: entity.id,
+        kind: entity.kind,
+        title: entity.title,
+        status: entity.author,
+        snippet: compactPreviewText(entity.objective),
+        fields: {
+          protocolId: entity.protocolId,
+          researchQuestion: entity.researchQuestion,
+          evidenceTargets: entity.evidenceTargets.slice(0, 8),
+          manuscriptConstraints: entity.manuscriptConstraints.slice(0, 8)
         }
       };
     case "workItem":
@@ -935,9 +981,15 @@ function supportLinkFromInput(input: {
   const requestedEvidenceCell = input.evidenceCellId === null
     ? null
     : readResearchWorkStoreEntity<WorkStoreEvidenceCell>(input.store, "evidenceCells", input.evidenceCellId);
+  if (input.evidenceCellId !== null && requestedEvidenceCell === null) {
+    return null;
+  }
   const evidenceCell = requestedEvidenceCell
     ?? evidenceCellForSourceSupport(input.store, input.sourceId)
     ?? null;
+  if (evidenceCell === null) {
+    return null;
+  }
   const sourceId = renderableSourceIdForSupport(input.store, evidenceCell?.sourceId ?? input.sourceId);
   const supportSnippet = meaningfulSupportSnippet(
     input.entity.supportSnippet,
@@ -988,6 +1040,9 @@ function repairWorkspaceCitationsFromClaimSources(input: {
         continue;
       }
       const evidenceCell = evidenceCellForSourceSupport(input.store, sourceId);
+      if (evidenceCell === null) {
+        continue;
+      }
 
       const citation: WorkStoreCitation = {
         id: generatedSupportLinkId(input.run, claim.id, sourceId, evidenceCell?.id ?? null),
@@ -1000,21 +1055,11 @@ function repairWorkspaceCitationsFromClaimSources(input: {
         evidenceCellId: evidenceCell?.id ?? null,
         supportSnippet: meaningfulSupportSnippet(evidenceCell?.value, claim.evidence, claim.text) ?? claim.text,
         confidence: claim.confidence,
-        relevance: "claim-source support",
+        relevance: "recovered_from_claim_source",
         claimIds: [claim.id],
         sectionIds
       };
       nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(nextStore, citation, input.now);
-      if (claim.supportStatus === "weak" || claim.supportStatus === "unchecked") {
-        nextStore = patchResearchWorkStoreEntity(nextStore, {
-          collection: "claims",
-          id: claim.id,
-          changes: {
-            supportStatus: "supported",
-            risk: null
-          }
-        }, input.now);
-      }
       repairedCount += 1;
     }
   }
@@ -1022,6 +1067,249 @@ function repairWorkspaceCitationsFromClaimSources(input: {
   return {
     store: nextStore,
     repairedCount
+  };
+}
+
+type SupportReadinessIssue = {
+  kind: "missing_section_claim" | "missing_claim" | "missing_support_link" | "missing_source" | "missing_evidence_cell" | "source_mismatch" | "weak_snippet";
+  message: string;
+  sectionId: string | null;
+  claimId: string | null;
+  citationId: string | null;
+  sourceId: string | null;
+  evidenceCellId: string | null;
+  suggestedActions: string[];
+};
+
+type ValidSupportChain = {
+  section: WorkStoreManuscriptSection | null;
+  claim: WorkStoreClaim;
+  citation: WorkStoreCitation;
+  source: WorkStoreCanonicalSource;
+  evidenceCell: WorkStoreEvidenceCell;
+};
+
+type SupportReadinessReport = {
+  chains: ValidSupportChain[];
+  issues: SupportReadinessIssue[];
+  supportedClaimIds: Set<string>;
+  unsupportedClaimIds: Set<string>;
+  renderableSourceIds: Set<string>;
+};
+
+function supportIssue(input: SupportReadinessIssue): SupportReadinessIssue {
+  return input;
+}
+
+function canonicalSourceForId(store: ResearchWorkStore, sourceId: string): WorkStoreCanonicalSource | null {
+  return store.objects.canonicalSources.find((source) => (
+    source.id === sourceId || createLiteratureEntityId("paper", source.key) === sourceId
+  )) ?? null;
+}
+
+function evidenceCellMatchesSource(store: ResearchWorkStore, cell: WorkStoreEvidenceCell, source: WorkStoreCanonicalSource): boolean {
+  return sourceEquivalentIds(store, source.id).includes(cell.sourceId);
+}
+
+function claimHasEquivalentSource(store: ResearchWorkStore, claim: WorkStoreClaim, source: WorkStoreCanonicalSource): boolean {
+  const equivalentIds = new Set(sourceEquivalentIds(store, source.id));
+  return claim.sourceIds.some((sourceId) => equivalentIds.has(sourceId));
+}
+
+function supportLinkCandidate(input: {
+  store: ResearchWorkStore;
+  section: WorkStoreManuscriptSection | null;
+  claim: WorkStoreClaim;
+  citation: WorkStoreCitation;
+}): { chain: ValidSupportChain | null; issues: SupportReadinessIssue[] } {
+  const issues: SupportReadinessIssue[] = [];
+  const source = canonicalSourceForId(input.store, input.citation.sourceId);
+  if (source === null) {
+    issues.push(supportIssue({
+      kind: "missing_source",
+      message: `Support link ${input.citation.id} references source ${input.citation.sourceId}, but that canonical source is not available.`,
+      sectionId: input.section?.id ?? null,
+      claimId: input.claim.id,
+      citationId: input.citation.id,
+      sourceId: input.citation.sourceId,
+      evidenceCellId: input.citation.evidenceCellId,
+      suggestedActions: ["workspace.read", "source.search", "claim.link_support"]
+    }));
+    return { chain: null, issues };
+  }
+
+  if (!claimHasEquivalentSource(input.store, input.claim, source)) {
+    issues.push(supportIssue({
+      kind: "missing_source",
+      message: `Support link ${input.citation.id} cites ${source.title}, but claim ${input.claim.id} does not list that source as support.`,
+      sectionId: input.section?.id ?? null,
+      claimId: input.claim.id,
+      citationId: input.citation.id,
+      sourceId: source.id,
+      evidenceCellId: input.citation.evidenceCellId,
+      suggestedActions: ["claim.link_support", "claim.patch"]
+    }));
+  }
+
+  if (input.citation.evidenceCellId === null) {
+    issues.push(supportIssue({
+      kind: "missing_evidence_cell",
+      message: `Support link ${input.citation.id} has no evidence-cell id.`,
+      sectionId: input.section?.id ?? null,
+      claimId: input.claim.id,
+      citationId: input.citation.id,
+      sourceId: source.id,
+      evidenceCellId: null,
+      suggestedActions: ["workspace.list", "claim.link_support"]
+    }));
+    return { chain: null, issues };
+  }
+
+  const evidenceCell = readResearchWorkStoreEntity<WorkStoreEvidenceCell>(input.store, "evidenceCells", input.citation.evidenceCellId);
+  if (evidenceCell === null) {
+    issues.push(supportIssue({
+      kind: "missing_evidence_cell",
+      message: `Support link ${input.citation.id} references missing evidence cell ${input.citation.evidenceCellId}.`,
+      sectionId: input.section?.id ?? null,
+      claimId: input.claim.id,
+      citationId: input.citation.id,
+      sourceId: source.id,
+      evidenceCellId: input.citation.evidenceCellId,
+      suggestedActions: ["workspace.list", "claim.link_support"]
+    }));
+    return { chain: null, issues };
+  }
+
+  if (!evidenceCellMatchesSource(input.store, evidenceCell, source)) {
+    issues.push(supportIssue({
+      kind: "source_mismatch",
+      message: `Support link ${input.citation.id} cites ${source.title}, but evidence cell ${evidenceCell.id} belongs to source ${evidenceCell.sourceId}.`,
+      sectionId: input.section?.id ?? null,
+      claimId: input.claim.id,
+      citationId: input.citation.id,
+      sourceId: source.id,
+      evidenceCellId: evidenceCell.id,
+      suggestedActions: ["claim.link_support", "claim.patch"]
+    }));
+  }
+
+  if (meaningfulSupportSnippet(input.citation.supportSnippet, evidenceCell.value) === null) {
+    issues.push(supportIssue({
+      kind: "weak_snippet",
+      message: `Support link ${input.citation.id} lacks a meaningful support snippet.`,
+      sectionId: input.section?.id ?? null,
+      claimId: input.claim.id,
+      citationId: input.citation.id,
+      sourceId: source.id,
+      evidenceCellId: evidenceCell.id,
+      suggestedActions: ["workspace.read", "claim.link_support"]
+    }));
+  }
+
+  if (issues.length > 0) {
+    return { chain: null, issues };
+  }
+
+  return {
+    chain: {
+      section: input.section,
+      claim: input.claim,
+      citation: input.citation,
+      source,
+      evidenceCell
+    },
+    issues
+  };
+}
+
+function supportReadinessForWorkspace(store: ResearchWorkStore): SupportReadinessReport {
+  const chains: ValidSupportChain[] = [];
+  const issues: SupportReadinessIssue[] = [];
+  const supportedClaimIds = new Set<string>();
+  const unsupportedClaimIds = new Set<string>();
+  const renderableSourceIds = new Set<string>();
+  const sections = store.objects.manuscriptSections;
+  const sectionClaims = sections.flatMap((section) => {
+    if (section.claimIds.length === 0) {
+      issues.push(supportIssue({
+        kind: "missing_section_claim",
+        message: `Section ${section.id} has no claim ids attached.`,
+        sectionId: section.id,
+        claimId: null,
+        citationId: null,
+        sourceId: null,
+        evidenceCellId: null,
+        suggestedActions: ["section.link_claim", "claim.create"]
+      }));
+    }
+    return section.claimIds.map((claimId) => ({ section, claimId }));
+  });
+  const claimTargets = sectionClaims.length > 0
+    ? sectionClaims
+    : store.objects.claims.map((claim) => ({ section: null, claimId: claim.id }));
+
+  for (const target of claimTargets) {
+    const claim = readResearchWorkStoreEntity<WorkStoreClaim>(store, "claims", target.claimId);
+    if (claim === null) {
+      issues.push(supportIssue({
+        kind: "missing_claim",
+        message: `Section ${target.section?.id ?? "workspace"} references missing claim ${target.claimId}.`,
+        sectionId: target.section?.id ?? null,
+        claimId: target.claimId,
+        citationId: null,
+        sourceId: null,
+        evidenceCellId: null,
+        suggestedActions: ["section.patch", "claim.create"]
+      }));
+      unsupportedClaimIds.add(target.claimId);
+      continue;
+    }
+
+    const citations = store.objects.citations.filter((citation) => citation.claimIds.includes(claim.id));
+    if (citations.length === 0) {
+      issues.push(supportIssue({
+        kind: "missing_support_link",
+        message: `Claim ${claim.id} is used in manuscript state but has no support link/citation.`,
+        sectionId: target.section?.id ?? null,
+        claimId: claim.id,
+        citationId: null,
+        sourceId: null,
+        evidenceCellId: null,
+        suggestedActions: ["workspace.list", "claim.link_support"]
+      }));
+      unsupportedClaimIds.add(claim.id);
+      continue;
+    }
+
+    const validChainsForClaim = citations.flatMap((citation) => {
+      const result = supportLinkCandidate({
+        store,
+        section: target.section,
+        claim,
+        citation
+      });
+      issues.push(...result.issues);
+      return result.chain === null ? [] : [result.chain];
+    });
+
+    if (validChainsForClaim.length === 0) {
+      unsupportedClaimIds.add(claim.id);
+      continue;
+    }
+
+    for (const chain of validChainsForClaim) {
+      chains.push(chain);
+      supportedClaimIds.add(claim.id);
+      renderableSourceIds.add(chain.source.id);
+    }
+  }
+
+  return {
+    chains,
+    issues,
+    supportedClaimIds,
+    unsupportedClaimIds,
+    renderableSourceIds
   };
 }
 
@@ -1048,6 +1336,43 @@ function agentWorkItemFromCreateInput(input: {
     affectedClaimIds: stringArrayInput(input.entity.affectedClaimIds),
     suggestedActions: stringArrayInput(input.entity.suggestedActions, 20),
     source: "runtime"
+  };
+}
+
+function protocolFromToolInput(input: {
+  run: RunRecord;
+  now: string;
+  decision: ResearchActionDecision;
+}): WorkStoreProtocol {
+  const entity = input.decision.inputs.workStore?.entity ?? {};
+  const protocolPayload = objectInput(entity.protocol) ?? objectInput(entity.body) ?? objectInput(entity.payload);
+  const title = stringInput(entity.title, "Research protocol");
+  const objective = stringInput(
+    entity.objective,
+    stringInput(protocolPayload?.objective, input.decision.inputs.reason ?? input.decision.rationale)
+  );
+  const researchQuestion = typeof entity.researchQuestion === "string"
+    ? entity.researchQuestion
+    : typeof protocolPayload?.researchQuestion === "string" ? protocolPayload.researchQuestion : input.run.brief.researchQuestion;
+
+  return {
+    id: stringInput(entity.id, generatedToolEntityId("protocol", input.run, input.now, objective)),
+    kind: "protocol",
+    runId: input.run.id,
+    createdAt: input.now,
+    updatedAt: input.now,
+    protocolId: stringInput(entity.protocolId, "current-protocol"),
+    title,
+    objective,
+    researchQuestion,
+    scope: stringArrayInput(entity.scope ?? protocolPayload?.scope, 20),
+    inclusionCriteria: stringArrayInput(entity.inclusionCriteria ?? protocolPayload?.inclusionCriteria, 30),
+    exclusionCriteria: stringArrayInput(entity.exclusionCriteria ?? protocolPayload?.exclusionCriteria, 30),
+    evidenceTargets: stringArrayInput(entity.evidenceTargets ?? protocolPayload?.evidenceTargets, 30),
+    manuscriptConstraints: stringArrayInput(entity.manuscriptConstraints ?? protocolPayload?.manuscriptConstraints, 30),
+    notes: stringArrayInput(entity.notes ?? protocolPayload?.notes, 30),
+    protocol: protocolPayload,
+    author: "researcher"
   };
 }
 
@@ -1165,6 +1490,112 @@ function manuscriptSectionFromToolInput(input: {
       ...stringArrayInput(entity.claimIds ?? changes.claimIds, 40)
     ]),
     status: "needs_revision"
+  };
+}
+
+function guidancePreviewForAgent(item: {
+  id: string;
+  kind: string;
+  title: string;
+  summary: string;
+  tags: string[];
+}): AgentVisibleEntityPreview {
+  return {
+    id: item.id,
+    kind: item.kind,
+    title: item.title,
+    snippet: compactPreviewText(item.summary, 260),
+    fields: {
+      tags: item.tags.slice(0, 10),
+      advisory: true,
+      overridable: true,
+      notAReleaseGate: true
+    }
+  };
+}
+
+async function executeGuidanceToolAction(input: {
+  run: RunRecord;
+  now: () => string;
+  decision: ResearchActionDecision;
+  store: ResearchWorkStore;
+}): Promise<WorkspaceToolExecutionResult> {
+  if (!isGuidanceToolAction(input.decision.action)) {
+    return {
+      handled: false,
+      store: input.store,
+      message: null
+    };
+  }
+
+  const args = input.decision.inputs.workStore ?? defaultWorkStoreArgs();
+  const timestamp = input.now();
+
+  if (input.decision.action === "guidance.read") {
+    const guidanceId = args.entityId ?? stringInput(args.entity.id, input.decision.inputs.paperIds[0] ?? "");
+    const guidance = readResearchGuidance(guidanceId);
+    const message = guidance === null
+      ? `Guidance read found no advisory object ${guidanceId || "(missing id)"}.`
+      : `Guidance read ${guidance.title}.`;
+    return {
+      handled: true,
+      store: input.store,
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp,
+        status: guidance === null ? "noop" : "ok",
+        readOnly: true,
+        message,
+        collection: "guidance",
+        query: { entityId: guidanceId },
+        count: guidance === null ? 0 : 1,
+        totalCount: guidance === null ? 0 : 1,
+        entity: guidance === null
+          ? null
+          : {
+            ...guidancePreviewForAgent(guidance),
+            snippet: compactPreviewText(guidance.body, 900)
+          },
+        nextHints: guidance === null
+          ? ["guidance.search", "guidance.recommend"]
+          : ["workspace.search", "source.search", "claim.create", "section.patch"]
+      })
+    };
+  }
+
+  const query = input.decision.action === "guidance.recommend"
+    ? null
+    : args.semanticQuery ?? input.decision.inputs.searchQueries.join(" ") ?? input.decision.inputs.reason;
+  const result = input.decision.action === "guidance.recommend"
+    ? recommendResearchGuidance({ brief: input.run.brief, limit: args.limit ?? 6 })
+    : searchResearchGuidance(query, args.limit ?? 6);
+  const message = input.decision.action === "guidance.recommend"
+    ? `Guidance recommend returned ${result.count} advisory object(s).`
+    : `Guidance search returned ${result.count} advisory object(s).`;
+  return {
+    handled: true,
+    store: input.store,
+    message,
+    result: makeAgentToolResult({
+      run: input.run,
+      action: input.decision.action,
+      timestamp,
+      readOnly: true,
+      message,
+      collection: "guidance",
+      query: {
+        query: result.query,
+        advisory: true,
+        overridable: true,
+        notAReleaseGate: true
+      },
+      count: result.count,
+      totalCount: result.count,
+      items: result.items.map(guidancePreviewForAgent),
+      nextHints: ["guidance.read", "workspace.search", "source.search", "claim.create"]
+    })
   };
 }
 
@@ -1352,9 +1783,18 @@ async function executeWorkStoreToolAction(input: {
           collection: "claims",
           id: claim.id,
           changes: {
-            sourceIds: uniqueStrings([...claim.sourceIds, sourceId]),
-            supportStatus: "supported",
-            risk: null
+            sourceIds: uniqueStrings([...claim.sourceIds, sourceId])
+          }
+        }, nowText);
+        const supportReadiness = supportReadinessForWorkspace(nextStore);
+        const supported = supportReadiness.supportedClaimIds.has(claim.id);
+        const claimIssues = supportReadiness.issues.filter((issue) => issue.claimId === claim.id);
+        nextStore = patchResearchWorkStoreEntity(nextStore, {
+          collection: "claims",
+          id: claim.id,
+          changes: {
+            supportStatus: supported ? "supported" : claim.supportStatus,
+            risk: supported ? null : claimIssues[0]?.message ?? claim.risk
           }
         }, nowText);
       }
@@ -1414,6 +1854,21 @@ async function executeResearchObjectToolAction(input: {
 
   const args = input.decision.inputs.workStore ?? defaultWorkStoreArgs();
   const nowText = input.now();
+
+  if (input.decision.action === "protocol.create_or_revise") {
+    const protocol = protocolFromToolInput({
+      run: input.run,
+      now: nowText,
+      decision: input.decision
+    });
+    const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, protocol, nowText);
+    await writeResearchWorkStore(nextStore);
+    return {
+      handled: true,
+      store: nextStore,
+      message: `Researcher-authored protocol ${protocol.id} persisted in the workspace.`
+    };
+  }
 
   if (input.decision.action === "critic.create_work_item" || input.decision.action === "work_item.create") {
     const workItem = agentWorkItemFromCreateInput({
@@ -1502,22 +1957,23 @@ async function executeResearchObjectToolAction(input: {
         message: "Claim support check skipped because the claim was not found."
       };
     }
-    const knownSourceIds = new Set(input.store.objects.canonicalSources.map((source) => source.id));
-    const supportedSourceIds = claim.sourceIds.filter((sourceId) => knownSourceIds.has(sourceId));
+    const supportReadiness = supportReadinessForWorkspace(input.store);
+    const supported = supportReadiness.supportedClaimIds.has(claim.id);
+    const claimIssues = supportReadiness.issues.filter((issue) => issue.claimId === claim.id);
     const nextStore = patchResearchWorkStoreEntity(input.store, {
       collection: "claims",
       id: claim.id,
       changes: {
-        supportStatus: supportedSourceIds.length > 0 ? "supported" : "weak",
-        confidence: supportedSourceIds.length > 0 ? claim.confidence : "low",
-        risk: supportedSourceIds.length > 0 ? null : "No canonical source currently supports this claim."
+        supportStatus: supported ? "supported" : "weak",
+        confidence: supported ? claim.confidence : "low",
+        risk: supported ? null : claimIssues[0]?.message ?? "No durable evidence-backed support link currently supports this claim."
       }
     }, nowText);
     await writeResearchWorkStore(nextStore);
     return {
       handled: true,
       store: nextStore,
-      message: `Claim support checked ${claim.id}: ${supportedSourceIds.length > 0 ? "supported" : "weak"}.`
+      message: `Claim support checked ${claim.id}: ${supported ? "supported" : "weak"}.`
     };
   }
 
@@ -1565,19 +2021,30 @@ async function executeResearchObjectToolAction(input: {
       return {
         handled: true,
         store: input.store,
-        message: `Claim support link skipped because claim ${claimId} was not found.`
+        message: `Claim support link skipped because claim ${claimId} or evidence cell ${evidenceCellId || "(auto)"} was not available.`
       };
     }
     let nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, citation, nowText);
+    const nextClaimSourceIds = uniqueStrings([...claim.sourceIds, citation.sourceId]);
+    const nextUsedInSections = uniqueStrings([...claim.usedInSections, ...sectionIds]);
     nextStore = patchResearchWorkStoreEntity(nextStore, {
       collection: "claims",
       id: claimId,
       changes: {
-        sourceIds: uniqueStrings([...claim.sourceIds, citation.sourceId]),
-        usedInSections: uniqueStrings([...claim.usedInSections, ...sectionIds]),
-        supportStatus: "supported",
-        confidence: citation.confidence ?? claim.confidence,
-        risk: null
+        sourceIds: nextClaimSourceIds,
+        usedInSections: nextUsedInSections,
+        confidence: citation.confidence ?? claim.confidence
+      }
+    }, nowText);
+    const supportReadiness = supportReadinessForWorkspace(nextStore);
+    const supported = supportReadiness.supportedClaimIds.has(claimId);
+    const claimIssues = supportReadiness.issues.filter((issue) => issue.claimId === claimId);
+    nextStore = patchResearchWorkStoreEntity(nextStore, {
+      collection: "claims",
+      id: claimId,
+      changes: {
+        supportStatus: supported ? "supported" : claim.supportStatus,
+        risk: supported ? null : claimIssues[0]?.message ?? claim.risk
       }
     }, nowText);
     await writeResearchWorkStore(nextStore);
@@ -1714,6 +2181,54 @@ async function executeResearchObjectToolAction(input: {
     };
   }
 
+  if (input.decision.action === "release.verify" || (input.decision.action === "check.run" && args.entityId === null)) {
+    const references = referencesFromWorkStore(input.run, input.store);
+    const checkBundle = workspaceManuscriptChecks({
+      run: input.run,
+      store: input.store,
+      references
+    });
+    const releaseChecks = checkBundle.checks.map((check): WorkStoreReleaseCheck => ({
+      id: `release-check-${numericTextIdPart(check.id)}-${input.run.id}`,
+      kind: "releaseCheck",
+      runId: input.run.id,
+      createdAt: nowText,
+      updatedAt: nowText,
+      checkId: check.id,
+      title: check.title,
+      status: check.status,
+      severity: check.severity,
+      message: check.message
+    }));
+    const nextStore = upsertResearchWorkStoreEntities(input.store, releaseChecks, nowText);
+    await writeResearchWorkStore(nextStore);
+    const hardFailures = releaseChecks.filter((check) => check.status === "fail" && check.severity === "blocker");
+    const message = `Release verification wrote ${releaseChecks.length} check(s): ${hardFailures.length} hard invariant blocker(s).`;
+    return {
+      handled: true,
+      store: nextStore,
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        readOnly: false,
+        message,
+        collection: "releaseChecks",
+        count: releaseChecks.length,
+        totalCount: releaseChecks.length,
+        items: releaseChecks.map((check) => entityPreviewForAgent(check, nextStore)),
+        stateDelta: {
+          releaseChecksCreated: releaseChecks.length,
+          hardInvariantBlockers: hardFailures.length
+        },
+        nextHints: hardFailures.length > 0
+          ? ["workspace.read", "claim.link_support", "section.link_claim"]
+          : ["manuscript.release", "critic.review"]
+      })
+    };
+  }
+
   if (input.decision.action === "section.check_claims" || input.decision.action === "manuscript.check_section_claims" || input.decision.action === "check.run") {
     const sectionId = args.entityId;
     const section = sectionId === null ? null : readResearchWorkStoreEntity<WorkStoreManuscriptSection>(input.store, "manuscriptSections", sectionId);
@@ -1728,29 +2243,37 @@ async function executeResearchObjectToolAction(input: {
       const claim = readResearchWorkStoreEntity<WorkStoreClaim>(input.store, "claims", claimId);
       return claim === null ? [] : [claim];
     });
-    const unsupported = claims.filter((claim) => claim.sourceIds.length === 0 || claim.supportStatus === "weak");
+    const supportReadiness = supportReadinessForWorkspace(input.store);
+    const unsupportedClaimIds = section.claimIds.filter((claimId) => !supportReadiness.supportedClaimIds.has(claimId));
+    const unsupported = claims.filter((claim) => unsupportedClaimIds.includes(claim.id));
+    const sectionReady = section.claimIds.length > 0 && unsupportedClaimIds.length === 0;
     let nextStore = patchResearchWorkStoreEntity(input.store, {
       collection: "manuscriptSections",
       id: section.id,
       changes: {
-        status: unsupported.length === 0 && claims.length > 0 ? "checked" : "needs_revision"
+        status: sectionReady ? "checked" : "needs_revision"
       }
     }, nowText);
-    if (unsupported.length > 0 || claims.length === 0) {
+    if (!sectionReady) {
+      const sectionIssues = supportReadiness.issues
+        .filter((issue) => issue.sectionId === section.id || (issue.sectionId === null && issue.claimId !== null && section.claimIds.includes(issue.claimId)))
+        .slice(0, 4);
       const workItem = agentWorkItemFromCreateInput({
         run: input.run,
         now: nowText,
         decision: input.decision,
         entity: {
           title: `Section claim support needs revision: ${section.title}`,
-          description: claims.length === 0
+          description: section.claimIds.length === 0
             ? "The section has no claim ids attached."
-            : `Unsupported claim ids: ${unsupported.map((claim) => claim.id).join(", ")}`,
+            : sectionIssues.length > 0
+              ? sectionIssues.map((issue) => issue.message).join(" ")
+              : `Unsupported claim ids: ${unsupportedClaimIds.join(", ")}`,
           severity: "major",
           type: "unsupported_claim",
           targetKind: "manuscriptSection",
           targetId: section.id,
-          affectedClaimIds: unsupported.map((claim) => claim.id),
+          affectedClaimIds: unsupportedClaimIds,
           suggestedActions: ["claim.link_support", "claim.patch", "section.patch"]
         }
       });
@@ -1760,7 +2283,7 @@ async function executeResearchObjectToolAction(input: {
     return {
       handled: true,
       store: nextStore,
-      message: `Section checked ${section.id}: ${unsupported.length} unsupported claim(s).`
+      message: `Section checked ${section.id}: ${unsupportedClaimIds.length} unsupported claim(s).`
     };
   }
 
@@ -1777,6 +2300,11 @@ async function executeWorkspaceToolAction(input: {
   decision: ResearchActionDecision;
   store: ResearchWorkStore;
 }): Promise<WorkspaceToolExecutionResult> {
+  const guidanceResult = await executeGuidanceToolAction(input);
+  if (guidanceResult.handled) {
+    return guidanceResult;
+  }
+
   const workStoreResult = await executeWorkStoreToolAction(input);
   if (workStoreResult.handled) {
     return workStoreResult;
@@ -1926,6 +2454,7 @@ async function runAgenticSourceGathering(input: {
         },
         sourceState: sourceStateForAgent(session),
         workStore: workStoreContextForAgent(workStore),
+        guidance: guidanceContextForAgent({ brief: run.brief, plan: request.plan }),
         toolResults,
         criticReports: [],
         retryInstruction: [
@@ -1976,6 +2505,7 @@ async function runAgenticSourceGathering(input: {
           },
           sourceState: sourceStateForAgent(session),
           workStore: workStoreContextForAgent(workStore),
+          guidance: guidanceContextForAgent({ brief: run.brief, plan: request.plan }),
           toolResults,
           criticReports: [],
           retryInstruction: [
@@ -2051,7 +2581,7 @@ async function runAgenticSourceGathering(input: {
     }
 
     if (isSourceSelectEvidenceAction(decision.action)) {
-      const observation = await session.selectEvidenceSet();
+      const observation = await session.selectEvidenceSet(decision.inputs.paperIds);
       await appendEvent(run, now, "source", observation.message);
       await appendStdout(run, `Source tool observation: ${observation.message}`);
       await checkpointAgenticSourceState({
@@ -2382,17 +2912,6 @@ function compactRecoveryQuery(text: string | null | undefined, limit = 12): stri
     : null;
 }
 
-function anchorRecoveryQuery(anchor: string, compactQuery: string): string {
-  const anchorKey = normalizedRecoveryQueryKey(anchor);
-  const queryKey = normalizedRecoveryQueryKey(compactQuery);
-  const anchorTerms = anchorKey.split(" ").filter((term) => term.length > 0);
-  const queryTerms = new Set(queryKey.split(" ").filter((term) => term.length > 0));
-
-  return anchorTerms.length > 0 && anchorTerms.every((term) => queryTerms.has(term))
-    ? compactQuery
-    : `${anchor} ${compactQuery}`;
-}
-
 function stripRecoveryQueryCommand(text: string): string {
   return text
     .replace(/^\s*(?:search|find|retrieve|collect|seek)\s+(?:for\s+)?/i, "")
@@ -2434,142 +2953,6 @@ function sanitizeRecoveryQueries(queries: Array<string | null | undefined>, limi
     const sanitized = sanitizeRecoveryQuery(query, limit);
     return sanitized === null ? [] : [sanitized];
   }));
-}
-
-function recoveryQueryAnchor(run: RunRecord, plan: ResearchPlan): string {
-  return compactRecoveryQuery(run.brief.topic, 6)
-    ?? compactRecoveryQuery(run.brief.researchQuestion, 6)
-    ?? compactRecoveryQuery(plan.objective, 6)
-    ?? "literature";
-}
-
-function facetRecoveryQueries(
-  run: RunRecord,
-  plan: ResearchPlan,
-  gathered: ResearchSourceGatherResult
-): { queries: string[]; focusTerms: string[] } {
-  const anchor = recoveryQueryAnchor(run, plan);
-  const missingFacets = [
-    ...(gathered.selectionQuality?.missingRequiredFacets ?? []),
-    ...(gathered.selectionQuality?.backgroundOnlyFacets ?? [])
-  ].filter((facet) => isSubstantiveReviewFacet(facet));
-  const focusTerms = uniqueStrings(missingFacets.flatMap((facet) => [
-    facet.label,
-    ...facet.terms
-  ])).filter((term) => !isRetrievalQualityConstraintPhrase(term));
-  const queries = focusTerms.flatMap((term) => {
-    const compact = compactRecoveryQuery(term, 6);
-    return compact === null ? [] : [anchorRecoveryQuery(anchor, compact)];
-  });
-
-  return {
-    queries,
-    focusTerms
-  };
-}
-
-function buildEvidenceRecoveryQueries(input: {
-  run: RunRecord;
-  plan: ResearchPlan;
-  gathered: ResearchSourceGatherResult;
-  synthesis?: ResearchSynthesis | null;
-  agenda?: ResearchAgenda | null;
-  verification?: VerificationReport | null;
-  criticReports?: CriticReviewArtifact[];
-  extraQuestions?: string[];
-}): { queries: string[]; focusTerms: string[] } {
-  const anchor = recoveryQueryAnchor(input.run, input.plan);
-  const facetQueries = facetRecoveryQueries(input.run, input.plan, input.gathered);
-  const diagnosticQueries = sanitizeRecoveryQueries(input.gathered.retrievalDiagnostics?.suggestedNextQueries ?? [], 12)
-    .map((query) => anchorRecoveryQuery(anchor, query));
-  const criticTexts = (input.criticReports ?? []).flatMap((report) => {
-    const hasSearchAdvice = report.revisionAdvice.searchQueries.length > 0
-      || report.revisionAdvice.evidenceTargets.length > 0;
-    const hasSourceSetAdvice = report.revisionAdvice.papersToExclude.length > 0
-      || report.revisionAdvice.papersToPromote.length > 0;
-
-    return hasSearchAdvice || !hasSourceSetAdvice
-      ? criticRevisionTexts([report])
-      : [];
-  });
-  const questionQueries = [
-    ...(input.synthesis?.nextQuestions ?? []),
-    ...(input.agenda?.holdReasons ?? []),
-    ...(input.verification?.unknowns ?? []),
-    ...(input.verification?.unverifiedClaims.map((claim) => claim.reason) ?? []),
-    ...criticTexts,
-    ...(input.extraQuestions ?? [])
-  ].flatMap((question) => {
-    const compact = compactRecoveryQuery(question, 8);
-    return compact === null ? [] : [anchorRecoveryQuery(anchor, compact)];
-  });
-  const thinSetQueries = input.gathered.reviewedPapers.length < 8
-    || input.gathered.selectionQuality?.adequacy !== "strong"
-    ? [
-      `${anchor} systematic review`,
-      `${anchor} survey`,
-      `${anchor} empirical evaluation`,
-      `${anchor} limitations`
-    ]
-    : [];
-
-  return {
-    queries: uniqueStrings([
-      ...facetQueries.queries,
-      ...diagnosticQueries,
-      ...questionQueries,
-      ...thinSetQueries
-    ]).slice(0, 16),
-    focusTerms: uniqueStrings([
-      ...facetQueries.focusTerms,
-      ...(input.criticReports ?? []).flatMap((report) => report.revisionAdvice.evidenceTargets)
-    ]).filter((term) => compactRecoveryQuery(term, 8) !== null)
-  };
-}
-
-function buildProtocolCriticRecoveryQueries(input: {
-  run: RunRecord;
-  plan: ResearchPlan;
-  criticReport: CriticReviewArtifact;
-}): { queries: string[]; focusTerms: string[] } {
-  return {
-    queries: sanitizeRecoveryQueries(input.criticReport.revisionAdvice.searchQueries, 12).slice(0, 12),
-    focusTerms: uniqueStrings(input.criticReport.revisionAdvice.evidenceTargets)
-      .filter((term) => !isFileLikeResearchTerm(term))
-      .filter((term) => compactRecoveryQuery(term, 8) !== null)
-  };
-}
-
-function protocolRecoveryPlanUpdate(
-  plan: ResearchPlan,
-  queries: string[],
-  focusTerms: string[]
-): { plan: ResearchPlan; recoveryQueries: string[] } | null {
-  const cleanExistingQueries = plan.searchQueries.filter((query) => compactRecoveryQuery(query, 12) !== null);
-  const existingQueryKeys = new Set(cleanExistingQueries.map(normalizedRecoveryQueryKey));
-  const recoveryQueries = sanitizeRecoveryQueries(queries, 12)
-    .filter((query) => !existingQueryKeys.has(normalizedRecoveryQueryKey(query)))
-    .slice(0, 8);
-
-  if (recoveryQueries.length === 0) {
-    return null;
-  }
-
-  const rationaleSuffix = "Autonomous protocol revision refined retrieval scope before source gathering.";
-
-  return {
-    recoveryQueries,
-    plan: {
-      ...plan,
-      rationale: plan.rationale.includes(rationaleSuffix)
-        ? plan.rationale
-        : `${plan.rationale} ${rationaleSuffix}`,
-      searchQueries: uniqueStrings([...cleanExistingQueries, ...recoveryQueries]).slice(0, 16),
-      localFocus: uniqueStrings([...plan.localFocus, ...focusTerms])
-        .filter((focus) => compactRecoveryQuery(focus, 8) !== null)
-        .slice(0, 16)
-    }
-  };
 }
 
 function evidenceRecoveryPlanUpdate(
@@ -2918,6 +3301,7 @@ async function runManuscriptWorkspaceLoop(input: {
           revisionPassesRemaining: Math.max(0, input.runtimeConfig.evidenceRecoveryMaxPasses - input.revisionPassesUsed)
         },
         workStore: workStoreContextForAgent(workStore),
+        guidance: guidanceContextForAgent({ brief: input.run.brief, plan: input.plan }),
         toolResults,
         criticReports: [],
         retryInstruction: [
@@ -3270,7 +3654,7 @@ function internalActionsFromRun(input: {
     .filter((summary) => summary.finalReadiness !== "pass")
     .flatMap((summary) => summary.topObjections.map((objection) => `${summary.stage}: ${objection}`));
   const failedChecks = input.manuscriptBundle.checks.checks
-    .filter((check) => check.status === "fail")
+    .filter((check) => check.status !== "pass")
     .map((check) => `${check.title}: ${check.message}`);
 
   return uniqueStrings([
@@ -3294,16 +3678,7 @@ function researchWorkerStatusFromRun(input: {
     return "externally_blocked";
   }
 
-  if (input.internalActions.some((action) => requiresUserDecision(action))) {
-    return "needs_user_decision";
-  }
-
   return "working";
-}
-
-function requiresUserDecision(text: string): boolean {
-  return /\b(user decision|human decision|choose between|pick one|select one|scope change|reframe the research question|clarify with the user|requires user|ask the user)\b/i.test(text)
-    && !/\b(continue autonomous|continuing autonomously|machine-actionable|search|retrieve|extract|revise|check|rewrite)\b/i.test(text);
 }
 
 function researchWorkerStatusReason(status: ResearchWorkerStatus, readiness: string): string {
@@ -4444,7 +4819,8 @@ function referenceFromCanonicalSource(source: ResearchWorkStore["objects"]["cano
 }
 
 function referencesFromWorkStore(run: RunRecord, store: ResearchWorkStore): ReferencesArtifact {
-  const citedSourceIds = new Set(store.objects.citations.map((citation) => citation.sourceId));
+  const supportReadiness = supportReadinessForWorkspace(store);
+  const citedSourceIds = supportReadiness.renderableSourceIds;
   const referenced = store.objects.canonicalSources
     .filter((source) => citedSourceIds.has(source.id))
     .map(referenceFromCanonicalSource);
@@ -4467,19 +4843,7 @@ function manuscriptReadinessFromWorkspace(input: {
   if (/\b(credential|api key|quota|rate limit|permission|access denied|forbidden|unauthori[sz]ed|paywall|license)\b/i.test(blockerMessages)) {
     return "blocked";
   }
-  const evidenceBlockerIds = new Set([
-    "workspace-sources",
-    "workspace-evidence",
-    "evidence-coverage",
-    "workspace-claims"
-  ]);
-  if (failedBlockers.some((check) => evidenceBlockerIds.has(check.id))) {
-    return "needs_more_evidence";
-  }
-  if (input.checks.some((check) => check.status === "fail")) {
-    return "needs_human_review";
-  }
-  if (input.checks.some((check) => check.status === "warning")) {
+  if (failedBlockers.length > 0) {
     return "needs_human_review";
   }
   return "ready_for_revision";
@@ -4496,47 +4860,44 @@ function workspaceManuscriptChecks(input: {
   const sections = input.store.objects.manuscriptSections;
   const openBlockingWorkItems = input.store.objects.workItems
     .filter((item) => item.status === "open" && item.severity === "blocking");
-  const citationSupportedClaimIds = new Set(input.store.objects.citations
-    .filter((citation) => input.references.references.some((reference) => reference.sourceId === citation.sourceId))
-    .flatMap((citation) => citation.claimIds));
-  const sectionClaimIds = new Set(sections.flatMap((section) => section.claimIds));
-  const claimsRequiringCitation = claims.filter((claim) => sectionClaimIds.size === 0 || sectionClaimIds.has(claim.id));
-  const unsupportedClaims = claimsRequiringCitation.filter((claim) => (
-    !citationSupportedClaimIds.has(claim.id)
-    || claim.sourceIds.length === 0
-    || claim.supportStatus === "weak"
-  ));
-  const uncheckedSections = sections.filter((section) => section.status !== "checked");
+  const openExternalBlockers = openBlockingWorkItems
+    .filter((item) => item.type === "external_blocker" || item.type === "source_access");
+  const supportReadiness = supportReadinessForWorkspace(input.store);
+  const unsupportedClaims = claims.filter((claim) => supportReadiness.unsupportedClaimIds.has(claim.id));
+  const supportIssueMessages = supportReadiness.issues.map((issue) => issue.message);
+  const unsupportedSectionCount = sections.filter((section) => (
+    section.claimIds.length === 0 || section.claimIds.some((claimId) => !supportReadiness.supportedClaimIds.has(claimId))
+  )).length;
   const selectionReasons = input.gathered === undefined ? [] : selectionQualityHoldReasons(input.gathered);
   const evidenceRows = input.evidenceMatrix?.rowCount ?? input.store.objects.extractions.length;
   const checks: ManuscriptCheck[] = [
     {
       id: "workspace-sources",
       title: "Workspace has canonical sources",
-      status: input.store.objects.canonicalSources.length > 0 ? "pass" : "fail",
-      severity: "blocker",
+      status: input.store.objects.canonicalSources.length > 0 ? "pass" : "warning",
+      severity: "warning",
       message: input.store.objects.canonicalSources.length > 0
         ? `${input.store.objects.canonicalSources.length} canonical source(s) are available.`
-        : "No canonical sources are available in the work store."
+        : "No canonical sources are available in the work store; this is research work to perform, not a hard invariant failure."
     },
     {
       id: "workspace-evidence",
       title: "Workspace has evidence cells",
-      status: input.store.objects.evidenceCells.length > 0 ? "pass" : "fail",
-      severity: "blocker",
+      status: input.store.objects.evidenceCells.length > 0 ? "pass" : "warning",
+      severity: "warning",
       message: input.store.objects.evidenceCells.length > 0
         ? `${input.store.objects.evidenceCells.length} evidence cell(s) are available.`
-        : "No evidence cells are available for claim-led synthesis."
+        : "No evidence cells are available for claim-led synthesis; the researcher can search, read, or extract more."
     },
     {
       id: "evidence-coverage",
-      title: "Evidence coverage is sufficient",
-      status: evidenceRows >= 3 && selectionReasons.length === 0 ? "pass" : "fail",
-      severity: "blocker",
+      title: "Evidence coverage diagnostic",
+      status: evidenceRows >= 3 && selectionReasons.length === 0 ? "pass" : "warning",
+      severity: "warning",
       message: evidenceRows >= 3 && selectionReasons.length === 0
-        ? "The reviewed evidence set meets the minimum coverage gate."
+        ? "The reviewed evidence set has multiple evidence rows and no selection-quality warnings."
         : [
-          evidenceRows < 3 ? `Only ${evidenceRows} reviewed evidence row(s) are available; at least 3 are needed for release.` : null,
+          evidenceRows < 3 ? `Only ${evidenceRows} reviewed evidence row(s) are available.` : null,
           ...selectionReasons
         ].filter((message): message is string => message !== null).join(" ")
     },
@@ -4547,7 +4908,7 @@ function workspaceManuscriptChecks(input: {
       severity: "blocker",
       message: claims.length > 0
         ? `${claims.length} claim(s) are available.`
-        : "No claims have been created through claim tools."
+        : "No claims have been created through claim tools; a manuscript export needs claim objects before release."
     },
     {
       id: "workspace-sections",
@@ -4556,7 +4917,7 @@ function workspaceManuscriptChecks(input: {
       severity: "blocker",
       message: sections.length > 0
         ? `${sections.length} manuscript section(s) are available.`
-        : "No manuscript sections have been created through section tools."
+        : "No manuscript sections have been created through section tools; a manuscript export needs section objects before release."
     },
     {
       id: "claim-citation-support",
@@ -4564,8 +4925,13 @@ function workspaceManuscriptChecks(input: {
       status: unsupportedClaims.length === 0 && claims.length > 0 ? "pass" : "fail",
       severity: "blocker",
       message: unsupportedClaims.length === 0 && claims.length > 0
-        ? "All workspace claims have source support."
-        : `Unsupported claim count: ${unsupportedClaims.length}.`
+        ? "All manuscript claims have durable evidence-backed support links."
+        : claims.length === 0
+          ? "No claims exist yet; the researcher should create and support claims before manuscript release."
+          : [
+            `Unsupported claim count: ${unsupportedClaims.length}.`,
+            ...supportIssueMessages.slice(0, 4)
+          ].join(" ")
     },
     {
       id: "reference-rendering",
@@ -4573,26 +4939,30 @@ function workspaceManuscriptChecks(input: {
       status: input.references.referenceCount > 0 ? "pass" : "fail",
       severity: "blocker",
       message: input.references.referenceCount > 0
-        ? `${input.references.referenceCount} reference(s) can be rendered.`
-        : "No references can be rendered from workspace support links/citations."
+        ? `${input.references.referenceCount} reference(s) can be rendered from valid support links.`
+        : input.store.objects.citations.length > 0 || claims.length > 0
+          ? "No references can be rendered from existing workspace support links/citations."
+          : "No workspace support links/citations exist yet; a manuscript export needs renderable references before release."
     },
     {
       id: "section-claim-checks",
       title: "Section claim checks passed",
-      status: uncheckedSections.length === 0 && sections.length > 0 ? "pass" : "warning",
+      status: unsupportedSectionCount === 0 && sections.length > 0 ? "pass" : "warning",
       severity: "warning",
-      message: uncheckedSections.length === 0 && sections.length > 0
-        ? "All manuscript sections have checked claim support."
-        : `${uncheckedSections.length} section(s) still need claim-support checks.`
+      message: unsupportedSectionCount === 0 && sections.length > 0
+        ? "All manuscript sections have evidence-backed claim support."
+        : `${unsupportedSectionCount} section(s) still need evidence-backed claim support.`
     },
     {
       id: "open-blocking-work-items",
-      title: "No open blocking work items",
-      status: openBlockingWorkItems.length === 0 ? "pass" : "fail",
-      severity: "blocker",
-      message: openBlockingWorkItems.length === 0
-        ? "No open blocking work items remain."
-        : `Open blocking work item count: ${openBlockingWorkItems.length}.`
+      title: "External blockers",
+      status: openExternalBlockers.length === 0 ? openBlockingWorkItems.length === 0 ? "pass" : "warning" : "fail",
+      severity: openExternalBlockers.length === 0 ? "warning" : "blocker",
+      message: openExternalBlockers.length === 0
+        ? openBlockingWorkItems.length === 0
+          ? "No open blocking work items remain."
+          : `Open non-external blocking work item count: ${openBlockingWorkItems.length}; these are visible research debt, not runtime stop conditions.`
+        : `Open external/source-access blocker count: ${openExternalBlockers.length}.`
     }
   ];
   const readinessStatus = manuscriptReadinessFromWorkspace({
@@ -5392,7 +5762,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
   const store = new RunStore(options.projectRoot, options.version, now);
   const run = await store.load(options.runId);
   const useAgenticSourceLoop = options.sourceGatherer === undefined;
-  const sourceGatherer = options.sourceGatherer ?? createDefaultResearchSourceGatherer();
+  const injectedSourceGatherer = options.sourceGatherer ?? null;
   const projectConfigStore = new ProjectConfigStore(options.projectRoot, now);
   const projectConfig = await projectConfigStore.load();
   const researchBackend = options.researchBackend ?? await createProjectResearchBackend({
@@ -5564,7 +5934,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     await writeJsonArtifact(run.artifacts.reviewProtocolPath, currentProtocol);
     await writeFile(run.artifacts.reviewProtocolMarkdownPath, `${reviewProtocolMarkdown(currentProtocol)}\n`, "utf8");
 
-    let protocolCritic = await reviewWithCritic({
+    const protocolCritic = await reviewWithCritic({
       run,
       now,
       researchBackend,
@@ -5583,10 +5953,18 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         plan
       }
     });
-    const maxProtocolCriticAttempts = Math.max(1, runtimeLlmConfig.evidenceRecoveryMaxPasses + 1);
-    const protocolRecoveryStartedAtMs = Date.now();
-    let protocolCriticAttempts = 1;
     rememberCriticReport(protocolCritic);
+    const protocolCriticWorkItems = workItemsFromCriticReports(run, [protocolCritic], now());
+    if (protocolCriticWorkItems.length > 0) {
+      workStore = upsertResearchWorkStoreEntities(workStore, protocolCriticWorkItems, now());
+      await writeResearchWorkStore(workStore);
+      await appendEvent(
+        run,
+        now,
+        "memory",
+        `Protocol critic created ${protocolCriticWorkItems.length} visible workspace work item(s).`
+      );
+    }
     await agent.record({
       actor: "critic",
       phase: "protocol",
@@ -5596,83 +5974,9 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       artifactPaths: [run.artifacts.reviewProtocolPath, run.artifacts.criticProtocolReviewPath],
       counts: {
         objections: protocolCritic.objections.length,
-        attempt: protocolCriticAttempts
+        attempt: 1
       }
     });
-
-    while (
-      !criticReviewPassed(protocolCritic)
-      && protocolCriticAttempts < maxProtocolCriticAttempts
-      && criticReviewNeedsRevision(protocolCritic)
-      && criticRevisionIsActionable(protocolCritic)
-      && !evidenceRecoveryBudgetExhausted(protocolRecoveryStartedAtMs, runtimeLlmConfig)
-    ) {
-      const recovery = buildProtocolCriticRecoveryQueries({
-        run,
-        plan,
-        criticReport: protocolCritic
-      });
-      const recoveryUpdate = protocolRecoveryPlanUpdate(plan, recovery.queries, recovery.focusTerms);
-
-      if (recoveryUpdate === null) {
-        break;
-      }
-
-      protocolCriticAttempts += 1;
-      plan = recoveryUpdate.plan;
-      currentProtocol = buildReviewProtocol({
-        run,
-        plan,
-        scholarlyDiscoveryProviders,
-        publisherFullTextProviders,
-        oaRetrievalHelperProviders,
-        generalWebProviders,
-        localContextEnabled: localEnabled
-      });
-      await writeJsonArtifact(run.artifacts.planPath, plan);
-      await writeJsonArtifact(run.artifacts.reviewProtocolPath, currentProtocol);
-      await writeFile(run.artifacts.reviewProtocolMarkdownPath, `${reviewProtocolMarkdown(currentProtocol)}\n`, "utf8");
-      await appendEvent(
-        run,
-        now,
-        "next",
-        `Protocol critic requested autonomous protocol revision ${protocolCriticAttempts - 1}.`
-      );
-      await appendStdout(run, `Protocol revision ${protocolCriticAttempts - 1}: ${recoveryUpdate.recoveryQueries.join(" | ")}`);
-      protocolCritic = await reviewWithCritic({
-        run,
-        now,
-        researchBackend,
-        runtimeConfig: runtimeLlmConfig,
-        request: {
-          projectRoot: run.projectRoot,
-          runId: run.id,
-          stage: "protocol",
-          iteration: {
-            attempt: protocolCriticAttempts,
-            maxAttempts: maxProtocolCriticAttempts,
-            revisionPassesUsed: protocolCriticAttempts - 1
-          },
-          brief: run.brief,
-          protocol: currentProtocol,
-          plan
-        }
-      });
-      rememberCriticReport(protocolCritic);
-      await agent.record({
-        actor: "critic",
-        phase: "protocol",
-        action: "review_revised_protocol",
-        status: criticReviewPassed(protocolCritic) ? "completed" : "revising",
-        summary: `Protocol critic returned ${protocolCritic.readiness} after revision ${protocolCriticAttempts - 1}.`,
-        artifactPaths: [run.artifacts.reviewProtocolPath, run.artifacts.criticProtocolReviewPath],
-        counts: {
-          objections: protocolCritic.objections.length,
-          attempt: protocolCriticAttempts,
-          revisions: protocolCriticAttempts - 1
-        }
-      });
-    }
 
     if (!criticReviewPassed(protocolCritic)) {
       unresolvedNonTerminalCriticReports.push(protocolCritic);
@@ -5681,13 +5985,13 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         now,
         "literature",
         criticRevisionIsActionable(protocolCritic)
-          ? "Protocol critic still had concerns after bounded protocol revisions; continuing to retrieval and recording the concerns in the quality report."
-          : "Protocol critic did not provide actionable revision advice after retry; continuing to retrieval and recording the concern as a quality warning."
+          ? "Protocol critic concerns were recorded as visible work items; the researcher agent owns any protocol revision."
+          : "Protocol critic did not provide actionable revision advice; continuing to retrieval and recording the concern as a quality warning."
       );
       await appendStdout(
         run,
         criticRevisionIsActionable(protocolCritic)
-          ? "Protocol critic still had concerns after bounded self-validation; continuing to retrieval so source-selection, evidence, and release checks can validate the actual work."
+          ? "Protocol critic concerns were converted into workspace work items; no protocol search query was invented by the runtime."
           : "Protocol critic gave non-actionable feedback; continuing to retrieval so later concrete checks can validate the actual work."
       );
     }
@@ -5710,8 +6014,6 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     let previousEvidenceQuality: EvidenceQualitySnapshot | null = null;
     let bestUsefulGathered: ResearchSourceGatherResult | null = null;
     let nonImprovingEvidencePasses = 0;
-    const criticExcludedPaperIds = new Set<string>();
-    const criticPromotedPaperIds = new Set<string>();
 
     while (true) {
     await writeJsonArtifact(run.artifacts.planPath, plan);
@@ -5740,8 +6042,8 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       memoryContext,
       literatureContext,
       revisionQueries: pendingRecoveryQueries,
-      criticExcludedPaperIds: [...criticExcludedPaperIds],
-      criticPromotedPaperIds: [...criticPromotedPaperIds],
+      criticExcludedPaperIds: [],
+      criticPromotedPaperIds: [],
       scholarlyProviderIds: scholarlyProviders,
       generalWebProviderIds: generalWebProviders,
       projectFilesEnabled: localEnabled,
@@ -5778,7 +6080,13 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     if (sourceLoopResult !== null) {
       workStore = sourceLoopResult.workStore;
     }
-    let gathered = sourceLoopResult?.gathered ?? await sourceGatherer.gather(sourceRequest);
+    if (sourceLoopResult === null && injectedSourceGatherer === null) {
+      throw new Error("Source gathering requires the agentic source loop or an explicitly injected test adapter.");
+    }
+    if (sourceLoopResult === null) {
+      await appendEvent(run, now, "summary", "Using explicitly injected source gatherer adapter; production/default execution uses the agentic source tool loop.");
+    }
+    let gathered = sourceLoopResult?.gathered ?? await injectedSourceGatherer!.gather(sourceRequest);
     if ((gathered.canonicalPapers.length === 0 || gathered.reviewedPapers.length === 0) && bestUsefulGathered !== null) {
       await appendEvent(
         run,
@@ -5907,6 +6215,17 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       }
     });
     rememberCriticReport(sourceSelectionCritic);
+    const sourceCriticWorkItems = workItemsFromCriticReports(run, [sourceSelectionCritic], now());
+    if (sourceCriticWorkItems.length > 0) {
+      workStore = upsertResearchWorkStoreEntities(workStore, sourceCriticWorkItems, now());
+      await writeResearchWorkStore(workStore);
+      await appendEvent(
+        run,
+        now,
+        "memory",
+        `Source-selection critic created ${sourceCriticWorkItems.length} visible workspace work item(s).`
+      );
+    }
     await agent.record({
       actor: "critic",
       phase: "source_selection",
@@ -5922,78 +6241,19 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
 
     if (!criticReviewPassed(sourceSelectionCritic)) {
       const criticActionable = criticRevisionIsActionable(sourceSelectionCritic);
-      const excludedBefore = criticExcludedPaperIds.size;
-      for (const paperId of sourceSelectionCritic.revisionAdvice.papersToExclude) {
-        criticExcludedPaperIds.add(paperId);
-        criticPromotedPaperIds.delete(paperId);
-      }
-      const criticExclusionsChanged = criticExcludedPaperIds.size > excludedBefore;
-      const promotedBefore = criticPromotedPaperIds.size;
-      for (const paperId of sourceSelectionCritic.revisionAdvice.papersToPromote) {
-        if (!criticExcludedPaperIds.has(paperId)) {
-          criticPromotedPaperIds.add(paperId);
-        }
-      }
-      const criticPromotionsChanged = criticPromotedPaperIds.size > promotedBefore;
-      const recovery = buildEvidenceRecoveryQueries({
-        run,
-        plan,
-        gathered,
-        criticReports: [sourceSelectionCritic]
-      });
-      const hasCriticSearchAdvice = sourceSelectionCritic.revisionAdvice.searchQueries.length > 0
-        || sourceSelectionCritic.revisionAdvice.evidenceTargets.length > 0;
-      const structuredSourceSetRevision = (criticExclusionsChanged || criticPromotionsChanged) && !hasCriticSearchAdvice;
-      const recoveryUpdate = structuredSourceSetRevision
-        ? null
-        : evidenceRecoveryPlanUpdate(plan, recovery.queries, recovery.focusTerms);
-      const runtimeEvidenceRecoveryAvailable = recoveryUpdate !== null && recovery.queries.length > 0;
-
-      if (
-        criticReviewNeedsRevision(sourceSelectionCritic)
-        && (criticActionable || runtimeEvidenceRecoveryAvailable || criticExclusionsChanged || criticPromotionsChanged)
-        && (recoveryUpdate !== null || criticExclusionsChanged || criticPromotionsChanged)
-        && autonomousRecoveryPasses < runtimeLlmConfig.evidenceRecoveryMaxPasses
-        && !evidenceRecoveryBudgetExhausted(evidenceRecoveryStartedAtMs, runtimeLlmConfig)
-        && nonImprovingEvidencePasses < 2
-      ) {
-        autonomousRecoveryPasses += 1;
-        if (recoveryUpdate !== null) {
-          plan = recoveryUpdate.plan;
-          pendingRecoveryQueries = recoveryUpdate.recoveryQueries;
-        } else {
-          pendingRecoveryQueries = [];
-        }
-        await appendEvent(
-          run,
-          now,
-          "next",
-          `Source-selection critic requested evidence revision pass ${autonomousRecoveryPasses}.`
-        );
-        await appendStdout(
-          run,
-          pendingRecoveryQueries.length > 0
-            ? `Evidence revision pass ${autonomousRecoveryPasses}: ${pendingRecoveryQueries.join(" | ")}`
-            : criticPromotionsChanged
-              ? `Evidence revision pass ${autonomousRecoveryPasses}: promoting stronger candidates already in the source pool.`
-              : `Evidence revision pass ${autonomousRecoveryPasses}: applying critic source exclusions.`
-        );
-        continue;
-      }
-
       unresolvedNonTerminalCriticReports.push(sourceSelectionCritic);
       await appendEvent(
         run,
         now,
         "next",
         criticActionable
-          ? "Source-selection critic still had concerns after bounded revision; continuing to extraction and recording the concerns in the quality report."
-          : "Source-selection critic did not provide actionable revision advice after retry; continuing to extraction and recording the concern as a quality warning."
+          ? "Source-selection critic concerns were recorded as visible work items; the researcher agent will decide whether to search, exclude, promote, or revise."
+          : "Source-selection critic did not provide actionable revision advice; continuing to extraction and recording the concern as a quality warning."
       );
       await appendStdout(
         run,
         criticActionable
-          ? "Source-selection critic still had concerns after bounded revision; continuing so later evidence, synthesis, and final quality checks can complete."
+          ? "Source-selection critic concerns were converted into workspace work items; no source set was mutated by the runtime."
           : "Source-selection critic gave non-actionable feedback; continuing so evidence, synthesis, and final checks can produce concrete diagnostics."
       );
     }
@@ -6016,28 +6276,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       const failureMessage = gathered.canonicalPapers.length === 0
         ? "Literature retrieval did not retain any canonical papers that could ground synthesis."
         : "The review workflow did not retain any sufficiently reviewed papers for synthesis.";
-      const recovery = buildEvidenceRecoveryQueries({
-        run,
-        plan,
-        gathered,
-        extraQuestions: nextQuestions
-      });
-      const recoveryUpdate = evidenceRecoveryPlanUpdate(plan, recovery.queries, recovery.focusTerms);
-      if (
-        recoveryUpdate !== null
-        && autonomousRecoveryPasses < runtimeLlmConfig.evidenceRecoveryMaxPasses
-        && !evidenceRecoveryBudgetExhausted(evidenceRecoveryStartedAtMs, runtimeLlmConfig)
-        && nonImprovingEvidencePasses < 2
-      ) {
-        autonomousRecoveryPasses += 1;
-        plan = recoveryUpdate.plan;
-        pendingRecoveryQueries = recoveryUpdate.recoveryQueries;
-        await appendEvent(run, now, "next", `${failureMessage} Continuing autonomously with evidence revision pass ${autonomousRecoveryPasses}.`);
-        await appendStdout(run, `Evidence revision pass ${autonomousRecoveryPasses}: ${pendingRecoveryQueries.join(" | ")}`);
-        continue;
-      }
-
-      const terminalFailureMessage = `${failureMessage} Autonomous evidence revision could not find a stronger evidence set within the configured revision budget.`;
+      const terminalFailureMessage = `${failureMessage} The runtime recorded this as machine-actionable research debt rather than inventing replacement search queries.`;
       const paperExtractions: PaperExtraction[] = [];
       const evidenceMatrix = buildEvidenceMatrix({
         runId: run.id,
@@ -6327,48 +6566,19 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
 
     if (!criticReviewPassed(evidenceCritic)) {
       const criticActionable = criticRevisionIsActionable(evidenceCritic);
-      const recovery = buildEvidenceRecoveryQueries({
-        run,
-        plan,
-        gathered,
-        criticReports: [evidenceCritic]
-      });
-      const recoveryUpdate = evidenceRecoveryPlanUpdate(plan, recovery.queries, recovery.focusTerms);
-
-      if (
-        criticReviewNeedsRevision(evidenceCritic)
-        && criticActionable
-        && recoveryUpdate !== null
-        && autonomousRecoveryPasses < runtimeLlmConfig.evidenceRecoveryMaxPasses
-        && !evidenceRecoveryBudgetExhausted(evidenceRecoveryStartedAtMs, runtimeLlmConfig)
-        && nonImprovingEvidencePasses < 2
-      ) {
-        autonomousRecoveryPasses += 1;
-        plan = recoveryUpdate.plan;
-        pendingRecoveryQueries = recoveryUpdate.recoveryQueries;
-        await appendEvent(
-          run,
-          now,
-          "next",
-          `Evidence critic requested evidence revision pass ${autonomousRecoveryPasses}.`
-        );
-        await appendStdout(run, `Evidence revision pass ${autonomousRecoveryPasses}: ${pendingRecoveryQueries.join(" | ")}`);
-        continue;
-      }
-
       unresolvedNonTerminalCriticReports.push(evidenceCritic);
       await appendEvent(
         run,
         now,
         "next",
         criticActionable
-          ? "Evidence critic still had concerns after bounded revision; continuing to synthesis and recording the concerns in the quality report."
-          : "Evidence critic did not provide actionable revision advice after retry; continuing to synthesis and recording the concern as a quality warning."
+          ? "Evidence critic concerns were recorded as visible work items; the researcher agent will decide whether to search, re-extract, revise claims, or continue."
+          : "Evidence critic did not provide actionable revision advice; continuing to synthesis and recording the concern as a quality warning."
       );
       await appendStdout(
         run,
         criticActionable
-          ? "Evidence critic still had concerns after bounded revision; continuing to synthesis with quality warnings."
+          ? "Evidence critic concerns were converted into workspace work items; no search query was invented by the runtime."
           : "Evidence critic gave non-actionable feedback; continuing to synthesis so deterministic manuscript checks can produce concrete diagnostics."
       );
     }
@@ -6477,7 +6687,6 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         evidenceMatrix: normalizedEvidenceMatrix
       });
 
-    let releaseCriticBlocked = false;
     if (manuscriptBundle.checks.readinessStatus === "ready_for_revision") {
       const releaseCritic = await reviewWithCritic({
         run,
@@ -6510,12 +6719,12 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         }
       });
       rememberCriticReport(releaseCritic);
-      releaseCriticBlocked = !criticReviewPassed(releaseCritic);
+      const releaseCriticPassed = criticReviewPassed(releaseCritic);
       await agent.record({
         actor: "critic",
         phase: "release",
         action: "review_release_candidate",
-        status: criticReviewPassed(releaseCritic) ? "completed" : "revising",
+        status: releaseCriticPassed ? "completed" : "revising",
         summary: `Release critic returned ${releaseCritic.readiness}.`,
         artifactPaths: [run.artifacts.criticReleaseReviewPath, run.artifacts.manuscriptChecksPath],
         counts: {
@@ -6528,8 +6737,8 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         manuscriptBundle,
         [releaseCritic]
       );
-      if (releaseCriticBlocked) {
-        finalContinuationLimitReason = "The release critic did not pass the manuscript after the available autonomous revision budget; the current objective needs user-level reframing or external evidence changes before release.";
+      if (!releaseCriticPassed) {
+        await appendEvent(run, now, "next", "Release critic diagnostics were recorded as visible warnings/work items; they do not override computable release invariants.");
       }
     } else {
       await writeJsonArtifact(run.artifacts.criticReleaseReviewPath, skippedArtifactStatus(
@@ -6540,46 +6749,8 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       ));
     }
 
-    if (manuscriptBundle.checks.readinessStatus === "needs_more_evidence" && !releaseCriticBlocked) {
-      const workspaceEvidenceQuestions = manuscriptBundle.checks.checks
-        .filter((check) => check.status === "fail" && check.severity === "blocker")
-        .filter((check) => ["workspace-sources", "workspace-evidence", "evidence-coverage", "workspace-claims"].includes(check.id))
-        .flatMap((check) => [check.title, check.message]);
-      const recovery = buildEvidenceRecoveryQueries({
-        run,
-        plan,
-        gathered,
-        synthesis: normalizedSynthesis,
-        agenda: normalizedAgenda,
-        verification,
-        extraQuestions: workspaceEvidenceQuestions
-      });
-      const recoveryUpdate = evidenceRecoveryPlanUpdate(plan, recovery.queries, recovery.focusTerms);
-
-      if (
-          recoveryUpdate !== null
-          && autonomousRecoveryPasses < runtimeLlmConfig.evidenceRecoveryMaxPasses
-          && !evidenceRecoveryBudgetExhausted(evidenceRecoveryStartedAtMs, runtimeLlmConfig)
-          && nonImprovingEvidencePasses < 2
-      ) {
-        autonomousRecoveryPasses += 1;
-        plan = recoveryUpdate.plan;
-        pendingRecoveryQueries = recoveryUpdate.recoveryQueries;
-        await appendEvent(
-          run,
-          now,
-          "next",
-          `Manuscript checks need more evidence; continuing autonomously with evidence revision pass ${autonomousRecoveryPasses}.`
-        );
-        await appendStdout(run, `Evidence revision pass ${autonomousRecoveryPasses}: ${pendingRecoveryQueries.join(" | ")}`);
-        continue;
-      }
-
-      finalContinuationLimitReason = nonImprovingEvidencePasses >= 2
-        ? "Manuscript checks still need more evidence, but repeated autonomous evidence revision passes did not improve relevance or coverage."
-        : recoveryUpdate === null
-          ? "Manuscript checks still need more evidence, but the worker could not derive unused revision queries from the current objective and evidence."
-          : "Manuscript checks still need more evidence, but the autonomous evidence revision budget was exhausted for the current objective.";
+    if (manuscriptBundle.checks.readinessStatus === "needs_more_evidence") {
+      finalContinuationLimitReason = "Manuscript checks still need more evidence; the runtime recorded this as internal research work instead of deriving replacement search queries.";
       await appendEvent(run, now, "next", finalContinuationLimitReason);
     }
 

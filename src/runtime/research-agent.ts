@@ -1,6 +1,7 @@
 import type { ResearchBrief } from "./session-store.js";
 import type { ResearchPlan } from "./research-backend.js";
 import type { CriticReviewArtifact } from "./research-critic.js";
+import type { ResearchGuidanceContext } from "./research-guidance.js";
 
 export type LegacyResearchActionName =
   | "revise_protocol"
@@ -36,6 +37,7 @@ export type LegacyResearchActionName =
   | "manuscript.status";
 
 export type ResearchWorkspaceToolName =
+  | "protocol.create_or_revise"
   | "workspace.search"
   | "workspace.read"
   | "workspace.list"
@@ -61,12 +63,17 @@ export type ResearchWorkspaceToolName =
   | "section.check_claims"
   | "work_item.create"
   | "work_item.patch"
+  | "guidance.search"
+  | "guidance.read"
+  | "guidance.recommend"
   | "check.run"
+  | "release.verify"
   | "manuscript.release";
 
 export type ResearchActionName = LegacyResearchActionName | ResearchWorkspaceToolName;
 
 export const researchWorkspaceToolActions: ResearchWorkspaceToolName[] = [
+  "protocol.create_or_revise",
   "workspace.search",
   "workspace.read",
   "workspace.list",
@@ -91,7 +98,11 @@ export const researchWorkspaceToolActions: ResearchWorkspaceToolName[] = [
   "section.check_claims",
   "work_item.create",
   "work_item.patch",
+  "guidance.search",
+  "guidance.read",
+  "guidance.recommend",
   "check.run",
+  "release.verify",
   "manuscript.release",
   "workspace.status"
 ];
@@ -268,6 +279,7 @@ export type ResearchActionRequest = {
   workStore?: {
     path: string;
     summary: {
+      protocols: number;
       canonicalSources: number;
       extractions: number;
       evidenceCells: number;
@@ -282,6 +294,13 @@ export type ResearchActionRequest = {
       nextInternalActions: string[];
       userBlockers: string[];
     };
+    recentProtocols: Array<{
+      id: string;
+      title: string;
+      objective: string;
+      evidenceTargets: string[];
+      author: string;
+    }>;
     openWorkItems: Array<{
       id: string;
       type: string;
@@ -321,6 +340,7 @@ export type ResearchActionRequest = {
       sectionIds: string[];
     }>;
   };
+  guidance?: ResearchGuidanceContext;
   criticReports: CriticReviewArtifact[];
   toolResults?: AgentToolResult[];
   retryInstruction?: string;
@@ -501,7 +521,7 @@ export function modelUnsuitableActionDecision(
     ? "workspace.status"
     : request.allowedActions.includes("manuscript.status")
       ? "manuscript.status"
-      : request.allowedActions[0] ?? "workspace.status";
+      : "workspace.status";
 
   return {
     schemaVersion: 1,
@@ -536,7 +556,7 @@ export function modelUnsuitableActionDecision(
         }
       }
     },
-    expectedOutcome: "Complete the run with a status-only report and model-suitability diagnostics.",
-    stopCondition: "Do not release a full manuscript when the research agent cannot drive the action loop."
+    expectedOutcome: "Record a diagnostic status observation and model-suitability warning.",
+    stopCondition: "Do not choose semantic research work when the research agent cannot drive the action loop."
   };
 }

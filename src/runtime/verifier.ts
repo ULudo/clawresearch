@@ -189,130 +189,6 @@ function topicalTokens(text: string | null | undefined): string[] {
     .filter((token) => !topicalStopTokens.has(token));
 }
 
-function matchesAny(patterns: RegExp[], text: string): boolean {
-  return patterns.some((pattern) => pattern.test(text));
-}
-
-function scopedRelevanceOverride(briefText: string, sourceText: string): SourceRelevance | null {
-  const matchedBriefTerms: string[] = [];
-
-  if (/\b(nursing homes?|long[- ]term care|care homes?|aged care)\b/i.test(briefText)) {
-    const domainMatched = matchesAny([
-      /\bnursing homes?\b/i,
-      /\blong[- ]term care\b/i,
-      /\bcare homes?\b/i,
-      /\baged care\b/i
-    ], sourceText);
-    const effectMatched = !/\b(workforce|staffing|displacement|care quality|quality of care|resident care)\b/i.test(briefText)
-      || matchesAny([
-        /\bworkforce\b/i,
-        /\bstaffing\b/i,
-        /\bdisplacement\b/i,
-        /\bcare quality\b/i,
-        /\bquality of care\b/i,
-        /\bresident care\b/i
-      ], sourceText);
-
-    if (domainMatched) {
-      matchedBriefTerms.push("nursing-home/long-term-care");
-    }
-
-    if (effectMatched) {
-      matchedBriefTerms.push("requested effect/outcome");
-    }
-
-    return {
-      sourceId: "",
-      status: domainMatched && effectMatched ? "relevant" : domainMatched ? "weak" : "off_topic",
-      matchedBriefTerms,
-      rationale: domainMatched && effectMatched
-        ? "The source matches the long-term-care scope and requested effect/outcome evidence."
-        : domainMatched
-          ? "The source matches the care setting but not the requested effect/outcome evidence closely enough."
-          : "The source does not match the nursing-home or long-term-care scope required by the brief."
-    };
-  }
-
-  if (/\b(riemann zeta|zeta zeros?|zeta function)\b/i.test(briefText)) {
-    const zetaMatched = matchesAny([
-      /\briemann zeta\b/i,
-      /\bzeta function\b/i,
-      /\bzeta zeros?\b/i,
-      /\bnon[- ]trivial zeros?\b/i
-    ], sourceText);
-    const verificationNeeded = /\b(rigorous|verification|verified|error bounds?|interval arithmetic|ball arithmetic|turing method|zero counting)\b/i.test(briefText);
-    const verificationMatched = !verificationNeeded || matchesAny([
-      /\brigorous\b/i,
-      /\bverification\b/i,
-      /\bverified\b/i,
-      /\berror bounds?\b/i,
-      /\binterval arithmetic\b/i,
-      /\bball arithmetic\b/i,
-      /\bturing(?:'s)? method\b/i,
-      /\bzero counting\b/i,
-      /\bisolat(?:e|ing)\b/i
-    ], sourceText);
-
-    if (zetaMatched) {
-      matchedBriefTerms.push("Riemann/zeta zeros");
-    }
-
-    if (verificationMatched) {
-      matchedBriefTerms.push("rigorous verification method");
-    }
-
-    return {
-      sourceId: "",
-      status: zetaMatched && verificationMatched ? "relevant" : zetaMatched ? "weak" : "off_topic",
-      matchedBriefTerms,
-      rationale: zetaMatched && verificationMatched
-        ? "The source matches the zeta-zero scope and requested rigorous-verification evidence."
-        : zetaMatched
-          ? "The source is zeta-adjacent but does not match the requested rigorous-verification evidence closely enough."
-          : "The source does not match the Riemann-zeta-zero scope required by the brief."
-    };
-  }
-
-  if (/\b(autonomous research agents?|research agents?|literature review automation|literature synthesis agents?)\b/i.test(briefText)) {
-    const agentMatched = matchesAny([
-      /\bagents?\b/i,
-      /\bllm agents?\b/i,
-      /\bautonomous research\b/i,
-      /\bai scientist\b/i
-    ], sourceText);
-    const researchMatched = matchesAny([
-      /\bresearch\b/i,
-      /\bliterature review\b/i,
-      /\bliterature synthesis\b/i,
-      /\bliterature summary\b/i,
-      /\bsystematic review\b/i,
-      /\breview generation\b/i,
-      /\bevidence synthesis\b/i
-    ], sourceText);
-
-    if (agentMatched) {
-      matchedBriefTerms.push("agent");
-    }
-
-    if (researchMatched) {
-      matchedBriefTerms.push("research/literature-review task");
-    }
-
-    return {
-      sourceId: "",
-      status: agentMatched && researchMatched ? "relevant" : agentMatched || researchMatched ? "weak" : "off_topic",
-      matchedBriefTerms,
-      rationale: agentMatched && researchMatched
-        ? "The source matches research-agent and literature/research-task scope."
-        : agentMatched || researchMatched
-          ? "The source only partially matches the research-agent review scope."
-          : "The source does not match the autonomous research-agent review scope."
-    };
-  }
-
-  return null;
-}
-
 function sourceRelevanceToBrief(brief: ResearchBrief, source: CanonicalPaper): SourceRelevance {
   const topicTokens = [...new Set(topicalTokens(brief.topic))];
   const briefTokens = [...new Set([
@@ -328,27 +204,6 @@ function sourceRelevanceToBrief(brief: ResearchBrief, source: CanonicalPaper): S
     source.venue,
     ...source.tags
   ].filter((value): value is string => typeof value === "string").join(" "));
-  const rawBriefText = [
-    brief.topic,
-    brief.researchQuestion,
-    brief.researchDirection,
-    brief.successCriterion
-  ].filter((value): value is string => typeof value === "string").join(" ");
-  const scopedOverride = scopedRelevanceOverride(rawBriefText, [
-    source.title,
-    source.abstract,
-    source.citation,
-    source.venue,
-    ...source.tags
-  ].filter((value): value is string => typeof value === "string").join(" "));
-
-  if (scopedOverride !== null) {
-    return {
-      ...scopedOverride,
-      sourceId: source.id
-    };
-  }
-
   const sourceTokens = new Set(topicalTokens(sourceText));
   const matchedBriefTerms = briefTokens.filter((token) => sourceTokens.has(token) || sourceText.includes(token));
   const matchedTopicTerms = topicTokens.filter((token) => sourceTokens.has(token) || sourceText.includes(token));
@@ -479,8 +334,7 @@ export function verifyResearchClaims(request: VerificationRequest): Verification
     const offTopicSourceIds = matchedSources
       .filter((source) => relevanceBySourceId.get(source.id)?.status === "off_topic")
       .map((source) => source.id);
-    const supportEligibleSources = matchedSources.filter((source) => relevanceBySourceId.get(source.id)?.status !== "off_topic");
-    const profile = supportProfile(claim, supportEligibleSources);
+    const profile = supportProfile(claim, matchedSources);
     const notes = [...profile.notes];
 
     if (missingSourceIds.length > 0) {
@@ -488,7 +342,7 @@ export function verifyResearchClaims(request: VerificationRequest): Verification
     }
 
     if (offTopicSourceIds.length > 0) {
-      notes.push(`Cited sources outside the scoped topic were ignored for support: ${offTopicSourceIds.join(", ")}.`);
+      notes.push(`Source relevance diagnostics flagged these cited sources for researcher review: ${offTopicSourceIds.join(", ")}.`);
     }
 
     let supportStatus = profile.supportStatus;

@@ -312,7 +312,7 @@ test("role-aware source classification separates primary systems from surveys an
     assert.notEqual(byTitle("PaperArena")?.selectionDecision, "selected_primary");
     assert.equal(byTitle("LEGOMem")?.sourceRole, "method_component");
     assert.notEqual(gathered.selectionQuality?.adequacy, "strong");
-    assert.ok(gathered.selectionQuality?.selectionRationale.some((line) => /Role-aware source gate/i.test(line)));
+    assert.ok(gathered.selectionQuality?.selectionRationale.some((line) => /Role-aware source diagnostic/i.test(line)));
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
@@ -1217,7 +1217,7 @@ test("missing unpaywall email is reported as an access limitation", async () => 
   }
 });
 
-test("literature-review filtering rejects unrelated query noise even when it shares review language", async () => {
+test("literature-review screening keeps query noise visible with advisory diagnostics", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-topic-filter-"));
   const originalFetch = globalThis.fetch;
 
@@ -1292,8 +1292,11 @@ test("literature-review filtering rejects unrelated query noise even when it sha
     });
 
     assert.deepEqual(gathered.canonicalPapers.map((paper) => paper.title), [
-      "On Robin's criterion for the Riemann hypothesis"
+      "On Robin's criterion for the Riemann hypothesis",
+      "Modelling urban sewer flooding and quantitative microbial risk assessment: A critical review"
     ]);
+    assert.ok((gathered.retrievalDiagnostics?.screeningSummary.rejected ?? 0) >= 1);
+    assert.match(gathered.notes.join("\n"), /retained them for researcher-visible screening/i);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
@@ -1480,7 +1483,7 @@ test("review workflow promotes high-quality uncertain abstract papers when inclu
   }
 });
 
-test("review workflow does not promote off-topic papers that only match generic design or efficiency terms", async () => {
+test("review workflow reports off-topic diagnostics without hiding researcher-visible papers", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-topic-gate-"));
   const originalFetch = globalThis.fetch;
 
@@ -1570,7 +1573,7 @@ test("review workflow does not promote off-topic papers that only match generic 
       plan: {
         researchMode: "literature_synthesis",
         objective: "Review autonomous research-agent literature review systems.",
-        rationale: "Generic design and efficiency papers should not enter synthesis.",
+        rationale: "Generic design and efficiency papers should remain visible with diagnostics.",
         searchQueries: ["autonomous research agents literature review summarization"],
         localFocus: ["information retrieval", "summarization", "information organization"]
       },
@@ -1578,12 +1581,13 @@ test("review workflow does not promote off-topic papers that only match generic 
       scholarlyProviderIds: ["openalex"]
     });
 
-    assert.equal(gathered.reviewedPapers.length, 1);
+    assert.equal(gathered.reviewedPapers.length, 3);
     assert.match(gathered.reviewedPapers[0]?.title ?? "", /Autonomous research agents/i);
-    assert.equal(gathered.reviewWorkflow.counts.selectedForSynthesis, 1);
-    assert.match(gathered.reviewWorkflow.notes.join("\n"), /Held back 2 otherwise retained papers/i);
+    assert.equal(gathered.reviewWorkflow.counts.selectedForSynthesis, 3);
+    assert.match(gathered.reviewWorkflow.notes.join("\n"), /Advisory relevance diagnostics/i);
     assert.equal(gathered.relevanceAssessments?.filter((assessment) => assessment.status === "excluded").length, 2);
-    assert.ok(!gathered.reviewedPapers.some((paper) => /CMIP6|industrial IoT/i.test(paper.title)));
+    assert.ok(gathered.reviewedPapers.some((paper) => /CMIP6/i.test(paper.title)));
+    assert.ok(gathered.reviewedPapers.some((paper) => /industrial IoT/i.test(paper.title)));
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
@@ -1753,7 +1757,7 @@ test("review selection records missing method facets when zeta evidence drifts a
 
     const missingLabels = gathered.selectionQuality?.missingRequiredFacets.map((facet) => facet.label.toLowerCase()) ?? [];
 
-    assert.equal(gathered.reviewedPapers.length, 0);
+    assert.equal(gathered.reviewedPapers.length, 1);
     assert.equal(gathered.relevanceAssessments?.[0]?.status, "borderline");
     assert.ok(missingLabels.some((label) => /error bounds|rigorous numerical verification|verification/.test(label)));
     assert.notEqual(gathered.selectionQuality?.adequacy, "strong");

@@ -826,7 +826,10 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     "Use claim.create/patch/check_support/link_support for claim-led synthesis.",
     "Use section.create/read/patch/link_claim/check_claims for section-level writing.",
     "Use work_item.create/patch when critic or check feedback becomes actionable research debt.",
+    "Use guidance.search/read/recommend to inspect advisory research-lab scaffolding. Guidance is not a gate and may be overridden.",
+    "Use protocol.create_or_revise when the research protocol itself needs visible revision by the researcher.",
     "Use critic.review for fresh stateless critique, and check.run for release/support checks.",
+    "Use release.verify for final computable release invariants; semantic concerns should become diagnostics or work items.",
     "Critic objections and checks are normal work-store work items. Prefer concrete tool steps over stopping.",
     "Recent tool results are authoritative observations from executed tools. Use returned ids, snippets, and previews before repeating the same read action.",
     "Use workspace.status only when the next step is genuinely external to the agent, unsafe, or impossible with the configured tools.",
@@ -872,6 +875,7 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     `Observations: ${JSON.stringify(request.observations)}`,
     `Source state: ${JSON.stringify(request.sourceState ?? null)}`,
     `Work store: ${JSON.stringify(request.workStore ?? null)}`,
+    `Guidance: ${JSON.stringify(request.guidance ?? null)}`,
     `Recent tool results: ${JSON.stringify(request.toolResults ?? [])}`,
     `Critic reports: ${JSON.stringify(criticSummaries)}`,
     request.retryInstruction === undefined ? "Retry instruction: null" : `Retry instruction: ${request.retryInstruction}`
@@ -1153,7 +1157,7 @@ function criticStageGuidance(stage: CriticReviewStage): { releaseRule: string; r
   switch (stage) {
     case "protocol":
       return {
-        releaseRule: "This gate decides whether the protocol is ready for autonomous retrieval, not whether the final manuscript is ready.",
+        releaseRule: "This review diagnoses whether the protocol is ready for autonomous retrieval; it creates visible objections rather than hidden runtime decisions.",
         rules: [
           "Review only the brief, plan, and review protocol.",
           "No papers, selected sources, extractions, claims, synthesis, verification, or manuscript should exist yet.",
@@ -1164,7 +1168,7 @@ function criticStageGuidance(stage: CriticReviewStage): { releaseRule: string; r
       };
     case "source_selection":
       return {
-        releaseRule: "This gate decides whether the selected sources are ready for extraction.",
+        releaseRule: "This review diagnoses whether the selected sources are ready for extraction; the researcher decides how to revise.",
         rules: [
           "Review the brief, protocol, selected papers, relevance assessments, retrieval diagnostics, and selection quality.",
           "Do not require extracted evidence, synthesized claims, references, or a manuscript yet.",
@@ -1176,7 +1180,7 @@ function criticStageGuidance(stage: CriticReviewStage): { releaseRule: string; r
       };
     case "evidence":
       return {
-        releaseRule: "This gate decides whether extracted evidence is ready for synthesis.",
+        releaseRule: "This review diagnoses whether extracted evidence is ready for synthesis; objections become work items or warnings.",
         rules: [
           "Review selected papers, relevance assessments, paper extractions, and the evidence matrix.",
           "Do not require final prose, references, or release checks yet.",
@@ -1187,7 +1191,7 @@ function criticStageGuidance(stage: CriticReviewStage): { releaseRule: string; r
       };
     case "release":
       return {
-        releaseRule: "This gate decides whether a full manuscript may be released.",
+        releaseRule: "This review diagnoses manuscript-release risks. Computable release invariants are checked separately by the runtime.",
         rules: [
           "Review the manuscript, references, verification, deterministic manuscript checks, protocol, and selected papers.",
           "Object to unsupported claims, missing citations, off-topic evidence, failed checks, missing limitations, or mismatches between the paper and evidence matrix.",
@@ -1626,7 +1630,10 @@ function nativeAgentStepInstruction(request: ResearchActionRequest): string {
     "Use claim.create/patch/check_support/link_support for claim-led synthesis.",
     "Use section.create/read/patch/link_claim/check_claims for section-level writing.",
     "Use work_item.create/patch when critic or check feedback becomes actionable research debt.",
+    "Use guidance.search/read/recommend to inspect advisory research-lab scaffolding. Guidance is not a gate and may be overridden.",
+    "Use protocol.create_or_revise when the research protocol itself needs visible revision by the researcher.",
     "Use critic.review for fresh stateless critique, and check.run for release/support checks.",
+    "Use release.verify for final computable release invariants; semantic concerns should become diagnostics or work items.",
     "Critic objections and checks are normal work-store work items. Prefer concrete tool steps over stopping.",
     "Recent tool results are authoritative observations from executed tools. Use returned ids, snippets, and previews before repeating the same read action.",
     "Use workspace.status only when the next step is genuinely external to the agent, unsafe, or impossible with the configured tools.",
@@ -1641,6 +1648,7 @@ function nativeAgentStepInstruction(request: ResearchActionRequest): string {
     `Observations: ${JSON.stringify(request.observations)}`,
     `Source state: ${JSON.stringify(request.sourceState ?? null)}`,
     `Work store: ${JSON.stringify(request.workStore ?? null)}`,
+    `Guidance: ${JSON.stringify(request.guidance ?? null)}`,
     `Recent tool results: ${JSON.stringify(request.toolResults ?? [])}`,
     `Critic reports: ${JSON.stringify(request.criticReports.map((report) => ({
       stage: report.stage,
