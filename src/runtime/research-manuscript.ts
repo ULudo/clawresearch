@@ -4,7 +4,7 @@ import type {
   ResearchPlan
 } from "./research-backend.js";
 import { briefFingerprint } from "./research-evidence.js";
-import type { ResearchSourceGatherResult } from "./research-sources.js";
+import type { ResearchSourceSnapshot } from "./research-sources.js";
 import type { CriticReviewArtifact } from "./research-critic.js";
 import type { RunRecord } from "./run-store.js";
 
@@ -65,9 +65,9 @@ export type ReviewProtocol = {
     rawSourceCount: number;
     canonicalPaperCount: number;
     reviewedPaperCount: number;
-    reviewWorkflow: ResearchSourceGatherResult["reviewWorkflow"];
-    providerAttempts: NonNullable<ResearchSourceGatherResult["retrievalDiagnostics"]>["providerAttempts"];
-    screeningSummary: NonNullable<ResearchSourceGatherResult["retrievalDiagnostics"]>["screeningSummary"] | null;
+    reviewWorkflow: ResearchSourceSnapshot["reviewWorkflow"];
+    providerAttempts: NonNullable<ResearchSourceSnapshot["retrievalDiagnostics"]>["providerAttempts"];
+    screeningSummary: NonNullable<ResearchSourceSnapshot["retrievalDiagnostics"]>["screeningSummary"] | null;
     revisionPasses: number;
     recoveryPasses?: number;
     accessLimitations: string[];
@@ -196,7 +196,7 @@ export type ReviewProtocolInput = {
   oaRetrievalHelperProviders: string[];
   generalWebProviders: string[];
   localContextEnabled: boolean;
-  gathered?: ResearchSourceGatherResult | null;
+  gathered?: ResearchSourceSnapshot | null;
 };
 
 function compactText(text: string): string {

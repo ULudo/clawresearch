@@ -11,7 +11,7 @@ import type {
 import type { ResearchAgenda, ResearchPlan, ResearchSynthesis } from "./research-backend.js";
 import type { CriticReviewArtifact, CriticReviewStage } from "./research-critic.js";
 import type { EvidenceMatrix, EvidenceMatrixRow, PaperExtraction } from "./research-evidence.js";
-import type { ResearchSource, ResearchSourceGatherResult } from "./research-sources.js";
+import type { ResearchSource, ResearchSourceSnapshot } from "./research-sources.js";
 import type { ResearchBrief } from "./session-store.js";
 import { runtimeDirectoryPath as runtimeDir } from "./session-store.js";
 import type { RunRecord } from "./run-store.js";
@@ -947,8 +947,10 @@ function loadWorkspaceDatabase(input: {
       .flatMap((row) => rowJsonEntity<WorkStoreWorkItem>(row, "workItem") ?? []);
     const releaseChecks = statementRows<Record<string, unknown>>(database, "SELECT json FROM checks ORDER BY updated_at, id")
       .flatMap((row) => rowJsonEntity<WorkStoreReleaseCheck>(row, "releaseCheck") ?? []);
-    const eventRows = statementRows<Record<string, unknown>>(database, "SELECT json FROM events WHERE entity_kind = 'providerRun' ORDER BY id");
-    const providerRuns = eventRows.flatMap((row) => rowJsonEntity<WorkStoreProviderRun>(row, "providerRun") ?? []);
+    const providerRunRows = statementRows<Record<string, unknown>>(database, "SELECT json FROM events WHERE entity_kind = 'providerRun' ORDER BY id");
+    const providerRuns = providerRunRows.flatMap((row) => rowJsonEntity<WorkStoreProviderRun>(row, "providerRun") ?? []);
+    const sourceRows = statementRows<Record<string, unknown>>(database, "SELECT json FROM events WHERE entity_kind = 'source' ORDER BY id");
+    const rawSources = sourceRows.flatMap((row) => rowJsonEntity<WorkStoreSource>(row, "source") ?? []);
 
     return {
       schemaVersion: workStoreSchemaVersion,
@@ -960,7 +962,7 @@ function loadWorkspaceDatabase(input: {
       worker: normalizeWorker(workerRow?.json === undefined ? null : parseJsonValue(workerRow.json, null), input.now),
       objects: {
         providerRuns,
-        sources: [],
+        sources: rawSources,
         canonicalSources: sources,
         screeningDecisions: sources.flatMap((source) => generatedScreeningDecision(source) ?? []),
         fullTextRecords: sources.map((source) => generatedFullTextRecord(source)),
@@ -1293,7 +1295,7 @@ export function updateResearchWorkStoreWorker(
   };
 }
 
-function providerRunsFromGathered(run: RunRecord, gathered: ResearchSourceGatherResult | null, now: string): WorkStoreProviderRun[] {
+function providerRunsFromGathered(run: RunRecord, gathered: ResearchSourceSnapshot | null, now: string): WorkStoreProviderRun[] {
   return (gathered?.retrievalDiagnostics?.providerAttempts ?? []).map((attempt, index) => ({
     id: stableId("provider-run", [run.id, index, attempt.providerId, attempt.phase, attempt.rawCandidateCount]),
     kind: "providerRun",
@@ -1587,7 +1589,7 @@ export function mergeRunSegmentIntoResearchWorkStore(
   input: {
     run: RunRecord;
     plan: ResearchPlan;
-    gathered: ResearchSourceGatherResult | null;
+    gathered: ResearchSourceSnapshot | null;
     paperExtractions: PaperExtraction[];
     evidenceMatrix: EvidenceMatrix | null;
     synthesis: ResearchSynthesis | null;
@@ -1757,6 +1759,8 @@ export function buildLiteratureContextFromWorkStore(store: ResearchWorkStore): L
 }
 
 export type ResearchWorkStoreSummary = {
+  providerRuns: number;
+  sources: number;
   protocols: number;
   canonicalSources: number;
   extractions: number;
@@ -1768,6 +1772,8 @@ export type ResearchWorkStoreSummary = {
 
 export function summarizeResearchWorkStore(store: ResearchWorkStore): ResearchWorkStoreSummary {
   return {
+    providerRuns: store.objects.providerRuns.length,
+    sources: store.objects.sources.length,
     protocols: store.objects.protocols.length,
     canonicalSources: store.objects.canonicalSources.length,
     extractions: store.objects.extractions.length,

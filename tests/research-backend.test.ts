@@ -679,6 +679,8 @@ test("agent-step backend exposes first-class claim and manuscript-section tools"
       workStore: {
         path: "/tmp/project/.clawresearch/workspace.sqlite",
         summary: {
+          providerRuns: 0,
+          sources: 0,
           protocols: 0,
           canonicalSources: 3,
           extractions: 3,
@@ -696,6 +698,7 @@ test("agent-step backend exposes first-class claim and manuscript-section tools"
         },
         openWorkItems: [],
         recentProtocols: [],
+        recentSourceCandidates: [],
         recentSources: [{
           id: "paper-1",
           title: "Design Patterns for Autonomous Research Agents",

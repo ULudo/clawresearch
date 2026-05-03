@@ -9,7 +9,6 @@ export type LegacyResearchActionName =
   | "search_sources"
   | "screen_sources"
   | "merge_sources"
-  | "rank_sources"
   | "resolve_access"
   | "select_sources"
   | "select_evidence_set"
@@ -48,7 +47,6 @@ export type ResearchWorkspaceToolName =
   | "workspace.status"
   | "source.search"
   | "source.merge"
-  | "source.rank"
   | "source.resolve_access"
   | "source.select_evidence"
   | "claim.create"
@@ -83,7 +81,6 @@ export const researchWorkspaceToolActions: ResearchWorkspaceToolName[] = [
   "workspace.unlink",
   "source.search",
   "source.merge",
-  "source.rank",
   "source.resolve_access",
   "source.select_evidence",
   "claim.create",
@@ -242,7 +239,7 @@ export type ResearchActionRequest = {
     rawSources: number;
     screenedSources: number;
     backgroundSources: number;
-    sourceStage: string;
+    canonicalMergeCompleted: boolean;
     canonicalPapers: number;
     candidatePaperIds: string[];
     resolvedPaperIds: string[];
@@ -263,7 +260,6 @@ export type ResearchActionRequest = {
     mergeReadiness: {
       ready: boolean;
       reason: string;
-      recommendedActions: ResearchActionName[];
     };
     recentActions: Array<{
       action: string;
@@ -279,6 +275,8 @@ export type ResearchActionRequest = {
   workStore?: {
     path: string;
     summary: {
+      providerRuns: number;
+      sources: number;
       protocols: number;
       canonicalSources: number;
       extractions: number;
@@ -300,6 +298,13 @@ export type ResearchActionRequest = {
       objective: string;
       evidenceTargets: string[];
       author: string;
+    }>;
+    recentSourceCandidates: Array<{
+      id: string;
+      title: string;
+      providerId: string | null;
+      category: string;
+      sourceKind: string;
     }>;
     openWorkItems: Array<{
       id: string;

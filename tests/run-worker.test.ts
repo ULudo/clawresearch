@@ -27,9 +27,9 @@ import type {
   PaperExtraction
 } from "../src/runtime/research-evidence.js";
 import type {
-  ResearchSourceGatherRequest,
-  ResearchSourceGatherResult,
-  ResearchSourceGatherer
+  ResearchSourceToolRequest,
+  ResearchSourceSnapshot,
+  ResearchSourceToolAdapter
 } from "../src/runtime/research-sources.js";
 import { ProjectConfigStore } from "../src/runtime/project-config-store.js";
 import { researchDirectionPath, runDirectoryPath, runFilePath, RunStore } from "../src/runtime/run-store.js";
@@ -1186,7 +1186,7 @@ class EvidenceTargetOnlyRevisionBackend extends StubResearchBackend {
   }
 }
 
-class AgenticSourceBackend extends StubResearchBackend {
+class SourceToolBackend extends StubResearchBackend {
   readonly sourceActions: ResearchActionDecision[] = [];
   readonly sourceActionRequests: ResearchActionRequest[] = [];
 
@@ -1239,33 +1239,22 @@ class AgenticSourceBackend extends StubResearchBackend {
           stopCondition: "Stop this action after the arXiv result is screened.",
           transport: "strict_json"
         };
-      } else if (sourceState.sourceStage === "querying") {
+      } else if (sourceState.canonicalMergeCompleted !== true) {
         action = {
           schemaVersion: 1,
           action: "source.merge",
-          rationale: "The retrieved hits should be merged into canonical papers before ranking.",
+          rationale: "The retrieved hits should be merged into canonical papers before access resolution and evidence selection.",
           confidence: 0.88,
           inputs: baseInputs,
           expectedOutcome: "Canonical papers are available in source state.",
           stopCondition: "Stop when canonical merge completes.",
           transport: "strict_json"
         };
-      } else if (sourceState.sourceStage === "merged") {
-        action = {
-          schemaVersion: 1,
-          action: "source.rank",
-          rationale: "The canonical papers should be ranked against the review protocol before access resolution.",
-          confidence: 0.87,
-          inputs: baseInputs,
-          expectedOutcome: "Candidate paper ids are available for access resolution.",
-          stopCondition: "Stop when candidate ranking is checkpointed.",
-          transport: "strict_json"
-        };
-      } else if (sourceState.sourceStage === "ranked") {
+      } else if (sourceState.resolvedPaperIds.length === 0) {
         action = {
           schemaVersion: 1,
           action: "source.resolve_access",
-          rationale: "Resolve access only for the currently ranked candidate papers.",
+          rationale: "Resolve access only for the currently visible candidate papers.",
           confidence: 0.85,
           inputs: {
             ...baseInputs,
@@ -1279,7 +1268,7 @@ class AgenticSourceBackend extends StubResearchBackend {
         action = {
           schemaVersion: 1,
           action: "source.select_evidence",
-          rationale: "Ranked and access-resolved candidates are ready for the synthesis evidence set.",
+          rationale: "Access-resolved candidates are ready for the synthesis evidence set.",
           confidence: 0.86,
           inputs: {
             ...baseInputs,
@@ -1299,9 +1288,9 @@ class AgenticSourceBackend extends StubResearchBackend {
   }
 }
 
-class UnknownEvidenceSelectionBackend extends AgenticSourceBackend {
+class UnknownEvidenceSelectionBackend extends SourceToolBackend {
   override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
-    if (request.phase === "source_selection" && request.sourceState?.sourceStage === "access_resolved") {
+    if (request.phase === "source_selection" && (request.sourceState?.resolvedPaperIds.length ?? 0) > 0) {
       this.sourceActionRequests.push(request);
       const action: ResearchActionDecision = {
         schemaVersion: 1,
@@ -1328,7 +1317,7 @@ class UnknownEvidenceSelectionBackend extends AgenticSourceBackend {
   }
 }
 
-class WorkStoreFirstSourceBackend extends AgenticSourceBackend {
+class WorkStoreFirstSourceBackend extends SourceToolBackend {
   private createdWorkItem = false;
 
   override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
@@ -1409,22 +1398,11 @@ class StubbornSourceSearchBackend extends StubResearchBackend {
     };
     let action: ResearchActionDecision;
 
-    if (sourceState?.sourceStage === "merged") {
-      action = {
-        schemaVersion: 1,
-        action: "rank_sources",
-        rationale: "Canonical sources can now be ranked.",
-        confidence: 0.82,
-        inputs: baseInputs,
-        expectedOutcome: "Candidate source ranking.",
-        stopCondition: "Stop after ranking.",
-        transport: "strict_json"
-      };
-    } else if (sourceState?.sourceStage === "ranked") {
+    if (sourceState?.canonicalMergeCompleted === true) {
       action = {
         schemaVersion: 1,
         action: "select_evidence_set",
-        rationale: "Ranked sources are ready for the evidence pass.",
+        rationale: "Canonical sources are ready for explicit evidence selection.",
         confidence: 0.82,
         inputs: {
           ...baseInputs,
@@ -1516,8 +1494,52 @@ class DashboardIgnoringSourceSearchBackend extends StubResearchBackend {
   }
 }
 
-class StubSourceGatherer implements ResearchSourceGatherer {
-  async gather(): Promise<ResearchSourceGatherResult> {
+class ProviderlessSourceSearchBackend extends StubResearchBackend {
+  readonly sourceActions: ResearchActionDecision[] = [];
+
+  async planResearch(): Promise<ResearchPlan> {
+    return {
+      researchMode: "literature_synthesis",
+      objective: "Test that source.search requires explicit provider choices.",
+      rationale: "The runtime should not choose a fallback provider for the researcher.",
+      searchQueries: [
+        "autonomous research agent harness architecture evaluation"
+      ],
+      localFocus: [
+        "provider choice"
+      ]
+    };
+  }
+
+  async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "source_selection") {
+      return super.chooseResearchAction(request);
+    }
+
+    const action: ResearchActionDecision = {
+      schemaVersion: 1,
+      action: "source.search",
+      rationale: "Try a search without provider ids to prove the runtime does not pick one.",
+      confidence: 0.72,
+      inputs: {
+        providerIds: [],
+        searchQueries: ["autonomous research agent harness architecture evaluation"],
+        evidenceTargets: ["provider choice"],
+        paperIds: [],
+        criticStage: null,
+        reason: null
+      },
+      expectedOutcome: "The runtime returns a no-op observation instead of querying a fallback provider.",
+      stopCondition: "Stop after the no-op observation.",
+      transport: "strict_json"
+    };
+    this.sourceActions.push(action);
+    return action;
+  }
+}
+
+class StubSourceToolAdapter implements ResearchSourceToolAdapter {
+  async run(): Promise<ResearchSourceSnapshot> {
     const papers = [
       canonicalPaper()
     ];
@@ -1592,10 +1614,10 @@ class StubSourceGatherer implements ResearchSourceGatherer {
   }
 }
 
-class MultiPaperSourceGatherer implements ResearchSourceGatherer {
+class MultiPaperSourceToolAdapter implements ResearchSourceToolAdapter {
   constructor(private readonly count: number) {}
 
-  async gather(): Promise<ResearchSourceGatherResult> {
+  async run(): Promise<ResearchSourceSnapshot> {
     const papers = Array.from({ length: this.count }, (_, index) => canonicalPaper({
       id: `paper-${index + 1}`,
       key: `doi:10.1000/revision-${index + 1}`,
@@ -1624,10 +1646,10 @@ class MultiPaperSourceGatherer implements ResearchSourceGatherer {
   }
 }
 
-class EvidenceRecoverySourceGatherer implements ResearchSourceGatherer {
-  requests: ResearchSourceGatherRequest[] = [];
+class EvidenceRecoverySourceToolAdapter implements ResearchSourceToolAdapter {
+  requests: ResearchSourceToolRequest[] = [];
 
-  async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
+  async run(request: ResearchSourceToolRequest): Promise<ResearchSourceSnapshot> {
     this.requests.push(request);
 
     if (this.requests.length === 1) {
@@ -1712,10 +1734,10 @@ class EvidenceRecoverySourceGatherer implements ResearchSourceGatherer {
   }
 }
 
-class UsefulThenEmptySourceGatherer implements ResearchSourceGatherer {
-  readonly requests: ResearchSourceGatherRequest[] = [];
+class UsefulThenEmptySourceToolAdapter implements ResearchSourceToolAdapter {
+  readonly requests: ResearchSourceToolRequest[] = [];
 
-  async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
+  async run(request: ResearchSourceToolRequest): Promise<ResearchSourceSnapshot> {
     this.requests.push(request);
 
     if (this.requests.length > 1) {
@@ -1765,10 +1787,10 @@ class UsefulThenEmptySourceGatherer implements ResearchSourceGatherer {
   }
 }
 
-class CriticExclusionSourceGatherer implements ResearchSourceGatherer {
-  requests: ResearchSourceGatherRequest[] = [];
+class CriticExclusionSourceToolAdapter implements ResearchSourceToolAdapter {
+  requests: ResearchSourceToolRequest[] = [];
 
-  async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
+  async run(request: ResearchSourceToolRequest): Promise<ResearchSourceSnapshot> {
     this.requests.push(request);
     const weakPaper = canonicalPaper({
       id: "paper-weak",
@@ -1819,10 +1841,10 @@ class CriticExclusionSourceGatherer implements ResearchSourceGatherer {
   }
 }
 
-class CriticPromotionSourceGatherer implements ResearchSourceGatherer {
-  requests: ResearchSourceGatherRequest[] = [];
+class CriticPromotionSourceToolAdapter implements ResearchSourceToolAdapter {
+  requests: ResearchSourceToolRequest[] = [];
 
-  async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
+  async run(request: ResearchSourceToolRequest): Promise<ResearchSourceSnapshot> {
     this.requests.push(request);
     const weakPaper = canonicalPaper({
       id: "paper-weak",
@@ -1926,8 +1948,8 @@ class PersistentlyFailingExtractionBackend extends StubResearchBackend {
   }
 }
 
-class NoEvidenceSourceGatherer implements ResearchSourceGatherer {
-  async gather(): Promise<ResearchSourceGatherResult> {
+class NoEvidenceSourceToolAdapter implements ResearchSourceToolAdapter {
+  async run(): Promise<ResearchSourceSnapshot> {
     return {
       notes: [
         "No relevant scholarly hits were retained."
@@ -2056,8 +2078,8 @@ class LiteratureAwareResearchBackend implements ResearchBackend {
   }
 }
 
-class LiteratureAwareSourceGatherer implements ResearchSourceGatherer {
-  async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
+class LiteratureAwareSourceToolAdapter implements ResearchSourceToolAdapter {
+  async run(request: ResearchSourceToolRequest): Promise<ResearchSourceSnapshot> {
     assert.equal(request.literatureContext?.available, true);
     assert.match(request.literatureContext?.queryHints.join(" | ") ?? "", /mollifier/i);
     const papers = [
@@ -2535,7 +2557,7 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer: new StubSourceGatherer()
+      sourceToolAdapter: new StubSourceToolAdapter()
     });
 
     const completedRun = await runStore.load(run.id);
@@ -2717,7 +2739,7 @@ test("run worker lets the research agent choose source provider order and source
     projectConfig.sources.explicitlyConfigured = true;
     await projectConfigStore.save(projectConfig);
 
-    const backend = new AgenticSourceBackend();
+    const backend = new SourceToolBackend();
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
@@ -2736,8 +2758,8 @@ test("run worker lets the research agent choose source provider order and source
           selectedForSynthesis?: number;
         };
       };
-      agenticSourceState?: {
-        sourceStage?: string;
+      sourceToolState?: {
+        canonicalMergeCompleted?: boolean;
         recentActions?: Array<{ action: string }>;
       } | null;
     };
@@ -2750,33 +2772,45 @@ test("run worker lets the research agent choose source provider order and source
     assert.equal(exitCode, 0);
     assert.equal(sourcesArtifact.retrievalDiagnostics?.providerAttempts?.[0]?.providerId, "arxiv");
     assert.ok((sourcesArtifact.reviewWorkflow?.counts?.selectedForSynthesis ?? 0) > 0);
-    assert.equal(sourcesArtifact.agenticSourceState?.sourceStage, "selected");
-    assert.ok(sourcesArtifact.agenticSourceState?.recentActions?.some((action) => action.action === "select_evidence_set"));
-    assert.deepEqual(backend.sourceActions.map((action) => action.action).slice(0, 5), [
+    assert.equal(sourcesArtifact.sourceToolState?.canonicalMergeCompleted, true);
+    assert.ok(sourcesArtifact.sourceToolState?.recentActions?.some((action) => action.action === "select_evidence_set"));
+    assert.deepEqual(backend.sourceActions.map((action) => action.action).slice(0, 4), [
       "source.search",
       "source.merge",
-      "source.rank",
       "source.resolve_access",
       "source.select_evidence"
     ]);
     assert.ok(backend.sourceActions[0]?.inputs.providerIds.includes("arxiv"));
     assert.ok(backend.sourceActionRequests.every((request) => request.allowedActions.includes("workspace.search")));
     assert.ok(backend.sourceActionRequests.every((request) => request.allowedActions.includes("section.create")));
+    const postSearchRequest = backend.sourceActionRequests.find((request) => (
+      request.sourceState?.attemptedProviderIds.includes("arxiv") === true
+      && request.toolResults?.some((result) => result.action === "source.search") === true
+    ));
+    assert.ok(postSearchRequest);
+    const sourceSearchResult = postSearchRequest.toolResults?.find((result) => result.action === "source.search");
+    assert.equal(sourceSearchResult?.collection, "sources");
+    assert.ok((sourceSearchResult?.count ?? 0) > 0);
+    assert.ok(sourceSearchResult?.items?.some((item) => (
+      item.kind === "source"
+      && /Autonomous research agent harnesses/i.test(item.title ?? "")
+      && /architecture/i.test(item.snippet ?? "")
+      && item.fields?.providerId === "arxiv"
+    )));
     assert.match(stdout, /Research agent action \(source_selection\): source\.search/);
     assert.match(stdout, /Research agent action \(source_selection\): source\.merge/);
-    assert.match(stdout, /Research agent action \(source_selection\): source\.rank/);
     assert.match(stdout, /Research agent action \(source_selection\): source\.resolve_access/);
     assert.match(stdout, /Research agent action \(source_selection\): source\.select_evidence/);
     assert.match(stdout, /Source tool observation: arxiv returned/i);
-    assert.match(stdout, /Agentic source-gathering loop active/i);
-    assert.doesNotMatch(stdout, /Source gathering completed with/i);
+    assert.match(stdout, /Source tool loop active/i);
+    assert.doesNotMatch(stdout, /Source tool execution completed with/i);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("agentic source loop does not substitute fallback evidence for unknown researcher-selected ids", async () => {
+test("source tool loop does not substitute fallback evidence for unknown researcher-selected ids", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-no-fallback-evidence-"));
   const now = createNow();
   const originalFetch = globalThis.fetch;
@@ -2836,7 +2870,7 @@ test("agentic source loop does not substitute fallback evidence for unknown rese
         };
         notes?: string[];
       };
-      agenticSourceState?: {
+      sourceToolState?: {
         selectedPapers?: number;
       } | null;
     };
@@ -2848,7 +2882,7 @@ test("agentic source loop does not substitute fallback evidence for unknown rese
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
     assert.equal(sourcesArtifact.reviewWorkflow?.counts?.selectedForSynthesis, 0);
-    assert.equal(sourcesArtifact.agenticSourceState?.selectedPapers, 0);
+    assert.equal(sourcesArtifact.sourceToolState?.selectedPapers, 0);
     assert.equal(paperExtractions.extractionCount, 0);
     assert.match((sourcesArtifact.reviewWorkflow?.notes ?? []).join(" "), /no fallback semantic selection/i);
     assert.match((sourcesArtifact.reviewWorkflow?.notes ?? []).join(" "), /paper-does-not-exist/i);
@@ -2925,15 +2959,93 @@ test("run worker executes work-store tool operations inside the source loop", as
       "source.search"
     ]);
     assert.ok(backend.sourceActionRequests.every((request) => request.allowedActions.includes("workspace.patch")));
+    assert.ok(backend.sourceActionRequests.some((request) => (
+      request.workStore?.summary.sources === 2
+      && request.workStore.summary.providerRuns === 1
+      && request.workStore.recentSourceCandidates.some((source) => /Autonomous research agent harnesses/i.test(source.title))
+    )));
+    assert.ok(backend.sourceActionRequests.some((request) => (
+      (request.workStore?.summary.canonicalSources ?? 0) > 0
+      && (request.workStore?.recentSources.some((source) => /Autonomous research agent harnesses/i.test(source.title)) ?? false)
+    )));
     assert.match(stdout, /Work store tool observation: Workspace created work item/);
     assert.ok(workStore.objects.workItems.some((item) => item.title === "Inspect full-text-accessible autonomous research agent sources" && item.source === "runtime"));
+    assert.equal(workStore.objects.providerRuns.length, 1);
+    assert.ok(workStore.objects.sources.some((source) => /Autonomous research agent harnesses/i.test(source.title)));
+    assert.ok(workStore.objects.canonicalSources.some((source) => /Autonomous research agent harnesses/i.test(source.title)));
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("agentic source dashboard asks the model to reconsider repeated low-yield searches", async () => {
+test("source tool loop does not choose a fallback provider for providerless searches", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-no-source-provider-fallback-"));
+  const now = createNow();
+  const originalFetch = globalThis.fetch;
+  let fetchCalls = 0;
+
+  try {
+    globalThis.fetch = async (): Promise<Response> => {
+      fetchCalls += 1;
+      throw new Error("No source provider should be queried without explicit provider ids.");
+    };
+
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "autonomous research agent harnesses",
+      researchQuestion: "How should source tools handle missing provider choices?",
+      researchDirection: "Validate source-tool autonomy boundaries.",
+      successCriterion: "Do not let the runtime choose semantic/provider strategy for the model."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = [];
+    projectConfig.sources.publisherFullText.selectedProviderIds = ["arxiv"];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.localContext.projectFilesEnabled = false;
+    projectConfig.sources.explicitlyConfigured = true;
+    await projectConfigStore.save(projectConfig);
+
+    const backend = new ProviderlessSourceSearchBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+    const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as {
+      sourceToolState?: {
+        attemptedProviderIds?: string[];
+        canonicalMergeCompleted?: boolean;
+      } | null;
+      reviewWorkflow?: {
+        counts?: {
+          selectedForSynthesis?: number;
+        };
+      };
+    };
+
+    assert.equal(exitCode, 0);
+    assert.equal(fetchCalls, 0);
+    assert.ok(backend.sourceActions.every((action) => action.action === "source.search"));
+    assert.match(stdout, /no fallback provider was selected/i);
+    assert.equal(sourcesArtifact.sourceToolState?.canonicalMergeCompleted, false);
+    assert.deepEqual(sourcesArtifact.sourceToolState?.attemptedProviderIds, []);
+    assert.equal(sourcesArtifact.reviewWorkflow?.counts?.selectedForSynthesis, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("source tool dashboard asks the model to reconsider repeated low-yield searches", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-source-dashboard-"));
   const now = createNow();
   const originalFetch = globalThis.fetch;
@@ -2988,8 +3100,8 @@ test("agentic source dashboard asks the model to reconsider repeated low-yield s
     const completedRun = await runStore.load(run.id);
     const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
     const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as {
-      agenticSourceState?: {
-        sourceStage?: string;
+      sourceToolState?: {
+        canonicalMergeCompleted?: boolean;
         consecutiveNoProgressSearches?: number;
         repeatedSearchWarnings?: string[];
         recentActions?: Array<{ action: string; newSources: number }>;
@@ -3002,17 +3114,17 @@ test("agentic source dashboard asks the model to reconsider repeated low-yield s
     assert.ok(backend.sourceActions.some((action) => action.action === "merge_sources"));
     assert.match(stdout, /Source dashboard:/);
     assert.match(stdout, /low-yield|exhausted|consecutive source searches/i);
-    assert.equal(sourcesArtifact.agenticSourceState?.sourceStage, "selected");
-    assert.ok((sourcesArtifact.agenticSourceState?.consecutiveNoProgressSearches ?? 0) >= 2);
-    assert.ok(sourcesArtifact.agenticSourceState?.repeatedSearchWarnings?.some((warning) => /consecutive source searches/i.test(warning)));
-    assert.ok(sourcesArtifact.agenticSourceState?.recentActions?.some((action) => action.action === "select_evidence_set"));
+    assert.equal(sourcesArtifact.sourceToolState?.canonicalMergeCompleted, true);
+    assert.ok((sourcesArtifact.sourceToolState?.consecutiveNoProgressSearches ?? 0) >= 2);
+    assert.ok(sourcesArtifact.sourceToolState?.repeatedSearchWarnings?.some((warning) => /consecutive source searches/i.test(warning)));
+    assert.ok(sourcesArtifact.sourceToolState?.recentActions?.some((action) => action.action === "select_evidence_set"));
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("agentic source dashboard does not fabricate evidence when the model ignores exhausted-search guidance", async () => {
+test("source tool dashboard does not fabricate evidence when the model ignores exhausted-search guidance", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-source-dashboard-ignore-"));
   const now = createNow();
   const originalFetch = globalThis.fetch;
@@ -3067,8 +3179,8 @@ test("agentic source dashboard does not fabricate evidence when the model ignore
     const completedRun = await runStore.load(run.id);
     const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
     const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as {
-      agenticSourceState?: {
-        sourceStage?: string;
+      sourceToolState?: {
+        canonicalMergeCompleted?: boolean;
         recentActions?: Array<{ action: string; newSources: number }>;
       } | null;
       reviewWorkflow?: {
@@ -3082,11 +3194,12 @@ test("agentic source dashboard does not fabricate evidence when the model ignore
     assert.equal(completedRun.status, "completed");
     assert.ok(backend.sourceActions.every((action) => action.action === "search_sources"));
     assert.match(stdout, /Source dashboard:/);
-    assert.match(stdout, /Source tool observation: Merged 1 screened scholarly sources into 1 canonical papers/i);
-    assert.equal(sourcesArtifact.agenticSourceState?.sourceStage, "selected");
+    assert.match(stdout, /runtime will not merge them unless the researcher explicitly calls source\.merge/i);
+    assert.doesNotMatch(stdout, /Source tool observation: Merged 1 screened scholarly sources into 1 canonical papers/i);
+    assert.match(stdout, /Source tool loop checkpointed with 0 canonical papers and 0 selected papers/i);
+    assert.equal(sourcesArtifact.sourceToolState?.canonicalMergeCompleted, false);
     assert.equal(sourcesArtifact.reviewWorkflow?.counts?.selectedForSynthesis, 0);
-    assert.match(stdout, /no fallback semantic selection/i);
-    assert.ok(sourcesArtifact.agenticSourceState?.recentActions?.some((action) => action.action === "select_evidence_set"));
+    assert.equal(sourcesArtifact.sourceToolState?.recentActions?.some((action) => action.action === "select_evidence_set"), false);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
@@ -3125,7 +3238,7 @@ test("run worker shrinks extraction batches after timeout and checkpoints retrie
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer: new MultiPaperSourceGatherer(3)
+      sourceToolAdapter: new MultiPaperSourceToolAdapter(3)
     });
 
     const completedRun = await runStore.load(run.id);
@@ -3179,7 +3292,7 @@ test("run worker builds manuscript progress through claim, evidence, and section
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer: new MultiPaperSourceGatherer(4)
+      sourceToolAdapter: new MultiPaperSourceToolAdapter(4)
     });
 
     const completedRun = await runStore.load(run.id);
@@ -3256,7 +3369,7 @@ test("protocol.create_or_revise persists a researcher-owned protocol object", as
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer: new MultiPaperSourceGatherer(3)
+      sourceToolAdapter: new MultiPaperSourceToolAdapter(3)
     });
 
     const workStore = await loadResearchWorkStore({
@@ -3322,7 +3435,7 @@ test("run worker feeds workspace list previews back into the next synthesis acti
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer: new MultiPaperSourceGatherer(4)
+      sourceToolAdapter: new MultiPaperSourceToolAdapter(4)
     });
 
     const completedRun = await runStore.load(run.id);
@@ -3383,7 +3496,7 @@ test("run worker creates durable support links from claims to evidence cells and
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer: new MultiPaperSourceGatherer(3)
+      sourceToolAdapter: new MultiPaperSourceToolAdapter(3)
     });
 
     const completedRun = await runStore.load(run.id);
@@ -3455,7 +3568,7 @@ test("run worker release checks reject mismatched support-link evidence provenan
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer: new MultiPaperSourceGatherer(3)
+      sourceToolAdapter: new MultiPaperSourceToolAdapter(3)
     });
 
     const completedRun = await runStore.load(run.id);
@@ -3518,7 +3631,7 @@ test("run worker finishes status-only when the model cannot choose structured ac
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer: new MultiPaperSourceGatherer(3)
+      sourceToolAdapter: new MultiPaperSourceToolAdapter(3)
     });
 
     const completedRun = await runStore.load(run.id);
@@ -3587,14 +3700,14 @@ test("run worker does not turn semantic evidence warnings into hardcoded revisio
     await projectConfigStore.save(projectConfig);
 
     const backend = new StubResearchBackend();
-    const sourceGatherer = new EvidenceRecoverySourceGatherer();
+    const sourceToolAdapter = new EvidenceRecoverySourceToolAdapter();
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer
+      sourceToolAdapter
     });
 
     const completedRun = await runStore.load(run.id);
@@ -3616,7 +3729,7 @@ test("run worker does not turn semantic evidence warnings into hardcoded revisio
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
-    assert.equal(sourceGatherer.requests.length, 1);
+    assert.equal(sourceToolAdapter.requests.length, 1);
     assert.equal(sourcesArtifact.autonomousEvidence.pass, 1);
     assert.equal(sourcesArtifact.autonomousEvidence.revisionPasses, 0);
     assert.ok(planArtifact.searchQueries.length > 0);
@@ -3653,14 +3766,14 @@ test("run worker does not generate recovery queries from evidence targets alone"
     await projectConfigStore.save(projectConfig);
 
     const backend = new EvidenceTargetOnlyRevisionBackend();
-    const sourceGatherer = new EvidenceRecoverySourceGatherer();
+    const sourceToolAdapter = new EvidenceRecoverySourceToolAdapter();
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer
+      sourceToolAdapter
     });
 
     const completedRun = await runStore.load(run.id);
@@ -3675,7 +3788,7 @@ test("run worker does not generate recovery queries from evidence targets alone"
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
-    assert.equal(sourceGatherer.requests.length, 1);
+    assert.equal(sourceToolAdapter.requests.length, 1);
     assert.equal(sourcesArtifact.autonomousEvidence.pass, 1);
     assert.equal(sourcesArtifact.autonomousEvidence.revisionPasses, 0);
     assert.doesNotMatch(planArtifact.searchQueries.join(" "), /benchmark evaluation/i);
@@ -3711,14 +3824,14 @@ test("run worker preserves the current useful evidence set when a revision pass 
     await projectConfigStore.save(projectConfig);
 
     const backend = new RevisionThenWorkspaceBackend();
-    const sourceGatherer = new UsefulThenEmptySourceGatherer();
+    const sourceToolAdapter = new UsefulThenEmptySourceToolAdapter();
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer
+      sourceToolAdapter
     });
 
     const completedRun = await runStore.load(run.id);
@@ -3742,8 +3855,8 @@ test("run worker preserves the current useful evidence set when a revision pass 
 
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
-    assert.equal(sourceGatherer.requests.length, 2);
-    assert.ok((sourceGatherer.requests[1]?.revisionQueries?.length ?? 0) > 0);
+    assert.equal(sourceToolAdapter.requests.length, 2);
+    assert.ok((sourceToolAdapter.requests[1]?.revisionQueries?.length ?? 0) > 0);
     assert.equal(sourcesArtifact.autonomousEvidence.pass, 2);
     assert.equal(sourcesArtifact.autonomousEvidence.revisionPasses, 1);
     assert.equal(sourcesArtifact.reviewWorkflow.counts.selectedForSynthesis, 3);
@@ -3791,7 +3904,7 @@ test("run worker blocks manuscript generation when extraction cannot complete af
       version: "0.7.0",
       now,
       researchBackend: new PersistentlyFailingExtractionBackend(),
-      sourceGatherer: new MultiPaperSourceGatherer(2)
+      sourceToolAdapter: new MultiPaperSourceToolAdapter(2)
     });
 
     const failedRun = await runStore.load(run.id);
@@ -3825,8 +3938,8 @@ test("run worker synthesizes from the reviewed subset instead of the full canoni
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-reviewed-subset-"));
   const now = createNow();
 
-  class ReviewedSubsetSourceGatherer implements ResearchSourceGatherer {
-    async gather(): Promise<ResearchSourceGatherResult> {
+  class ReviewedSubsetSourceToolAdapter implements ResearchSourceToolAdapter {
+    async run(): Promise<ResearchSourceSnapshot> {
       const includedPaper = canonicalPaper({
         id: "paper-reviewed",
         key: "doi:10.1000/reviewed",
@@ -3912,7 +4025,7 @@ test("run worker synthesizes from the reviewed subset instead of the full canoni
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer: new ReviewedSubsetSourceGatherer()
+      sourceToolAdapter: new ReviewedSubsetSourceToolAdapter()
     });
 
     const completedRun = await runStore.load(run.id);
@@ -3949,8 +4062,8 @@ test("run worker previews reviewed papers instead of raw-source noise in the liv
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-preview-"));
   const now = createNow();
 
-  class PreviewSourceGatherer implements ResearchSourceGatherer {
-    async gather(): Promise<ResearchSourceGatherResult> {
+  class PreviewSourceToolAdapter implements ResearchSourceToolAdapter {
+    async run(): Promise<ResearchSourceSnapshot> {
       const reviewedPaper = canonicalPaper({
         id: "paper-reviewed-preview",
         key: "doi:10.1000/reviewed-preview",
@@ -4047,7 +4160,7 @@ test("run worker previews reviewed papers instead of raw-source noise in the liv
       version: "0.7.0",
       now,
       researchBackend: new StubResearchBackend(),
-      sourceGatherer: new PreviewSourceGatherer()
+      sourceToolAdapter: new PreviewSourceToolAdapter()
     });
 
     const completedRun = await runStore.load(run.id);
@@ -4149,7 +4262,7 @@ test("run worker uses prior literature memory to inform planning and retrieval",
       version: "0.7.0",
       now,
       researchBackend: new LiteratureAwareResearchBackend(),
-      sourceGatherer: new LiteratureAwareSourceGatherer()
+      sourceToolAdapter: new LiteratureAwareSourceToolAdapter()
     });
 
     const completedRun = await runStore.load(run.id);
@@ -4188,7 +4301,7 @@ test("run worker writes a hold agenda when no canonical papers are retained", as
       version: "0.7.0",
       now,
       researchBackend: new StubResearchBackend(),
-      sourceGatherer: new NoEvidenceSourceGatherer()
+      sourceToolAdapter: new NoEvidenceSourceToolAdapter()
     });
 
     const completedRun = await runStore.load(run.id);
@@ -4247,8 +4360,8 @@ test("run worker writes a hold agenda when retrieval found papers but review ret
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-no-reviewed-"));
   const now = createNow();
 
-  class NoReviewedSubsetSourceGatherer implements ResearchSourceGatherer {
-    async gather(): Promise<ResearchSourceGatherResult> {
+  class NoReviewedSubsetSourceToolAdapter implements ResearchSourceToolAdapter {
+    async run(): Promise<ResearchSourceSnapshot> {
       const papers = [
         canonicalPaper({
           id: "paper-blocked",
@@ -4322,7 +4435,7 @@ test("run worker writes a hold agenda when retrieval found papers but review ret
       version: "0.7.0",
       now,
       researchBackend: new StubResearchBackend(),
-      sourceGatherer: new NoReviewedSubsetSourceGatherer()
+      sourceToolAdapter: new NoReviewedSubsetSourceToolAdapter()
     });
 
     const completedRun = await runStore.load(run.id);
@@ -4348,13 +4461,13 @@ test("protocol critic block records a warning and continues to source gathering"
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-protocol-"));
   const now = createNow();
 
-  class CapturingSourceGatherer implements ResearchSourceGatherer {
-    private readonly base = new StubSourceGatherer();
-    requests: ResearchSourceGatherRequest[] = [];
+  class CapturingSourceToolAdapter implements ResearchSourceToolAdapter {
+    private readonly base = new StubSourceToolAdapter();
+    requests: ResearchSourceToolRequest[] = [];
 
-    async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
+    async run(request: ResearchSourceToolRequest): Promise<ResearchSourceSnapshot> {
       this.requests.push(request);
-      return this.base.gather();
+      return this.base.run();
     }
   }
 
@@ -4367,14 +4480,14 @@ test("protocol critic block records a warning and continues to source gathering"
       successCriterion: "Produce a publication-style paper with citations."
     }, ["clawresearch", "research-loop"]);
 
-    const gatherer = new CapturingSourceGatherer();
+    const gatherer = new CapturingSourceToolAdapter();
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
       version: "0.7.0",
       now,
       researchBackend: new ProtocolBlockingBackend(),
-      sourceGatherer: gatherer
+      sourceToolAdapter: gatherer
     });
 
     const completedRun = await runStore.load(run.id);
@@ -4415,13 +4528,13 @@ test("protocol critic feedback becomes work items instead of runtime protocol qu
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-protocol-revision-"));
   const now = createNow();
 
-  class CapturingSourceGatherer implements ResearchSourceGatherer {
-    private readonly base = new StubSourceGatherer();
-    requests: ResearchSourceGatherRequest[] = [];
+  class CapturingSourceToolAdapter implements ResearchSourceToolAdapter {
+    private readonly base = new StubSourceToolAdapter();
+    requests: ResearchSourceToolRequest[] = [];
 
-    async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
+    async run(request: ResearchSourceToolRequest): Promise<ResearchSourceSnapshot> {
       this.requests.push(request);
-      return this.base.gather();
+      return this.base.run();
     }
   }
 
@@ -4435,14 +4548,14 @@ test("protocol critic feedback becomes work items instead of runtime protocol qu
     }, ["clawresearch", "research-loop"]);
 
     const backend = new ProtocolRecoveryBackend();
-    const gatherer = new CapturingSourceGatherer();
+    const gatherer = new CapturingSourceToolAdapter();
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer: gatherer
+      sourceToolAdapter: gatherer
     });
 
     const completedRun = await runStore.load(run.id);
@@ -4470,13 +4583,13 @@ test("persistent protocol critic revise continues to source gathering after boun
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-critic-protocol-revise-"));
   const now = createNow();
 
-  class CapturingSourceGatherer implements ResearchSourceGatherer {
-    private readonly base = new StubSourceGatherer();
-    requests: ResearchSourceGatherRequest[] = [];
+  class CapturingSourceToolAdapter implements ResearchSourceToolAdapter {
+    private readonly base = new StubSourceToolAdapter();
+    requests: ResearchSourceToolRequest[] = [];
 
-    async gather(request: ResearchSourceGatherRequest): Promise<ResearchSourceGatherResult> {
+    async run(request: ResearchSourceToolRequest): Promise<ResearchSourceSnapshot> {
       this.requests.push(request);
-      return this.base.gather();
+      return this.base.run();
     }
   }
 
@@ -4490,14 +4603,14 @@ test("persistent protocol critic revise continues to source gathering after boun
     }, ["clawresearch", "research-loop"]);
 
     const backend = new ProtocolAlwaysReviseBackend();
-    const gatherer = new CapturingSourceGatherer();
+    const gatherer = new CapturingSourceToolAdapter();
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer: gatherer
+      sourceToolAdapter: gatherer
     });
 
     const completedRun = await runStore.load(run.id);
@@ -4528,7 +4641,7 @@ test("source-selection critic feedback becomes work items instead of runtime sea
       successCriterion: "Cover benchmark evaluation directly."
     }, ["clawresearch", "research-loop"]);
 
-    const gatherer = new EvidenceRecoverySourceGatherer();
+    const gatherer = new EvidenceRecoverySourceToolAdapter();
     const backend = new SourceSelectionRecoveryBackend();
     const exitCode = await runDetachedJobWorker({
       projectRoot,
@@ -4536,7 +4649,7 @@ test("source-selection critic feedback becomes work items instead of runtime sea
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer: gatherer
+      sourceToolAdapter: gatherer
     });
 
     const completedRun = await runStore.load(run.id);
@@ -4573,7 +4686,7 @@ test("source-selection critic paper exclusions become work items without mutatin
       successCriterion: "Use direct autonomous research-agent system evidence."
     }, ["clawresearch", "research-loop"]);
 
-    const gatherer = new CriticExclusionSourceGatherer();
+    const gatherer = new CriticExclusionSourceToolAdapter();
     const backend = new SourceSelectionExclusionBackend();
     const exitCode = await runDetachedJobWorker({
       projectRoot,
@@ -4581,7 +4694,7 @@ test("source-selection critic paper exclusions become work items without mutatin
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer: gatherer
+      sourceToolAdapter: gatherer
     });
 
     const completedRun = await runStore.load(run.id);
@@ -4621,7 +4734,7 @@ test("source-selection critic paper promotions become work items without mutatin
       successCriterion: "Use the strongest autonomous research-agent architecture evidence already found."
     }, ["clawresearch", "research-loop"]);
 
-    const gatherer = new CriticPromotionSourceGatherer();
+    const gatherer = new CriticPromotionSourceToolAdapter();
     const backend = new SourceSelectionPromotionBackend();
     const exitCode = await runDetachedJobWorker({
       projectRoot,
@@ -4629,7 +4742,7 @@ test("source-selection critic paper promotions become work items without mutatin
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer: gatherer
+      sourceToolAdapter: gatherer
     });
 
     const completedRun = await runStore.load(run.id);
@@ -4673,7 +4786,7 @@ test("generic critic fallback text is recorded without becoming retrieval query 
       successCriterion: "Cover benchmark evaluation directly."
     }, ["clawresearch", "research-loop"]);
 
-    const gatherer = new EvidenceRecoverySourceGatherer();
+    const gatherer = new EvidenceRecoverySourceToolAdapter();
     const backend = new GenericSourceSelectionCriticBackend();
     const exitCode = await runDetachedJobWorker({
       projectRoot,
@@ -4681,7 +4794,7 @@ test("generic critic fallback text is recorded without becoming retrieval query 
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer: gatherer
+      sourceToolAdapter: gatherer
     });
 
     const revisionQueries = gatherer.requests[1]?.revisionQueries ?? [];
@@ -4716,7 +4829,7 @@ test("persistent source-selection critic concerns are reported without stopping 
       version: "0.7.0",
       now,
       researchBackend: backend,
-      sourceGatherer: new MultiPaperSourceGatherer(3)
+      sourceToolAdapter: new MultiPaperSourceToolAdapter(3)
     });
 
     const completedRun = await runStore.load(run.id);
@@ -4790,7 +4903,7 @@ test("release critic block is recorded as diagnostics without replacing a valid 
       version: "0.7.0",
       now,
       researchBackend: new ReleaseBlockingBackend(),
-      sourceGatherer: new MultiPaperSourceGatherer(3)
+      sourceToolAdapter: new MultiPaperSourceToolAdapter(3)
     });
 
     const completedRun = await runStore.load(run.id);

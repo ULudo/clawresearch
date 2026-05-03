@@ -80,14 +80,15 @@ import {
   type CriticReviewStage
 } from "./research-critic.js";
 import {
-  AgenticSourceGatherSession,
+  SourceToolRuntime,
   collectResearchLocalFileHints,
-  type AgenticSourceState,
+  type SourceToolState,
   type ResearchSource,
-  type ResearchSourceGatherRequest,
-  type SourceGatherProgressEvent,
-  type ResearchSourceGatherer,
-  type ResearchSourceGatherResult
+  type ResearchSourceToolRequest,
+  type SourceToolProgressEvent,
+  type ResearchSourceToolAdapter,
+  type ResearchSourceSnapshot,
+  type SourceToolObservation
 } from "./research-sources.js";
 import {
   type RunController
@@ -153,7 +154,7 @@ type WorkerOptions = {
   version: string;
   now?: () => string;
   researchBackend?: ResearchBackend;
-  sourceGatherer?: ResearchSourceGatherer;
+  sourceToolAdapter?: ResearchSourceToolAdapter;
   runController?: RunController;
 };
 
@@ -310,7 +311,7 @@ async function writeJsonArtifact(filePath: string, value: JsonValue | Record<str
   await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
-function sourceProgressEventKind(event: SourceGatherProgressEvent): RunEventKind {
+function sourceProgressEventKind(event: SourceToolProgressEvent): RunEventKind {
   if (event.status === "failed") {
     return "stderr";
   }
@@ -320,25 +321,25 @@ function sourceProgressEventKind(event: SourceGatherProgressEvent): RunEventKind
     : "literature";
 }
 
-function sourceProgressMessage(event: SourceGatherProgressEvent): string {
+function sourceProgressMessage(event: SourceToolProgressEvent): string {
   const provider = event.providerId === undefined ? "" : ` [${event.providerId}]`;
   return `${event.message}${provider}`;
 }
 
-async function writeSourceGatherCheckpoint(input: {
+async function writeSourceToolCheckpoint(input: {
   run: RunRecord;
   now: () => string;
   evidencePass: number;
   revisionPasses: number;
   maxRevisionPasses: number;
-  event: SourceGatherProgressEvent;
-  sourceState?: AgenticSourceState | null;
+  event: SourceToolProgressEvent;
+  sourceState?: SourceToolState | null;
 }): Promise<void> {
   await writeJsonArtifact(input.run.artifacts.sourcesPath, {
     schemaVersion: 1,
     runId: input.run.id,
     status: input.event.phase === "completed" && input.event.status === "completed" ? "completed" : "in_progress",
-    stage: "source_gathering",
+    stage: "source_tools",
     updatedAt: input.now(),
     autonomousEvidence: {
       pass: input.evidencePass,
@@ -350,7 +351,7 @@ async function writeSourceGatherCheckpoint(input: {
   });
 }
 
-function sourceStateForAgent(session: AgenticSourceGatherSession): ResearchActionRequest["sourceState"] {
+function sourceStateForAgent(session: SourceToolRuntime): ResearchActionRequest["sourceState"] {
   const state = session.state();
   return {
     availableProviderIds: state.availableProviderIds,
@@ -359,7 +360,7 @@ function sourceStateForAgent(session: AgenticSourceGatherSession): ResearchActio
     rawSources: state.rawSources,
     screenedSources: state.screenedSources,
     backgroundSources: state.backgroundSources,
-    sourceStage: state.sourceStage,
+    canonicalMergeCompleted: state.canonicalMergeCompleted,
     canonicalPapers: state.canonicalPapers,
     candidatePaperIds: state.candidatePaperIds,
     resolvedPaperIds: state.resolvedPaperIds,
@@ -439,6 +440,13 @@ function workStoreContextForAgent(store: ResearchWorkStore): ResearchActionReque
       evidenceTargets: protocol.evidenceTargets.slice(0, 8),
       author: protocol.author
     })),
+    recentSourceCandidates: store.objects.sources.slice(-12).map((source) => ({
+      id: source.id,
+      title: source.title,
+      providerId: source.providerId,
+      category: source.category,
+      sourceKind: source.sourceKind
+    })),
     recentSources: store.objects.canonicalSources.slice(-12).map((source) => ({
       id: source.id,
       title: source.title,
@@ -479,10 +487,6 @@ function isSourceSearchAction(action: ResearchActionDecision["action"]): boolean
 
 function isSourceMergeAction(action: ResearchActionDecision["action"]): boolean {
   return action === "source.merge" || action === "merge_sources";
-}
-
-function isSourceRankAction(action: ResearchActionDecision["action"]): boolean {
-  return action === "source.rank" || action === "rank_sources";
 }
 
 function isSourceResolveAccessAction(action: ResearchActionDecision["action"]): boolean {
@@ -899,6 +903,121 @@ function rememberAgentToolResult(results: AgentToolResult[], result: AgentToolRe
   }
 
   return [...results, result].slice(-6);
+}
+
+function canonicalSourceToolAction(action: SourceToolObservation["action"]): string {
+  switch (action) {
+    case "query_provider":
+      return "source.search";
+    case "merge_sources":
+      return "source.merge";
+    case "resolve_access":
+      return "source.resolve_access";
+    case "select_evidence_set":
+      return "source.select_evidence";
+  }
+}
+
+function sourceToolStatus(observation: SourceToolObservation): AgentToolResult["status"] {
+  if (/\b(failed|not available)\b/i.test(observation.message)) {
+    return "failed";
+  }
+
+  if (/\b(skipped|no automatic|without automatic|will not|no fallback|requires explicit|contained no known)\b/i.test(observation.message)) {
+    return "noop";
+  }
+
+  return "ok";
+}
+
+function sourceToolCount(observation: SourceToolObservation): number {
+  return observation.counts.selectedPapers
+    ?? observation.counts.resolvedPapers
+    ?? observation.counts.candidatePapers
+    ?? observation.counts.canonicalPapers
+    ?? observation.counts.newSources
+    ?? observation.items?.length
+    ?? 0;
+}
+
+function sourceToolTotalCount(observation: SourceToolObservation): number {
+  return observation.counts.rawCandidates
+    ?? observation.counts.canonicalPapers
+    ?? observation.counts.scholarlySources
+    ?? sourceToolCount(observation);
+}
+
+function sourceToolNextHints(observation: SourceToolObservation): string[] {
+  switch (observation.action) {
+    case "query_provider":
+      return ["source.search", "source.merge", "workspace.list"];
+    case "merge_sources":
+      return ["workspace.read", "source.resolve_access", "source.select_evidence"];
+    case "resolve_access":
+      return ["workspace.read", "source.select_evidence", "claim.create"];
+    case "select_evidence_set":
+      return ["workspace.read", "claim.create", "section.create"];
+  }
+}
+
+function sourceToolItemsForAgent(observation: SourceToolObservation): AgentVisibleEntityPreview[] {
+  return (observation.items ?? []).map((item) => ({
+    id: item.id,
+    kind: item.kind,
+    title: item.title,
+    sourceIds: item.sourceIds,
+    status: item.status ?? item.accessMode,
+    snippet: item.snippet,
+    fields: {
+      providerId: item.providerId ?? null,
+      locator: item.locator ?? null,
+      accessMode: item.accessMode ?? null,
+      year: item.year ?? null,
+      venue: item.venue ?? null,
+      ...(item.fields ?? {})
+    }
+  }));
+}
+
+function sourceToolResultFromObservation(input: {
+  run: RunRecord;
+  now: () => string;
+  decision: ResearchActionDecision;
+  observation: SourceToolObservation;
+  providerId?: SourceProviderId;
+}): AgentToolResult {
+  const timestamp = input.now();
+  const action = canonicalSourceToolAction(input.observation.action);
+  const items = sourceToolItemsForAgent(input.observation);
+  const providerIds = input.providerId === undefined
+    ? input.decision.inputs.providerIds
+    : [input.providerId];
+
+  return makeAgentToolResult({
+    run: input.run,
+    action,
+    timestamp,
+    status: sourceToolStatus(input.observation),
+    readOnly: false,
+    message: input.observation.message,
+    collection: action === "source.search" ? "sources" : "canonicalSources",
+    query: {
+      providerIds,
+      searchQueries: input.decision.inputs.searchQueries,
+      paperIds: input.decision.inputs.paperIds
+    },
+    count: sourceToolCount(input.observation),
+    totalCount: sourceToolTotalCount(input.observation),
+    hasMore: false,
+    items,
+    stateDelta: Object.fromEntries(
+      Object.entries(input.observation.counts)
+        .filter(([, value]) => typeof value === "number")
+        .map(([key, value]) => [key, value as number])
+    ),
+    nextHints: sourceToolNextHints(input.observation),
+    error: sourceToolStatus(input.observation) === "failed" ? input.observation.message : null
+  });
 }
 
 function numericTextIdPart(text: string): string {
@@ -2313,7 +2432,7 @@ async function executeWorkspaceToolAction(input: {
 
 function validSourceProviderChoices(
   decision: ResearchActionDecision,
-  session: AgenticSourceGatherSession
+  session: SourceToolRuntime
 ): SourceProviderId[] {
   const available = new Set(session.state().availableProviderIds);
   return uniqueStrings(decision.inputs.providerIds)
@@ -2322,7 +2441,7 @@ function validSourceProviderChoices(
 
 function sourceQueriesForAction(
   decision: ResearchActionDecision,
-  session: AgenticSourceGatherSession
+  session: SourceToolRuntime
 ): string[] {
   void session;
   return uniqueStrings(decision.inputs.searchQueries).slice(0, 6);
@@ -2330,7 +2449,7 @@ function sourceQueriesForAction(
 
 function sourceSearchReconsiderationReason(input: {
   decision: ResearchActionDecision;
-  session: AgenticSourceGatherSession;
+  session: SourceToolRuntime;
   providerIds: SourceProviderId[];
   queries: string[];
 }): string | null {
@@ -2341,8 +2460,8 @@ function sourceSearchReconsiderationReason(input: {
   const state = input.session.state();
   const exhaustedChosenProviders = input.providerIds.filter((providerId) => input.session.isSearchExhausted(providerId, input.queries));
   const reasons = [
-    state.sourceStage !== "querying"
-      ? `Source stage is already ${state.sourceStage}; searching again will discard the current canonical review state unless a specific gap requires it.`
+    state.canonicalMergeCompleted
+      ? "Canonical source records are already available; searching again will discard the current canonical source view unless a specific gap requires it."
       : null,
     state.mergeReadiness.ready
       ? state.mergeReadiness.reason
@@ -2359,22 +2478,20 @@ function sourceSearchReconsiderationReason(input: {
     return null;
   }
 
-  const recommended = state.mergeReadiness.recommendedActions.length > 0
-    ? `Recommended next source actions: ${state.mergeReadiness.recommendedActions.join(", ")}.`
-    : "If you still search, choose a not-yet-exhausted provider/query and name the missing evidence target.";
+  const recommended = "If you still search, choose a not-yet-exhausted provider/query and name the missing evidence target; otherwise explicitly choose source.merge or another source/workspace tool.";
 
   return `${reasons.join(" ")} ${recommended}`;
 }
 
-async function checkpointAgenticSourceState(input: {
+async function checkpointSourceToolState(input: {
   run: RunRecord;
   now: () => string;
-  session: AgenticSourceGatherSession;
+  session: SourceToolRuntime;
   evidencePassNumber: number;
   maxRevisionPasses: number;
   message: string;
 }): Promise<void> {
-  await writeSourceGatherCheckpoint({
+  await writeSourceToolCheckpoint({
     run: input.run,
     now: input.now,
     evidencePass: input.evidencePassNumber,
@@ -2389,18 +2506,43 @@ async function checkpointAgenticSourceState(input: {
   });
 }
 
-async function runAgenticSourceGathering(input: {
+async function persistSourceToolWorkspaceSnapshot(input: {
+  run: RunRecord;
+  now: () => string;
+  plan: ResearchPlan;
+  session: SourceToolRuntime;
+  workStore: ResearchWorkStore;
+}): Promise<ResearchWorkStore> {
+  const timestamp = input.now();
+  const nextStore = mergeRunSegmentIntoResearchWorkStore(input.workStore, {
+    run: input.run,
+    plan: input.plan,
+    gathered: input.session.snapshot(),
+    paperExtractions: [],
+    evidenceMatrix: null,
+    synthesis: null,
+    verification: null,
+    agenda: null,
+    manuscriptBundle: null,
+    criticReports: [],
+    now: timestamp
+  });
+  await writeResearchWorkStore(nextStore);
+  return nextStore;
+}
+
+async function runSourceToolLoop(input: {
   run: RunRecord;
   now: () => string;
   researchBackend: ResearchBackend;
   runtimeConfig: RuntimeLlmConfig;
   agent: AgentStepRecorder;
-  request: ResearchSourceGatherRequest;
+  request: ResearchSourceToolRequest;
   diagnostics: ResearchActionDiagnostic[];
   actionTransports: AgentActionTransportRecord[];
   evidencePassNumber: number;
   workStore: ResearchWorkStore;
-}): Promise<{ gathered: ResearchSourceGatherResult; workStore: ResearchWorkStore }> {
+}): Promise<{ gathered: ResearchSourceSnapshot; workStore: ResearchWorkStore }> {
   const {
     run,
     now,
@@ -2414,8 +2556,40 @@ async function runAgenticSourceGathering(input: {
   } = input;
   let workStore = input.workStore;
   let toolResults: AgentToolResult[] = [];
-  const session = await AgenticSourceGatherSession.create(request);
+  const session = await SourceToolRuntime.create(request);
   const maxSourceToolSteps = 10;
+  const rememberSourceObservation = (
+    decision: ResearchActionDecision,
+    observation: SourceToolObservation,
+    providerId?: SourceProviderId
+  ): void => {
+    toolResults = rememberAgentToolResult(toolResults, sourceToolResultFromObservation({
+      run,
+      now,
+      decision,
+      observation,
+      providerId
+    }));
+  };
+  const rememberSourceNoop = (decision: ResearchActionDecision, message: string): void => {
+    rememberSourceObservation(decision, {
+      action: "query_provider",
+      message,
+      counts: {
+        newSources: 0
+      },
+      items: []
+    });
+  };
+  const persistSourceWorkspace = async (): Promise<void> => {
+    workStore = await persistSourceToolWorkspaceSnapshot({
+      run,
+      now,
+      plan: request.plan,
+      session,
+      workStore
+    });
+  };
 
   for (let step = 1; step <= maxSourceToolSteps; step += 1) {
     const state = session.state();
@@ -2452,7 +2626,7 @@ async function runAgenticSourceGathering(input: {
         retryInstruction: [
           "Use the stable workspace tool surface. The source_selection milestone is progress context, not a restricted menu.",
           "Use source.search with providerIds and searchQueries to query specific databases.",
-          "Use source.merge, source.rank, source.resolve_access, and source.select_evidence when those operations fit the current work-store/source state.",
+          "Use source.merge, source.resolve_access, and source.select_evidence when those operations fit the current work-store/source state.",
           "Use workspace.search/read/list/patch/create when you need to inspect or update durable research state before choosing a source operation.",
           "Do not ask the runtime to query every provider unless the observations justify it."
         ].join(" ")
@@ -2503,7 +2677,7 @@ async function runAgenticSourceGathering(input: {
           retryInstruction: [
             reconsiderationReason,
             "You may still choose source.search, but only with a provider/query combination that is not exhausted and a concrete missing evidence target.",
-            "If the current screened sources are enough for this pass, choose source.merge, source.rank, source.resolve_access, or source.select_evidence."
+            "If the current screened sources are enough for this pass, choose source.merge, source.resolve_access, or source.select_evidence."
           ].join(" ")
         }
       });
@@ -2529,24 +2703,11 @@ async function runAgenticSourceGathering(input: {
 
     if (isSourceMergeAction(decision.action)) {
       const observation = await session.mergeSources();
+      rememberSourceObservation(decision, observation);
+      await persistSourceWorkspace();
       await appendEvent(run, now, "source", observation.message);
       await appendStdout(run, `Source tool observation: ${observation.message}`);
-      await checkpointAgenticSourceState({
-        run,
-        now,
-        session,
-        evidencePassNumber,
-        maxRevisionPasses: runtimeConfig.evidenceRecoveryMaxPasses,
-        message: observation.message
-      });
-      continue;
-    }
-
-    if (isSourceRankAction(decision.action)) {
-      const observation = await session.rankSources();
-      await appendEvent(run, now, "source", observation.message);
-      await appendStdout(run, `Source tool observation: ${observation.message}`);
-      await checkpointAgenticSourceState({
+      await checkpointSourceToolState({
         run,
         now,
         session,
@@ -2559,9 +2720,11 @@ async function runAgenticSourceGathering(input: {
 
     if (isSourceResolveAccessAction(decision.action)) {
       const observation = await session.resolveAccess(decision.inputs.paperIds);
+      rememberSourceObservation(decision, observation);
+      await persistSourceWorkspace();
       await appendEvent(run, now, "source", observation.message);
       await appendStdout(run, `Source tool observation: ${observation.message}`);
-      await checkpointAgenticSourceState({
+      await checkpointSourceToolState({
         run,
         now,
         session,
@@ -2574,9 +2737,11 @@ async function runAgenticSourceGathering(input: {
 
     if (isSourceSelectEvidenceAction(decision.action)) {
       const observation = await session.selectEvidenceSet(decision.inputs.paperIds);
+      rememberSourceObservation(decision, observation);
+      await persistSourceWorkspace();
       await appendEvent(run, now, "source", observation.message);
       await appendStdout(run, `Source tool observation: ${observation.message}`);
-      await checkpointAgenticSourceState({
+      await checkpointSourceToolState({
         run,
         now,
         session,
@@ -2591,7 +2756,8 @@ async function runAgenticSourceGathering(input: {
     }
 
     if (isStatusAction(decision.action)) {
-      await appendEvent(run, now, "next", "Research agent ended source tool loop with a status-report action; selecting from gathered sources.");
+      await appendEvent(run, now, "next", "Research agent ended source tool loop with a status-report action; checkpointing current source state without automatic merge or selection.");
+      await persistSourceWorkspace();
       return {
         gathered: await session.result(),
         workStore
@@ -2614,57 +2780,48 @@ async function runAgenticSourceGathering(input: {
 
     if (queries.length === 0) {
       const message = "Source search skipped because the researcher did not provide explicit search query text.";
+      rememberSourceNoop(decision, message);
       await appendEvent(run, now, "next", message);
       await appendStdout(run, `Source tool observation: ${message}`);
       continue;
     }
 
-    const fallbackProvider = session.state().availableProviderIds
-      .find((providerId) => !session.state().attemptedProviderIds.includes(providerId));
-    const providerOrder = providers.length > 0
-      ? providers
-      : fallbackProvider === undefined ? [] : [fallbackProvider];
+    const providerOrder = providers;
 
     if (providerOrder.length === 0) {
-      await appendEvent(run, now, "next", "No unused source provider remained for the agentic source loop; selecting from gathered sources.");
-      return {
-        gathered: await session.result(),
-        workStore
-      };
+      const message = "Source search skipped because the researcher did not provide explicit valid provider ids; no fallback provider was selected.";
+      rememberSourceNoop(decision, message);
+      await appendEvent(run, now, "next", message);
+      await appendStdout(run, `Source tool observation: ${message}`);
+      continue;
     }
 
     const executableProviderOrder = providerOrder
       .filter((providerId) => !session.isSearchExhausted(providerId, queries));
 
     if (executableProviderOrder.length === 0 && session.state().mergeReadiness.ready) {
-      await appendEvent(run, now, "next", "All chosen source searches are low-yield or exhausted; using the current screened sources for canonical merge.");
-      const observation = await session.mergeSources();
-      await appendEvent(run, now, "source", observation.message);
-      await appendStdout(run, `Source tool observation: ${observation.message}`);
-      await checkpointAgenticSourceState({
-        run,
-        now,
-        session,
-        evidencePassNumber,
-        maxRevisionPasses: runtimeConfig.evidenceRecoveryMaxPasses,
-        message: observation.message
-      });
+      const message = "All chosen source searches are low-yield or exhausted; current screened sources are available, but the runtime will not merge them unless the researcher explicitly calls source.merge.";
+      rememberSourceNoop(decision, message);
+      await appendEvent(run, now, "next", message);
+      await appendStdout(run, `Source tool observation: ${message}`);
       continue;
     }
 
     if (executableProviderOrder.length === 0) {
-      await appendEvent(run, now, "next", "No executable source search target remained after the source dashboard filtered low-yield choices; selecting from gathered sources.");
-      return {
-        gathered: await session.result(),
-        workStore
-      };
+      const message = "No executable source search target remained after filtering low-yield choices; checkpointing current source state without automatic merge or selection.";
+      rememberSourceNoop(decision, message);
+      await appendEvent(run, now, "next", message);
+      await appendStdout(run, `Source tool observation: ${message}`);
+      continue;
     }
 
     for (const providerId of executableProviderOrder.slice(0, 2)) {
       const observation = await session.queryProvider(providerId, queries);
+      rememberSourceObservation(decision, observation, providerId);
+      await persistSourceWorkspace();
       await appendEvent(run, now, "source", observation.message);
       await appendStdout(run, `Source tool observation: ${observation.message}`);
-      await checkpointAgenticSourceState({
+      await checkpointSourceToolState({
         run,
         now,
         session,
@@ -2675,7 +2832,8 @@ async function runAgenticSourceGathering(input: {
     }
   }
 
-  await appendEvent(run, now, "next", "Agentic source tool loop reached its step budget; selecting from gathered sources.");
+  await appendEvent(run, now, "next", "Source tool loop reached its step budget; checkpointing current source state without automatic merge or selection.");
+  await persistSourceWorkspace();
   return {
     gathered: await session.result(),
     workStore
@@ -3369,7 +3527,7 @@ async function runManuscriptWorkspaceLoop(input: {
   diagnostics: ResearchActionDiagnostic[];
   actionTransports: AgentActionTransportRecord[];
   plan: ResearchPlan;
-  gathered: ResearchSourceGatherResult;
+  gathered: ResearchSourceSnapshot;
   paperExtractions: PaperExtraction[];
   evidenceMatrix: EvidenceMatrix;
   workStore: ResearchWorkStore;
@@ -3545,7 +3703,7 @@ async function runManuscriptWorkspaceLoop(input: {
   };
 }
 
-function emptyGatheredResult(plan: ResearchPlan): ResearchSourceGatherResult {
+function emptyGatheredResult(plan: ResearchPlan): ResearchSourceSnapshot {
   return {
     notes: [],
     sources: [],
@@ -3595,7 +3753,7 @@ type EvidenceQualitySnapshot = {
   score: number;
 };
 
-function evidenceQualitySnapshot(gathered: ResearchSourceGatherResult): EvidenceQualitySnapshot {
+function evidenceQualitySnapshot(gathered: ResearchSourceSnapshot): EvidenceQualitySnapshot {
   const relevanceAssessments = gathered.relevanceAssessments ?? [];
   const inScopeIds = new Set(relevanceAssessments
     .filter((assessment) => assessment.status === "in_scope")
@@ -3720,7 +3878,7 @@ function modelSuitabilityRating(input: {
 function buildQualityReport(input: {
   run: RunRecord;
   backendLabel: string;
-  gathered: ResearchSourceGatherResult | null;
+  gathered: ResearchSourceSnapshot | null;
   paperExtractions: PaperExtraction[];
   evidenceMatrix: EvidenceMatrix;
   manuscriptBundle: ManuscriptBundle;
@@ -3861,7 +4019,7 @@ function researchWorkerStatusReason(status: ResearchWorkerStatus, readiness: str
 async function writeWorkerStateForRun(input: {
   run: RunRecord;
   previousState: ResearchWorkerState | null;
-  gathered: ResearchSourceGatherResult | null;
+  gathered: ResearchSourceSnapshot | null;
   paperExtractions: PaperExtraction[];
   evidenceMatrix: EvidenceMatrix;
   synthesis: ResearchSynthesis;
@@ -4023,7 +4181,7 @@ function summarizeVerifiedClaim(claim: VerifiedClaim): string {
   return `${claim.supportStatus} (${claim.confidence}): ${claim.claim}`;
 }
 
-function reviewWorkflowLines(gathered: ResearchSourceGatherResult): string[] {
+function reviewWorkflowLines(gathered: ResearchSourceSnapshot): string[] {
   return [
     `- Title screened: ${gathered.reviewWorkflow.counts.titleScreened}`,
     `- Abstract screened: ${gathered.reviewWorkflow.counts.abstractScreened}`,
@@ -4038,7 +4196,7 @@ function reviewWorkflowLines(gathered: ResearchSourceGatherResult): string[] {
 function researchSummaryMarkdown(
   run: RunRecord,
   plan: ResearchPlan,
-  gathered: ResearchSourceGatherResult,
+  gathered: ResearchSourceSnapshot,
   paperExtractions: PaperExtraction[],
   evidenceMatrix: EvidenceMatrix,
   synthesis: ResearchSynthesis,
@@ -4106,7 +4264,7 @@ function researchSummaryMarkdown(
 function synthesisMarkdown(
   run: RunRecord,
   plan: ResearchPlan,
-  gathered: ResearchSourceGatherResult,
+  gathered: ResearchSourceSnapshot,
   paperExtractions: PaperExtraction[],
   evidenceMatrix: EvidenceMatrix,
   synthesis: ResearchSynthesis,
@@ -4424,9 +4582,9 @@ function remapAgendaSourceIds(
 }
 
 function remapReviewWorkflow(
-  reviewWorkflow: ResearchSourceGatherResult["reviewWorkflow"],
+  reviewWorkflow: ResearchSourceSnapshot["reviewWorkflow"],
   canonicalIdByAnyId: Map<string, string>
-): ResearchSourceGatherResult["reviewWorkflow"] {
+): ResearchSourceSnapshot["reviewWorkflow"] {
   return {
     ...reviewWorkflow,
     titleScreenedPaperIds: remapPaperIds(reviewWorkflow.titleScreenedPaperIds, canonicalIdByAnyId),
@@ -4498,7 +4656,7 @@ function relatedClaimIdsForTheme(theme: ResearchTheme, claims: ResearchClaim[]):
 }
 
 function fallbackFinding(
-  gathered: ResearchSourceGatherResult,
+  gathered: ResearchSourceSnapshot,
   summaryText: string,
   failureMessage: string | null
 ): ResearchTheme {
@@ -5013,7 +5171,7 @@ function workspaceManuscriptChecks(input: {
   run: RunRecord;
   store: ResearchWorkStore;
   references: ReferencesArtifact;
-  gathered?: ResearchSourceGatherResult;
+  gathered?: ResearchSourceSnapshot;
   evidenceMatrix?: EvidenceMatrix;
 }): ManuscriptBundle["checks"] {
   const claims = input.store.objects.claims;
@@ -5342,7 +5500,7 @@ function workspaceManuscriptBundle(input: {
   oaRetrievalHelperProviders: string[];
   generalWebProviders: string[];
   localContextEnabled: boolean;
-  gathered: ResearchSourceGatherResult;
+  gathered: ResearchSourceSnapshot;
   evidenceMatrix?: EvidenceMatrix;
 }): ManuscriptBundle {
   const fallbackProtocol = buildReviewProtocol({
@@ -5394,7 +5552,7 @@ function workspaceManuscriptBundle(input: {
 function buildMemoryInputs(
   run: RunRecord,
   plan: ResearchPlan,
-  gathered: ResearchSourceGatherResult,
+  gathered: ResearchSourceSnapshot,
   evidenceMatrix: EvidenceMatrix,
   summaryText: string,
   themes: ResearchTheme[],
@@ -5564,7 +5722,7 @@ function buildAgendaMemoryInputs(
 function buildLiteratureInputs(
   run: RunRecord,
   plan: ResearchPlan,
-  gathered: ResearchSourceGatherResult,
+  gathered: ResearchSourceSnapshot,
   summaryText: string,
   themes: ResearchTheme[],
   claims: ResearchClaim[],
@@ -5644,7 +5802,7 @@ async function writeLiteratureSnapshot(
   run: RunRecord,
   literatureStore: LiteratureStore,
   result: LiteratureUpsertResult,
-  gathered: ResearchSourceGatherResult
+  gathered: ResearchSourceSnapshot
 ): Promise<void> {
   const canonicalIdByAnyId = canonicalPaperIdMap(gathered.canonicalPapers);
   await writeJsonArtifact(run.artifacts.literaturePath, {
@@ -5697,7 +5855,7 @@ async function commitWorkStoreSegment(input: {
   store: ResearchWorkStore;
   run: RunRecord;
   plan: ResearchPlan;
-  gathered: ResearchSourceGatherResult | null;
+  gathered: ResearchSourceSnapshot | null;
   paperExtractions: PaperExtraction[];
   evidenceMatrix: EvidenceMatrix | null;
   synthesis: ResearchSynthesis | null;
@@ -5745,7 +5903,7 @@ async function commitWorkStoreSegment(input: {
   return nextStore;
 }
 
-function insufficientEvidenceNextQuestions(plan: ResearchPlan, gathered?: ResearchSourceGatherResult): string[] {
+function insufficientEvidenceNextQuestions(plan: ResearchPlan, gathered?: ResearchSourceSnapshot): string[] {
   const diagnostics = gathered?.retrievalDiagnostics;
   const suggestedQueries = diagnostics?.suggestedNextQueries.slice(0, 3) ?? [];
   const providerErrors = diagnostics?.providerAttempts
@@ -5801,7 +5959,7 @@ function insufficientEvidenceAgenda(
   };
 }
 
-function retrievalDiagnosticHoldReasons(gathered: ResearchSourceGatherResult): string[] {
+function retrievalDiagnosticHoldReasons(gathered: ResearchSourceSnapshot): string[] {
   const diagnostics = gathered.retrievalDiagnostics;
 
   if (diagnostics === undefined) {
@@ -5831,7 +5989,7 @@ function retrievalDiagnosticHoldReasons(gathered: ResearchSourceGatherResult): s
 
 function agendaWithRetrievalHoldReasons(
   agenda: ResearchAgenda,
-  gathered: ResearchSourceGatherResult,
+  gathered: ResearchSourceSnapshot,
   evidenceMatrix: EvidenceMatrix
 ): ResearchAgenda {
   if (evidenceMatrix.rowCount >= 3) {
@@ -5856,7 +6014,7 @@ function agendaWithRetrievalHoldReasons(
 function insufficientEvidenceSynthesisMarkdown(
   run: RunRecord,
   plan: ResearchPlan,
-  gathered: ResearchSourceGatherResult,
+  gathered: ResearchSourceSnapshot,
   nextQuestions: string[],
   failureMessage: string
 ): string {
@@ -5947,8 +6105,8 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
   const now = options.now ?? (() => new Date().toISOString());
   const store = new RunStore(options.projectRoot, options.version, now);
   const run = await store.load(options.runId);
-  const useAgenticSourceLoop = options.sourceGatherer === undefined;
-  const injectedSourceGatherer = options.sourceGatherer ?? null;
+  const useSourceToolLoop = options.sourceToolAdapter === undefined;
+  const injectedSourceToolAdapter = options.sourceToolAdapter ?? null;
   const projectConfigStore = new ProjectConfigStore(options.projectRoot, now);
   const projectConfig = await projectConfigStore.load();
   const researchBackend = options.researchBackend ?? await createProjectResearchBackend({
@@ -6206,13 +6364,13 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     const evidenceRecoveryStartedAtMs = Date.now();
     let finalAgenda: ResearchAgenda | null = null;
     let finalManuscriptBundle: ManuscriptBundle | null = null;
-    let finalGathered: ResearchSourceGatherResult | null = null;
+    let finalGathered: ResearchSourceSnapshot | null = null;
     let finalPaperExtractions: PaperExtraction[] = [];
     let finalEvidenceMatrix: EvidenceMatrix | null = null;
     let finalSynthesis: ResearchSynthesis | null = null;
     let finalContinuationLimitReason: string | null = null;
     let previousEvidenceQuality: EvidenceQualitySnapshot | null = null;
-    let bestUsefulGathered: ResearchSourceGatherResult | null = null;
+    let bestUsefulGathered: ResearchSourceSnapshot | null = null;
     let nonImprovingEvidencePasses = 0;
 
     while (true) {
@@ -6222,7 +6380,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     if (pendingRecoveryQueries.length > 0) {
       await appendStdout(run, `Autonomous evidence revision queries: ${pendingRecoveryQueries.join(" | ")}`);
     }
-    await writeSourceGatherCheckpoint({
+    await writeSourceToolCheckpoint({
       run,
       now,
       evidencePass: evidencePassNumber,
@@ -6231,11 +6389,11 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       event: {
         phase: "setup",
         status: "started",
-        message: `Starting incremental source gathering for evidence pass ${evidencePassNumber}.`
+        message: `Starting incremental source tool pass ${evidencePassNumber}.`
       }
     });
 
-    const sourceRequest: ResearchSourceGatherRequest = {
+    const sourceRequest: ResearchSourceToolRequest = {
       projectRoot: run.projectRoot,
       brief: run.brief,
       plan,
@@ -6253,7 +6411,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         if (event.status === "completed" || event.status === "failed" || event.status === "skipped") {
           await appendStdout(run, sourceProgressMessage(event));
         }
-        await writeSourceGatherCheckpoint({
+        await writeSourceToolCheckpoint({
           run,
           now,
           evidencePass: evidencePassNumber,
@@ -6263,8 +6421,8 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         });
       }
     };
-    const sourceLoopResult = useAgenticSourceLoop
-      ? await runAgenticSourceGathering({
+    const sourceLoopResult = useSourceToolLoop
+      ? await runSourceToolLoop({
         run,
         now,
         researchBackend,
@@ -6280,13 +6438,13 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     if (sourceLoopResult !== null) {
       workStore = sourceLoopResult.workStore;
     }
-    if (sourceLoopResult === null && injectedSourceGatherer === null) {
-      throw new Error("Source gathering requires the agentic source loop or an explicitly injected test adapter.");
+    if (sourceLoopResult === null && injectedSourceToolAdapter === null) {
+      throw new Error("Source tool execution requires the source tool loop or an explicitly injected test adapter.");
     }
     if (sourceLoopResult === null) {
-      await appendEvent(run, now, "summary", "Using explicitly injected source gatherer adapter; production/default execution uses the agentic source tool loop.");
+      await appendEvent(run, now, "summary", "Using explicitly injected source tool adapter; production/default execution uses the source tool loop.");
     }
-    let gathered = sourceLoopResult?.gathered ?? await injectedSourceGatherer!.gather(sourceRequest);
+    let gathered = sourceLoopResult?.gathered ?? await injectedSourceToolAdapter!.run(sourceRequest);
     if ((gathered.canonicalPapers.length === 0 || gathered.reviewedPapers.length === 0) && bestUsefulGathered !== null) {
       await appendEvent(
         run,
@@ -6346,7 +6504,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       rawSources: gathered.sources,
       reviewWorkflow: gathered.reviewWorkflow,
       relevanceAssessments: gathered.relevanceAssessments ?? [],
-      agenticSourceState: gathered.agenticSourceState ?? null,
+      sourceToolState: gathered.sourceToolState ?? null,
       mergeDiagnostics: gathered.mergeDiagnostics,
       literatureReview: gathered.literatureReview ?? null
     });

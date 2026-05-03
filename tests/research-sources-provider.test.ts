@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { DefaultResearchSourceGatherer } from "../src/runtime/research-sources.js";
+import {
+  SourceToolRuntime,
+  type ResearchSourceToolRequest,
+  type ResearchSourceSnapshot
+} from "../src/runtime/research-sources.js";
 import type { ProjectMemoryContext } from "../src/runtime/memory-store.js";
 
 function emptyMemoryContext(): ProjectMemoryContext {
@@ -33,6 +37,20 @@ function emptyMemoryContext(): ProjectMemoryContext {
     queryHints: [],
     localFileHints: []
   };
+}
+
+async function runSourceTools(request: ResearchSourceToolRequest): Promise<ResearchSourceSnapshot> {
+  const session = await SourceToolRuntime.create(request);
+  const queries = request.plan.searchQueries.length > 0
+    ? request.plan.searchQueries
+    : session.state().candidateQueries;
+
+  for (const providerId of session.state().availableProviderIds) {
+    await session.queryProvider(providerId, queries);
+  }
+
+  await session.mergeSources();
+  return session.result();
 }
 
 test("source gathering honors grouped provider selection when only background retrieval is enabled", async () => {
@@ -86,8 +104,7 @@ test("source gathering honors grouped provider selection when only background re
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "Riemann Hypothesis",
@@ -114,8 +131,8 @@ test("source gathering honors grouped provider selection when only background re
 
     assert.ok(sourceKinds.includes("background_article"));
     assert.equal(gathered.canonicalPapers.length, 0);
-    assert.match(gathered.notes.join("\n"), /no scholarly discovery providers/i);
-    assert.match(gathered.notes.join("\n"), /Collected 1 general-web sources from wikipedia/i);
+    assert.match(gathered.notes.join("\n"), /Model-selected providers attempted: wikipedia/i);
+    assert.equal(gathered.sourceToolState?.attemptedProviderIds.includes("wikipedia"), true);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });

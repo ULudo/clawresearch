@@ -1,7 +1,7 @@
 import type { CanonicalPaper } from "./literature-store.js";
 import type { ResearchAgenda, ResearchPlan, ResearchSynthesis } from "./research-backend.js";
 import type { EvidenceMatrix, PaperExtraction } from "./research-evidence.js";
-import type { ResearchSourceGatherResult, LiteratureRelevanceAssessment } from "./research-sources.js";
+import type { ResearchSourceSnapshot, LiteratureRelevanceAssessment } from "./research-sources.js";
 import type {
   ManuscriptChecksArtifact,
   ReferencesArtifact,
@@ -81,7 +81,7 @@ export type CriticReviewRequest = {
   plan?: ResearchPlan | null;
   selectedPapers?: CanonicalPaper[];
   relevanceAssessments?: LiteratureRelevanceAssessment[];
-  gathered?: Pick<ResearchSourceGatherResult, "reviewWorkflow" | "retrievalDiagnostics" | "notes"> | null;
+  gathered?: Pick<ResearchSourceSnapshot, "reviewWorkflow" | "retrievalDiagnostics" | "notes"> | null;
   paperExtractions?: PaperExtraction[];
   evidenceMatrix?: EvidenceMatrix | null;
   synthesis?: ResearchSynthesis | null;

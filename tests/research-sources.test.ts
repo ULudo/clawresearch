@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { DefaultResearchSourceGatherer } from "../src/runtime/research-sources.js";
+import {
+  SourceToolRuntime,
+  type ResearchSourceToolRequest,
+  type ResearchSourceSnapshot
+} from "../src/runtime/research-sources.js";
 import type { ProjectMemoryContext } from "../src/runtime/memory-store.js";
 import type { LiteratureContext } from "../src/runtime/literature-store.js";
 
@@ -72,12 +76,277 @@ function emptyLiteratureContext(overrides: Partial<LiteratureContext> = {}): Lit
   };
 }
 
+async function runSourceTools(request: ResearchSourceToolRequest): Promise<ResearchSourceSnapshot> {
+  const session = await SourceToolRuntime.create(request);
+  const providerIds = session.state().availableProviderIds;
+  const queries = request.plan.searchQueries.length > 0
+    ? request.plan.searchQueries
+    : session.state().candidateQueries;
+
+  for (const providerId of providerIds) {
+    await session.queryProvider(providerId, queries);
+  }
+
+  await session.mergeSources();
+  const candidatePaperIds = session.state().candidatePaperIds;
+  if (candidatePaperIds.length > 0) {
+    await session.resolveAccess(candidatePaperIds);
+    await session.selectEvidenceSet(candidatePaperIds);
+  }
+
+  return session.result();
+}
+
+function sourceToolRequest(projectRoot: string, overrides: Partial<ResearchSourceToolRequest> = {}): ResearchSourceToolRequest {
+  return {
+    projectRoot,
+    brief: {
+      topic: "autonomous research agents",
+      researchQuestion: "How should source tools expose research evidence?",
+      researchDirection: "Inspect source tool behavior without a hidden source-gathering pipeline.",
+      successCriterion: "Keep source selection explicit."
+    },
+    plan: {
+      researchMode: "literature_synthesis",
+      objective: "Test source tool operations.",
+      rationale: "Source tools should expose observations and leave research judgment to the model.",
+      searchQueries: ["autonomous research agents source tools"],
+      localFocus: ["source tools"]
+    },
+    memoryContext: emptyMemoryContext(),
+    scholarlyProviderIds: ["openalex"],
+    generalWebProviderIds: [],
+    projectFilesEnabled: false,
+    ...overrides
+  };
+}
+
+test("source.search records provider runs and returns source previews", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-source-tool-search-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.openalex.org" && url.pathname === "/works") {
+        return new Response(JSON.stringify({
+          results: [{
+            id: "https://openalex.org/W-tool-search",
+            display_name: "Source tools for autonomous research agents",
+            publication_year: 2025,
+            authorships: [{ author: { display_name: "Tool Author" } }],
+            primary_location: {
+              source: { display_name: "Research Tooling" },
+              landing_page_url: "https://example.org/tool-search"
+            },
+            doi: "https://doi.org/10.1000/tool-search",
+            abstract_inverted_index: toAbstractIndex("Autonomous research agents source tools provider runs observations.")
+          }]
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const session = await SourceToolRuntime.create(sourceToolRequest(projectRoot));
+    const observation = await session.queryProvider("openalex", ["autonomous research agents source tools"]);
+
+    assert.equal(observation.action, "query_provider");
+    assert.equal(observation.counts.newSources, 1);
+    assert.equal(observation.items?.[0]?.title, "Source tools for autonomous research agents");
+    assert.equal(session.state().providerYields[0]?.providerId, "openalex");
+    assert.equal(session.state().providerYields[0]?.newSources, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("source.merge deduplicates only and does not auto-select evidence", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-source-tool-merge-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.openalex.org" && url.pathname === "/works") {
+        return new Response(JSON.stringify({
+          results: [
+            {
+              id: "https://openalex.org/W-merge-a",
+              display_name: "Canonical source identity for research agents",
+              publication_year: 2025,
+              authorships: [{ author: { display_name: "Merge Author" } }],
+              primary_location: { source: { display_name: "Research Tooling" }, landing_page_url: "https://example.org/merge-a" },
+              doi: "https://doi.org/10.1000/source-merge",
+              abstract_inverted_index: toAbstractIndex("Canonical source identity for autonomous research agents.")
+            },
+            {
+              id: "https://openalex.org/W-merge-b",
+              display_name: "Canonical source identity for research agents",
+              publication_year: 2025,
+              authorships: [{ author: { display_name: "Merge Author" } }],
+              primary_location: { source: { display_name: "Research Tooling" }, landing_page_url: "https://example.org/merge-b" },
+              doi: "https://doi.org/10.1000/source-merge",
+              abstract_inverted_index: toAbstractIndex("Duplicate provider hit for canonical source identity.")
+            }
+          ]
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const session = await SourceToolRuntime.create(sourceToolRequest(projectRoot));
+    await session.queryProvider("openalex", ["canonical source identity research agents"]);
+    const mergeObservation = await session.mergeSources();
+    const result = await session.result();
+
+    assert.equal(mergeObservation.counts.canonicalPapers, 1);
+    assert.equal(mergeObservation.items?.length, 1);
+    assert.equal(result.canonicalPapers.length, 1);
+    assert.equal(result.reviewedPapers.length, 0);
+    assert.equal(result.sourceToolState?.canonicalMergeCompleted, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("source result snapshots unmerged sources without automatic canonical merge", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-source-tool-snapshot-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.openalex.org" && url.pathname === "/works") {
+        return new Response(JSON.stringify({
+          results: [{
+            id: "https://openalex.org/W-snapshot",
+            display_name: "Checkpointed source observations for research agents",
+            publication_year: 2026,
+            authorships: [{ author: { display_name: "Snapshot Author" } }],
+            primary_location: { source: { display_name: "Research Tooling" }, landing_page_url: "https://example.org/snapshot" },
+            doi: "https://doi.org/10.1000/source-snapshot",
+            abstract_inverted_index: toAbstractIndex("Checkpointed source observations should remain visible without automatic canonical merge.")
+          }]
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const session = await SourceToolRuntime.create(sourceToolRequest(projectRoot));
+    await session.queryProvider("openalex", ["checkpointed source observations"]);
+    const result = await session.result();
+
+    assert.equal(result.canonicalPapers.length, 0);
+    assert.equal(result.reviewedPapers.length, 0);
+    assert.equal(result.sourceToolState?.canonicalMergeCompleted, false);
+    assert.ok(result.sources.some((source) => /Checkpointed source observations/i.test(source.title)));
+    assert.match(result.notes.join("\n"), /Canonical merge was not requested/i);
+    assert.equal(result.sourceToolState?.recentActions?.some((action) => action.action === "merge_sources"), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("source access and selection require an explicit prior merge", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-source-tool-no-implicit-merge-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.openalex.org" && url.pathname === "/works") {
+        return new Response(JSON.stringify({
+          results: [{
+            id: "https://openalex.org/W-no-implicit-merge",
+            display_name: "Explicit canonical merge for source tools",
+            publication_year: 2026,
+            authorships: [{ author: { display_name: "Merge Guard Author" } }],
+            primary_location: { source: { display_name: "Research Tooling" }, landing_page_url: "https://example.org/no-implicit-merge" },
+            doi: "https://doi.org/10.1000/source-no-implicit-merge",
+            abstract_inverted_index: toAbstractIndex("Explicit canonical merge must precede ranking access resolution and evidence selection.")
+          }]
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const session = await SourceToolRuntime.create(sourceToolRequest(projectRoot));
+    await session.queryProvider("openalex", ["explicit canonical merge"]);
+    const resolveObservation = await session.resolveAccess(["paper-missing"]);
+    const selectionObservation = await session.selectEvidenceSet(["paper-missing"]);
+    const result = await session.result();
+
+    assert.match(resolveObservation.message, /requires canonical papers from an explicit source\.merge/i);
+    assert.match(selectionObservation.message, /requires canonical papers from an explicit source\.merge/i);
+    assert.equal(result.canonicalPapers.length, 0);
+    assert.equal(result.reviewedPapers.length, 0);
+    assert.equal(result.sourceToolState?.canonicalMergeCompleted, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("source.resolve_access requires explicit ids and source.select_evidence honors known ids", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-source-tool-select-"));
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "api.openalex.org" && url.pathname === "/works") {
+        return new Response(JSON.stringify({
+          results: [{
+            id: "https://openalex.org/W-select",
+            display_name: "Explicit source selection for research agents",
+            publication_year: 2025,
+            authorships: [{ author: { display_name: "Select Author" } }],
+            primary_location: { source: { display_name: "Research Tooling" }, landing_page_url: "https://example.org/select" },
+            doi: "https://doi.org/10.1000/source-select",
+            abstract_inverted_index: toAbstractIndex("Explicit source selection for autonomous research agents.")
+          }]
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const session = await SourceToolRuntime.create(sourceToolRequest(projectRoot));
+    await session.queryProvider("openalex", ["explicit source selection"]);
+    await session.mergeSources();
+    const knownPaperId = session.state().candidatePaperIds[0]!;
+    const noIdResolution = await session.resolveAccess([]);
+    const selection = await session.selectEvidenceSet([knownPaperId, "paper-missing"]);
+    const result = await session.result();
+
+    assert.equal(noIdResolution.counts.resolvedPapers, 0);
+    assert.match(noIdResolution.message, /requires explicit known paper ids/i);
+    assert.equal(selection.counts.selectedPapers, 1);
+    assert.match(result.reviewWorkflow.notes.join("\n"), /Unknown requested paper id/i);
+    assert.deepEqual(result.reviewedPapers.map((paper) => paper.id), [knownPaperId]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("dynamic query expansion preserves plan queries and adds brief entities for unfamiliar topics", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-query-dynamic-"));
 
   try {
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "ritual soundscapes in medieval Icelandic legal assemblies",
@@ -112,8 +381,7 @@ test("dynamic query expansion does not add hidden domain-vocabulary queries", as
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-query-no-domain-vocab-"));
 
   try {
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "autonomous research agents for literature synthesis",
@@ -142,7 +410,7 @@ test("dynamic query expansion does not add hidden domain-vocabulary queries", as
   }
 });
 
-test("role-aware source classification separates primary systems from surveys and benchmarks", async () => {
+test("source diagnostics do not assign semantic source roles or primary-selection authority", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-role-classification-"));
   const originalFetch = globalThis.fetch;
 
@@ -208,8 +476,7 @@ test("role-aware source classification separates primary systems from surveys an
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "LLM-based autonomous research agents",
@@ -231,12 +498,12 @@ test("role-aware source classification separates primary systems from surveys an
     const assessments = gathered.relevanceAssessments ?? [];
     const byTitle = (title: string) => assessments.find((assessment) => assessment.title.includes(title));
 
-    assert.equal(byTitle("Agent Laboratory")?.sourceRole, "primary_system");
-    assert.equal(byTitle("GenXAI")?.sourceRole, "survey");
+    assert.equal(byTitle("Agent Laboratory")?.sourceRole, "background");
+    assert.equal(byTitle("GenXAI")?.sourceRole, "background");
     assert.notEqual(byTitle("GenXAI")?.selectionDecision, "selected_primary");
-    assert.equal(byTitle("PaperArena")?.sourceRole, "benchmark");
+    assert.equal(byTitle("PaperArena")?.sourceRole, "background");
     assert.notEqual(byTitle("PaperArena")?.selectionDecision, "selected_primary");
-    assert.equal(byTitle("LEGOMem")?.sourceRole, "method_component");
+    assert.equal(byTitle("LEGOMem")?.sourceRole, "background");
     assert.equal(Object.prototype.hasOwnProperty.call(gathered, "selectionQuality"), false);
   } finally {
     globalThis.fetch = originalFetch;
@@ -267,8 +534,7 @@ test("provider routing biases openalex, arxiv, and dblp for CS/AI briefs", async
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "autonomous research agents",
@@ -320,8 +586,7 @@ test("provider routing biases pubmed and europe pmc for biomedical briefs", asyn
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "clinical triage in nursing homes",
@@ -375,8 +640,7 @@ test("care-heavy AI briefs route biomedical providers before broad discovery", a
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "AI systems and work in nursing homes and elderly care",
@@ -430,8 +694,7 @@ test("mathematical briefs route through mathematics-aware providers by default",
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "Riemann Hypothesis",
@@ -491,8 +754,7 @@ test("mathematical briefs are not pulled into cs-ai routing by generated computa
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "Riemann Hypothesis",
@@ -550,8 +812,7 @@ test("social-science briefs prioritize broad scholarly and publisher sources ove
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "AI adoption and employment effects in social services",
@@ -641,8 +902,7 @@ test("canonical merge combines duplicate provider hits and chooses the best read
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "autonomous research agents",
@@ -719,8 +979,7 @@ test("direct arxiv full text beats metadata-only alternatives during access reso
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "autonomous research agents",
@@ -774,8 +1033,7 @@ test("literature and memory hints influence the next retrieval pass", async () =
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    await gatherer.gather({
+    await runSourceTools({
       projectRoot,
       brief: {
         topic: "Riemann Hypothesis",
@@ -895,8 +1153,7 @@ test("provider retrieval pages beyond the old five-result ceiling", async () => 
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "autonomous research agents",
@@ -978,8 +1235,7 @@ test("source gathering emits progress and resolves access only for promising pap
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "autonomous research agent harnesses",
@@ -1069,8 +1325,7 @@ test("provider fetch retries a transient rate limit before failing the run", asy
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "autonomous research agents",
@@ -1113,8 +1368,7 @@ test("missing unpaywall email is reported as an access limitation", async () => 
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "autonomous research agents",
@@ -1196,8 +1450,7 @@ test("literature-review screening keeps query noise visible with advisory diagno
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "Riemann Hypothesis",
@@ -1221,7 +1474,7 @@ test("literature-review screening keeps query noise visible with advisory diagno
       "Modelling urban sewer flooding and quantitative microbial risk assessment: A critical review"
     ]);
     assert.ok((gathered.retrievalDiagnostics?.screeningSummary.rejected ?? 0) >= 1);
-    assert.match(gathered.notes.join("\n"), /retained them for researcher-visible screening/i);
+    assert.ok((gathered.retrievalDiagnostics?.screeningSummary.weakMatchSamples.length ?? 0) > 0);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
@@ -1270,8 +1523,7 @@ test("source screening keeps strong task and focus matches visible without domai
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "autonomous research agents",
@@ -1378,8 +1630,7 @@ test("review workflow selects available high-quality papers without sparse-evide
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "autonomous research agents",
@@ -1486,8 +1737,7 @@ test("review workflow keeps researcher-visible papers without semantic off-topic
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "Design and build efficient autonomous research agents",
@@ -1579,8 +1829,7 @@ test("source selection retains papers without deterministic success-criterion fa
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "AI adoption in nursing homes",
@@ -1652,8 +1901,7 @@ test("source selection does not turn semantic drift into deterministic missing f
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "rigorous numerical verification of Riemann zeta zeros",
@@ -1743,8 +1991,7 @@ test("thin evidence does not trigger runtime-generated revision queries", async 
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "autonomous research agents",
@@ -1772,7 +2019,7 @@ test("thin evidence does not trigger runtime-generated revision queries", async 
   }
 });
 
-test("low-trust repository proof papers are kept out of the reviewed synthesis subset", async () => {
+test("source quality warnings do not alter explicit evidence selection", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-quality-"));
   const originalFetch = globalThis.fetch;
 
@@ -1856,8 +2103,7 @@ test("low-trust repository proof papers are kept out of the reviewed synthesis s
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "Riemann Hypothesis",
@@ -1884,16 +2130,14 @@ test("low-trust repository proof papers are kept out of the reviewed synthesis s
     assert.equal(suspiciousPapers.length, 2);
     assert.ok(suspiciousPapers.every((paper) => paper.tags.includes("quality:low")));
     assert.ok(suspiciousPapers.every((paper) => paper.screeningDecision !== "include"));
-    assert.deepEqual(gathered.reviewedPapers.map((paper) => paper.title), [
-      "Mollifier methods and zero-density estimates for the Riemann zeta function"
-    ]);
+    assert.deepEqual(gathered.reviewedPapers.map((paper) => paper.title).sort(), gathered.canonicalPapers.map((paper) => paper.title).sort());
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("review workflow collapses revision-style series into one reviewed paper", async () => {
+test("canonical merge does not collapse revision-style series into hidden evidence selection", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-series-"));
   const originalFetch = globalThis.fetch;
 
@@ -1937,8 +2181,7 @@ test("review workflow collapses revision-style series into one reviewed paper", 
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "Riemann Hypothesis",
@@ -1958,13 +2201,13 @@ test("review workflow collapses revision-style series into one reviewed paper", 
     });
 
     assert.equal(gathered.canonicalPapers.length, 3);
-    assert.equal(gathered.reviewedPapers.length, 2);
+    assert.equal(gathered.reviewedPapers.length, 3);
     assert.equal(
       gathered.reviewedPapers.filter((paper) => /Mollifier methods for the Riemann Hypothesis/i.test(paper.title)).length,
-      1
+      2
     );
     assert.ok(gathered.reviewedPapers.some((paper) => paper.title === "Zero-density estimates near the critical line"));
-    assert.ok(gathered.reviewWorkflow.notes.some((note) => /Collapsed 2 near-duplicate/i.test(note)));
+    assert.equal(gathered.reviewWorkflow.notes.some((note) => /Collapsed 2 near-duplicate/i.test(note)), false);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
@@ -2009,8 +2252,7 @@ test("ieee xplore discovery yields canonical papers with honest access state", a
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "autonomous research agents",
@@ -2113,8 +2355,7 @@ test("elsevier discovery and acquisition upgrade a canonical paper to licensed f
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "autonomous research agents",
@@ -2201,8 +2442,7 @@ test("elsevier discovery keeps scopus results even when the science direct entit
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "autonomous research agents",
@@ -2306,8 +2546,7 @@ test("springer nature discovery and OA lookup resolve an open full-text route", 
       throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
     };
 
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
+    const gathered = await runSourceTools({
       projectRoot,
       brief: {
         topic: "autonomous research agents",
