@@ -111,6 +111,51 @@ test("research work store supports create, query, read, and patch operations", a
   }
 });
 
+test("work store semantic search returns no items instead of unrelated fallback matches", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-work-store-no-semantic-fallback-"));
+
+  try {
+    const now = "2026-01-01T00:00:00.000Z";
+    let store = createResearchWorkStore({
+      projectRoot,
+      now,
+      brief: {
+        topic: "Autonomous research agents",
+        researchQuestion: "Can workspace search report honest no-match observations?",
+        researchDirection: "Keep search observations useful for the next model step.",
+        successCriterion: "Do not return arbitrary workspace objects when the semantic query misses."
+      }
+    });
+
+    store = createResearchWorkStoreEntity<WorkStoreClaim>(store, {
+      id: "claim-memory-1",
+      kind: "claim",
+      runId: "run-1",
+      text: "Persistent work stores improve long-horizon research.",
+      evidence: "Supported by durable workspace observations.",
+      sourceIds: ["paper-1"],
+      supportStatus: "partially_supported",
+      confidence: "medium",
+      usedInSections: [],
+      risk: null
+    } satisfies WorkStoreCreateInput<WorkStoreClaim>, now);
+
+    const result = queryResearchWorkStore(store, {
+      collection: "claims",
+      semanticQuery: "photosynthesis chloroplast marine plankton",
+      limit: 10
+    });
+
+    assert.equal(result.count, 0);
+    assert.equal(result.totalCount, 0);
+    assert.deepEqual(result.items, []);
+    assert.equal(result.hasMore, false);
+    assert.equal(result.nextCursor, null);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("work store segment merge does not re-import rendered manuscript views as canonical objects", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-work-store-merge-"));
 

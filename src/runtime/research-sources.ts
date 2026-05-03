@@ -4,22 +4,6 @@ import {
   credentialValue,
   type CredentialStoreState
 } from "./credential-store.js";
-import {
-  assessLiteratureSource,
-  assessPaperFacetCoverage,
-  buildReviewFacets,
-  buildReviewSelectionQuality,
-  buildLiteratureReviewProfile,
-  isCoreTopicReviewFacet,
-  isRetrievalQualityConstraintPhrase,
-  isSubstantiveReviewFacet,
-  shouldUseLiteratureReviewSubsystem,
-  type LiteratureReviewProfile,
-  type LiteratureSourceAssessment,
-  type PaperFacetCoverage,
-  type ReviewFacet,
-  type ReviewSelectionQuality
-} from "./literature-review.js";
 import type {
   CanonicalPaper,
   PaperAccessMode,
@@ -112,9 +96,9 @@ const preservedShortTokens = new Set([
 ]);
 
 const csAiCuePattern = /\b(ai|ml|machine learning|deep learning|language model|llm|nlp|computer vision|autonomous|agent|algorithm|algorithms|software|systems|robot|robotics)\b/i;
-const biomedicalCuePattern = /\b(biomedical|medicine|medical|clinical|patient|patients|drug|therapy|disease|genome|protein|cell|hospital|nursing home|nursing homes|healthcare|caregiver|pubmed)\b/i;
-const socialCareCuePattern = /\b(nursing home|nursing homes|elderly care|aged care|long[- ]term care|care home|care homes|caregiver|caregivers)\b/i;
-const mathematicsCuePattern = /\b(riemann hypothesis|riemann zeta|zeta function|number theory|analytic number theory|prime numbers?|prime-number|l-functions?|dedekind zeta|mollifier|zero density|explicit formula|li'?s criterion|tauberian|modular forms?|mathematics|mathematical)\b/i;
+const biomedicalCuePattern = /\b(biomedical|medicine|medical|clinical|patient|patients|drug|therapy|disease|genome|protein|cell|hospital|healthcare|pubmed)\b/i;
+const socialCareCuePattern = /\b(elderly care|aged care|caregiver|caregivers|residential care)\b/i;
+const mathematicsCuePattern = /\b(number theory|analytic number theory|prime numbers?|prime-number|l-functions?|explicit formula|tauberian|modular forms?|mathematics|mathematical)\b/i;
 const socialScienceCuePattern = /\b(employment|job|jobs|labor|labour|workforce|policy|policies|governance|public sector|public policy|economics|economic|sociology|social services?|social work|organizational|organisational|administration|education)\b/i;
 const coreTopicStopTokens = new Set([
   "about",
@@ -183,7 +167,6 @@ export type ResearchSource = {
   venue: string | null;
   identifiers: Partial<PaperIdentifiers>;
   access: Partial<PaperAccessRecord> | null;
-  assessment?: LiteratureSourceAssessment;
 };
 
 export type ProviderAuthSnapshot = {
@@ -200,7 +183,6 @@ export type QueryExpansionSource =
   | "brief_task"
   | "memory"
   | "literature"
-  | "domain_vocabulary"
   | "rejected_candidate"
   | "revision"
   | "recovery";
@@ -333,16 +315,9 @@ export type ResearchSourceGatherResult = {
   reviewWorkflow: ReviewWorkflowSummary;
   literatureReview?: {
     active: boolean;
-    profile: LiteratureReviewProfile;
-    selectedAssessments: Array<{
-      sourceId: string;
-      title: string;
-      assessment: LiteratureSourceAssessment;
-    }>;
     relevanceAssessments?: LiteratureRelevanceAssessment[];
   } | null;
   retrievalDiagnostics?: RetrievalDiagnostics;
-  selectionQuality?: ReviewSelectionQuality | null;
   relevanceAssessments?: LiteratureRelevanceAssessment[];
   agenticSourceState?: AgenticSourceState | null;
 };
@@ -477,7 +452,6 @@ type RetrievalBudget = {
 type FilterCandidatesResult = {
   sources: ResearchSource[];
   notes: string[];
-  assessments: Array<{ sourceId: string; title: string; assessment: LiteratureSourceAssessment }>;
   rejectedSamples: Array<{ title: string; excerpt: string; rationale: string }>;
   acceptedCount: number;
   rejectedCount: number;
@@ -487,7 +461,6 @@ type CanonicalReviewState = {
   canonicalPapers: CanonicalPaper[];
   reviewedPapers: CanonicalPaper[];
   reviewWorkflow: ReviewWorkflowSummary;
-  selectionQuality: ReviewSelectionQuality | null;
   mergeDiagnostics: string[];
   relevanceAssessments: LiteratureRelevanceAssessment[];
 };
@@ -1098,10 +1071,7 @@ function classifyDomain(brief: ResearchBrief, plan: ResearchPlan): SourceProvide
   return "general";
 }
 
-function buildRetrievalBudget(
-  request: ResearchSourceGatherRequest,
-  literatureReviewActive: boolean
-): RetrievalBudget {
+function buildRetrievalBudget(request: ResearchSourceGatherRequest): RetrievalBudget {
   const explicitQueries = uniqueStrings(request.plan.searchQueries);
   const hintCount = (request.memoryContext.queryHints.length + (request.literatureContext?.queryHints.length ?? 0));
   const focusCount = [
@@ -1116,7 +1086,7 @@ function buildRetrievalBudget(
   const maxQueries = Math.min(
     24,
     Math.max(
-      literatureReviewActive ? 12 : 8,
+      12,
       explicitQueries.length + focusCount + Math.min(4, hintCount) + (broadTopic ? 4 : 2)
     )
   );
@@ -1124,13 +1094,13 @@ function buildRetrievalBudget(
   return {
     maxQueries,
     maxQueriesPerProvider: Math.min(16, Math.max(8, maxQueries)),
-    maxProviderCallsPerProvider: literatureReviewActive ? 24 : 8,
-    pageSize: literatureReviewActive ? 25 : 10,
-    maxPagesPerQuery: literatureReviewActive ? 6 : 2,
-    maxCandidatesPerProvider: literatureReviewActive ? 200 : 40,
-    maxAccessResolutions: literatureReviewActive ? 32 : 12,
-    accessResolutionCheckpointSize: literatureReviewActive ? 8 : 4,
-    targetAcceptedSources: literatureReviewActive ? 120 : 24
+    maxProviderCallsPerProvider: 24,
+    pageSize: 25,
+    maxPagesPerQuery: 6,
+    maxCandidatesPerProvider: 200,
+    maxAccessResolutions: 32,
+    accessResolutionCheckpointSize: 8,
+    targetAcceptedSources: 120
   };
 }
 
@@ -1198,92 +1168,12 @@ function buildBriefTaskQueryCandidates(request: ResearchSourceGatherRequest): Qu
   return uniqueQueryCandidates(candidates);
 }
 
-function buildDomainVocabularyQueryCandidates(
-  request: ResearchSourceGatherRequest,
-  domain: SourceProviderDomain | "mixed"
-): QueryExpansionCandidate[] {
-  const text = combinedResearchText(request);
-  const anchor = primaryQueryAnchor(request);
-  const candidates: QueryExpansionCandidate[] = [];
-  const mathematicalVerification = domain === "mathematics"
-    && /\b(rigorous|numerical|verification|verified|compute|computed|computation|error|bound|bounds|zeros?)\b/i.test(text);
-
-  if (mathematicalVerification) {
-    for (const term of ["rigorous computation", "error bounds", "interval arithmetic", "ball arithmetic", "numerical verification"]) {
-      candidates.push(...queryCandidate(`${anchor} ${term}`, "domain_vocabulary", "Mathematical verification tasks often use this search vocabulary."));
-    }
-  }
-
-  if (domain === "biomedical" && /\b(nursing homes?|long[- ]term care|care homes?|residential care|aged care)\b/i.test(text)) {
-    for (const term of ["long-term care", "residential care", "care quality", "staffing", "workforce"]) {
-      candidates.push(...queryCandidate(`${anchor} ${term}`, "domain_vocabulary", "Care-delivery and workforce questions often use this search vocabulary."));
-    }
-  }
-
-  if ((domain === "cs_ai" || domain === "mixed") && /\b(agent|agents|autonomous|ai scientist|scientific discovery|research automation)\b/i.test(text)) {
-    for (const term of ["agent evaluation", "scientific discovery agents", "literature synthesis agents", "tool-using agents"]) {
-      candidates.push(...queryCandidate(`${anchor} ${term}`, "domain_vocabulary", "Research-agent questions often use this search vocabulary."));
-    }
-  }
-
-  if ((domain === "cs_ai" || domain === "mixed") && /\b(experiment|experimentation|exploration|evaluation|paper writing|publication|scientific progress|scientific discovery)\b/i.test(text)) {
-    for (const term of ["AI scientist experimentation", "autonomous scientific discovery", "agent benchmark evaluation", "research agent paper writing"]) {
-      candidates.push(...queryCandidate(`${anchor} ${term}`, "domain_vocabulary", "End-to-end research-agent questions often need lifecycle-specific vocabulary."));
-    }
-  }
-
-  if (domain === "social_science" && /\b(policy|governance|workforce|employment|organization|organisation)\b/i.test(text)) {
-    for (const term of ["policy evidence", "organizational impact", "workforce impact"]) {
-      candidates.push(...queryCandidate(`${anchor} ${term}`, "domain_vocabulary", "Social-science impact questions often use this search vocabulary."));
-    }
-  }
-
-  return uniqueQueryCandidates(candidates);
-}
-
-function buildRecoveryQueryCandidates(
-  request: ResearchSourceGatherRequest,
-  rejectedSamples: Array<{ title: string; excerpt: string; rationale: string }>,
-  selectionQuality: ReviewSelectionQuality | null = null
-): QueryExpansionCandidate[] {
-  const anchor = primaryQueryAnchor(request);
-  const missingFacetQueries = selectionQuality?.missingRequiredFacets
-    .filter((facet) => isSubstantiveReviewFacet(facet))
-    .slice(0, 6)
-    .flatMap((facet) => uniqueStrings([
-      facet.label,
-      facet.terms.slice(0, 4).join(" ")
-    ])
-      .filter((query) => !isRetrievalQualityConstraintPhrase(query))
-      .flatMap((query) => queryCandidate(
-        `${anchor} ${query}`,
-        "revision",
-        "Revision query for missing required review-facet coverage."
-      ))) ?? [];
-  const sampleQueries = rejectedSamples
-    .slice(0, 8)
-    .flatMap((sample) => keyPhrasesFromText(`${sample.title} ${sample.excerpt}`, 2))
-    .slice(0, 8)
-    .flatMap((phrase) => queryCandidate(`${anchor} ${phrase}`, "rejected_candidate", "Revision query from weakly matched candidate metadata."));
-  const broadTaskQueries = [
-    `${anchor} review`,
-    `${anchor} survey`,
-    `${anchor} evaluation`,
-    `${anchor} limitations`
-  ].flatMap((query) => queryCandidate(query, "revision", "Broad revision query for a thin evidence base."));
-
-  return uniqueQueryCandidates([
-    ...missingFacetQueries,
-    ...sampleQueries,
-    ...broadTaskQueries
-  ]);
-}
-
 function buildQueryExpansionCandidates(
   request: ResearchSourceGatherRequest,
   domain: SourceProviderDomain | "mixed",
   recoveryCandidates: QueryExpansionCandidate[] = []
 ): QueryExpansionCandidate[] {
+  void domain;
   const explicitQueries = uniqueStrings(request.plan.searchQueries);
   const topicPhrase = primaryQueryAnchor(request);
   const focusQueries = uniqueStrings([
@@ -1323,7 +1213,6 @@ function buildQueryExpansionCandidates(
     ...briefTaskCandidates,
     ...memoryCandidates,
     ...literatureCandidates,
-    ...buildDomainVocabularyQueryCandidates(request, domain),
     ...explicitRecoveryCandidates,
     ...recoveryCandidates
   ]);
@@ -1336,7 +1225,6 @@ function interleaveQueryCandidates(candidates: QueryExpansionCandidate[], limit:
     "brief_task",
     "memory",
     "literature",
-    "domain_vocabulary",
     "rejected_candidate",
     "revision",
     "recovery"
@@ -1729,53 +1617,6 @@ function accessRank(record: PaperAccessRecord): number {
     case "fulltext_blocked":
       return 1;
   }
-}
-
-function relaxedLiteratureAssessment(assessment: LiteratureSourceAssessment): LiteratureSourceAssessment {
-  const strongDomainEvidence = assessment.matchedDomainAnchors.length > 0
-    && (assessment.focusScore >= 2 || assessment.taskAttributeScore >= 4 || assessment.topicScore >= 6);
-  const strongTaskFocusEvidence = assessment.focusScore >= 4 && assessment.taskAttributeScore >= 4;
-  const highAggregateEvidence = assessment.totalScore >= 10;
-  const accepted = assessment.accepted
-    || strongDomainEvidence
-    || strongTaskFocusEvidence
-    || highAggregateEvidence;
-
-  if (!accepted || assessment.accepted) {
-    return assessment;
-  }
-
-  return {
-    ...assessment,
-    accepted: true,
-    rationale: `${assessment.rationale} Retained because the combined topic, task, and focus evidence was strong enough for a first-pass literature review.`
-  };
-}
-
-function screeningForSource(
-  source: ResearchSource,
-  profile: LiteratureReviewProfile | null
-): { assessment: LiteratureSourceAssessment | undefined; accepted: boolean } {
-  if (profile === null) {
-    const referenceTokens = new Set(tokenize(`${source.title} ${source.citation}`));
-    const score = overlapScore(`${source.title} ${source.excerpt}`, referenceTokens);
-    return {
-      assessment: undefined,
-      accepted: score >= 2 || tokenize(source.title).length >= 2
-    };
-  }
-
-  const assessment = assessLiteratureSource(profile, {
-    title: source.title,
-    excerpt: source.excerpt,
-    citation: source.citation
-  });
-  const relaxedAssessment = relaxedLiteratureAssessment(assessment);
-
-  return {
-    assessment: relaxedAssessment,
-    accepted: relaxedAssessment.accepted
-  };
 }
 
 async function walkTextFiles(projectRoot: string, currentDirectory = projectRoot): Promise<string[]> {
@@ -3073,43 +2914,26 @@ function screeningDecision(
   sourceIds: string[],
   sources: ResearchSource[],
   stage: "title" | "abstract" | "fulltext",
-  assessment: LiteratureSourceAssessment | null,
   quality: SourceQualityAssessment
 ): { decision: "include" | "background" | "exclude" | "uncertain"; rationale: string | null } {
-  if (assessment !== null && !assessment.accepted) {
-    return {
-      decision: "uncertain",
-      rationale: `${assessment.rationale} Retained as an advisory screening concern for researcher review.`
-    };
-  }
-
-  const relaxedRetained = assessment?.rationale.includes("Retained because the combined topic, task, and focus evidence") ?? false;
-
   if (stage === "fulltext") {
     if (quality.severeConcern) {
       return {
         decision: "uncertain",
-        rationale: `${assessment?.rationale ?? "Directly readable at full text."} Source-quality concerns (${quality.signals.join(", ")}) keep this paper out of the reviewed synthesis subset for now.`
+        rationale: `Directly readable at full text. Source-quality concerns (${quality.signals.join(", ")}) keep this paper out of the reviewed synthesis subset for now.`
       };
     }
 
     if (quality.tier === "low") {
       return {
         decision: "uncertain",
-        rationale: `${assessment?.rationale ?? "Directly readable at full text."} The paper remains reviewable, but its venue/title quality is too weak for automatic inclusion.`
-      };
-    }
-
-    if (relaxedRetained) {
-      return {
-        decision: "uncertain",
-        rationale: `${assessment?.rationale ?? "Directly readable at full text."} Retained as a cautious candidate because advisory domain-anchor diagnostics were incomplete.`
+        rationale: "Directly readable at full text. The paper remains reviewable, but its venue/title quality is too weak for automatic inclusion."
       };
     }
 
     return {
       decision: "include",
-      rationale: `${assessment?.rationale ?? "The paper is directly readable at full text."} Source quality tier: ${quality.tier}.`
+      rationale: `The paper is directly readable at full text. Source quality tier: ${quality.tier}.`
     };
   }
 
@@ -3117,27 +2941,20 @@ function screeningDecision(
     if (quality.severeConcern) {
       return {
         decision: "uncertain",
-        rationale: `${assessment?.rationale ?? "The paper can be screened at the abstract level."} Source-quality concerns (${quality.signals.join(", ")}) outweighed the current evidence.`
+        rationale: `The paper can be screened at the abstract level. Source-quality concerns (${quality.signals.join(", ")}) outweighed the current evidence.`
       };
     }
 
     if (quality.tier === "low") {
       return {
         decision: "uncertain",
-        rationale: `${assessment?.rationale ?? "The paper can be screened at the abstract level."} The abstract is accessible, but the publication quality is too weak for automatic inclusion.`
-      };
-    }
-
-    if (relaxedRetained) {
-      return {
-        decision: "uncertain",
-        rationale: `${assessment?.rationale ?? "The paper can be screened at the abstract level."} Retained as a cautious candidate because advisory domain-anchor diagnostics were incomplete.`
+        rationale: "The paper can be screened at the abstract level. The abstract is accessible, but the publication quality is too weak for automatic inclusion."
       };
     }
 
     return {
       decision: "include",
-      rationale: `${assessment?.rationale ?? "The paper can be screened at the abstract level."} Source quality tier: ${quality.tier}.`
+      rationale: `The paper can be screened at the abstract level. Source quality tier: ${quality.tier}.`
     };
   }
 
@@ -3146,7 +2963,7 @@ function screeningDecision(
   return scholarlySources.length > 0
     ? {
       decision: "uncertain",
-      rationale: assessment?.rationale ?? "Only metadata/title-level screening was possible."
+      rationale: "Only metadata/title-level screening was possible."
     }
     : {
       decision: "background",
@@ -3188,11 +3005,8 @@ function screeningHistoryForPaper(
   return history;
 }
 
-function paperScreeningPriority(paper: CanonicalPaper, coverage: PaperFacetCoverage | null = null): number {
+function paperScreeningPriority(paper: CanonicalPaper): number {
   const quality = sourceQualityAssessmentForPaper(paper);
-  const topicAnchorTagCount = paper.tags.filter((tag) => tag.startsWith("topic-anchor:")).length;
-  const focusTagCount = paper.tags.filter((tag) => tag.startsWith("focus:")).length;
-  const taskTagCount = paper.tags.filter((tag) => tag.startsWith("task:")).length;
   let score = 0;
 
   switch (paper.accessMode) {
@@ -3263,23 +3077,15 @@ function paperScreeningPriority(paper: CanonicalPaper, coverage: PaperFacetCover
       score -= 80;
       break;
   }
-  score += topicAnchorTagCount * 8;
-  score += focusTagCount * 10;
-  score += taskTagCount * 4;
-  score += (coverage?.coverageScore ?? 0) * 12;
-  score -= (coverage?.missingRequiredFacetIds.length ?? 0) * 3;
   score += Math.min(5, paper.discoveredVia.length) * 3;
   score += Math.max(0, Math.min(10, (paper.year ?? 0) - 2015));
   return score;
 }
 
-function sortPapersForReview(
-  papers: CanonicalPaper[],
-  coverageByPaperId: Map<string, PaperFacetCoverage> = new Map()
-): CanonicalPaper[] {
+function sortPapersForReview(papers: CanonicalPaper[]): CanonicalPaper[] {
   return [...papers].sort((left, right) => {
-    return paperScreeningPriority(right, coverageByPaperId.get(right.id) ?? null)
-      - paperScreeningPriority(left, coverageByPaperId.get(left.id) ?? null)
+    return paperScreeningPriority(right)
+      - paperScreeningPriority(left)
       || (right.year ?? 0) - (left.year ?? 0)
       || left.title.localeCompare(right.title);
   });
@@ -3515,159 +3321,8 @@ function finalizeRelevanceAssessments(
   });
 }
 
-function roleAwareSelectionQuality(
-  selectionQuality: ReviewSelectionQuality,
-  assessments: LiteratureRelevanceAssessment[],
-  requiredPrimarySystemCount: number
-): ReviewSelectionQuality {
-  if (requiredPrimarySystemCount <= 0) {
-    return selectionQuality;
-  }
-
-  const selectedPrimaryCount = assessments.filter((assessment) => assessment.selectionDecision === "selected_primary").length;
-  const availablePrimaryCount = assessments.filter((assessment) => (
-    assessment.status === "in_scope" && assessment.sourceRole === "primary_system"
-  )).length;
-
-  if (selectedPrimaryCount >= requiredPrimarySystemCount) {
-    return {
-      ...selectionQuality,
-      selectionRationale: [
-        ...selectionQuality.selectionRationale,
-        `Role-aware source diagnostic passed with ${selectedPrimaryCount} selected primary system/framework sources.`
-      ]
-    };
-  }
-
-  const adequacy: ReviewSelectionQuality["adequacy"] = selectedPrimaryCount === 0 ? "thin" : "partial";
-
-  return {
-    ...selectionQuality,
-    adequacy,
-    selectionRationale: [
-      ...selectionQuality.selectionRationale,
-      `Role-aware source diagnostic expected ${requiredPrimarySystemCount} primary system/framework sources but found only ${selectedPrimaryCount} selected; ${availablePrimaryCount} primary candidates were available in the current source pool. Supporting benchmarks, surveys, and component papers do not satisfy primary system-comparison slots.`
-    ]
-  };
-}
-
-function wordNumber(value: string): number | null {
-  const normalized = value.toLowerCase();
-  const words: Record<string, number> = {
-    one: 1,
-    two: 2,
-    three: 3,
-    four: 4,
-    five: 5,
-    six: 6,
-    seven: 7,
-    eight: 8,
-    nine: 9,
-    ten: 10
-  };
-
-  return /^\d+$/.test(normalized)
-    ? Number(normalized)
-    : words[normalized] ?? null;
-}
-
-function requiredPrimarySystemCount(request: ResearchSourceGatherRequest): number {
-  const text = normalizeWhitespace([
-    request.brief.successCriterion,
-    request.brief.researchDirection,
-    request.brief.researchQuestion,
-    request.plan.objective,
-    request.plan.rationale
-  ].filter((value): value is string => typeof value === "string").join(" ").toLowerCase());
-  const match = text.match(/\b(?:at least|minimum of|compare)\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b.{0,80}\b(?:systems?|frameworks?|agents?|architectures?|harnesses?)\b/);
-
-  if (match === null) {
-    return 0;
-  }
-
-  return Math.max(0, wordNumber(match[1]!) ?? 0);
-}
-
-function tokenSetForPaper(paper: CanonicalPaper): Set<string> {
-  return new Set(matchTokens(paperReviewText(paper)));
-}
-
-function termMatchesPaper(term: string, normalizedText: string, tokens: Set<string>): boolean {
-  const normalizedTerm = normalizeWhitespace(term.toLowerCase());
-  const termTokens = matchTokens(normalizedTerm);
-
-  if (termTokens.length === 0) {
-    return false;
-  }
-
-  return normalizedText.includes(normalizedTerm)
-    || termTokens.every((token) => tokens.has(token));
-}
-
-function matchedFacetLabels(
-  paper: CanonicalPaper,
-  facets: ReviewFacet[],
-  predicate: (facet: ReviewFacet) => boolean
-): string[] {
-  const normalizedText = normalizeWhitespace(paperReviewText(paper).toLowerCase());
-  const tokens = tokenSetForPaper(paper);
-
-  return facets
-    .filter(predicate)
-    .filter((facet) => facet.terms.some((term) => termMatchesPaper(term, normalizedText, tokens)))
-    .map((facet) => facet.label);
-}
-
-function reviewRelevanceAssessmentForPaper(
-  paper: CanonicalPaper,
-  facets: ReviewFacet[],
-  coverage: PaperFacetCoverage | null = null
-): LiteratureRelevanceAssessment {
-  if (facets.length === 0) {
-    const status: LiteratureRelevanceStatus = "in_scope";
-    const sourceRole = sourceRoleForPaper(paper, status);
-    const selectionDecision = selectedDecisionForRole(sourceRole, false, status);
-
-    return {
-      paperId: paper.id,
-      title: paper.title,
-      status,
-      sourceRole,
-      selectionDecision,
-      selectionReason: selectionReasonForAssessment(status, sourceRole, selectionDecision),
-      criticConcerns: [],
-      requiredForManuscript: false,
-      reviewer: "advisory_protocol_review",
-      matchedCriteria: ["No protocol criteria were available; source was retained by the ordinary screening workflow."],
-      missingCriteria: [],
-      reason: "No protocol criteria were available, so advisory relevance review deferred to screening state."
-    };
-  }
-
-  const requiredCoreFacets = facets.filter((facet) => facet.required && isCoreTopicReviewFacet(facet));
-  const requiredSubstantiveFacets = facets.filter((facet) => facet.required && isSubstantiveReviewFacet(facet));
-  const coreMatched = matchedFacetLabels(paper, requiredCoreFacets, () => true);
-  const substantiveMatched = matchedFacetLabels(paper, requiredSubstantiveFacets, () => true);
-  const coveredFacetIds = new Set(coverage?.coveredFacetIds ?? []);
-  const optionalMatched = facets
-    .filter((facet) => !facet.required && coveredFacetIds.has(facet.id))
-    .map((facet) => facet.label);
-  const coreSatisfied = requiredCoreFacets.length === 0 || coreMatched.length > 0;
-  const substantiveSatisfied = requiredSubstantiveFacets.length === 0 || substantiveMatched.length > 0;
-  const matchedCriteria = uniqueStrings([
-    ...coreMatched.map((label) => `core:${label}`),
-    ...substantiveMatched.map((label) => `evidence:${label}`),
-    ...optionalMatched.map((label) => `hint:${label}`)
-  ]);
-  const missingCriteria = uniqueStrings([
-    ...(coreSatisfied ? [] : requiredCoreFacets.map((facet) => `core:${facet.label}`)),
-    ...(substantiveSatisfied ? [] : requiredSubstantiveFacets.map((facet) => `evidence:${facet.label}`))
-  ]);
-  const status: LiteratureRelevanceStatus = coreSatisfied && substantiveSatisfied
-    ? "in_scope"
-    : coreSatisfied || substantiveSatisfied
-      ? "borderline"
-      : "excluded";
+function reviewRelevanceAssessmentForPaper(paper: CanonicalPaper): LiteratureRelevanceAssessment {
+  const status: LiteratureRelevanceStatus = "in_scope";
   const sourceRole = sourceRoleForPaper(paper, status);
   const selectionDecision = selectedDecisionForRole(sourceRole, false, status);
 
@@ -3681,90 +3336,29 @@ function reviewRelevanceAssessmentForPaper(
     criticConcerns: [],
     requiredForManuscript: false,
     reviewer: "advisory_protocol_review",
-    matchedCriteria,
-    missingCriteria,
-    reason: status === "in_scope"
-      ? "The paper matched the protocol core scope and at least one required evidence target."
-      : status === "borderline"
-        ? "The paper matched only part of the protocol scope/evidence diagnostic."
-        : "The paper did not closely match the advisory protocol scope or required evidence targets."
+    matchedCriteria: ["Runtime retained the source for researcher-visible review; semantic relevance belongs to the researcher/critic."],
+    missingCriteria: [],
+    reason: "No deterministic protocol/facet relevance gate was applied."
   };
 }
 
-function buildLiteratureRelevanceAssessments(
-  papers: CanonicalPaper[],
-  facets: ReviewFacet[],
-  coverageByPaperId: Map<string, PaperFacetCoverage>
-): LiteratureRelevanceAssessment[] {
-  return papers.map((paper) => reviewRelevanceAssessmentForPaper(paper, facets, coverageByPaperId.get(paper.id) ?? null));
-}
-
-function selectPapersForFacetCoverage(input: {
-  orderedCandidates: CanonicalPaper[];
-  facets: ReviewFacet[];
-  coverageByPaperId: Map<string, PaperFacetCoverage>;
-  limit: number;
-}): CanonicalPaper[] {
-  const selected: CanonicalPaper[] = [];
-  const selectedIds = new Set<string>();
-  const requiredFacets = input.facets.filter((facet) => facet.required);
-
-  for (const facet of requiredFacets) {
-    const best = input.orderedCandidates
-      .filter((paper) => !selectedIds.has(paper.id))
-      .filter((paper) => input.coverageByPaperId.get(paper.id)?.coveredFacetIds.includes(facet.id) ?? false)
-      .sort((left, right) => {
-        return paperScreeningPriority(right, input.coverageByPaperId.get(right.id) ?? null)
-          - paperScreeningPriority(left, input.coverageByPaperId.get(left.id) ?? null);
-      })[0];
-
-    if (best === undefined) {
-      continue;
-    }
-
-    selected.push(best);
-    selectedIds.add(best.id);
-
-    if (selected.length >= input.limit) {
-      return selected;
-    }
-  }
-
-  for (const paper of input.orderedCandidates) {
-    if (selectedIds.has(paper.id)) {
-      continue;
-    }
-
-    selected.push(paper);
-    selectedIds.add(paper.id);
-
-    if (selected.length >= input.limit) {
-      break;
-    }
-  }
-
-  return selected;
+function buildLiteratureRelevanceAssessments(papers: CanonicalPaper[]): LiteratureRelevanceAssessment[] {
+  return papers.map((paper) => reviewRelevanceAssessmentForPaper(paper));
 }
 
 function buildReviewWorkflow(
   canonicalPapers: CanonicalPaper[],
-  facets: ReviewFacet[],
-  requiredPrimarySources = 0,
   criticExcludedPaperIds: string[] = [],
   criticPromotedPaperIds: string[] = []
 ): {
   reviewedPapers: CanonicalPaper[];
   reviewWorkflow: ReviewWorkflowSummary;
-  selectionQuality: ReviewSelectionQuality | null;
   relevanceAssessments: LiteratureRelevanceAssessment[];
 } {
-  const coverageByPaperId = new Map(
-    canonicalPapers.map((paper) => [paper.id, assessPaperFacetCoverage(facets, paper)])
-  );
-  const relevanceAssessments = buildLiteratureRelevanceAssessments(canonicalPapers, facets, coverageByPaperId);
+  const relevanceAssessments = buildLiteratureRelevanceAssessments(canonicalPapers);
   const criticExcludedIds = new Set(criticExcludedPaperIds);
   const criticPromotedIds = new Set(criticPromotedPaperIds.filter((paperId) => !criticExcludedIds.has(paperId)));
-  const ordered = sortPapersForReview(canonicalPapers, coverageByPaperId);
+  const ordered = sortPapersForReview(canonicalPapers);
   const qualityCounts = {
     high: ordered.filter((paper) => sourceQualityAssessmentForPaper(paper).tier === "high").length,
     medium: ordered.filter((paper) => sourceQualityAssessmentForPaper(paper).tier === "medium").length,
@@ -3829,36 +3423,14 @@ function buildReviewWorkflow(
       .filter((paper) => synthesisEligiblePaperIds.has(paper.id))
       .map((paper) => paper.id)
   ]);
-  const uncoveredRequiredFacetIds = facets
-    .filter((facet) => facet.required)
-    .filter((facet) => ![...selectedCandidateIds].some((paperId) => (
-      coverageByPaperId.get(paperId)?.coveredFacetIds.includes(facet.id) ?? false
-    )))
-    .map((facet) => facet.id);
-  const facetRescuePapers = eligibleUncertainPapers.filter((paper) => {
-    if (selectedCandidateIds.has(paper.id)) {
-      return false;
-    }
-
-    const coverage = coverageByPaperId.get(paper.id);
-    return coverage !== undefined && uncoveredRequiredFacetIds.some((facetId) => coverage.coveredFacetIds.includes(facetId));
-  }).slice(0, Math.max(0, 24 - selectedCandidateIds.size));
   const collapsed = collapseReviewSeries([
     ...qualityEligibleIncludedPapers,
     ...promotedUncertainPapers,
-    ...facetRescuePapers,
     ...ordered
       .filter((paper) => criticPromotedIds.has(paper.id))
       .filter((paper) => synthesisEligiblePaperIds.has(paper.id))
   ]);
-  const selectedForSynthesis = facets.length === 0
-    ? collapsed.selected.slice(0, 24)
-    : selectPapersForFacetCoverage({
-      orderedCandidates: sortPapersForReview(collapsed.selected, coverageByPaperId),
-      facets,
-      coverageByPaperId,
-      limit: 24
-    });
+  const selectedForSynthesis = collapsed.selected.slice(0, 24);
   const synthesisPaperIds = selectedForSynthesis.map((paper) => paper.id);
   const selectedPaperIds = new Set(synthesisPaperIds);
   const finalizedRelevanceAssessments = finalizeRelevanceAssessments(relevanceAssessments, selectedPaperIds, criticExcludedIds);
@@ -3877,16 +3449,6 @@ function buildReviewWorkflow(
     const count = finalizedRelevanceAssessments.filter((assessment) => assessment.sourceRole === role).length;
     return `${role.replace(/_/g, " ")}: ${count}`;
   }).join(", ");
-  let selectionQuality = facets.length === 0
-    ? null
-    : buildReviewSelectionQuality({
-      facets,
-      papers: canonicalPapers,
-      selectedPaperIds: synthesisPaperIds
-    });
-  selectionQuality = selectionQuality === null
-    ? null
-    : roleAwareSelectionQuality(selectionQuality, finalizedRelevanceAssessments, requiredPrimarySources);
   const notes = [
     `Title screened ${titleScreenedPaperIds.length} canonical papers.`,
     `Abstract screened ${abstractScreenedPaperIds.length} papers and full-text screened ${fulltextScreenedPaperIds.length}.`,
@@ -3902,12 +3464,6 @@ function buildReviewWorkflow(
     promotedUncertainPapers.length > 0
       ? `Promoted ${promotedUncertainPapers.length} high/medium-quality uncertain papers into the reviewed set because fewer than 3 included papers were available.`
       : null,
-    facetRescuePapers.length > 0
-      ? `Added ${facetRescuePapers.length} high/medium-quality uncertain papers because they covered required review facets missing from the included set.`
-      : null,
-    selectionQuality !== null
-      ? `Review facet adequacy is ${selectionQuality.adequacy}; missing required facets: ${selectionQuality.missingRequiredFacets.map((facet) => facet.label).join(", ") || "<none>"}.`
-      : null,
     ...collapsed.notes,
     promotedUncertainPapers.length === 0 && synthesisPaperIds.length === includedPaperIds.length
       ? `Selected all ${synthesisPaperIds.length} included papers for synthesis.`
@@ -3916,7 +3472,6 @@ function buildReviewWorkflow(
 
   return {
     reviewedPapers,
-    selectionQuality,
     relevanceAssessments: finalizedRelevanceAssessments,
     reviewWorkflow: {
       titleScreenedPaperIds,
@@ -4009,9 +3564,6 @@ function canonicalPaperFromSources(
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
   });
-  const assessment = sources
-    .map((source) => source.assessment ?? null)
-    .find((candidate) => candidate !== null) ?? null;
   const stage = screeningStageFromAccess(access.best.accessMode);
   const provisionalPaper: CanonicalPaper = {
     id: createLiteratureEntityId("paper", key),
@@ -4060,18 +3612,10 @@ function canonicalPaperFromSources(
     updatedAt: new Date().toISOString()
   };
   const quality = sourceQualityAssessmentForPaper(provisionalPaper);
-  const screening = screeningDecision(sources.map((source) => source.id), sources, stage, assessment, quality);
-  const assessmentTags = assessment === null
-    ? []
-    : [
-      ...assessment.matchedDomainAnchors.map((anchor) => `topic-anchor:${slug(anchor)}`),
-      ...assessment.matchedFocusConcepts.map((concept) => `focus:${slug(concept)}`),
-      ...assessment.matchedTaskAttributes.map((attribute) => `task:${attribute}`)
-    ];
+  const screening = screeningDecision(sources.map((source) => source.id), sources, stage, quality);
   const qualityTags = [
     `quality:${quality.tier}`,
-    ...quality.signals.map((signal) => `quality-signal:${signal}`),
-    ...assessmentTags
+    ...quality.signals.map((signal) => `quality-signal:${signal}`)
   ];
 
   return {
@@ -4094,11 +3638,9 @@ function sourceTokensForBrief(request: ResearchSourceGatherRequest): Set<string>
 
 function filterCandidates(
   rawCandidates: RawCandidate[],
-  request: ResearchSourceGatherRequest,
-  profile: LiteratureReviewProfile | null
+  request: ResearchSourceGatherRequest
 ): FilterCandidatesResult {
   const notes: string[] = [];
-  const assessments: Array<{ sourceId: string; title: string; assessment: LiteratureSourceAssessment }> = [];
   const rejectedSamples: Array<{ title: string; excerpt: string; rationale: string }> = [];
   const acceptedSources: ResearchSource[] = [];
   const referenceTokens = sourceTokensForBrief(request);
@@ -4109,44 +3651,16 @@ function filterCandidates(
 
   for (const candidate of rawCandidates) {
     const source = toResearchSource(candidate);
-    const screening = screeningForSource(source, profile);
     const heuristicScore = overlapScore(`${source.title} ${source.excerpt}`, referenceTokens);
     const strongTopicScore = coreTopicScore(`${source.title} ${source.excerpt}`, topicTokens);
 
-    if (screening.assessment !== undefined) {
-      source.assessment = screening.assessment;
-    }
-
-    if (screening.assessment !== undefined) {
-      assessments.push({
-        sourceId: source.id,
-        title: source.title,
-        assessment: screening.assessment
-      });
-    }
-
     const anchorScore = overlapScore(`${source.title} ${source.excerpt}`, anchorTokens);
     const topicPhraseMatch = containsTopicPhrase(source, request);
-    const assessment = screening.assessment;
     const strongTopicAccepted = topicTokens.size === 0
       || strongTopicScore >= minimumTopicMatches
-      || topicPhraseMatch
-      || (assessment !== undefined && assessment.focusScore >= 4 && assessment.taskAttributeScore >= 4)
-      || (assessment !== undefined && assessment.totalScore >= 10);
-    const profileAccepted = profile === null
-      ? screening.accepted || heuristicScore >= 3
-      : (
-        screening.accepted
-        || (assessment !== undefined && assessment.focusScore >= 4 && assessment.taskAttributeScore >= 4)
-        || (assessment !== undefined && assessment.totalScore >= 10)
-        || (
-          assessment !== undefined
-          && assessment.topicScore >= 6
-          && (assessment.focusScore >= 2 || assessment.taskAttributeScore >= 4)
-        )
-        || (topicPhraseMatch && heuristicScore >= 3)
-      );
-    const accepted = strongTopicAccepted && profileAccepted;
+      || topicPhraseMatch;
+    const sourceReadable = heuristicScore >= 3 || tokenize(source.title).length >= 2;
+    const accepted = strongTopicAccepted && sourceReadable;
 
     if (!accepted) {
       weaklyMatched += 1;
@@ -4154,8 +3668,7 @@ function filterCandidates(
         rejectedSamples.push({
           title: source.title,
           excerpt: source.excerpt,
-          rationale: assessment?.rationale
-            ?? `Weak overlap with the scoped brief (anchor score ${anchorScore}, heuristic score ${heuristicScore}).`
+          rationale: `Weak lexical overlap diagnostic with the scoped brief (anchor score ${anchorScore}, heuristic score ${heuristicScore}).`
         });
       }
     }
@@ -4170,7 +3683,6 @@ function filterCandidates(
   return {
     sources: acceptedSources,
     notes,
-    assessments,
     rejectedSamples,
     acceptedCount: acceptedSources.length,
     rejectedCount: weaklyMatched
@@ -4488,16 +4000,12 @@ function groupedScholarlySources(
 
 function buildReviewStateFromPapers(
   canonicalPapers: CanonicalPaper[],
-  reviewFacets: ReviewFacet[],
   mergeDiagnostics: string[],
-  requiredPrimarySources: number,
   criticExcludedPaperIds: string[],
   criticPromotedPaperIds: string[]
 ): CanonicalReviewState {
-  const { reviewedPapers, reviewWorkflow, selectionQuality, relevanceAssessments } = buildReviewWorkflow(
+  const { reviewedPapers, reviewWorkflow, relevanceAssessments } = buildReviewWorkflow(
     canonicalPapers,
-    reviewFacets,
-    requiredPrimarySources,
     criticExcludedPaperIds,
     criticPromotedPaperIds
   );
@@ -4506,7 +4014,6 @@ function buildReviewStateFromPapers(
     canonicalPapers,
     reviewedPapers,
     reviewWorkflow,
-    selectionQuality,
     mergeDiagnostics,
     relevanceAssessments
   };
@@ -4521,12 +4028,10 @@ function accessResolutionTargets(
     return [];
   }
 
-  const coverageByPaperId = new Map((state.selectionQuality?.paperFacetCoverage ?? [])
-    .map((coverage) => [coverage.paperId, coverage]));
   const explicitTargetIds = new Set(targetPaperIds);
 
   if (explicitTargetIds.size > 0) {
-    return sortPapersForReview(state.canonicalPapers, coverageByPaperId)
+    return sortPapersForReview(state.canonicalPapers)
       .filter((paper) => explicitTargetIds.has(paper.id))
       .filter((paper) => paper.identifiers.doi !== null || paper.identifiers.arxivId !== null || paper.bestAccessUrl !== null)
       .slice(0, maxAccessResolutions);
@@ -4540,7 +4045,7 @@ function accessResolutionTargets(
       .map((assessment) => assessment.paperId),
     ...state.reviewWorkflow.uncertainPaperIds.slice(0, 8)
   ]);
-  const candidates = sortPapersForReview(state.canonicalPapers, coverageByPaperId)
+  const candidates = sortPapersForReview(state.canonicalPapers)
     .filter((paper) => selectedIds.has(paper.id))
     .filter((paper) => paper.identifiers.doi !== null || paper.identifiers.arxivId !== null || paper.bestAccessUrl !== null);
 
@@ -4551,16 +4056,14 @@ async function buildCanonicalReviewState(
   scholarlySources: ResearchSource[],
   routing: RoutingPlan,
   request: ResearchSourceGatherRequest,
-  reviewFacets: ReviewFacet[],
   options: CanonicalReviewBuildOptions
 ): Promise<CanonicalReviewState> {
   const { groupedSources, mergeDiagnostics } = groupedScholarlySources(scholarlySources);
-  const requiredPrimarySources = requiredPrimarySystemCount(request);
   const criticExcludedPaperIds = request.criticExcludedPaperIds ?? [];
   const criticPromotedPaperIds = request.criticPromotedPaperIds ?? [];
   const provisionalPapers = [...groupedSources.entries()]
     .map(([key, group]) => canonicalPaperFromSources(key, group, []));
-  const initialState = buildReviewStateFromPapers(provisionalPapers, reviewFacets, mergeDiagnostics, requiredPrimarySources, criticExcludedPaperIds, criticPromotedPaperIds);
+  const initialState = buildReviewStateFromPapers(provisionalPapers, mergeDiagnostics, criticExcludedPaperIds, criticPromotedPaperIds);
   const targets = accessResolutionTargets(initialState, options.maxAccessResolutions, uniqueStrings([
     ...(options.targetPaperIds ?? []),
     ...criticPromotedPaperIds
@@ -4664,7 +4167,7 @@ async function buildCanonicalReviewState(
     }
   });
 
-  return buildReviewStateFromPapers(canonicalPapers, reviewFacets, mergeDiagnostics, requiredPrimarySources, criticExcludedPaperIds, criticPromotedPaperIds);
+  return buildReviewStateFromPapers(canonicalPapers, mergeDiagnostics, criticExcludedPaperIds, criticPromotedPaperIds);
 }
 
 function accessLimitationsFromAuth(authStatus: ProviderAuthSnapshot[]): string[] {
@@ -4685,70 +4188,6 @@ function accessLimitationsFromAuth(authStatus: ProviderAuthSnapshot[]): string[]
   });
 }
 
-function selectionQualityNeedsRecovery(selectionQuality: ReviewSelectionQuality | null): boolean {
-  if (selectionQuality === null || selectionQuality.adequacy === "strong") {
-    return false;
-  }
-
-  return true;
-}
-
-function canonicalReviewQualityScore(state: CanonicalReviewState): number {
-  const inScope = state.relevanceAssessments.filter((assessment) => assessment.status === "in_scope").length;
-  const borderline = state.relevanceAssessments.filter((assessment) => assessment.status === "borderline").length;
-  const excluded = state.relevanceAssessments.filter((assessment) => assessment.status === "excluded").length;
-  const missing = state.selectionQuality?.missingRequiredFacets.length ?? 0;
-
-  return inScope * 20
-    + state.reviewedPapers.length * 5
-    + state.reviewWorkflow.counts.included
-    - missing * 12
-    - borderline * 3
-    - excluded;
-}
-
-function canonicalReviewImproved(previous: CanonicalReviewState, next: CanonicalReviewState): boolean {
-  const previousInScopeIds = new Set(previous.relevanceAssessments
-    .filter((assessment) => assessment.status === "in_scope")
-    .map((assessment) => assessment.paperId));
-  const nextInScopeIds = next.relevanceAssessments
-    .filter((assessment) => assessment.status === "in_scope")
-    .map((assessment) => assessment.paperId);
-  const gainedInScopePaper = nextInScopeIds.some((paperId) => !previousInScopeIds.has(paperId));
-  const previousMissing = previous.selectionQuality?.missingRequiredFacets.length ?? 0;
-  const nextMissing = next.selectionQuality?.missingRequiredFacets.length ?? 0;
-
-  return gainedInScopePaper
-    || nextMissing < previousMissing
-    || canonicalReviewQualityScore(next) > canonicalReviewQualityScore(previous);
-}
-
-function shouldRunRecoveryPass(
-  state: CanonicalReviewState,
-  literatureReviewActive: boolean,
-  recoveryPasses: number
-): boolean {
-  return literatureReviewActive
-    && recoveryPasses < 2
-    && (
-      state.canonicalPapers.length === 0
-      || state.reviewedPapers.length < 3
-      || selectionQualityNeedsRecovery(state.selectionQuality)
-    );
-}
-
-function recoveryReason(state: CanonicalReviewState): string {
-  if (state.canonicalPapers.length === 0 || state.reviewedPapers.length < 3) {
-    return "Evidence remained thin after the first pass";
-  }
-
-  const missing = state.selectionQuality?.missingRequiredFacets.map((facet) => facet.label).slice(0, 4) ?? [];
-
-  return missing.length > 0
-    ? `Review facet coverage remained incomplete (${missing.join(", ")})`
-    : "Review selection quality remained below the confidence target";
-}
-
 export class AgenticSourceGatherSession {
   private readonly scholarlyProviderIds: SourceProviderId[];
   private readonly generalWebProviderIds: SourceProviderId[];
@@ -4756,11 +4195,7 @@ export class AgenticSourceGatherSession {
   private readonly authStatus: ProviderAuthSnapshot[];
   private readonly domain: SourceProviderDomain | "mixed";
   private readonly routing: RoutingPlan;
-  private readonly literatureReviewActive: boolean;
   private readonly budget: RetrievalBudget;
-  private readonly literatureProfile: LiteratureReviewProfile | null;
-  private readonly reviewFacets: ReviewFacet[];
-  private readonly selectedAssessments: Array<{ sourceId: string; title: string; assessment: LiteratureSourceAssessment }> = [];
   private readonly providerAttempts: RetrievalDiagnostics["providerAttempts"] = [];
   private readonly rejectedSamples: Array<{ title: string; excerpt: string; rationale: string }> = [];
   private readonly scholarlySources: ResearchSource[] = [];
@@ -4788,25 +4223,10 @@ export class AgenticSourceGatherSession {
     this.authStatus = authSnapshots(request, this.scholarlyProviderIds, this.generalWebProviderIds, this.localEnabled);
     this.domain = classifyDomain(request.brief, request.plan);
     this.routing = routeProviders(this.domain, this.scholarlyProviderIds);
-    this.literatureReviewActive = shouldUseLiteratureReviewSubsystem(request.plan, request.brief);
-    this.budget = buildRetrievalBudget(request, this.literatureReviewActive);
+    this.budget = buildRetrievalBudget(request);
     this.queryPlan = buildQueryPlan(request, this.domain, this.budget);
     this.queries = this.queryPlan.queries;
     this.routing.plannedQueries = this.queries;
-    this.literatureProfile = this.literatureReviewActive
-      ? buildLiteratureReviewProfile({
-        brief: request.brief,
-        plan: request.plan,
-        memoryContext: request.memoryContext
-      })
-      : null;
-    this.reviewFacets = this.literatureReviewActive
-      ? buildReviewFacets({
-        brief: request.brief,
-        plan: request.plan,
-        profile: this.literatureProfile
-      })
-      : [];
   }
 
   static async create(request: ResearchSourceGatherRequest): Promise<AgenticSourceGatherSession> {
@@ -4971,9 +4391,7 @@ export class AgenticSourceGatherSession {
       return preferredIds.slice(0, limit);
     }
 
-    const coverageByPaperId = new Map((this.canonicalReview.selectionQuality?.paperFacetCoverage ?? [])
-      .map((coverage) => [coverage.paperId, coverage]));
-    return sortPapersForReview(this.canonicalReview.canonicalPapers, coverageByPaperId)
+    return sortPapersForReview(this.canonicalReview.canonicalPapers)
       .map((paper) => paper.id)
       .slice(0, limit);
   }
@@ -5068,7 +4486,26 @@ export class AgenticSourceGatherSession {
       };
     }
 
-    const querySet = uniqueStrings(queries.length > 0 ? queries : this.queries.slice(0, 4)).slice(0, 6);
+    const querySet = uniqueStrings(queries).slice(0, 6);
+    if (querySet.length === 0) {
+      this.lastObservation = `${getSourceProviderDefinition(providerId).label} search skipped because no explicit researcher-authored query text was provided.`;
+      this.recordSearchOutcome({
+        providerId,
+        querySet,
+        rawCandidates: 0,
+        newSources: 0,
+        error: this.lastObservation,
+        message: this.lastObservation
+      });
+      return {
+        action: "query_provider",
+        message: this.lastObservation,
+        counts: {
+          newSources: 0,
+          scholarlySources: this.scholarlySources.length
+        }
+      };
+    }
     const queryKey = providerQueryKey(providerId, querySet);
     if (this.exhaustedProviderQueryKeys.has(queryKey)) {
       this.lastObservation = `${getSourceProviderDefinition(providerId).label} search skipped because this provider/query set already produced no new screened sources twice.`;
@@ -5143,7 +4580,7 @@ export class AgenticSourceGatherSession {
         };
       }
 
-      const filtered = filterCandidates(providerResult.candidates, this.request, this.literatureProfile);
+      const filtered = filterCandidates(providerResult.candidates, this.request);
       const newSources = filtered.sources.filter((source) => {
         if (this.seenScholarlySourceIds.has(source.id)) {
           return false;
@@ -5153,7 +4590,6 @@ export class AgenticSourceGatherSession {
         return true;
       });
       this.scholarlySources.push(...newSources);
-      this.selectedAssessments.push(...filtered.assessments);
       this.rejectedSamples.push(...filtered.rejectedSamples);
       this.acceptedScreeningCount += filtered.acceptedCount;
       this.rejectedScreeningCount += filtered.rejectedCount;
@@ -5238,7 +4674,7 @@ export class AgenticSourceGatherSession {
         scholarlySources: this.scholarlySources.length
       }
     });
-    this.canonicalReview = await buildCanonicalReviewState(this.scholarlySources, this.routing, this.request, this.reviewFacets, {
+    this.canonicalReview = await buildCanonicalReviewState(this.scholarlySources, this.routing, this.request, {
       maxAccessResolutions: 0,
       accessResolutionCheckpointSize: this.budget.accessResolutionCheckpointSize,
       progress: this.request.progress
@@ -5297,7 +4733,7 @@ export class AgenticSourceGatherSession {
     const targetPaperIds = uniqueStrings(paperIds.length > 0 ? paperIds : this.candidatePaperIds(this.budget.maxAccessResolutions))
       .filter((paperId) => knownPaperIds.has(paperId))
       .slice(0, this.budget.maxAccessResolutions);
-    this.canonicalReview = await buildCanonicalReviewState(this.scholarlySources, this.routing, this.request, this.reviewFacets, {
+    this.canonicalReview = await buildCanonicalReviewState(this.scholarlySources, this.routing, this.request, {
       maxAccessResolutions: Math.min(this.budget.maxAccessResolutions, Math.max(0, targetPaperIds.length)),
       accessResolutionCheckpointSize: this.budget.accessResolutionCheckpointSize,
       targetPaperIds,
@@ -5328,58 +4764,41 @@ export class AgenticSourceGatherSession {
 
     let canonicalReview = this.canonicalReview!;
     const requestedPaperIds = uniqueStrings(paperIds);
-    if (requestedPaperIds.length > 0) {
-      const knownPaperIds = new Set(canonicalReview.canonicalPapers.map((paper) => paper.id));
-      const selectedPaperIds = requestedPaperIds.filter((paperId) => knownPaperIds.has(paperId));
-      const unknownPaperIds = requestedPaperIds.filter((paperId) => !knownPaperIds.has(paperId));
-      const selectedPaperIdSet = new Set(selectedPaperIds);
-      const reviewedPapers = canonicalReview.canonicalPapers.filter((paper) => selectedPaperIdSet.has(paper.id));
-      const deferredPaperIds = canonicalReview.reviewWorkflow.includedPaperIds.filter((paperId) => !selectedPaperIdSet.has(paperId));
-      let selectionQuality = this.reviewFacets.length === 0
-        ? null
-        : buildReviewSelectionQuality({
-          facets: this.reviewFacets,
-          papers: canonicalReview.canonicalPapers,
-          selectedPaperIds
-        });
-      selectionQuality = selectionQuality === null
-        ? null
-        : roleAwareSelectionQuality(
-          selectionQuality,
-          finalizeRelevanceAssessments(canonicalReview.relevanceAssessments, selectedPaperIdSet, new Set(canonicalReview.reviewWorkflow.excludedPaperIds)),
-          0
-        );
-      canonicalReview = {
-        ...canonicalReview,
-        reviewedPapers,
-        selectionQuality,
-        relevanceAssessments: finalizeRelevanceAssessments(
-          canonicalReview.relevanceAssessments,
-          selectedPaperIdSet,
-          new Set(canonicalReview.reviewWorkflow.excludedPaperIds)
-        ),
-        reviewWorkflow: {
-          ...canonicalReview.reviewWorkflow,
-          synthesisPaperIds: selectedPaperIds,
-          deferredPaperIds,
-          counts: {
-            ...canonicalReview.reviewWorkflow.counts,
-            selectedForSynthesis: selectedPaperIds.length,
-            deferred: deferredPaperIds.length
-          },
-          notes: [
-            ...canonicalReview.reviewWorkflow.notes,
-            selectedPaperIds.length > 0
-              ? `Researcher-selected evidence set honored ${selectedPaperIds.length} known paper id(s).`
-              : "Researcher-selected evidence set contained no known paper ids; no fallback semantic selection was substituted.",
-            unknownPaperIds.length > 0
-              ? `Unknown requested paper id(s) were ignored visibly: ${unknownPaperIds.slice(0, 12).join(", ")}.`
-              : null
-          ].filter((note): note is string => note !== null)
-        }
-      };
-      this.canonicalReview = canonicalReview;
-    }
+    const knownPaperIds = new Set(canonicalReview.canonicalPapers.map((paper) => paper.id));
+    const selectedPaperIds = requestedPaperIds.filter((paperId) => knownPaperIds.has(paperId));
+    const unknownPaperIds = requestedPaperIds.filter((paperId) => !knownPaperIds.has(paperId));
+    const selectedPaperIdSet = new Set(selectedPaperIds);
+    const reviewedPapers = canonicalReview.canonicalPapers.filter((paper) => selectedPaperIdSet.has(paper.id));
+    const deferredPaperIds = canonicalReview.reviewWorkflow.includedPaperIds.filter((paperId) => !selectedPaperIdSet.has(paperId));
+    canonicalReview = {
+      ...canonicalReview,
+      reviewedPapers,
+      relevanceAssessments: finalizeRelevanceAssessments(
+        canonicalReview.relevanceAssessments,
+        selectedPaperIdSet,
+        new Set(canonicalReview.reviewWorkflow.excludedPaperIds)
+      ),
+      reviewWorkflow: {
+        ...canonicalReview.reviewWorkflow,
+        synthesisPaperIds: selectedPaperIds,
+        deferredPaperIds,
+        counts: {
+          ...canonicalReview.reviewWorkflow.counts,
+          selectedForSynthesis: selectedPaperIds.length,
+          deferred: deferredPaperIds.length
+        },
+        notes: [
+          ...canonicalReview.reviewWorkflow.notes,
+          selectedPaperIds.length > 0
+            ? `Researcher-selected evidence set honored ${selectedPaperIds.length} known paper id(s).`
+            : "Researcher-selected evidence set contained no known paper ids; no fallback semantic selection was substituted.",
+          unknownPaperIds.length > 0
+            ? `Unknown requested paper id(s) were ignored visibly: ${unknownPaperIds.slice(0, 12).join(", ")}.`
+            : null
+        ].filter((note): note is string => note !== null)
+      }
+    };
+    this.canonicalReview = canonicalReview;
 
     this.sourceStage = "selected";
     this.lastObservation = requestedPaperIds.length > 0
@@ -5413,7 +4832,7 @@ export class AgenticSourceGatherSession {
     }
 
     const canonicalReview = this.canonicalReview!;
-    const { canonicalPapers, reviewedPapers, reviewWorkflow, selectionQuality, relevanceAssessments } = canonicalReview;
+    const { canonicalPapers, reviewedPapers, reviewWorkflow, relevanceAssessments } = canonicalReview;
     const allSources: ResearchSource[] = [
       {
         id: "brief:project",
@@ -5452,10 +4871,7 @@ export class AgenticSourceGatherSession {
       },
       revisionPasses: 0,
       accessLimitations: accessLimitationsFromAuth(this.authStatus),
-      suggestedNextQueries: buildRecoveryQueryCandidates(this.request, this.rejectedSamples, selectionQuality)
-        .map((candidate) => candidate.query)
-        .filter((query) => !this.queries.map(normalizeQueryKey).includes(normalizeQueryKey(query)))
-        .slice(0, 8)
+      suggestedNextQueries: []
     };
 
     await emitSourceProgress(this.request.progress, {
@@ -5484,16 +4900,8 @@ export class AgenticSourceGatherSession {
       mergeDiagnostics: canonicalReview.mergeDiagnostics,
       authStatus: this.authStatus,
       reviewWorkflow,
-      literatureReview: this.literatureProfile === null
-        ? null
-        : {
-          active: true,
-          profile: this.literatureProfile,
-          selectedAssessments: this.selectedAssessments,
-          relevanceAssessments
-        },
+      literatureReview: null,
       retrievalDiagnostics,
-      selectionQuality,
       relevanceAssessments,
       agenticSourceState: this.state()
     };
@@ -5510,26 +4918,10 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
     const mergeDiagnostics: string[] = [];
     const domain = classifyDomain(request.brief, request.plan);
     const routing = routeProviders(domain, scholarlyProviderIds);
-    const literatureReviewActive = shouldUseLiteratureReviewSubsystem(request.plan, request.brief);
-    const budget = buildRetrievalBudget(request, literatureReviewActive);
-    let queryPlan = buildQueryPlan(request, domain, budget);
-    let queries = queryPlan.queries;
+    const budget = buildRetrievalBudget(request);
+    const queryPlan = buildQueryPlan(request, domain, budget);
+    const queries = queryPlan.queries;
     routing.plannedQueries = queries;
-    const literatureProfile = literatureReviewActive
-      ? buildLiteratureReviewProfile({
-        brief: request.brief,
-        plan: request.plan,
-        memoryContext: request.memoryContext
-      })
-      : null;
-    const reviewFacets = literatureReviewActive
-      ? buildReviewFacets({
-        brief: request.brief,
-        plan: request.plan,
-        profile: literatureProfile
-      })
-      : [];
-    const selectedAssessments: Array<{ sourceId: string; title: string; assessment: LiteratureSourceAssessment }> = [];
     const providerAttempts: RetrievalDiagnostics["providerAttempts"] = [];
     const rejectedSamples: Array<{ title: string; excerpt: string; rationale: string }> = [];
     const localSources = await gatherLocalProjectFiles(request);
@@ -5538,17 +4930,7 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
     const backgroundSources: ResearchSource[] = [];
     let acceptedScreeningCount = 0;
     let rejectedScreeningCount = 0;
-    let revisionPasses = 0;
-
-    if (literatureProfile !== null) {
-      notes.push("Literature review subsystem active.");
-      if (literatureProfile.taskAttributes.length > 0) {
-        notes.push(`Task-aware paper ranking attributes: ${literatureProfile.taskAttributes.join(", ")}.`);
-      }
-      if (reviewFacets.length > 0) {
-        notes.push(`Review facet selection will track: ${reviewFacets.map((facet) => `${facet.label}${facet.required ? " (required)" : ""}`).join(", ")}.`);
-      }
-    }
+    const revisionPasses = 0;
 
     notes.push(`Query planning produced ${queries.length} retrieval queries.`);
     notes.push(
@@ -5566,9 +4948,7 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
       }
     });
 
-    const minimumProviderPassesBeforeStop = literatureReviewActive
-      ? Math.min(domain === "biomedical" ? 4 : 3, routing.discoveryProviderIds.length)
-      : 1;
+    const minimumProviderPassesBeforeStop = Math.min(3, routing.discoveryProviderIds.length);
     const runScholarlyDiscoveryPass = async (
       passQueries: string[],
       passBudget: RetrievalBudget,
@@ -5594,7 +4974,7 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
         try {
           const providerResult = await queryProvider(providerId, passQueries, request, passBudget);
           const rawCandidates = providerResult.candidates;
-          const filtered = filterCandidates(rawCandidates, request, literatureProfile);
+          const filtered = filterCandidates(rawCandidates, request);
           const newSources = filtered.sources.filter((source) => {
             if (seenScholarlySourceIds.has(source.id)) {
               return false;
@@ -5605,7 +4985,6 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
           });
           scholarlySources.push(...newSources);
           notes.push(...filtered.notes);
-          selectedAssessments.push(...filtered.assessments);
           rejectedSamples.push(...filtered.rejectedSamples);
           acceptedScreeningCount += filtered.acceptedCount;
           rejectedScreeningCount += filtered.rejectedCount;
@@ -5720,7 +5099,7 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
         scholarlySources: scholarlySources.length
       }
     });
-    let canonicalReview = await buildCanonicalReviewState(scholarlySources, routing, request, reviewFacets, {
+    const canonicalReview = await buildCanonicalReviewState(scholarlySources, routing, request, {
       maxAccessResolutions: budget.maxAccessResolutions,
       accessResolutionCheckpointSize: budget.accessResolutionCheckpointSize,
       progress: request.progress
@@ -5735,59 +5114,7 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
         includedPapers: canonicalReview.reviewWorkflow.counts.included
       }
     });
-    let nonImprovingRecoveryPasses = 0;
-
-    while (shouldRunRecoveryPass(canonicalReview, literatureReviewActive, revisionPasses)) {
-      const previousReview = canonicalReview;
-      const initialQueryKeys = new Set(queries.map(normalizeQueryKey));
-      const recoveryCandidates = buildRecoveryQueryCandidates(request, rejectedSamples, canonicalReview.selectionQuality);
-      queryPlan = buildQueryPlan(request, domain, {
-        ...budget,
-        maxQueries: Math.min(12, budget.maxQueries)
-      }, recoveryCandidates);
-      const recoveryQueries = interleaveQueryCandidates(queryPlan.candidates, 24)
-        .filter((candidate) => !initialQueryKeys.has(normalizeQueryKey(candidate.query)))
-        .slice(0, 12)
-        .map((candidate) => candidate.query);
-
-      if (recoveryQueries.length > 0) {
-        revisionPasses += 1;
-        queries = uniqueStrings([...queries, ...recoveryQueries]);
-        routing.plannedQueries = queries;
-        notes.push(`${recoveryReason(canonicalReview)}; running revision pass ${revisionPasses} with ${recoveryQueries.length} additional queries.`);
-        await runScholarlyDiscoveryPass(recoveryQueries, {
-          ...budget,
-          maxQueries: recoveryQueries.length,
-          maxQueriesPerProvider: Math.min(8, recoveryQueries.length),
-          maxProviderCallsPerProvider: Math.min(12, budget.maxProviderCallsPerProvider),
-          maxPagesPerQuery: Math.min(2, budget.maxPagesPerQuery),
-          maxCandidatesPerProvider: Math.min(80, budget.maxCandidatesPerProvider),
-          maxAccessResolutions: Math.min(16, budget.maxAccessResolutions),
-          targetAcceptedSources: Math.max(24, Math.floor(budget.targetAcceptedSources / 2))
-        }, "revision");
-        canonicalReview = await buildCanonicalReviewState(scholarlySources, routing, request, reviewFacets, {
-          maxAccessResolutions: Math.min(16, budget.maxAccessResolutions),
-          accessResolutionCheckpointSize: budget.accessResolutionCheckpointSize,
-          progress: request.progress
-        });
-        if (canonicalReviewImproved(previousReview, canonicalReview)) {
-          nonImprovingRecoveryPasses = 0;
-          notes.push("Revision improved the in-scope evidence set or reduced missing evidence targets.");
-        } else {
-          nonImprovingRecoveryPasses += 1;
-          notes.push("Revision did not improve the in-scope evidence set; the next revision pass must pivot strategy or stop.");
-          if (nonImprovingRecoveryPasses >= 2) {
-            notes.push("Revision stopped because repeated passes did not improve protocol relevance or coverage.");
-            break;
-          }
-        }
-      } else {
-        notes.push(`${recoveryReason(canonicalReview)}; no unused revision queries remained, so retrieval stopped.`);
-        break;
-      }
-    }
-
-    const { canonicalPapers, reviewedPapers, reviewWorkflow, selectionQuality, relevanceAssessments } = canonicalReview;
+    const { canonicalPapers, reviewedPapers, reviewWorkflow, relevanceAssessments } = canonicalReview;
     mergeDiagnostics.push(...canonicalReview.mergeDiagnostics);
     notes.push(`Canonical merge produced ${canonicalPapers.length} scholarly papers from ${scholarlySources.length} discovery hits.`);
     notes.push(...reviewWorkflow.notes);
@@ -5804,10 +5131,7 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
       },
       revisionPasses,
       accessLimitations: accessLimitationsFromAuth(authStatus),
-      suggestedNextQueries: buildRecoveryQueryCandidates(request, rejectedSamples, selectionQuality)
-        .map((candidate) => candidate.query)
-        .filter((query) => !queries.map(normalizeQueryKey).includes(normalizeQueryKey(query)))
-        .slice(0, 8)
+      suggestedNextQueries: []
     };
 
     const allSources: ResearchSource[] = [
@@ -5858,16 +5182,8 @@ export class DefaultResearchSourceGatherer implements ResearchSourceGatherer {
       mergeDiagnostics,
       authStatus,
       reviewWorkflow,
-      literatureReview: literatureProfile === null
-        ? null
-        : {
-          active: true,
-          profile: literatureProfile,
-          selectedAssessments,
-          relevanceAssessments
-        },
+      literatureReview: null,
       retrievalDiagnostics,
-      selectionQuality,
       relevanceAssessments
     };
   }

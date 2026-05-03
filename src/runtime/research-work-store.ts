@@ -1180,17 +1180,15 @@ export function queryResearchWorkStore<T extends WorkStoreEntity = WorkStoreEnti
     }))
     .filter((entry) => terms.length === 0 || entry.score > 0)
     .sort((left, right) => right.score - left.score);
-  const fallback = terms.length > 0 && scored.length === 0
-    ? filtered.slice().reverse()
-    : scored.map((entry) => entry.entity);
-  const items = fallback.slice(offset, offset + limit) as T[];
+  const matches = scored.map((entry) => entry.entity);
+  const items = matches.slice(offset, offset + limit) as T[];
   const nextOffset = offset + items.length;
-  const hasMore = nextOffset < fallback.length;
+  const hasMore = nextOffset < matches.length;
 
   return {
     collection: query.collection,
     count: items.length,
-    totalCount: fallback.length,
+    totalCount: matches.length,
     cursor: query.cursor ?? null,
     hasMore,
     nextCursor: hasMore ? `${query.collection}:${nextOffset}` : null,

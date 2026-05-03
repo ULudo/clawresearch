@@ -22,9 +22,6 @@ import {
 } from "./research-critic.js";
 import type { VerificationReport } from "./verifier.js";
 import {
-  type ReviewSelectionQuality
-} from "./literature-review.js";
-import {
   normalizeResearchActionDecision,
   type ResearchAgentControlMode,
   type ResearchActionDecision,
@@ -162,7 +159,6 @@ export type ResearchAgendaRequest = {
   evidenceMatrix: EvidenceMatrix;
   synthesis: ResearchSynthesis;
   verification: VerificationReport;
-  selectionQuality?: ReviewSelectionQuality | null;
   memoryContext: ProjectMemoryContext;
   literatureContext?: LiteratureContext;
 };
@@ -994,8 +990,8 @@ function agendaInstruction(request: ResearchAgendaRequest): string {
     "Convert the reviewed literature, verified claims, open questions, and project memory into an internal research agenda for a persistent autonomous research worker.",
     "This is proposal ranking, not scientific proof. Do not treat polished text as evidence.",
     "Use only the reviewed papers and verified-claim context provided here.",
-    "Use review selection quality as a boundary condition: do not claim release readiness when required evidence is missing.",
-    "If selection adequacy is thin or required facets are missing, record internal evidence-gathering or revision needs in gaps and holdReasons.",
+    "Use reviewer and source-quality diagnostics as visible context, not as hidden semantic gates.",
+    "If the evidence record is thin, record internal evidence-gathering or revision needs in gaps and holdReasons.",
     "Prefer 2 to 5 concrete candidate directions.",
     "Do not generate a selectedWorkPackage object. The worker continues internally through research actions rather than handing execution back to the user.",
     "Always return selectedWorkPackage as null.",
@@ -1072,7 +1068,6 @@ function agendaInstruction(request: ResearchAgendaRequest): string {
     `Brief: ${JSON.stringify(request.brief)}`,
     `Plan: ${JSON.stringify(request.plan)}`,
     `Reviewed papers: ${JSON.stringify(reviewedPapers)}`,
-    `Review selection quality: ${JSON.stringify(request.selectionQuality ?? null)}`,
     `Paper extractions: ${JSON.stringify(request.paperExtractions)}`,
     `Evidence matrix: ${JSON.stringify(request.evidenceMatrix)}`,
     `Synthesis themes: ${JSON.stringify(request.synthesis.themes)}`,
@@ -1170,7 +1165,7 @@ function criticStageGuidance(stage: CriticReviewStage): { releaseRule: string; r
       return {
         releaseRule: "This review diagnoses whether the selected sources are ready for extraction; the researcher decides how to revise.",
         rules: [
-          "Review the brief, protocol, selected papers, relevance assessments, retrieval diagnostics, and selection quality.",
+          "Review the brief, protocol, selected papers, relevance assessments, and retrieval diagnostics.",
           "Do not require extracted evidence, synthesized claims, references, or a manuscript yet.",
           "Object to off-topic selected papers, missing evidence targets, weak source fit, or selection/relevance contradictions.",
           "If readiness is revise or block, you must provide at least one concrete objection with a specific message and suggested revision.",
@@ -1231,7 +1226,6 @@ function criticPacketLines(
         `Selected papers: ${JSON.stringify(selectedPapers)}`,
         `Known selected paper IDs: ${JSON.stringify(selectedPapers.map((paper) => paper.id))}`,
         `Review workflow: ${JSON.stringify(request.gathered?.reviewWorkflow ?? null)}`,
-        `Selection quality: ${JSON.stringify(request.selectionQuality ?? null)}`,
         `Relevance assessments: ${JSON.stringify(request.relevanceAssessments ?? [])}`
       ];
     case "evidence":

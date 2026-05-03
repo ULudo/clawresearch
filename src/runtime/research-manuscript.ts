@@ -4,10 +4,6 @@ import type {
   ResearchPlan
 } from "./research-backend.js";
 import { briefFingerprint } from "./research-evidence.js";
-import {
-  buildReviewFacets,
-  isRetrievalQualityConstraintPhrase
-} from "./literature-review.js";
 import type { ResearchSourceGatherResult } from "./research-sources.js";
 import type { CriticReviewArtifact } from "./research-critic.js";
 import type { RunRecord } from "./run-store.js";
@@ -61,14 +57,6 @@ export type ReviewProtocol = {
   manuscriptRequirements: string[];
   workflowNotes: string[];
   successCriteria: string[];
-  requiredSuccessCriterionFacets: Array<{
-    id: string;
-    label: string;
-    kind: string;
-    required: boolean;
-    terms: string[];
-    rationale: string;
-  }>;
   screeningStages: string[];
   qualityAppraisalCriteria: string[];
   stoppingConditions: string[];
@@ -272,78 +260,29 @@ function splitSentences(text: string | null | undefined): string[] {
     .filter((sentence) => sentence.length > 0);
 }
 
-function isFileLikeProtocolPhrase(phrase: string): boolean {
-  const compact = phrase.trim();
-  return /(^|[/\\])[\w.-]+\.(txt|md|json|jsonl|log|csv|ts|tsx|js|jsx|py|yaml|yml)$/i.test(compact)
-    || /^[\w.-]+\.(txt|md|json|jsonl|log|csv|ts|tsx|js|jsx|py|yaml|yml)$/i.test(compact);
-}
-
-function isWorkflowProtocolPhrase(phrase: string): boolean {
-  const compact = compactText(phrase);
-
-  return /\b(?:create|build|produce|generate|fill|complete|update|append|save)\s+(?:a\s+|an\s+|the\s+)?(?:source\s+matrix|evidence\s+matrix|matrix|table|json|markdown|md|file|artifact)\b/i.test(compact)
-    || /\b(?:convert|turn|translate)\s+(?:the\s+)?findings\s+into\s+(?:a\s+|an\s+|the\s+)?(?:design\s+brief|report|paper|manuscript|markdown|file)\b/i.test(compact)
-    || /\b(?:run|execute|invoke|use)\s+(?:the\s+)?(?:\/go|\/continue|go command|continue command)\b/i.test(compact)
-    || /\b(?:source\s+matrix|write\s+the\s+file|save\s+to\s+file|update\s+summary\.md|append\s+to\s+summary\.md)\b/i.test(compact);
-}
-
-function isProtocolEvidencePhrase(phrase: string): boolean {
-  return !isRetrievalQualityConstraintPhrase(phrase)
-    && !isFileLikeProtocolPhrase(phrase)
-    && !isWorkflowProtocolPhrase(phrase);
-}
-
-function protocolFacetsFor(input: ReviewProtocolInput): NonNullable<ResearchSourceGatherResult["selectionQuality"]>["requiredFacets"] {
-  const gatheredFacets = input.gathered?.selectionQuality?.requiredFacets ?? [];
-
-  if (gatheredFacets.length > 0) {
-    return gatheredFacets.filter((facet) => isProtocolEvidencePhrase(facet.label));
-  }
-
-  return buildReviewFacets({
-    brief: input.run.brief,
-    plan: input.plan
-  }).filter((facet) => facet.required && isProtocolEvidencePhrase(facet.label));
-}
-
 function manuscriptConstraintsFor(input: ReviewProtocolInput): string[] {
-  const successSentences = splitSentences(input.run.brief.successCriterion);
-  const constraints = successSentences.filter((sentence) => (
-    isRetrievalQualityConstraintPhrase(sentence)
-    && !isWorkflowProtocolPhrase(sentence)
-  ));
-
   return uniqueStrings([
-    ...constraints,
-    "Do not present a full manuscript unless the selected evidence set is in scope and manuscript checks pass.",
-    "Keep limitations and missing-evidence status visible when evidence is incomplete."
+    "Release a manuscript export only when computable citation, provenance, schema, and export checks pass.",
+    "Keep limitations and unresolved work visible when the researcher or critic records them in the workspace."
   ]);
 }
 
 function workflowNotesFor(input: ReviewProtocolInput): string[] {
-  return uniqueStrings([
-    ...splitSentences(input.run.brief.successCriterion),
-    ...input.plan.localFocus
-  ].filter((phrase) => isWorkflowProtocolPhrase(phrase))).slice(0, 12);
+  return uniqueStrings(splitSentences(input.run.brief.successCriterion)).slice(0, 12);
 }
 
 function successCriteriaFor(input: ReviewProtocolInput): string[] {
-  const criteria = splitSentences(input.run.brief.successCriterion)
-    .filter((sentence) => !isWorkflowProtocolPhrase(sentence));
-
+  const criteria = splitSentences(input.run.brief.successCriterion);
   return uniqueStrings(criteria.length > 0
     ? criteria
     : [input.run.brief.successCriterion ?? ""]
   ).slice(0, 12);
 }
 
-function evidenceTargetsFor(input: ReviewProtocolInput, labels: string[]): string[] {
+function evidenceTargetsFor(input: ReviewProtocolInput): string[] {
   return uniqueStrings([
-    ...labels.filter(isProtocolEvidencePhrase),
-    ...input.plan.localFocus.filter(isProtocolEvidencePhrase),
-    ...splitSentences(input.run.brief.researchQuestion)
-      .filter(isProtocolEvidencePhrase)
-      .slice(0, 2)
+    ...input.plan.localFocus,
+    input.plan.objective
   ]).slice(0, 16);
 }
 
@@ -356,8 +295,7 @@ export function buildReviewProtocol(input: ReviewProtocolInput): ReviewProtocol 
       source: "plan",
       reason: "Planned by the research backend."
     }));
-  const requiredFacets = protocolFacetsFor(input);
-  const evidenceTargets = evidenceTargetsFor(input, requiredFacets.map((facet) => facet.label));
+  const evidenceTargets = evidenceTargetsFor(input);
   const manuscriptConstraints = manuscriptConstraintsFor(input);
   const workflowNotes = workflowNotesFor(input);
   const successCriteria = successCriteriaFor(input);
@@ -374,10 +312,7 @@ export function buildReviewProtocol(input: ReviewProtocolInput): ReviewProtocol 
       topic: input.run.brief.topic,
       coreQuestion: input.run.brief.researchQuestion,
       boundaries: uniqueStrings([
-        input.run.brief.researchDirection ?? "",
-        ...(input.run.brief.successCriterion === null
-          ? []
-          : splitSentences(input.run.brief.successCriterion).filter((sentence) => !isRetrievalQualityConstraintPhrase(sentence)))
+        input.run.brief.researchDirection ?? ""
       ]).slice(0, 8)
     },
     searchStrategy: {
@@ -395,29 +330,13 @@ export function buildReviewProtocol(input: ReviewProtocolInput): ReviewProtocol 
       },
       localContextEnabled: input.localContextEnabled
     },
-    inclusionCriteria: [
-      "Sources must match the scoped research question and the protocol evidence targets.",
-      "Reviewed papers should expose at least abstract-level evidence; full text is preferred when available.",
-      "Background sources may inform retrieval and framing but must not be cited as primary evidence unless explicitly reviewed."
-    ],
-    exclusionCriteria: [
-      "Generic review noise without topic, task, or facet relevance is excluded from the reviewed set.",
-      "Low-trust proof, revision, or repository spam is not promoted into the reviewed synthesis.",
-      "Title-only or blocked records remain backlog evidence unless the workflow explicitly retains them as uncertain."
-    ],
+    inclusionCriteria: [],
+    exclusionCriteria: [],
     evidenceTargets,
     manuscriptConstraints,
     manuscriptRequirements: manuscriptConstraints,
     workflowNotes,
     successCriteria,
-    requiredSuccessCriterionFacets: requiredFacets.map((facet) => ({
-      id: facet.id,
-      label: facet.label,
-      kind: facet.kind,
-      required: facet.required,
-      terms: facet.terms,
-      rationale: facet.rationale
-    })),
     screeningStages: [
       "title screening",
       "abstract screening",
@@ -425,17 +344,12 @@ export function buildReviewProtocol(input: ReviewProtocolInput): ReviewProtocol 
       "reviewed-set selection for synthesis"
     ],
     qualityAppraisalCriteria: [
-      "source trust and bibliographic quality",
-      "fit to the research question and success criterion",
-      "access state and extractable evidence",
-      "coverage of required facets",
-      "support for claims, limitations, and open problems"
+      "source identity, access state, and bibliographic quality",
+      "traceable support for claims, limitations, and open problems"
     ],
     stoppingConditions: [
-      "stop with a blocked manuscript if no canonical papers are retained",
-      "stop with a blocked manuscript if no reviewed papers are retained for synthesis",
-      "mark the manuscript as needing more evidence when required facets are missing or the reviewed set is too sparse",
-      "mark the manuscript ready for revision only when citations, claims, method, limitations, and evidence coverage pass deterministic checks"
+      "checkpoint progress without treating a budget boundary as research completion",
+      "release only when computable citation, provenance, schema, and export checks pass"
     ],
     protocolLimitations: uniqueStrings([
       ...accessLimitations,
@@ -501,13 +415,6 @@ export function reviewProtocolMarkdown(protocol: ReviewProtocol): string {
     "## Success Criteria",
     "",
     ...markdownList(protocol.successCriteria, "No success criteria were recorded."),
-    "",
-    "## Required Protocol Concepts",
-    "",
-    ...markdownList(
-      protocol.requiredSuccessCriterionFacets.map((facet) => `${facet.label} (${facet.kind})`),
-      "No required success-criterion facets were available yet."
-    ),
     "",
     "## Screening And Appraisal",
     "",

@@ -69,6 +69,7 @@ import {
   type PaperOutline,
   type ReferenceRecord,
   type ReferencesArtifact,
+  type ReviewProtocol,
   type ReviewPaperArtifact
 } from "./research-manuscript.js";
 import {
@@ -139,9 +140,6 @@ import {
   type WorkStoreReleaseCheck,
   type WorkStoreWorkItem
 } from "./research-work-store.js";
-import {
-  isRetrievalQualityConstraintPhrase
-} from "./literature-review.js";
 import {
   guidanceContextForAgent,
   readResearchGuidance,
@@ -2326,14 +2324,8 @@ function sourceQueriesForAction(
   decision: ResearchActionDecision,
   session: AgenticSourceGatherSession
 ): string[] {
-  const state = session.state();
-  const chosen = uniqueStrings([
-    ...decision.inputs.searchQueries,
-    ...decision.inputs.evidenceTargets.map((target) => target)
-  ]);
-  return chosen.length > 0
-    ? chosen.slice(0, 6)
-    : state.candidateQueries.slice(0, 4);
+  void session;
+  return uniqueStrings(decision.inputs.searchQueries).slice(0, 6);
 }
 
 function sourceSearchReconsiderationReason(input: {
@@ -2617,6 +2609,13 @@ async function runAgenticSourceGathering(input: {
         run,
         `Source tool observation: ${decision.action} is not directly executable before an evidence set exists; choose a source or workspace tool next.`
       );
+      continue;
+    }
+
+    if (queries.length === 0) {
+      const message = "Source search skipped because the researcher did not provide explicit search query text.";
+      await appendEvent(run, now, "next", message);
+      await appendStdout(run, `Source tool observation: ${message}`);
       continue;
     }
 
@@ -2907,7 +2906,6 @@ function compactRecoveryQuery(text: string | null | undefined, limit = 12): stri
   const compact = filtered.length > 0 ? filtered.slice(0, limit).join(" ") : null;
   return compact !== null
     && !isUnsafeRevisionQueryText(compact)
-    && !isRetrievalQualityConstraintPhrase(compact)
     ? compact
     : null;
 }
@@ -2934,7 +2932,6 @@ function sanitizeRecoveryQuery(query: string | null | undefined, limit = 12): st
     direct.length > 0
     && !isFileLikeResearchTerm(direct)
     && !isUnsafeRevisionQueryText(direct)
-    && !isRetrievalQualityConstraintPhrase(direct)
   ) {
     const tokenCount = direct.match(/[a-z0-9][a-z0-9-]*/gi)?.length ?? 0;
     const looksLikeDiagnosticSentence = /\b(?:lacks?|missing|needs?|should|revise|revised?|prior|stage|release|manuscript|artifact|critic)\b/i.test(direct);
@@ -3211,6 +3208,158 @@ async function chooseResearchActionStrict(input: {
   return fallback;
 }
 
+async function runProtocolWorkspaceLoop(input: {
+  run: RunRecord;
+  now: () => string;
+  researchBackend: ResearchBackend;
+  runtimeConfig: RuntimeLlmConfig;
+  agent: AgentStepRecorder;
+  diagnostics: ResearchActionDiagnostic[];
+  actionTransports: AgentActionTransportRecord[];
+  plan: ResearchPlan;
+  workStore: ResearchWorkStore;
+}): Promise<ResearchWorkStore> {
+  let workStore = input.workStore;
+  let toolResults: AgentToolResult[] = [];
+  const maxToolSteps = 4;
+
+  if (workspaceProtocolEntity(workStore) !== null) {
+    return workStore;
+  }
+
+  await appendEvent(input.run, input.now, "memory", "Ask the research agent to author the durable ResearchProtocol workspace object.");
+
+  for (let step = 1; step <= maxToolSteps; step += 1) {
+    const decision = await chooseResearchActionStrict({
+      run: input.run,
+      now: input.now,
+      researchBackend: input.researchBackend,
+      runtimeConfig: input.runtimeConfig,
+      agent: input.agent,
+      diagnostics: input.diagnostics,
+      actionTransports: input.actionTransports,
+      request: {
+        projectRoot: input.run.projectRoot,
+        runId: input.run.id,
+        phase: "protocol",
+        allowedActions: workspaceResearchActions(),
+        brief: input.run.brief,
+        plan: input.plan,
+        observations: {
+          canonicalPapers: workStore.objects.canonicalSources.length,
+          selectedPapers: 0,
+          extractedPapers: workStore.objects.extractions.length,
+          evidenceRows: workStore.objects.evidenceCells.length,
+          evidenceInsights: 0,
+          manuscriptReadiness: null,
+          revisionPassesUsed: 0,
+          revisionPassesRemaining: input.runtimeConfig.evidenceRecoveryMaxPasses
+        },
+        workStore: workStoreContextForAgent(workStore),
+        guidance: guidanceContextForAgent({ brief: input.run.brief, plan: input.plan }),
+        toolResults,
+        criticReports: [],
+        retryInstruction: [
+          "Create or revise the model-authored ResearchProtocol as durable workspace state before provider/source work begins.",
+          "Use protocol.create_or_revise when the current brief and plan are enough to define scope, inclusion/exclusion criteria, evidence targets, and manuscript constraints.",
+          "Guidance and workspace read/list/search tools may be used first if you need inspectable context.",
+          "Do not turn output-style requirements into evidence targets; semantic choices belong in the protocol object and can be revised later."
+        ].join(" ")
+      }
+    });
+
+    if (isStatusAction(decision.action)) {
+      const message = decision.inputs.reason ?? decision.rationale;
+      await appendEvent(input.run, input.now, "next", `Research agent did not author a protocol yet: ${message}`);
+      await appendStdout(input.run, `Protocol tool observation: ${message}`);
+      break;
+    }
+
+    const protocolStageExecutable = isGuidanceToolAction(decision.action)
+      || isWorkStoreToolAction(decision.action)
+      || decision.action === "protocol.create_or_revise"
+      || decision.action === "work_item.create"
+      || decision.action === "work_item.patch";
+
+    if (!protocolStageExecutable) {
+      const timestamp = input.now();
+      const message = `${decision.action} was deferred until a ResearchProtocol exists.`;
+      const result = makeAgentToolResult({
+        run: input.run,
+        action: decision.action,
+        timestamp,
+        status: "noop",
+        readOnly: true,
+        message,
+        count: 0,
+        totalCount: 0,
+        nextHints: ["protocol.create_or_revise", "guidance.recommend", "workspace.read"]
+      });
+      toolResults = rememberAgentToolResult(toolResults, result);
+      await appendEvent(input.run, input.now, "next", message);
+      await appendStdout(input.run, `Protocol tool observation: ${message}`);
+      continue;
+    }
+
+    const execution = await executeWorkspaceToolAction({
+      run: input.run,
+      now: input.now,
+      decision,
+      store: workStore
+    });
+
+    if (execution.handled) {
+      workStore = execution.store;
+      toolResults = rememberAgentToolResult(toolResults, execution.result);
+      if (execution.message !== null) {
+        await appendEvent(input.run, input.now, "memory", execution.message);
+        await appendStdout(input.run, `Protocol tool observation: ${execution.message}`);
+      }
+      if (workspaceProtocolEntity(workStore) !== null) {
+        await input.agent.record({
+          phase: "protocol",
+          action: "persist_research_protocol",
+          status: "completed",
+          summary: "Researcher-authored protocol is now canonical workspace state.",
+          artifactPaths: [
+            researchWorkStoreFilePath(input.run.projectRoot),
+            input.run.artifacts.reviewProtocolPath
+          ],
+          counts: {
+            protocols: workStore.objects.protocols.length
+          }
+        });
+        return workStore;
+      }
+      continue;
+    }
+
+    const message = `${decision.action} is not executable during the protocol checkpoint.`;
+    const result = makeAgentToolResult({
+      run: input.run,
+      action: decision.action,
+      timestamp: input.now(),
+      status: "noop",
+      readOnly: true,
+      message,
+      count: 0,
+      totalCount: 0,
+      nextHints: ["protocol.create_or_revise"]
+    });
+    toolResults = rememberAgentToolResult(toolResults, result);
+    await appendEvent(input.run, input.now, "next", message);
+    await appendStdout(input.run, `Protocol tool observation: ${message}`);
+  }
+
+  await appendEvent(
+    input.run,
+    input.now,
+    "memory",
+    "No researcher-authored protocol was persisted during the protocol checkpoint; using a neutral model-plan protocol shell without runtime-derived semantic requirements."
+  );
+  return workStore;
+}
+
 async function runManuscriptWorkspaceLoop(input: {
   run: RunRecord;
   now: () => string;
@@ -3316,10 +3465,25 @@ async function runManuscriptWorkspaceLoop(input: {
     });
 
     if (decision.action === "source.search" || decision.action === "evidence.revise_strategy") {
-      const revisionQueries = uniqueStrings([
-        ...decision.inputs.searchQueries,
-        ...decision.inputs.evidenceTargets.map((target) => `${input.run.brief.topic ?? input.plan.objective} ${target}`)
-      ]);
+      const revisionQueries = uniqueStrings(decision.inputs.searchQueries);
+      if (revisionQueries.length === 0) {
+        const timestamp = input.now();
+        const result = makeAgentToolResult({
+          run: input.run,
+          action: decision.action,
+          timestamp,
+          status: "noop",
+          readOnly: true,
+          message: "Source revision skipped because the researcher did not provide explicit search query text.",
+          count: 0,
+          totalCount: 0,
+          nextHints: ["source.search", "workspace.search", "work_item.create"]
+        });
+        toolResults = rememberAgentToolResult(toolResults, result);
+        await appendEvent(input.run, input.now, "next", result.message);
+        await appendStdout(input.run, `Workspace tool observation: ${result.message}`);
+        continue;
+      }
       return {
         workStore,
         requestedRevision: true,
@@ -3427,7 +3591,6 @@ type EvidenceQualitySnapshot = {
   inScopeCount: number;
   borderlineCount: number;
   excludedCount: number;
-  missingTargetCount: number;
   selectedCount: number;
   score: number;
 };
@@ -3440,7 +3603,6 @@ function evidenceQualitySnapshot(gathered: ResearchSourceGatherResult): Evidence
   const inScopeCount = inScopeIds.size;
   const borderlineCount = relevanceAssessments.filter((assessment) => assessment.status === "borderline").length;
   const excludedCount = relevanceAssessments.filter((assessment) => assessment.status === "excluded").length;
-  const missingTargetCount = gathered.selectionQuality?.missingRequiredFacets.length ?? 0;
   const selectedCount = gathered.reviewedPapers.length;
 
   return {
@@ -3448,9 +3610,8 @@ function evidenceQualitySnapshot(gathered: ResearchSourceGatherResult): Evidence
     inScopeCount,
     borderlineCount,
     excludedCount,
-    missingTargetCount,
     selectedCount,
-    score: inScopeCount * 20 + selectedCount * 5 - missingTargetCount * 12 - borderlineCount * 3 - excludedCount
+    score: inScopeCount * 20 + selectedCount * 5 - borderlineCount * 3 - excludedCount
   };
 }
 
@@ -3460,7 +3621,6 @@ function evidenceQualityImproved(previous: EvidenceQualitySnapshot | null, next:
   }
 
   return [...next.inScopeIds].some((paperId) => !previous.inScopeIds.has(paperId))
-    || next.missingTargetCount < previous.missingTargetCount
     || next.score > previous.score;
 }
 
@@ -4868,7 +5028,6 @@ function workspaceManuscriptChecks(input: {
   const unsupportedSectionCount = sections.filter((section) => (
     section.claimIds.length === 0 || section.claimIds.some((claimId) => !supportReadiness.supportedClaimIds.has(claimId))
   )).length;
-  const selectionReasons = input.gathered === undefined ? [] : selectionQualityHoldReasons(input.gathered);
   const evidenceRows = input.evidenceMatrix?.rowCount ?? input.store.objects.extractions.length;
   const checks: ManuscriptCheck[] = [
     {
@@ -4892,14 +5051,11 @@ function workspaceManuscriptChecks(input: {
     {
       id: "evidence-coverage",
       title: "Evidence coverage diagnostic",
-      status: evidenceRows >= 3 && selectionReasons.length === 0 ? "pass" : "warning",
+      status: evidenceRows >= 3 ? "pass" : "warning",
       severity: "warning",
-      message: evidenceRows >= 3 && selectionReasons.length === 0
-        ? "The reviewed evidence set has multiple evidence rows and no selection-quality warnings."
-        : [
-          evidenceRows < 3 ? `Only ${evidenceRows} reviewed evidence row(s) are available.` : null,
-          ...selectionReasons
-        ].filter((message): message is string => message !== null).join(" ")
+      message: evidenceRows >= 3
+        ? "The workspace has multiple reviewed evidence rows."
+        : `Only ${evidenceRows} reviewed evidence row(s) are available. This is a diagnostic for the researcher, not a semantic release blocker.`
     },
     {
       id: "workspace-claims",
@@ -5111,6 +5267,71 @@ function renderWorkspacePaperMarkdown(paper: ReviewPaperArtifact, references: Re
   ].join("\n").trim();
 }
 
+function workspaceProtocolEntity(store: ResearchWorkStore): WorkStoreProtocol | null {
+  return store.objects.protocols
+    .slice()
+    .reverse()
+    .find((protocol) => protocol.author === "researcher")
+    ?? store.objects.protocols.slice().reverse()[0]
+    ?? null;
+}
+
+function neutralReviewProtocolShell(input: Parameters<typeof buildReviewProtocol>[0]): ReviewProtocol {
+  const protocol = buildReviewProtocol(input);
+  const planAuthoredEvidenceTargets = uniqueStrings(
+    input.plan.localFocus.length > 0
+      ? input.plan.localFocus
+      : [input.plan.objective]
+  ).slice(0, 12);
+
+  return {
+    ...protocol,
+    evidenceTargets: planAuthoredEvidenceTargets,
+    qualityAppraisalCriteria: protocol.qualityAppraisalCriteria
+      .filter((criterion) => !/facet/i.test(criterion)),
+    stoppingConditions: [
+      "checkpoint progress without treating a budget boundary as research completion",
+      "release only when computable provenance, citation, schema, and export invariants pass",
+      "surface semantic concerns as critic diagnostics or work items for the researcher agent"
+    ],
+    protocolLimitations: uniqueStrings([
+      ...protocol.protocolLimitations,
+      "This neutral protocol shell preserves model-authored plan fields and runtime provider metadata without deriving required semantic facets from prompt wording."
+    ])
+  };
+}
+
+function reviewProtocolFromWorkspace(input: {
+  fallback: ReviewProtocol;
+  store: ResearchWorkStore;
+}): ReviewProtocol {
+  const entity = workspaceProtocolEntity(input.store);
+  if (entity === null) {
+    return input.fallback;
+  }
+
+  return {
+    ...input.fallback,
+    researchQuestion: entity.researchQuestion ?? input.fallback.researchQuestion,
+    objective: entity.objective,
+    scope: {
+      ...input.fallback.scope,
+      coreQuestion: entity.researchQuestion ?? input.fallback.scope.coreQuestion,
+      boundaries: entity.scope
+    },
+    inclusionCriteria: entity.inclusionCriteria,
+    exclusionCriteria: entity.exclusionCriteria,
+    evidenceTargets: entity.evidenceTargets,
+    manuscriptConstraints: entity.manuscriptConstraints,
+    manuscriptRequirements: entity.manuscriptConstraints,
+    workflowNotes: entity.notes,
+    protocolLimitations: [
+      ...input.fallback.protocolLimitations,
+      `Canonical protocol authored by ${entity.author} workspace object ${entity.id}.`
+    ]
+  };
+}
+
 function workspaceManuscriptBundle(input: {
   run: RunRecord;
   plan: ResearchPlan;
@@ -5124,7 +5345,7 @@ function workspaceManuscriptBundle(input: {
   gathered: ResearchSourceGatherResult;
   evidenceMatrix?: EvidenceMatrix;
 }): ManuscriptBundle {
-  const protocol = buildReviewProtocol({
+  const fallbackProtocol = buildReviewProtocol({
     run: input.run,
     plan: input.plan,
     scholarlyDiscoveryProviders: input.scholarlyDiscoveryProviders,
@@ -5133,6 +5354,10 @@ function workspaceManuscriptBundle(input: {
     generalWebProviders: input.generalWebProviders,
     localContextEnabled: input.localContextEnabled,
     gathered: input.gathered
+  });
+  const protocol = reviewProtocolFromWorkspace({
+    fallback: fallbackProtocol,
+    store: input.store
   });
   const references = referencesFromWorkStore(input.run, input.store);
   const checks = workspaceManuscriptChecks({
@@ -5429,7 +5654,6 @@ async function writeLiteratureSnapshot(
     papers: canonicalizePapers(gathered.canonicalPapers),
     reviewedPapers: canonicalizePapers(gathered.reviewedPapers),
     reviewWorkflow: remapReviewWorkflow(gathered.reviewWorkflow, canonicalIdByAnyId),
-    selectionQuality: gathered.selectionQuality ?? null,
     relevanceAssessments: gathered.relevanceAssessments ?? [],
     mergeDiagnostics: gathered.mergeDiagnostics,
     authStatus: gathered.authStatus,
@@ -5511,7 +5735,6 @@ async function commitWorkStoreSegment(input: {
       papers: canonicalizePapers(input.gathered.canonicalPapers),
       reviewedPapers: canonicalizePapers(input.gathered.reviewedPapers),
       reviewWorkflow: remapReviewWorkflow(input.gathered.reviewWorkflow, canonicalIdByAnyId),
-      selectionQuality: input.gathered.selectionQuality ?? null,
       relevanceAssessments: input.gathered.relevanceAssessments ?? [],
       mergeDiagnostics: input.gathered.mergeDiagnostics,
       authStatus: input.gathered.authStatus,
@@ -5606,53 +5829,16 @@ function retrievalDiagnosticHoldReasons(gathered: ResearchSourceGatherResult): s
   ];
 }
 
-function selectionQualityHoldReasons(gathered: ResearchSourceGatherResult): string[] {
-  const selectionQuality = gathered.selectionQuality;
-
-  if (selectionQuality === undefined || selectionQuality === null || selectionQuality.adequacy === "strong") {
-    return [];
-  }
-
-  const missing = selectionQuality.missingRequiredFacets
-    .filter((facet) => !isRetrievalQualityConstraintPhrase(facet.label))
-    .map((facet) => facet.label)
-    .slice(0, 5);
-  const backgroundOnly = selectionQuality.backgroundOnlyFacets
-    .filter((facet) => !isRetrievalQualityConstraintPhrase(facet.label))
-    .map((facet) => facet.label)
-    .slice(0, 3);
-
-  if (missing.length === 0 && backgroundOnly.length === 0 && selectionQuality.adequacy !== "thin") {
-    return [];
-  }
-
-  const reasons = [
-    missing.length > 0
-      ? `The reviewed set does not cover required success-criterion facets: ${missing.join(", ")}.`
-      : `The reviewed set has only ${selectionQuality.adequacy} coverage of the required review facets.`,
-    backgroundOnly.length > 0
-      ? `Some required facets appeared only in unselected/background candidates: ${backgroundOnly.join(", ")}.`
-      : null
-  ].filter((reason): reason is string => reason !== null);
-
-  return reasons;
-}
-
 function agendaWithRetrievalHoldReasons(
   agenda: ResearchAgenda,
   gathered: ResearchSourceGatherResult,
   evidenceMatrix: EvidenceMatrix
 ): ResearchAgenda {
-  const selectionReasons = selectionQualityHoldReasons(gathered);
-
-  if (evidenceMatrix.rowCount >= 3 && selectionReasons.length === 0) {
+  if (evidenceMatrix.rowCount >= 3) {
     return agenda;
   }
 
-  const extraReasons = [
-    ...selectionReasons,
-    ...(evidenceMatrix.rowCount < 3 ? retrievalDiagnosticHoldReasons(gathered) : [])
-  ];
+  const extraReasons = retrievalDiagnosticHoldReasons(gathered);
 
   if (extraReasons.length === 0) {
     return agenda;
@@ -5922,14 +6108,28 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     };
 
     await writeJsonArtifact(run.artifacts.planPath, plan);
-    let currentProtocol = buildReviewProtocol({
+    workStore = await runProtocolWorkspaceLoop({
       run,
+      now,
+      researchBackend,
+      runtimeConfig: runtimeLlmConfig,
+      agent,
+      diagnostics: agentActionDiagnostics,
+      actionTransports: agentActionTransports,
       plan,
-      scholarlyDiscoveryProviders,
-      publisherFullTextProviders,
-      oaRetrievalHelperProviders,
-      generalWebProviders,
-      localContextEnabled: localEnabled
+      workStore
+    });
+    const currentProtocol = reviewProtocolFromWorkspace({
+      fallback: neutralReviewProtocolShell({
+        run,
+        plan,
+        scholarlyDiscoveryProviders,
+        publisherFullTextProviders,
+        oaRetrievalHelperProviders,
+        generalWebProviders,
+        localContextEnabled: localEnabled
+      }),
+      store: workStore
     });
     await writeJsonArtifact(run.artifacts.reviewProtocolPath, currentProtocol);
     await writeFile(run.artifacts.reviewProtocolMarkdownPath, `${reviewProtocolMarkdown(currentProtocol)}\n`, "utf8");
@@ -6106,12 +6306,12 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     if (previousEvidenceQuality !== null) {
       if (evidenceImproved) {
         nonImprovingEvidencePasses = 0;
-        await appendEvent(run, now, "literature", "Evidence revision improved the in-scope source set or reduced missing targets.");
-        await appendStdout(run, "Evidence revision improved the protocol relevance/coverage score.");
+        await appendEvent(run, now, "literature", "Evidence revision expanded the selected source set or improved source continuity.");
+        await appendStdout(run, "Evidence revision improved the source-set continuity score.");
       } else {
         nonImprovingEvidencePasses += 1;
-        await appendEvent(run, now, "literature", "Evidence revision did not improve the protocol relevance/coverage score.");
-        await appendStdout(run, "Evidence revision did not improve the protocol relevance/coverage score.");
+        await appendEvent(run, now, "literature", "Evidence revision did not improve the selected source set.");
+        await appendStdout(run, "Evidence revision did not improve the source-set continuity score.");
       }
     }
     previousEvidenceQuality = currentEvidenceQuality;
@@ -6145,7 +6345,6 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       notes: gathered.notes,
       rawSources: gathered.sources,
       reviewWorkflow: gathered.reviewWorkflow,
-      selectionQuality: gathered.selectionQuality ?? null,
       relevanceAssessments: gathered.relevanceAssessments ?? [],
       agenticSourceState: gathered.agenticSourceState ?? null,
       mergeDiagnostics: gathered.mergeDiagnostics,
@@ -6174,15 +6373,18 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       }
     });
 
-    const currentProtocol = buildReviewProtocol({
-      run,
-      plan,
-      scholarlyDiscoveryProviders,
-      publisherFullTextProviders,
-      oaRetrievalHelperProviders,
-      generalWebProviders,
-      localContextEnabled: localEnabled,
-      gathered
+    const currentProtocol = reviewProtocolFromWorkspace({
+      fallback: neutralReviewProtocolShell({
+        run,
+        plan,
+        scholarlyDiscoveryProviders,
+        publisherFullTextProviders,
+        oaRetrievalHelperProviders,
+        generalWebProviders,
+        localContextEnabled: localEnabled,
+        gathered
+      }),
+      store: workStore
     });
     await writeJsonArtifact(run.artifacts.reviewProtocolPath, currentProtocol);
     await writeFile(run.artifacts.reviewProtocolMarkdownPath, `${reviewProtocolMarkdown(currentProtocol)}\n`, "utf8");
@@ -6206,7 +6408,6 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         plan,
         selectedPapers: canonicalReviewedPapers,
         relevanceAssessments: gathered.relevanceAssessments ?? [],
-        selectionQuality: gathered.selectionQuality ?? null,
         gathered: {
           reviewWorkflow: gathered.reviewWorkflow,
           retrievalDiagnostics: gathered.retrievalDiagnostics,
@@ -6544,7 +6745,6 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         plan,
         selectedPapers: canonicalReviewedPapers,
         relevanceAssessments: gathered.relevanceAssessments ?? [],
-        selectionQuality: gathered.selectionQuality ?? null,
         paperExtractions,
         evidenceMatrix: normalizedEvidenceMatrix
       }
@@ -6661,7 +6861,6 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       evidenceMatrix: normalizedEvidenceMatrix,
       synthesis: normalizedSynthesis,
       verification,
-      selectionQuality: gathered.selectionQuality ?? null,
       memoryContext,
       literatureContext
     }, {
@@ -6707,7 +6906,6 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
           plan,
           selectedPapers: canonicalReviewedPapers,
           relevanceAssessments: gathered.relevanceAssessments ?? [],
-          selectionQuality: gathered.selectionQuality ?? null,
           paperExtractions,
           evidenceMatrix: normalizedEvidenceMatrix,
           synthesis: normalizedSynthesis,

@@ -108,81 +108,8 @@ test("dynamic query expansion preserves plan queries and adds brief entities for
   }
 });
 
-test("dynamic query expansion adds broad mathematical verification vocabulary without topic hardcoding", async () => {
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-query-math-"));
-
-  try {
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
-      projectRoot,
-      brief: {
-        topic: "rigorous numerical verification of Riemann zeta zeros",
-        researchQuestion: "What evidence exists for reliable numerical verification and error control?",
-        researchDirection: "Run a literature synthesis of verification methods and unresolved computational tasks.",
-        successCriterion: "Identify reliability gaps and a bounded computational follow-up."
-      },
-      plan: {
-        researchMode: "literature_synthesis",
-        objective: "Review rigorous numerical verification methods.",
-        rationale: "Mathematical verification requires search vocabulary beyond the initial phrasing.",
-        searchQueries: ["Riemann zeta zeros numerical verification"],
-        localFocus: ["verification methods", "error control"]
-      },
-      memoryContext: emptyMemoryContext(),
-      scholarlyProviderIds: []
-    });
-
-    const domainQueries = (gathered.retrievalDiagnostics?.queries ?? [])
-      .filter((query) => query.source === "domain_vocabulary")
-      .map((query) => query.query.toLowerCase());
-
-    assert.ok(domainQueries.some((query) => query.includes("rigorous computation")));
-    assert.ok(domainQueries.some((query) => query.includes("error bounds")));
-    assert.ok(domainQueries.some((query) => query.includes("interval arithmetic") || query.includes("ball arithmetic")));
-  } finally {
-    await rm(projectRoot, { recursive: true, force: true });
-  }
-});
-
-test("dynamic query expansion adds care-workforce vocabulary from brief intent", async () => {
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-query-care-"));
-
-  try {
-    const gatherer = new DefaultResearchSourceGatherer();
-    const gathered = await gatherer.gather({
-      projectRoot,
-      brief: {
-        topic: "AI tools in nursing homes and workforce effects",
-        researchQuestion: "What evidence exists that AI tools change staffing patterns, care quality, and worker displacement risk?",
-        researchDirection: "Run a literature synthesis comparing deployment patterns and workforce impacts.",
-        successCriterion: "Produce a grounded summary and concrete next research task."
-      },
-      plan: {
-        researchMode: "literature_synthesis",
-        objective: "Review AI in nursing homes and workforce outcomes.",
-        rationale: "Care-delivery evidence uses long-term-care and staffing vocabulary.",
-        searchQueries: ["AI tools nursing homes workforce effects"],
-        localFocus: ["staffing", "care quality"]
-      },
-      memoryContext: emptyMemoryContext(),
-      scholarlyProviderIds: []
-    });
-
-    const queries = (gathered.retrievalDiagnostics?.queries ?? []).map((query) => query.query.toLowerCase());
-    const domainQueries = (gathered.retrievalDiagnostics?.queries ?? [])
-      .filter((query) => query.source === "domain_vocabulary")
-      .map((query) => query.query.toLowerCase());
-
-    assert.ok(domainQueries.some((query) => query.includes("long-term care")));
-    assert.ok(queries.some((query) => query.includes("care quality")));
-    assert.ok(queries.some((query) => query.includes("staffing") || query.includes("workforce")));
-  } finally {
-    await rm(projectRoot, { recursive: true, force: true });
-  }
-});
-
-test("dynamic query expansion adds research-agent evaluation vocabulary from brief intent", async () => {
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-query-agents-"));
+test("dynamic query expansion does not add hidden domain-vocabulary queries", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-query-no-domain-vocab-"));
 
   try {
     const gatherer = new DefaultResearchSourceGatherer();
@@ -205,12 +132,11 @@ test("dynamic query expansion adds research-agent evaluation vocabulary from bri
       scholarlyProviderIds: []
     });
 
-    const domainQueries = (gathered.retrievalDiagnostics?.queries ?? [])
-      .filter((query) => query.source === "domain_vocabulary")
-      .map((query) => query.query.toLowerCase());
+    const queries = gathered.retrievalDiagnostics?.queries ?? [];
 
-    assert.ok(domainQueries.some((query) => query.includes("agent evaluation")));
-    assert.ok(domainQueries.some((query) => query.includes("literature synthesis agents")));
+    assert.ok(queries.some((query) => query.source === "plan"));
+    assert.ok(queries.some((query) => query.source === "brief_task"));
+    assert.equal(queries.some((query) => (query.source as string) === "domain_vocabulary"), false);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -311,8 +237,7 @@ test("role-aware source classification separates primary systems from surveys an
     assert.equal(byTitle("PaperArena")?.sourceRole, "benchmark");
     assert.notEqual(byTitle("PaperArena")?.selectionDecision, "selected_primary");
     assert.equal(byTitle("LEGOMem")?.sourceRole, "method_component");
-    assert.notEqual(gathered.selectionQuality?.adequacy, "strong");
-    assert.ok(gathered.selectionQuality?.selectionRationale.some((line) => /Role-aware source diagnostic/i.test(line)));
+    assert.equal(Object.prototype.hasOwnProperty.call(gathered, "selectionQuality"), false);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
@@ -1303,7 +1228,7 @@ test("literature-review screening keeps query noise visible with advisory diagno
   }
 });
 
-test("literature-review screening retains strong task and focus matches without exact domain-anchor wording", async () => {
+test("source screening keeps strong task and focus matches visible without domain-anchor gating", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-relaxed-screening-"));
   const originalFetch = globalThis.fetch;
 
@@ -1366,16 +1291,16 @@ test("literature-review screening retains strong task and focus matches without 
     });
 
     assert.equal(gathered.canonicalPapers.length, 1);
-    assert.equal(gathered.canonicalPapers[0]?.screeningDecision, "uncertain");
+    assert.equal(gathered.canonicalPapers[0]?.screeningDecision, "include");
     assert.equal(gathered.reviewedPapers.length, 1);
-    assert.match(gathered.canonicalPapers[0]?.screeningRationale ?? "", /Retained because the combined topic, task, and focus evidence/i);
+    assert.match(gathered.canonicalPapers[0]?.screeningRationale ?? "", /Source quality tier/i);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("review workflow promotes high-quality uncertain abstract papers when included evidence is sparse", async () => {
+test("review workflow selects available high-quality papers without sparse-evidence promotion rules", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-review-promotion-"));
   const originalFetch = globalThis.fetch;
 
@@ -1474,16 +1399,16 @@ test("review workflow promotes high-quality uncertain abstract papers when inclu
     });
 
     assert.equal(gathered.reviewedPapers.length, 3);
-    assert.equal(gathered.reviewWorkflow.counts.included, 1);
+    assert.equal(gathered.reviewWorkflow.counts.included, 3);
     assert.equal(gathered.reviewWorkflow.counts.selectedForSynthesis, 3);
-    assert.match(gathered.reviewWorkflow.notes.join("\n"), /Promoted 2 high\/medium-quality uncertain papers/i);
+    assert.doesNotMatch(gathered.reviewWorkflow.notes.join("\n"), /Promoted .* uncertain papers/i);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("review workflow reports off-topic diagnostics without hiding researcher-visible papers", async () => {
+test("review workflow keeps researcher-visible papers without semantic off-topic exclusion", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-topic-gate-"));
   const originalFetch = globalThis.fetch;
 
@@ -1584,8 +1509,8 @@ test("review workflow reports off-topic diagnostics without hiding researcher-vi
     assert.equal(gathered.reviewedPapers.length, 3);
     assert.match(gathered.reviewedPapers[0]?.title ?? "", /Autonomous research agents/i);
     assert.equal(gathered.reviewWorkflow.counts.selectedForSynthesis, 3);
-    assert.match(gathered.reviewWorkflow.notes.join("\n"), /Advisory relevance diagnostics/i);
-    assert.equal(gathered.relevanceAssessments?.filter((assessment) => assessment.status === "excluded").length, 2);
+    assert.doesNotMatch(gathered.reviewWorkflow.notes.join("\n"), /Advisory relevance diagnostics/i);
+    assert.equal(gathered.relevanceAssessments?.filter((assessment) => assessment.status === "excluded").length, 0);
     assert.ok(gathered.reviewedPapers.some((paper) => /CMIP6/i.test(paper.title)));
     assert.ok(gathered.reviewedPapers.some((paper) => /industrial IoT/i.test(paper.title)));
   } finally {
@@ -1594,7 +1519,7 @@ test("review workflow reports off-topic diagnostics without hiding researcher-vi
   }
 });
 
-test("review selection records success-criterion facet coverage for the selected papers", async () => {
+test("source selection retains papers without deterministic success-criterion facet coverage", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-facet-coverage-"));
   const originalFetch = globalThis.fetch;
 
@@ -1674,26 +1599,18 @@ test("review selection records success-criterion facet coverage for the selected
       scholarlyProviderIds: ["openalex"]
     });
 
-    const selectionQuality = gathered.selectionQuality;
     const targetedPaper = gathered.reviewedPapers.find((paper) => /staffing, and care quality/i.test(paper.title));
-    const targetedCoverage = selectionQuality?.paperFacetCoverage.find((coverage) => coverage.paperId === targetedPaper?.id);
-    const coveredLabels = selectionQuality?.requiredFacets
-      .filter((facet) => targetedCoverage?.coveredFacetIds.includes(facet.id))
-      .map((facet) => facet.label.toLowerCase()) ?? [];
 
-    assert.ok(selectionQuality !== undefined && selectionQuality !== null);
+    assert.equal(Object.prototype.hasOwnProperty.call(gathered, "selectionQuality"), false);
     assert.ok(targetedPaper !== undefined);
-    assert.ok(coveredLabels.some((label) => /nursing homes/.test(label)));
-    assert.ok(coveredLabels.some((label) => /staffing|workforce/.test(label)));
-    assert.ok(coveredLabels.some((label) => /care quality/.test(label)));
-    assert.match(gathered.reviewWorkflow.notes.join("\n"), /Review facet adequacy/i);
+    assert.doesNotMatch(gathered.reviewWorkflow.notes.join("\n"), /Review facet adequacy/i);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("review selection records missing method facets when zeta evidence drifts away from verification", async () => {
+test("source selection does not turn semantic drift into deterministic missing facets", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-facet-missing-"));
   const originalFetch = globalThis.fetch;
 
@@ -1755,19 +1672,16 @@ test("review selection records missing method facets when zeta evidence drifts a
       scholarlyProviderIds: ["openalex"]
     });
 
-    const missingLabels = gathered.selectionQuality?.missingRequiredFacets.map((facet) => facet.label.toLowerCase()) ?? [];
-
     assert.equal(gathered.reviewedPapers.length, 1);
-    assert.equal(gathered.relevanceAssessments?.[0]?.status, "borderline");
-    assert.ok(missingLabels.some((label) => /error bounds|rigorous numerical verification|verification/.test(label)));
-    assert.notEqual(gathered.selectionQuality?.adequacy, "strong");
+    assert.equal(gathered.relevanceAssessments?.[0]?.status, "in_scope");
+    assert.equal(Object.prototype.hasOwnProperty.call(gathered, "selectionQuality"), false);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("thin evidence triggers one revision pass and records diagnostics", async () => {
+test("thin evidence does not trigger runtime-generated revision queries", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-revision-"));
   const originalFetch = globalThis.fetch;
 
@@ -1841,7 +1755,7 @@ test("thin evidence triggers one revision pass and records diagnostics", async (
       plan: {
         researchMode: "literature_synthesis",
         objective: "Review autonomous research-agent evidence.",
-        rationale: "The first pass should be too thin and trigger revision.",
+        rationale: "The runtime should not invent recovery queries from thin evidence.",
         searchQueries: ["autonomous research agents evidence"],
         localFocus: ["planning", "evaluation"]
       },
@@ -1849,10 +1763,9 @@ test("thin evidence triggers one revision pass and records diagnostics", async (
       scholarlyProviderIds: ["openalex"]
     });
 
-    assert.equal(gathered.retrievalDiagnostics?.revisionPasses, 1);
-    assert.ok(gathered.retrievalDiagnostics?.providerAttempts.some((attempt) => attempt.phase === "revision"));
-    assert.ok(gathered.retrievalDiagnostics?.queries.some((query) => query.source === "revision" || query.source === "rejected_candidate"));
-    assert.ok(gathered.canonicalPapers.some((paper) => /limitations and evaluation/i.test(paper.title)));
+    assert.equal(gathered.retrievalDiagnostics?.revisionPasses, 0);
+    assert.equal(gathered.retrievalDiagnostics?.providerAttempts.some((attempt) => attempt.phase === "revision"), false);
+    assert.equal(gathered.retrievalDiagnostics?.queries.some((query) => query.source === "revision" || query.source === "rejected_candidate"), false);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });

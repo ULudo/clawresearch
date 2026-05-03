@@ -184,53 +184,6 @@ function reviewWorkflowFor(papers: CanonicalPaper[], reviewedPaperIds?: string[]
   };
 }
 
-function selectionQualityFor(
-  papers: CanonicalPaper[],
-  options: {
-    adequacy: "thin" | "partial" | "strong";
-    facetLabel: string;
-    missing?: boolean;
-  }
-) {
-  const facet = {
-    id: `facet-${options.facetLabel.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`,
-    label: options.facetLabel,
-    kind: "method" as const,
-    required: true,
-    terms: [options.facetLabel],
-    source: "success_criterion" as const,
-    rationale: "Extracted from the test success criterion."
-  };
-  const selectedIds = papers.map((paper) => paper.id);
-
-  return {
-    schemaVersion: 1 as const,
-    requiredFacets: [facet],
-    optionalFacets: [],
-    paperFacetCoverage: papers.map((paper) => ({
-      paperId: paper.id,
-      coveredFacetIds: options.missing ? [] : [facet.id],
-      missingRequiredFacetIds: options.missing ? [facet.id] : [],
-      coverageScore: options.missing ? 0 : 4,
-      matchedTerms: options.missing ? [] : [options.facetLabel],
-      rationale: options.missing ? "The facet is not visible in this pass." : "The facet is covered by the selected paper."
-    })),
-    selectedSetCoverage: [{
-      facetId: facet.id,
-      label: facet.label,
-      required: true,
-      coveredByPaperIds: options.missing ? [] : selectedIds,
-      count: options.missing ? 0 : selectedIds.length
-    }],
-    missingRequiredFacets: options.missing ? [facet] : [],
-    backgroundOnlyFacets: [],
-    adequacy: options.adequacy,
-    selectionRationale: options.missing
-      ? [`Missing required facets in the selected reviewed set: ${options.facetLabel}.`]
-      : [`Selected set covers the ${options.facetLabel} facet.`]
-  };
-}
-
 function workspaceManuscriptDecisionForRequest(
   request: ResearchActionRequest,
   rationale = "Proceed with the next claim/evidence/section workspace action."
@@ -364,6 +317,7 @@ class StubResearchBackend implements ResearchBackend {
   readonly label = "stub:research";
   capturedExtractionPaperIds: string[] = [];
   readonly actionRequests: ResearchActionRequest[] = [];
+  readonly criticRequests: CriticReviewRequest[] = [];
 
   async planResearch(): Promise<ResearchPlan> {
     return {
@@ -383,6 +337,48 @@ class StubResearchBackend implements ResearchBackend {
 
   async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
     this.actionRequests.push(request);
+    if (request.phase === "protocol") {
+      return {
+        schemaVersion: 1,
+        action: "protocol.create_or_revise",
+        rationale: "Persist the researcher-owned protocol before source work begins.",
+        confidence: 0.92,
+        inputs: {
+          providerIds: [],
+          searchQueries: request.plan.searchQueries,
+          evidenceTargets: request.plan.localFocus,
+          paperIds: [],
+          criticStage: null,
+          reason: "The protocol should be durable workspace state.",
+          workStore: {
+            collection: "protocols",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            changes: {},
+            entity: {
+              id: "protocol-current",
+              protocolId: "current-protocol",
+              title: "Researcher-authored review protocol",
+              objective: request.plan.objective,
+              researchQuestion: request.brief.researchQuestion,
+              scope: [
+                request.brief.researchDirection ?? request.brief.topic ?? request.plan.objective
+              ],
+              inclusionCriteria: request.plan.localFocus.map((focus) => `Include sources that directly inform ${focus}.`),
+              exclusionCriteria: ["Exclude output-style instructions as evidence targets."],
+              evidenceTargets: request.plan.localFocus,
+              manuscriptConstraints: ["Use traceable support links for manuscript claims."],
+              notes: ["Authored through the protocol workspace tool loop."]
+            }
+          }
+        },
+        expectedOutcome: "The protocol is visible through the work store.",
+        stopCondition: "Continue to source work after the protocol exists.",
+        transport: "strict_json"
+      };
+    }
     const workspaceDecision = workspaceManuscriptDecisionForRequest(request);
     if (workspaceDecision !== null) {
       return workspaceDecision;
@@ -460,6 +456,7 @@ class StubResearchBackend implements ResearchBackend {
   }
 
   async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    this.criticRequests.push(request);
     return {
       schemaVersion: 1,
       runId: request.runId,
@@ -483,7 +480,7 @@ class ProtocolToolBackend extends StubResearchBackend {
   private protocolCreated = false;
 
   override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
-    if (request.phase === "synthesis" && !this.protocolCreated && (request.workStore?.recentProtocols.length ?? 0) === 0) {
+    if ((request.phase === "protocol" || request.phase === "synthesis") && !this.protocolCreated && (request.workStore?.recentProtocols.length ?? 0) === 0) {
       this.actionRequests.push(request);
       this.protocolCreated = true;
       return {
@@ -1159,6 +1156,36 @@ class RevisionThenWorkspaceBackend extends StubResearchBackend {
   }
 }
 
+class EvidenceTargetOnlyRevisionBackend extends StubResearchBackend {
+  private requestedEvidenceRevision = false;
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase === "synthesis" && !this.requestedEvidenceRevision) {
+      this.actionRequests.push(request);
+      this.requestedEvidenceRevision = true;
+      return {
+        schemaVersion: 1,
+        action: "source.search",
+        rationale: "Signal a semantic evidence gap without giving explicit search query text.",
+        confidence: 0.82,
+        inputs: {
+          providerIds: ["openalex"],
+          searchQueries: [],
+          evidenceTargets: ["benchmark evaluation"],
+          paperIds: [],
+          criticStage: null,
+          reason: null
+        },
+        expectedOutcome: "The runtime should not invent a recovery query from this target.",
+        stopCondition: "Continue with visible diagnostics.",
+        transport: "strict_json"
+      };
+    }
+
+    return super.chooseResearchAction(request);
+  }
+}
+
 class AgenticSourceBackend extends StubResearchBackend {
   readonly sourceActions: ResearchActionDecision[] = [];
   readonly sourceActionRequests: ResearchActionRequest[] = [];
@@ -1254,13 +1281,45 @@ class AgenticSourceBackend extends StubResearchBackend {
           action: "source.select_evidence",
           rationale: "Ranked and access-resolved candidates are ready for the synthesis evidence set.",
           confidence: 0.86,
-          inputs: baseInputs,
+          inputs: {
+            ...baseInputs,
+            paperIds: sourceState.candidatePaperIds
+          },
           expectedOutcome: "Select the current evidence set.",
           stopCondition: "Stop after the evidence set has been checkpointed.",
           transport: "strict_json"
         };
       }
 
+      this.sourceActions.push(action);
+      return action;
+    }
+
+    return super.chooseResearchAction(request);
+  }
+}
+
+class UnknownEvidenceSelectionBackend extends AgenticSourceBackend {
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase === "source_selection" && request.sourceState?.sourceStage === "access_resolved") {
+      this.sourceActionRequests.push(request);
+      const action: ResearchActionDecision = {
+        schemaVersion: 1,
+        action: "source.select_evidence",
+        rationale: "Intentionally select an unknown paper id to prove the runtime does not substitute fallback evidence.",
+        confidence: 0.8,
+        inputs: {
+          providerIds: [],
+          searchQueries: [],
+          evidenceTargets: [],
+          paperIds: ["paper-does-not-exist"],
+          criticStage: null,
+          reason: null
+        },
+        expectedOutcome: "Unknown ids are rejected visibly.",
+        stopCondition: "Stop after the selection attempt.",
+        transport: "strict_json"
+      };
       this.sourceActions.push(action);
       return action;
     }
@@ -1367,7 +1426,10 @@ class StubbornSourceSearchBackend extends StubResearchBackend {
         action: "select_evidence_set",
         rationale: "Ranked sources are ready for the evidence pass.",
         confidence: 0.82,
-        inputs: baseInputs,
+        inputs: {
+          ...baseInputs,
+          paperIds: sourceState.candidatePaperIds
+        },
         expectedOutcome: "Selected evidence set.",
         stopCondition: "Stop after selection.",
         transport: "strict_json"
@@ -1459,38 +1521,6 @@ class StubSourceGatherer implements ResearchSourceGatherer {
     const papers = [
       canonicalPaper()
     ];
-    const selectionQuality = {
-      schemaVersion: 1 as const,
-      requiredFacets: [{
-        id: "facet-proof-techniques",
-        label: "proof techniques",
-        kind: "method" as const,
-        required: true,
-        terms: ["proof techniques"],
-        source: "success_criterion" as const,
-        rationale: "Extracted from the test success criterion."
-      }],
-      optionalFacets: [],
-      paperFacetCoverage: [{
-        paperId: "paper-1",
-        coveredFacetIds: ["facet-proof-techniques"],
-        missingRequiredFacetIds: [],
-        coverageScore: 4,
-        matchedTerms: ["proof techniques"],
-        rationale: "Covered by the survey metadata."
-      }],
-      selectedSetCoverage: [{
-        facetId: "facet-proof-techniques",
-        label: "proof techniques",
-        required: true,
-        coveredByPaperIds: ["paper-1"],
-        count: 1
-      }],
-      missingRequiredFacets: [],
-      backgroundOnlyFacets: [],
-      adequacy: "strong" as const,
-      selectionRationale: ["Selected set covers the proof-techniques facet."]
-    };
 
     return {
       notes: [
@@ -1557,8 +1587,7 @@ class StubSourceGatherer implements ResearchSourceGatherer {
           status: "missing_optional"
         }
       ],
-      reviewWorkflow: reviewWorkflowFor(papers),
-      selectionQuality
+      reviewWorkflow: reviewWorkflowFor(papers)
     };
   }
 }
@@ -1635,15 +1664,10 @@ class EvidenceRecoverySourceGatherer implements ResearchSourceGatherer {
           rejected: 0,
           weakMatchSamples: []
         },
-          revisionPasses: 0,
-          accessLimitations: [],
-          suggestedNextQueries: ["autonomous research agents benchmark evaluation"]
-        },
-        selectionQuality: selectionQualityFor(papers, {
-          adequacy: "partial",
-          facetLabel: "benchmark evaluation",
-          missing: true
-        })
+        revisionPasses: 0,
+        accessLimitations: [],
+        suggestedNextQueries: ["autonomous research agents benchmark evaluation"]
+        }
       };
     }
 
@@ -1683,11 +1707,7 @@ class EvidenceRecoverySourceGatherer implements ResearchSourceGatherer {
         revisionPasses: 0,
         accessLimitations: [],
         suggestedNextQueries: []
-      },
-      selectionQuality: selectionQualityFor(papers, {
-        adequacy: "strong",
-        facetLabel: "benchmark evaluation"
-      })
+      }
     };
   }
 }
@@ -1713,12 +1733,7 @@ class UsefulThenEmptySourceGatherer implements ResearchSourceGatherer {
         },
         mergeDiagnostics: [],
         authStatus: [],
-        reviewWorkflow: reviewWorkflowFor([]),
-        selectionQuality: selectionQualityFor([], {
-          adequacy: "thin",
-          facetLabel: "benchmark evaluation",
-          missing: true
-        })
+        reviewWorkflow: reviewWorkflowFor([])
       };
     }
 
@@ -1745,11 +1760,7 @@ class UsefulThenEmptySourceGatherer implements ResearchSourceGatherer {
       },
       mergeDiagnostics: [],
       authStatus: [],
-      reviewWorkflow: reviewWorkflowFor(papers),
-      selectionQuality: selectionQualityFor(papers, {
-        adequacy: "strong",
-        facetLabel: "benchmark evaluation"
-      })
+      reviewWorkflow: reviewWorkflowFor(papers)
     };
   }
 }
@@ -1803,11 +1814,7 @@ class CriticExclusionSourceGatherer implements ResearchSourceGatherer {
         revisionPasses: 0,
         accessLimitations: [],
         suggestedNextQueries: []
-      },
-      selectionQuality: selectionQualityFor(papers, {
-        adequacy: "strong",
-        facetLabel: "research-agent system"
-      })
+      }
     };
   }
 }
@@ -1862,11 +1869,7 @@ class CriticPromotionSourceGatherer implements ResearchSourceGatherer {
         revisionPasses: 0,
         accessLimitations: [],
         suggestedNextQueries: []
-      },
-      selectionQuality: selectionQualityFor(reviewed, {
-        adequacy: "strong",
-        facetLabel: "research-agent architecture"
-      })
+      }
     };
   }
 }
@@ -2559,7 +2562,6 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
         canonicalPaperCount: number;
         reviewedPaperCount: number;
       } | null;
-      requiredSuccessCriterionFacets: Array<{ label: string }>;
       evidenceTargets: string[];
       manuscriptConstraints: string[];
     };
@@ -2621,11 +2623,10 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     assert.match(JSON.stringify(sourcesArtifact), /rawSources/);
     assert.match(JSON.stringify(sourcesArtifact), /sourceConfig/);
     assert.match(JSON.stringify(sourcesArtifact), /mergeDiagnostics/);
-    assert.match(JSON.stringify(sourcesArtifact), /selectionQuality/);
+    assert.doesNotMatch(JSON.stringify(sourcesArtifact), /selectionQuality/);
     assert.match(JSON.stringify(literatureArtifact), /paper-1/);
     assert.match(JSON.stringify(literatureArtifact), /fulltext_open/);
-    assert.match(JSON.stringify(literatureArtifact), /proof techniques/);
-    assert.match(JSON.stringify(literatureArtifact), /selectionQuality/);
+    assert.doesNotMatch(JSON.stringify(literatureArtifact), /selectionQuality/);
     assert.equal(paperExtractionsArtifact.schemaVersion, 1);
     assert.equal(paperExtractionsArtifact.runId, completedRun.id);
     assert.equal(typeof paperExtractionsArtifact.briefFingerprint, "string");
@@ -2637,9 +2638,9 @@ test("run worker writes raw retrieval and canonical literature artifacts, and sy
     assert.equal(reviewProtocol.runId, completedRun.id);
     assert.equal(reviewProtocol.actualRetrieval?.canonicalPaperCount, 1);
     assert.equal(reviewProtocol.actualRetrieval?.reviewedPaperCount, 1);
-    assert.match(JSON.stringify(reviewProtocol.requiredSuccessCriterionFacets), /proof techniques/);
+    assert.equal("requiredSuccessCriterionFacets" in reviewProtocol, false);
     assert.match(reviewProtocol.evidenceTargets.join(" "), /proof techniques/i);
-    assert.match(reviewProtocol.manuscriptConstraints.join(" "), /Do not present a full manuscript/i);
+    assert.match(reviewProtocol.manuscriptConstraints.join(" "), /support links/i);
     assert.match(reviewProtocolMarkdown, /Review Protocol/);
     assert.equal(paperArtifact.schemaVersion, 1);
     assert.equal(paperArtifact.runId, completedRun.id);
@@ -2767,6 +2768,91 @@ test("run worker lets the research agent choose source provider order and source
     assert.match(stdout, /Research agent action \(source_selection\): source\.resolve_access/);
     assert.match(stdout, /Research agent action \(source_selection\): source\.select_evidence/);
     assert.match(stdout, /Source tool observation: arxiv returned/i);
+    assert.match(stdout, /Agentic source-gathering loop active/i);
+    assert.doesNotMatch(stdout, /Source gathering completed with/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("agentic source loop does not substitute fallback evidence for unknown researcher-selected ids", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-no-fallback-evidence-"));
+  const now = createNow();
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (input: string | URL | Request): Promise<Response> => {
+      const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+
+      if (url.hostname === "export.arxiv.org" && url.pathname === "/api/query") {
+        return new Response(`<?xml version="1.0" encoding="UTF-8"?>
+          <feed>
+            <entry>
+              <id>http://arxiv.org/abs/2601.12345</id>
+              <title>Autonomous research agent harnesses for scientific workflow evaluation</title>
+              <summary>Autonomous research agent harness architecture with planning, tool use, retrieval, verification, reproducibility, and benchmark evaluation.</summary>
+              <published>2026-01-10T00:00:00Z</published>
+              <author><name>Example Author</name></author>
+            </entry>
+          </feed>`, { status: 200, headers: { "content-type": "application/atom+xml" } });
+      }
+
+      throw new Error(`Unexpected fetch URL in test: ${url.toString()}`);
+    };
+
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "autonomous research agent harnesses",
+      researchQuestion: "Can the runtime avoid fallback evidence selection?",
+      researchDirection: "The model must explicitly select known source ids.",
+      successCriterion: "Unknown selected ids should not be replaced by runtime-selected evidence."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = [];
+    projectConfig.sources.publisherFullText.selectedProviderIds = ["arxiv"];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.localContext.projectFilesEnabled = false;
+    projectConfig.sources.explicitlyConfigured = true;
+    await projectConfigStore.save(projectConfig);
+
+    const backend = new UnknownEvidenceSelectionBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as {
+      reviewWorkflow?: {
+        counts?: {
+          selectedForSynthesis?: number;
+        };
+        notes?: string[];
+      };
+      agenticSourceState?: {
+        selectedPapers?: number;
+      } | null;
+    };
+    const paperExtractions = JSON.parse(await readFile(completedRun.artifacts.paperExtractionsPath, "utf8")) as {
+      extractionCount: number;
+    };
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.equal(sourcesArtifact.reviewWorkflow?.counts?.selectedForSynthesis, 0);
+    assert.equal(sourcesArtifact.agenticSourceState?.selectedPapers, 0);
+    assert.equal(paperExtractions.extractionCount, 0);
+    assert.match((sourcesArtifact.reviewWorkflow?.notes ?? []).join(" "), /no fallback semantic selection/i);
+    assert.match((sourcesArtifact.reviewWorkflow?.notes ?? []).join(" "), /paper-does-not-exist/i);
+    assert.match(stdout, /no fallback semantic selection/i);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
@@ -2926,7 +3012,7 @@ test("agentic source dashboard asks the model to reconsider repeated low-yield s
   }
 });
 
-test("agentic source dashboard converges even when the model ignores exhausted-search guidance", async () => {
+test("agentic source dashboard does not fabricate evidence when the model ignores exhausted-search guidance", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-source-dashboard-ignore-"));
   const now = createNow();
   const originalFetch = globalThis.fetch;
@@ -2998,7 +3084,8 @@ test("agentic source dashboard converges even when the model ignores exhausted-s
     assert.match(stdout, /Source dashboard:/);
     assert.match(stdout, /Source tool observation: Merged 1 screened scholarly sources into 1 canonical papers/i);
     assert.equal(sourcesArtifact.agenticSourceState?.sourceStage, "selected");
-    assert.ok((sourcesArtifact.reviewWorkflow?.counts?.selectedForSynthesis ?? 0) > 0);
+    assert.equal(sourcesArtifact.reviewWorkflow?.counts?.selectedForSynthesis, 0);
+    assert.match(stdout, /no fallback semantic selection/i);
     assert.ok(sourcesArtifact.agenticSourceState?.recentActions?.some((action) => action.action === "select_evidence_set"));
   } finally {
     globalThis.fetch = originalFetch;
@@ -3159,7 +3246,7 @@ test("protocol.create_or_revise persists a researcher-owned protocol object", as
       topic: "Autonomous research agents",
       researchQuestion: "How should autonomous research work be structured?",
       researchDirection: "Test model-owned protocol persistence.",
-      successCriterion: "The protocol must be queryable as workspace state."
+      successCriterion: "The protocol must be queryable as workspace state and the paper should be complete, publication-style, traceable, and citation-backed."
     }, ["clawresearch", "research-loop"]);
 
     const backend = new ProtocolToolBackend();
@@ -3176,12 +3263,29 @@ test("protocol.create_or_revise persists a researcher-owned protocol object", as
       projectRoot,
       now: now()
     });
+    const reviewProtocol = JSON.parse(await readFile((await runStore.load(run.id)).artifacts.reviewProtocolPath, "utf8")) as {
+      evidenceTargets: string[];
+      manuscriptConstraints: string[];
+      protocolLimitations: string[];
+    };
 
     assert.equal(exitCode, 0);
     assert.equal(workStore.objects.protocols.length, 1);
     assert.equal(workStore.objects.protocols[0]?.author, "researcher");
     assert.equal(workStore.objects.protocols[0]?.title, "Agentic research protocol");
     assert.deepEqual(workStore.objects.protocols[0]?.evidenceTargets, ["agentic tool-loop evidence"]);
+    assert.deepEqual(reviewProtocol.evidenceTargets, ["agentic tool-loop evidence"]);
+    assert.equal("requiredSuccessCriterionFacets" in reviewProtocol, false);
+    assert.doesNotMatch(reviewProtocol.evidenceTargets.join(" "), /complete|publication-style|traceable|citation-backed/i);
+    assert.match(reviewProtocol.protocolLimitations.join(" "), /Canonical protocol authored by researcher/i);
+    const protocolAction = backend.actionRequests.find((request) => request.phase === "protocol");
+    assert.ok(protocolAction);
+    assert.ok(protocolAction.allowedActions.includes("workspace.search"));
+    assert.ok(protocolAction.allowedActions.includes("source.search"));
+    const protocolCriticRequest = backend.criticRequests.find((request) => request.stage === "protocol");
+    assert.ok(protocolCriticRequest?.protocol);
+    assert.deepEqual(protocolCriticRequest.protocol.evidenceTargets, ["agentic tool-loop evidence"]);
+    assert.equal("requiredSuccessCriterionFacets" in protocolCriticRequest.protocol, false);
     assert.ok(backend.actionRequests.some((request) => request.workStore?.recentProtocols.length === 1));
     assert.ok(!workStore.objects.workItems.some((item) => item.targetKind === "protocol" && item.source === "runtime"));
   } finally {
@@ -3519,6 +3623,64 @@ test("run worker does not turn semantic evidence warnings into hardcoded revisio
     assert.equal(backend.capturedExtractionPaperIds.length, 1);
     assert.equal(paper.readinessStatus, "ready_for_revision");
     assert.ok(paper.referencedPaperIds.length >= 1);
+    assert.doesNotMatch(stdout, /Evidence revision pass 1/i);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("run worker does not generate recovery queries from evidence targets alone", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-no-target-query-generation-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "Autonomous research agents",
+      researchQuestion: "Can the runtime keep semantic evidence targets separate from query execution?",
+      researchDirection: "The researcher model may name missing evidence targets, but only explicit search query text can trigger retrieval.",
+      successCriterion: "Do not synthesize recovery queries from evidence target labels."
+    }, ["clawresearch", "research-loop"]);
+
+    const projectConfigStore = new ProjectConfigStore(projectRoot, now);
+    const projectConfig = await projectConfigStore.load();
+    projectConfig.sources.scholarlyDiscovery.selectedProviderIds = ["openalex"];
+    projectConfig.sources.publisherFullText.selectedProviderIds = [];
+    projectConfig.sources.oaRetrievalHelpers.selectedProviderIds = [];
+    projectConfig.sources.generalWeb.selectedProviderIds = [];
+    projectConfig.sources.explicitlyConfigured = true;
+    projectConfig.runtime.llm.evidenceRecoveryMaxPasses = 2;
+    await projectConfigStore.save(projectConfig);
+
+    const backend = new EvidenceTargetOnlyRevisionBackend();
+    const sourceGatherer = new EvidenceRecoverySourceGatherer();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend,
+      sourceGatherer
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+    const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as {
+      autonomousEvidence: { pass: number; revisionPasses: number };
+    };
+    const planArtifact = JSON.parse(await readFile(completedRun.artifacts.planPath, "utf8")) as {
+      searchQueries: string[];
+      localFocus: string[];
+    };
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.equal(sourceGatherer.requests.length, 1);
+    assert.equal(sourcesArtifact.autonomousEvidence.pass, 1);
+    assert.equal(sourcesArtifact.autonomousEvidence.revisionPasses, 0);
+    assert.doesNotMatch(planArtifact.searchQueries.join(" "), /benchmark evaluation/i);
+    assert.doesNotMatch(planArtifact.localFocus.join(" "), /benchmark evaluation/i);
+    assert.match(stdout, /did not provide explicit search query text/i);
     assert.doesNotMatch(stdout, /Evidence revision pass 1/i);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
