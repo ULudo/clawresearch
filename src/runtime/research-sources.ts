@@ -4535,9 +4535,13 @@ export class SourceToolRuntime {
     };
     this.canonicalReview = canonicalReview;
 
-    this.lastObservation = requestedPaperIds.length > 0
-      ? `Selected ${canonicalReview.reviewedPapers.length} researcher-requested papers for the evidence set from ${canonicalReview.canonicalPapers.length} canonical papers.`
-      : `Selected ${canonicalReview.reviewedPapers.length} papers for the evidence set from ${canonicalReview.canonicalPapers.length} canonical papers.`;
+    this.lastObservation = selectedPaperIds.length === 0 && unknownPaperIds.length > 0
+      ? `source.select_evidence contained no known paper ids; no fallback evidence selection was substituted. Unknown id(s): ${unknownPaperIds.slice(0, 12).join(", ")}.`
+      : unknownPaperIds.length > 0
+        ? `Selected ${canonicalReview.reviewedPapers.length} known researcher-requested papers for the evidence set from ${canonicalReview.canonicalPapers.length} canonical papers; ignored unknown id(s): ${unknownPaperIds.slice(0, 12).join(", ")}.`
+        : requestedPaperIds.length > 0
+          ? `Selected ${canonicalReview.reviewedPapers.length} researcher-requested papers for the evidence set from ${canonicalReview.canonicalPapers.length} canonical papers.`
+          : `Selected ${canonicalReview.reviewedPapers.length} papers for the evidence set from ${canonicalReview.canonicalPapers.length} canonical papers.`;
     await emitSourceProgress(this.request.progress, {
       phase: "review_selection",
       status: "completed",

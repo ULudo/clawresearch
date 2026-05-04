@@ -248,7 +248,7 @@ test("Ollama backend accumulates streamed JSON chunks instead of relying on one 
 test("research-agent backend uses native tool calls by default", async () => {
   const originalFetch = globalThis.fetch;
   let capturedBody: {
-    tools?: Array<{ function?: { name?: string; parameters?: { properties?: { action?: { enum?: string[] } } } } }>;
+    tools?: Array<{ function?: { name?: string; strict?: boolean; parameters?: { properties?: { action?: { enum?: string[] }; inputs?: { properties?: { workStore?: { properties?: Record<string, { description?: string }> } } } } } } }>;
     messages?: Array<{ content?: string }>;
   } = {};
 
@@ -308,6 +308,11 @@ test("research-agent backend uses native tool calls by default", async () => {
         localFocus: ["action loop"]
       },
       observations: {
+        sourceCandidates: 7,
+        canonicalSources: 5,
+        screenedInSources: 4,
+        explicitlySelectedEvidenceSources: 4,
+        resolvedAccessSources: 4,
         canonicalPapers: 5,
         selectedPapers: 4,
         extractedPapers: 4,
@@ -329,7 +334,14 @@ test("research-agent backend uses native tool calls by default", async () => {
       "claim.create",
       "workspace.status"
     ]);
+    const workStoreSchema = capturedBody.tools?.[0]?.function?.parameters?.properties?.inputs?.properties?.workStore?.properties;
+    assert.match(workStoreSchema?.payloadJson?.description ?? "", /workspace\.status/i);
+    assert.match(workStoreSchema?.patchJson?.description ?? "", /patch fields/i);
+    assert.match(workStoreSchema?.filterJson?.description ?? "", /exact-match filters/i);
     assert.match(capturedBody.messages?.[0]?.content ?? "", /Call choose_research_action exactly once/);
+    assert.match(capturedBody.messages?.[0]?.content ?? "", /workspace dashboard is an index/i);
+    assert.match(capturedBody.messages?.[0]?.content ?? "", /lab manual/i);
+    assert.doesNotMatch(capturedBody.messages?.[0]?.content ?? "", /bounded first-pass/i);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -408,6 +420,11 @@ test("research-agent backend falls back to strict JSON when native tool calls ar
         localFocus: ["action loop"]
       },
       observations: {
+        sourceCandidates: 7,
+        canonicalSources: 5,
+        screenedInSources: 4,
+        explicitlySelectedEvidenceSources: 4,
+        resolvedAccessSources: 4,
         canonicalPapers: 5,
         selectedPapers: 4,
         extractedPapers: 4,
@@ -506,6 +523,11 @@ test("OpenAI Responses backend uses native function tools for research actions",
         localFocus: ["action loop"]
       },
       observations: {
+        sourceCandidates: 7,
+        canonicalSources: 5,
+        screenedInSources: 4,
+        explicitlySelectedEvidenceSources: 4,
+        resolvedAccessSources: 4,
         canonicalPapers: 5,
         selectedPapers: 4,
         extractedPapers: 4,
@@ -524,6 +546,7 @@ test("OpenAI Responses backend uses native function tools for research actions",
     assert.equal(capturedAuth, "Bearer test-openai-key");
     assert.equal(capturedBody.model, "gpt-test");
     assert.equal(capturedBody.tools?.[0]?.name, "choose_research_action");
+    assert.equal(capturedBody.tools?.[0]?.strict, true);
     assert.equal(capturedBody.tool_choice?.name, "choose_research_action");
     assert.match(capturedBody.instructions ?? "", /Call choose_research_action exactly once/);
   } finally {
@@ -602,6 +625,11 @@ test("agent-step backend exposes first-class claim and manuscript-section tools"
         localFocus: ["evaluation practices"]
       },
       observations: {
+        sourceCandidates: 6,
+        canonicalSources: 4,
+        screenedInSources: 3,
+        explicitlySelectedEvidenceSources: 3,
+        resolvedAccessSources: 3,
         canonicalPapers: 4,
         selectedPapers: 3,
         extractedPapers: 3,

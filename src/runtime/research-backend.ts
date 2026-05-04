@@ -323,7 +323,7 @@ function normalizePlan(raw: unknown, brief: ResearchBrief): ResearchPlan {
   return {
     researchMode: safeResearchMode(record.researchMode) ?? "literature_synthesis",
     objective: safeString(record.objective) ?? fallbackQuestion,
-    rationale: safeString(record.rationale) ?? "Begin with a bounded literature-grounded pass before making stronger claims.",
+    rationale: safeString(record.rationale) ?? "Begin with a literature-grounded operating plan before making stronger claims.",
     searchQueries: safeStringArray(record.searchQueries, 5).length > 0
       ? safeStringArray(record.searchQueries, 5)
       : [fallbackTopic, fallbackQuestion],
@@ -345,7 +345,7 @@ function planningInstruction(request: ResearchPlanningRequest): string {
 
   return [
     "You are ClawResearch's planning module for a console-first autonomous research runtime.",
-    "Plan a bounded first-pass research mode using the brief and local project context.",
+    "Plan an initial research operating mode using the brief, current workspace memory, and local project context.",
     "Use the project memory when it is relevant so the next pass builds on prior findings, open questions, useful ideas, and existing artifacts instead of starting from scratch.",
     "Ground the plan in the following design principles:",
     "- choose a research mode explicitly",
@@ -397,10 +397,12 @@ function agentStepInstruction(request: ResearchActionRequest): string {
   }));
 
   return [
-    "You are ClawResearch's research-agent controller.",
-    "Choose exactly one next tool operation from the allowed tool list.",
+    "You are the researcher. ClawResearch is the lab runtime.",
+    "Inspect the current workspace/source/tool observations, then choose exactly one useful next tool operation from the allowed tool list.",
     "Do not invent tool names. Do not execute the action yourself. The runtime will validate and execute the chosen action.",
     "The phase value is only a milestone/progress label. It must not limit your tool choice.",
+    "The workspace dashboard is an index, not full memory; use workspace.list/search/read to inspect older or complete state.",
+    "If a custom tool family is unclear, use guidance.search/read/recommend to inspect the ClawResearch lab manual.",
     "Use workspace.search/read/list/create/patch/link/unlink to inspect or update the durable SQLite research workspace.",
     "Use source.search, source.merge, source.resolve_access, and source.select_evidence for source discovery and evidence-set construction.",
     "Use claim.create/patch/check_support/link_support for claim-led synthesis.",
@@ -410,9 +412,9 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     "Use protocol.create_or_revise when the research protocol itself needs visible revision by the researcher.",
     "Use critic.review for fresh stateless critique, and check.run for release/support checks.",
     "Use release.verify for final computable release invariants; semantic concerns should become diagnostics or work items.",
-    "Critic objections and checks are normal work-store work items. Prefer concrete tool steps over stopping.",
+    "Critic objections, failed release checks, and not-ready tool results are repair signals. Prefer concrete tool steps over stopping.",
     "Recent tool results are authoritative observations from executed tools. Use returned ids, snippets, and previews before repeating the same read action.",
-    "Use workspace.status only when the next step is genuinely external to the agent, unsafe, or impossible with the configured tools.",
+    "Use workspace.status only for a true checkpoint, segment-budget boundary, external blocker, or real user decision; do not checkpoint merely because machine-actionable work remains.",
     "",
     "Return JSON only with this exact shape:",
     "{",
@@ -427,7 +429,7 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     '    "criticScope": "protocol|sources|evidence|release|null",',
     '    "reason": "short status reason or null",',
     '    "workStore": {',
-    '      "collection": "workItems|canonicalSources|extractions|claims|citations|manuscriptSections|releaseChecks|null",',
+    '      "collection": "providerRuns|sources|canonicalSources|screeningDecisions|fullTextRecords|extractions|evidenceCells|claims|citations|protocols|workItems|manuscriptSections|releaseChecks|null",',
     '      "entityId": "known entity id or null",',
     '      "filters": {},',
     '      "filterJson": "{\\"field\\":\\"simple exact match value\\"} or null",',
@@ -708,6 +710,7 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
                       "evidenceCells",
                       "claims",
                       "citations",
+                      "protocols",
                       "workItems",
                       "manuscriptSections",
                       "releaseChecks",
@@ -720,11 +723,12 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
                   filters: {
                     type: "object",
                     additionalProperties: false,
-                    properties: {}
+                    properties: {},
+                    description: "Reserved closed object for native schemas; use filterJson for dynamic exact-match filters."
                   },
                   filterJson: {
                     type: ["string", "null"],
-                    description: "Optional JSON object string for exact-match filters."
+                    description: "Optional JSON object string for exact-match filters, for example {\"status\":\"open\"}."
                   },
                   semanticQuery: {
                     type: ["string", "null"]
@@ -739,20 +743,22 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
                   changes: {
                     type: "object",
                     additionalProperties: false,
-                    properties: {}
+                    properties: {},
+                    description: "Reserved closed object for native schemas; use patchJson for dynamic patch fields."
                   },
                   entity: {
                     type: "object",
                     additionalProperties: false,
-                    properties: {}
+                    properties: {},
+                    description: "Reserved closed object for native schemas; use payloadJson for dynamic create/status payload fields."
                   },
                   patchJson: {
                     type: ["string", "null"],
-                    description: "Optional JSON object string for patch fields."
+                    description: "Optional JSON object string for patch fields, for example {\"status\":\"resolved\"}."
                   },
                   payloadJson: {
                     type: ["string", "null"],
-                    description: "Optional JSON object string for create payload fields."
+                    description: "Optional JSON object string for create/status payload fields. workspace.status may include {\"status\":\"working|externally_blocked|needs_user_decision\",\"statusReason\":\"...\",\"nextInternalActions\":[\"...\"]}."
                   },
                   link: {
                     type: "object",
@@ -823,10 +829,12 @@ function responseResearchActionToolDefinition(request: ResearchActionRequest): {
 
 function nativeAgentStepInstruction(request: ResearchActionRequest): string {
   return [
-    "You are ClawResearch's research-agent controller.",
+    "You are the researcher. ClawResearch is the lab runtime.",
     `Call ${researchActionToolName} exactly once.`,
     "Do not answer in prose. Do not invent tools. The runtime validates and executes the chosen action.",
     "The phase value is only a milestone/progress label. It must not limit your tool choice.",
+    "The workspace dashboard is an index, not full memory; use workspace.list/search/read to inspect older or complete state.",
+    "If a custom tool family is unclear, use guidance.search/read/recommend to inspect the ClawResearch lab manual.",
     "Use workspace.search/read/list/create/patch/link/unlink to inspect or update the durable SQLite research workspace.",
     "Use source.search, source.merge, source.resolve_access, and source.select_evidence for source discovery and evidence-set construction.",
     "Use claim.create/patch/check_support/link_support for claim-led synthesis.",
@@ -836,9 +844,9 @@ function nativeAgentStepInstruction(request: ResearchActionRequest): string {
     "Use protocol.create_or_revise when the research protocol itself needs visible revision by the researcher.",
     "Use critic.review for fresh stateless critique, and check.run for release/support checks.",
     "Use release.verify for final computable release invariants; semantic concerns should become diagnostics or work items.",
-    "Critic objections and checks are normal work-store work items. Prefer concrete tool steps over stopping.",
+    "Critic objections, failed release checks, and not-ready tool results are repair signals. Prefer concrete tool steps over stopping.",
     "Recent tool results are authoritative observations from executed tools. Use returned ids, snippets, and previews before repeating the same read action.",
-    "Use workspace.status only when the next step is genuinely external to the agent, unsafe, or impossible with the configured tools.",
+    "Use workspace.status only for a true checkpoint, segment-budget boundary, external blocker, or real user decision; do not checkpoint merely because machine-actionable work remains.",
     "",
     `Project root: ${request.projectRoot}`,
     `Run id: ${request.runId}`,

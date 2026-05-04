@@ -14,6 +14,7 @@ import type {
   ResearchBackendCallOptions
 } from "../src/runtime/research-backend.js";
 import { ResearchBackendError } from "../src/runtime/research-backend.js";
+import { workspaceResearchActions } from "../src/runtime/research-agent.js";
 import type {
   ResearchActionDecision,
   ResearchActionRequest
@@ -26,7 +27,7 @@ import type {
 import { ProjectConfigStore } from "../src/runtime/project-config-store.js";
 import { researchDirectionPath, runDirectoryPath, runFilePath, RunStore } from "../src/runtime/run-store.js";
 import { runDetachedJobWorker } from "../src/runtime/run-worker.js";
-import { researchWorkerStatePath } from "../src/runtime/research-state.js";
+import { loadResearchWorkerState, researchWorkerStatePath } from "../src/runtime/research-state.js";
 import {
   createResearchWorkStore,
   loadResearchWorkStore,
@@ -2109,6 +2110,7 @@ async function seedCanonicalWorkspaceSource(input: {
 
 class ExplicitResearchToolBackend extends StubResearchBackend {
   readonly sourceActions: ResearchActionDecision[] = [];
+  readonly researchRequests: ResearchActionRequest[] = [];
   private extractionId: string | null = null;
   private evidenceCellId: string | null = null;
   private matrixViewed = false;
@@ -2120,6 +2122,7 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
     if (request.phase !== "research") {
       return super.chooseResearchAction(request);
     }
+    this.researchRequests.push(request);
 
     for (const result of request.toolResults ?? []) {
       if (result.action === "extraction.create" && result.entity?.id !== undefined) {
@@ -2445,11 +2448,13 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
 
 class ExplicitManuscriptReleaseBlockedBackend extends StubResearchBackend {
   private releaseRequested = false;
+  readonly researchRequests: ResearchActionRequest[] = [];
 
   override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
     if (request.phase !== "research") {
       return super.chooseResearchAction(request);
     }
+    this.researchRequests.push(request);
 
     if (!this.releaseRequested) {
       this.releaseRequested = true;
@@ -2824,6 +2829,7 @@ test("explicit researcher tools create extraction, evidence, critic work items, 
       readiness: string;
     };
     const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
+    const agentSteps = await readFile(completedRun.artifacts.agentStepsPath, "utf8");
 
     assert.equal(exitCode, 0);
     assert.deepEqual(backend.sourceActions.map((action) => action.action), [
@@ -2837,6 +2843,31 @@ test("explicit researcher tools create extraction, evidence, critic work items, 
       "release.verify",
       "manuscript.release"
     ]);
+    const validActions = new Set(workspaceResearchActions());
+    const emittedHints = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .flatMap((result) => result.nextHints ?? []);
+    for (const hint of emittedHints) {
+      assert.ok(validActions.has(hint as never), `Unexpected model-facing next hint ${hint}`);
+    }
+    const claimCreateResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "claim.create");
+    assert.equal(claimCreateResult?.collection, "claims");
+    assert.equal(claimCreateResult?.entity?.kind, "claim");
+    assert.ok(claimCreateResult?.entity?.id);
+    assert.ok(claimCreateResult?.nextHints?.includes("claim.link_support"));
+    const supportLinkResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "claim.link_support");
+    assert.equal(supportLinkResult?.collection, "citations");
+    assert.equal(supportLinkResult?.entity?.kind, "citation");
+    assert.ok(supportLinkResult?.related?.some((item) => item.kind === "claim"));
+    const sectionCreateResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "section.create");
+    assert.equal(sectionCreateResult?.collection, "manuscriptSections");
+    assert.equal(sectionCreateResult?.entity?.kind, "manuscriptSection");
     assert.equal(workStore.objects.extractions.length, 1);
     assert.equal(workStore.objects.extractions[0]?.sourceId, sourceId);
     assert.equal(workStore.objects.evidenceCells.length, 1);
@@ -2855,6 +2886,9 @@ test("explicit researcher tools create extraction, evidence, critic work items, 
     assert.match(stdout, /Research tool observation: Extraction created/);
     assert.match(stdout, /Research tool observation: Evidence matrix view returned 1 row/);
     assert.match(stdout, /Research tool observation: Manuscript released from workspace state/);
+    assert.match(agentSteps, /"action":"manuscript\.release_result"/);
+    assert.match(agentSteps, /"toolAction":"manuscript\.release"/);
+    assert.match(agentSteps, /"manuscriptExportsCreated":1/);
     assert.equal(workStore.worker.status, "release_ready");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
@@ -3010,12 +3044,13 @@ test("explicit manuscript.release fails visibly when release invariants are miss
       successCriterion: "The explicit release tool reports invariant failures."
     }, ["clawresearch", "research-loop"]);
 
+    const backend = new ExplicitManuscriptReleaseBlockedBackend();
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
       version: "0.7.0",
       now,
-      researchBackend: new ExplicitManuscriptReleaseBlockedBackend()
+      researchBackend: backend
     });
 
     const completedRun = await runStore.load(run.id);
@@ -3036,6 +3071,14 @@ test("explicit manuscript.release fails visibly when release invariants are miss
     assert.match(paperMarkdown, /Manuscript release was explicitly requested/);
     assert.match(paperMarkdown, /No claims have been created/);
     assert.notEqual(workStore.worker.status, "release_ready");
+    assert.ok(workStore.worker.nextInternalActions.some((action) => /not_ready tool result from manuscript\.release/i.test(action)));
+    assert.ok(workStore.worker.nextInternalActions.some((action) => /release checks/i.test(action)));
+    const releaseResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "manuscript.release");
+    assert.equal(releaseResult?.status, "not_ready");
+    assert.equal(releaseResult?.stateDelta?.manuscriptExportsCreated, 0);
+    assert.ok(releaseResult?.related?.some((item) => item.kind === "releaseRepair" && item.fields?.suggestedActions !== undefined));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -3187,6 +3230,7 @@ test("run worker lets the research agent choose source provider order and source
       projectRoot,
       now: now()
     });
+    const workerState = await loadResearchWorkerState(projectRoot);
 
     assert.equal(exitCode, 0);
     assert.equal(sourcesArtifact.retrievalDiagnostics?.providerAttempts?.[0]?.providerId, "arxiv");
@@ -3202,11 +3246,19 @@ test("run worker lets the research agent choose source provider order and source
     assert.ok(backend.sourceActions[0]?.inputs.providerIds.includes("arxiv"));
     assert.ok(backend.sourceActionRequests.every((request) => request.allowedActions.includes("workspace.search")));
     assert.ok(backend.sourceActionRequests.every((request) => request.allowedActions.includes("section.create")));
+    for (const [index, request] of backend.sourceActionRequests.entries()) {
+      assert.equal(request.observations.sessionStepsUsed, index);
+      assert.equal(request.observations.sessionStepsRemaining, 24 - index);
+    }
     const postSearchRequest = backend.sourceActionRequests.find((request) => (
       request.sourceState?.attemptedProviderIds.includes("arxiv") === true
       && request.toolResults?.some((result) => result.action === "source.search") === true
     ));
     assert.ok(postSearchRequest);
+    assert.ok(postSearchRequest.observations.sourceCandidates > 0);
+    assert.match(postSearchRequest.workStore?.dashboard?.lookupReminder ?? "", /workspace\.list/);
+    assert.ok((postSearchRequest.workStore?.dashboard?.sourceAccess.sourceCandidates ?? 0) > 0);
+    assert.equal("recentExtractions" in (postSearchRequest.workStore?.dashboard ?? {}), false);
     const sourceSearchResult = postSearchRequest.toolResults?.find((result) => result.action === "source.search");
     assert.equal(sourceSearchResult?.collection, "sources");
     assert.ok((sourceSearchResult?.count ?? 0) > 0);
@@ -3216,6 +3268,18 @@ test("run worker lets the research agent choose source provider order and source
       && /architecture/i.test(item.snippet ?? "")
       && item.fields?.providerId === "arxiv"
     )));
+    const postMergeRequest = backend.sourceActionRequests.find((request) => request.sourceState?.canonicalMergeCompleted === true);
+    assert.ok(postMergeRequest);
+    assert.ok(postMergeRequest.observations.canonicalSources > 0);
+    assert.ok(postMergeRequest.observations.screenedInSources > 0);
+    assert.equal(postMergeRequest.observations.explicitlySelectedEvidenceSources, 0);
+    const postSelectionRequest = backend.sourceActionRequests.find((request) => (request.sourceState?.selectedPapers ?? 0) > 0);
+    assert.ok(postSelectionRequest);
+    assert.equal(postSelectionRequest.observations.explicitlySelectedEvidenceSources, postSelectionRequest.sourceState?.selectedPapers);
+    assert.equal(postSelectionRequest.observations.selectedPapers, postSelectionRequest.observations.explicitlySelectedEvidenceSources);
+    assert.ok(postSelectionRequest.observations.screenedInSources >= postSelectionRequest.observations.explicitlySelectedEvidenceSources);
+    assert.ok((workerState?.evidence?.includedPapers ?? 0) >= (workerState?.evidence?.explicitlySelectedEvidencePapers ?? 0));
+    assert.equal(workerState?.evidence?.selectedPapers, workerState?.evidence?.explicitlySelectedEvidencePapers);
     assert.match(stdout, /Research agent action \(research\): source\.search/);
     assert.match(stdout, /Research agent action \(research\): source\.merge/);
     assert.match(stdout, /Research agent action \(research\): source\.resolve_access/);
@@ -3307,7 +3371,12 @@ test("source tool runtime does not substitute fallback evidence for unknown rese
     assert.equal(workStore.objects.evidenceCells.length, 0);
     assert.match((sourcesArtifact.reviewWorkflow?.notes ?? []).join(" "), /no fallback semantic selection/i);
     assert.match((sourcesArtifact.reviewWorkflow?.notes ?? []).join(" "), /paper-does-not-exist/i);
-    assert.match(stdout, /Selected 0 researcher-requested papers for the evidence set/i);
+    assert.match(stdout, /no fallback evidence selection was substituted/i);
+    const selectionResult = backend.sourceActionRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "source.select_evidence");
+    assert.equal(selectionResult?.status, "noop");
+    assert.match(selectionResult?.message ?? "", /unknown id/i);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
@@ -3620,7 +3689,7 @@ test("source tool dashboard does not fabricate evidence when the model ignores e
     assert.match(stdout, /Source dashboard:/);
     assert.match(stdout, /without automatic merge or selection/i);
     assert.doesNotMatch(stdout, /Source tool observation: Merged 1 screened scholarly sources into 1 canonical papers/i);
-    assert.match(stdout, /Research work store checkpointed: 0 sources, 0 open work items/i);
+    assert.match(stdout, /Research work store checkpointed: 0 canonical sources, \d+ source candidates, 0 open work items/i);
     assert.equal(sourcesArtifact.sourceToolState?.canonicalMergeCompleted, false);
     assert.equal(sourcesArtifact.reviewWorkflow?.counts?.selectedForSynthesis, 0);
     assert.equal(sourcesArtifact.sourceToolState?.recentActions?.some((action) => action.action === "source.select_evidence"), false);

@@ -124,7 +124,7 @@ export type AgentVisibleEntityPreview = {
 export type AgentToolResult = {
   id: string;
   action: string;
-  status: "ok" | "failed" | "blocked" | "noop";
+  status: "ok" | "failed" | "blocked" | "not_ready" | "noop";
   readOnly: boolean;
   timestamp: string;
   message: string;
@@ -196,6 +196,11 @@ export type ResearchActionRequest = {
   brief: ResearchBrief;
   plan: ResearchPlan;
   observations: {
+    sourceCandidates: number;
+    canonicalSources: number;
+    screenedInSources: number;
+    explicitlySelectedEvidenceSources: number;
+    resolvedAccessSources: number;
     canonicalPapers: number;
     selectedPapers: number;
     extractedPapers: number;
@@ -257,6 +262,28 @@ export type ResearchActionRequest = {
       claims: number;
       openWorkItems: number;
       releaseChecks: number;
+    };
+    dashboard?: {
+      lookupReminder: string;
+      openWorkItems: number;
+      blockingWorkItems: number;
+      unsupportedClaims: number;
+      sectionsNeedingRevision: number;
+      failedReleaseChecks: number;
+      releaseCheckBlockers: number;
+      sourceAccess: {
+        sourceCandidates: number;
+        canonicalSources: number;
+        screenedInSources: number;
+        fullTextAvailableSources: number;
+        metadataOnlySources: number;
+      };
+      recentlyChangedIds: Array<{
+        collection: string;
+        id: string;
+        updatedAt: string;
+      }>;
+      suggestedLookupTools: string[];
     };
     worker: {
       status: string;

@@ -274,6 +274,15 @@ export type ResearchWorkStoreWorker = {
   paperReadiness: string | null;
   nextInternalActions: string[];
   userBlockers: string[];
+  evidence: {
+    canonicalPapers: number;
+    includedPapers: number;
+    explicitlySelectedEvidencePapers: number;
+    selectedPapers: number;
+    extractedPapers: number;
+    evidenceRows: number;
+    referencedPapers: number;
+  } | null;
 };
 
 export type ResearchWorkStoreObjects = {
@@ -560,7 +569,8 @@ function createEmptyWorker(now: string): ResearchWorkStoreWorker {
     statusReason: "No autonomous research worker segment has started yet.",
     paperReadiness: null,
     nextInternalActions: [],
-    userBlockers: []
+    userBlockers: [],
+    evidence: null
   };
 }
 
@@ -613,7 +623,26 @@ function normalizeWorker(value: unknown, now: string): ResearchWorkStoreWorker {
     statusReason: readString(record.statusReason) ?? base.statusReason,
     paperReadiness: readString(record.paperReadiness),
     nextInternalActions: readStringArray(record.nextInternalActions, 40),
-    userBlockers: readStringArray(record.userBlockers, 40)
+    userBlockers: readStringArray(record.userBlockers, 40),
+    evidence: normalizeWorkerEvidence(record.evidence)
+  };
+}
+
+function normalizeWorkerEvidence(value: unknown): ResearchWorkStoreWorker["evidence"] {
+  const record = asObject(value);
+  if (Object.keys(record).length === 0) {
+    return null;
+  }
+
+  const explicitlySelectedEvidencePapers = readNumber(record.explicitlySelectedEvidencePapers);
+  return {
+    canonicalPapers: readNumber(record.canonicalPapers),
+    includedPapers: readNumber(record.includedPapers),
+    explicitlySelectedEvidencePapers,
+    selectedPapers: readNumber(record.selectedPapers) || explicitlySelectedEvidencePapers,
+    extractedPapers: readNumber(record.extractedPapers),
+    evidenceRows: readNumber(record.evidenceRows),
+    referencedPapers: readNumber(record.referencedPapers)
   };
 }
 

@@ -55,3 +55,25 @@ test("research guidance read returns the full advisory object", () => {
   assert.equal(item.advisory, true);
   assert.match(item.body, /computable integrity/i);
 });
+
+test("research lab manual teaches custom tool families on demand", () => {
+  const workspaceGuide = readResearchGuidance("tool-guide.workspace");
+  const releaseSearch = searchResearchGuidance("release verify not ready repair", 4);
+
+  assert.ok(workspaceGuide !== null);
+  assert.equal(workspaceGuide.kind, "ToolGuide");
+  assert.match(workspaceGuide.body, /workspace\.list/);
+  assert.match(workspaceGuide.body, /full workspace memory/i);
+  assert.ok(releaseSearch.items.some((item) => item.id === "tool-guide.release"));
+
+  const context = guidanceContextForAgent({
+    brief: {
+      topic: "agentic literature reviews",
+      researchQuestion: null,
+      researchDirection: null,
+      successCriterion: null
+    }
+  });
+  assert.match(context.message, /lab manual/i);
+  assert.equal(context.policy, "advisory_only");
+});

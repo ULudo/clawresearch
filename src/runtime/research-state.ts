@@ -12,6 +12,8 @@ export type { ResearchWorkerStatus } from "./research-work-store.js";
 
 export type ResearchWorkerEvidenceSnapshot = {
   canonicalPapers: number;
+  includedPapers: number;
+  explicitlySelectedEvidencePapers: number;
   selectedPapers: number;
   extractedPapers: number;
   evidenceRows: number;
@@ -94,9 +96,11 @@ export async function loadResearchWorkerState(
     paperReadiness: store.worker.paperReadiness,
     nextInternalActions: store.worker.nextInternalActions,
     userBlockers: store.worker.userBlockers,
-    evidence: {
+    evidence: store.worker.evidence ?? {
       canonicalPapers: store.objects.canonicalSources.length,
-      selectedPapers: store.objects.canonicalSources.filter((source) => source.screeningDecision === "include").length,
+      includedPapers: store.objects.canonicalSources.filter((source) => source.screeningDecision === "include").length,
+      explicitlySelectedEvidencePapers: 0,
+      selectedPapers: 0,
       extractedPapers: store.objects.extractions.length,
       evidenceRows: new Set(store.objects.evidenceCells.map((cell) => cell.sourceId)).size,
       referencedPapers: new Set(store.objects.citations.map((citation) => citation.sourceId)).size
@@ -159,6 +163,7 @@ export async function writeResearchWorkerState(state: ResearchWorkerState): Prom
     statusReason: state.statusReason,
     paperReadiness: state.paperReadiness,
     nextInternalActions: state.nextInternalActions,
-    userBlockers: state.userBlockers
+    userBlockers: state.userBlockers,
+    evidence: state.evidence
   }, now));
 }

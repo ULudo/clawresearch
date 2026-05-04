@@ -321,6 +321,17 @@ function sourceStateForAgent(session: SourceToolRuntime): ResearchActionRequest[
   };
 }
 
+function recentlyChangedWorkspaceIds(store: ResearchWorkStore): Array<{ collection: string; id: string; updatedAt: string }> {
+  return workStoreCollections
+    .flatMap((collection) => store.objects[collection].map((entity) => ({
+      collection,
+      id: entity.id,
+      updatedAt: entity.updatedAt
+    })))
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+    .slice(0, 12);
+}
+
 const workStoreCollections: WorkStoreCollectionName[] = [
   "providerRuns",
   "sources",
@@ -354,9 +365,32 @@ const workStoreEntityKinds: WorkStoreEntityKind[] = [
 ];
 
 function workStoreContextForAgent(store: ResearchWorkStore): ResearchActionRequest["workStore"] {
+  const supportReadiness = supportReadinessForWorkspace(store);
+  const openWorkItems = store.objects.workItems.filter((item) => item.status === "open");
+  const failedReleaseChecks = store.objects.releaseChecks.filter((check) => check.status === "fail");
+  const sourceAccess = {
+    sourceCandidates: store.objects.sources.length,
+    canonicalSources: store.objects.canonicalSources.length,
+    screenedInSources: store.objects.canonicalSources.filter((source) => source.screeningDecision === "include").length,
+    fullTextAvailableSources: store.objects.fullTextRecords.filter((record) => record.fulltextAvailable).length,
+    metadataOnlySources: store.objects.canonicalSources.filter((source) => source.accessMode === "metadata_only").length
+  };
+
   return {
     path: researchWorkStoreFilePath(store.projectRoot),
     summary: summarizeResearchWorkStore(store),
+    dashboard: {
+      lookupReminder: "The dashboard is only a compact index. Use workspace.list, workspace.search, and workspace.read to inspect older or full workspace objects before deciding.",
+      openWorkItems: openWorkItems.length,
+      blockingWorkItems: openWorkItems.filter((item) => item.severity === "blocking").length,
+      unsupportedClaims: supportReadiness.unsupportedClaimIds.size,
+      sectionsNeedingRevision: store.objects.manuscriptSections.filter((section) => section.status === "needs_revision" || section.claimIds.length === 0).length,
+      failedReleaseChecks: failedReleaseChecks.length,
+      releaseCheckBlockers: failedReleaseChecks.filter((check) => check.severity === "blocker").length,
+      sourceAccess,
+      recentlyChangedIds: recentlyChangedWorkspaceIds(store),
+      suggestedLookupTools: ["workspace.list", "workspace.search", "workspace.read"]
+    },
     worker: {
       status: store.worker.status,
       statusReason: store.worker.statusReason,
@@ -930,6 +964,37 @@ function sourceToolResultFromObservation(input: {
     nextHints: sourceToolNextHints(input.observation),
     error: sourceToolStatus(input.observation) === "failed" ? input.observation.message : null
   });
+}
+
+function releaseRepairHintsForCheck(check: { id?: string; checkId?: string; message: string; title: string }): string[] {
+  const text = `${check.id ?? check.checkId ?? ""} ${check.title} ${check.message}`.toLowerCase();
+  if (/section/.test(text) && /claim/.test(text)) {
+    return ["workspace.list", "section.link_claim", "claim.create"];
+  }
+  if (/section/.test(text)) {
+    return ["section.create", "section.patch", "workspace.read"];
+  }
+  if (/claim/.test(text) && /support|citation|reference/.test(text)) {
+    return ["workspace.list", "claim.link_support", "claim.check_support"];
+  }
+  if (/reference|citation/.test(text)) {
+    return ["workspace.list", "claim.link_support", "release.verify"];
+  }
+  return ["workspace.read", "workspace.list", "work_item.create"];
+}
+
+function releaseRepairPreviews(checks: Array<{ id: string; title: string; severity: string; message: string }>): AgentVisibleEntityPreview[] {
+  return checks.slice(0, 8).map((check) => ({
+    id: `repair-${check.id}`,
+    kind: "releaseRepair",
+    title: check.title,
+    status: check.severity,
+    snippet: compactPreviewText(check.message, 260),
+    fields: {
+      checkId: check.id,
+      suggestedActions: releaseRepairHintsForCheck(check)
+    }
+  }));
 }
 
 function numericTextIdPart(text: string): string {
@@ -1839,7 +1904,7 @@ async function executeWorkStoreToolAction(input: {
         nextCursor: result.nextCursor,
         items: result.items.map((entity) => entityPreviewForAgent(entity, input.store)),
         nextHints: queryCollection === "extractions" || queryCollection === "evidenceCells"
-          ? ["claim.create", "workspace.read", "evidence.find_support"]
+          ? ["claim.create", "workspace.read", "workspace.search"]
           : ["workspace.read", "workspace.search"]
       })
     };
@@ -1894,20 +1959,44 @@ async function executeWorkStoreToolAction(input: {
   }
 
   if (input.decision.action === "workspace.patch") {
+    const timestamp = input.now();
     if (collection === null || args.entityId === null || Object.keys(args.changes).length === 0) {
+      const message = "Workspace patch skipped because collection, entityId, or changes were missing.";
       return {
         handled: true,
         store: input.store,
-        message: "Workspace patch skipped because collection, entityId, or changes were missing."
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp,
+          status: "noop",
+          readOnly: false,
+          message,
+          collection,
+          nextHints: ["workspace.list", "workspace.read"]
+        })
       };
     }
 
     const existing = readResearchWorkStoreEntity(input.store, collection, args.entityId);
     if (existing === null) {
+      const message = `Workspace patch found no ${collection} entity ${args.entityId}.`;
       return {
         handled: true,
         store: input.store,
-        message: `Workspace patch found no ${collection} entity ${args.entityId}.`
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp,
+          status: "noop",
+          readOnly: false,
+          message,
+          collection,
+          query: { entityId: args.entityId },
+          nextHints: ["workspace.list", "workspace.search"]
+        })
       };
     }
 
@@ -1915,12 +2004,28 @@ async function executeWorkStoreToolAction(input: {
       collection,
       id: args.entityId,
       changes: args.changes
-    }, input.now());
+    }, timestamp);
     await writeResearchWorkStore(nextStore);
+    const patched = readResearchWorkStoreEntity(nextStore, collection, args.entityId);
+    const message = `Workspace patched ${collection} entity ${args.entityId}.`;
     return {
       handled: true,
       store: nextStore,
-      message: `Workspace patched ${collection} entity ${args.entityId}.`
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp,
+        readOnly: false,
+        message,
+        collection,
+        query: { entityId: args.entityId },
+        count: patched === null ? 0 : 1,
+        totalCount: nextStore.objects[collection].length,
+        entity: patched === null ? null : entityPreviewForAgent(patched, nextStore),
+        stateDelta: { workspaceEntitiesPatched: 1 },
+        nextHints: ["workspace.read", "workspace.status"]
+      })
     };
   }
 
@@ -1931,10 +2036,22 @@ async function executeWorkStoreToolAction(input: {
     if (link?.fromCollection === "claims" && link.fromId !== null && link.toId !== null) {
       const claim = readResearchWorkStoreEntity<WorkStoreClaim>(input.store, "claims", link.fromId);
       if (claim === null) {
+        const message = `Workspace link found no claim ${link.fromId}.`;
         return {
           handled: true,
           store: input.store,
-          message: `Workspace link found no claim ${link.fromId}.`
+          message,
+          result: makeAgentToolResult({
+            run: input.run,
+            action: input.decision.action,
+            timestamp: nowText,
+            status: "noop",
+            readOnly: false,
+            message,
+            collection: "claims",
+            query: { entityId: link.fromId },
+            nextHints: ["workspace.search", "claim.create"]
+          })
         };
       }
       const linkedEvidenceCell = link.toCollection === "evidenceCells"
@@ -1987,17 +2104,52 @@ async function executeWorkStoreToolAction(input: {
         }, nowText);
       }
       await writeResearchWorkStore(nextStore);
+      const updatedClaim = readResearchWorkStoreEntity<WorkStoreClaim>(nextStore, "claims", claim.id);
+      const message = `Workspace ${unlink ? "unlinked" : "linked"} claim ${claim.id} ${unlink ? "from" : "to"} source ${sourceId}.`;
       return {
         handled: true,
         store: nextStore,
-        message: `Workspace ${unlink ? "unlinked" : "linked"} claim ${claim.id} ${unlink ? "from" : "to"} source ${sourceId}.`
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          readOnly: false,
+          message,
+          collection: "claims",
+          query: {
+            fromId: claim.id,
+            toId: sourceId,
+            relation: link.relation
+          },
+          count: updatedClaim === null ? 0 : 1,
+          totalCount: nextStore.objects.claims.length,
+          entity: updatedClaim === null ? null : entityPreviewForAgent(updatedClaim, nextStore),
+          related: nextStore.objects.citations
+            .filter((citation) => citation.claimIds.includes(claim.id))
+            .slice(-4)
+            .map((citation) => entityPreviewForAgent(citation, nextStore)),
+          stateDelta: { supportLinksChanged: unlink ? -1 : 1 },
+          nextHints: ["claim.check_support", "section.link_claim", "release.verify"]
+        })
       };
     }
 
+    const message = "Workspace link skipped because the requested relation is not a supported primitive yet.";
     return {
       handled: true,
       store: input.store,
-      message: "Workspace link skipped because the requested relation is not a supported primitive yet."
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        status: "noop",
+        readOnly: false,
+        message,
+        collection,
+        nextHints: ["claim.link_support", "workspace.read"]
+      })
     };
   }
 
@@ -2019,10 +2171,24 @@ async function executeWorkStoreToolAction(input: {
   });
   const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, workItem, nowText);
   await writeResearchWorkStore(nextStore);
+  const message = `Workspace created work item ${workItem.id}.`;
   return {
     handled: true,
     store: nextStore,
-    message: `Workspace created work item ${workItem.id}.`
+    message,
+    result: makeAgentToolResult({
+      run: input.run,
+      action: input.decision.action,
+      timestamp: nowText,
+      readOnly: false,
+      message,
+      collection: "workItems",
+      count: 1,
+      totalCount: nextStore.objects.workItems.length,
+      entity: entityPreviewForAgent(workItem, nextStore),
+      stateDelta: { workItemsCreated: 1 },
+      nextHints: ["workspace.read", "work_item.patch", "workspace.status"]
+    })
   };
 }
 
@@ -2051,10 +2217,24 @@ async function executeResearchObjectToolAction(input: {
     });
     const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, protocol, nowText);
     await writeResearchWorkStore(nextStore);
+    const message = `Researcher-authored protocol ${protocol.id} persisted in the workspace.`;
     return {
       handled: true,
       store: nextStore,
-      message: `Researcher-authored protocol ${protocol.id} persisted in the workspace.`
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        readOnly: false,
+        message,
+        collection: "protocols",
+        count: 1,
+        totalCount: nextStore.objects.protocols.length,
+        entity: entityPreviewForAgent(protocol, nextStore),
+        stateDelta: { protocolsCreated: 1 },
+        nextHints: ["workspace.read", "source.search", "guidance.read"]
+      })
     };
   }
 
@@ -2158,20 +2338,45 @@ async function executeResearchObjectToolAction(input: {
     });
     const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, workItem, nowText);
     await writeResearchWorkStore(nextStore);
+    const message = `Critic work item created ${workItem.id}.`;
     return {
       handled: true,
       store: nextStore,
-      message: `Critic work item created ${workItem.id}.`
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        readOnly: false,
+        message,
+        collection: "workItems",
+        count: 1,
+        totalCount: nextStore.objects.workItems.length,
+        entity: entityPreviewForAgent(workItem, nextStore),
+        stateDelta: { workItemsCreated: 1 },
+        nextHints: ["workspace.read", "work_item.patch", "workspace.status"]
+      })
     };
   }
 
   if (input.decision.action === "work_item.patch") {
     const workItemId = args.entityId ?? input.decision.inputs.paperIds[0] ?? null;
     if (workItemId === null) {
+      const message = "Critic work item resolution skipped because no work item id was provided.";
       return {
         handled: true,
         store: input.store,
-        message: "Critic work item resolution skipped because no work item id was provided."
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "noop",
+          readOnly: false,
+          message,
+          collection: "workItems",
+          nextHints: ["workspace.list", "workspace.search"]
+        })
       };
     }
     const nextStore = patchResearchWorkStoreEntity(input.store, {
@@ -2182,10 +2387,26 @@ async function executeResearchObjectToolAction(input: {
       }
     }, nowText);
     await writeResearchWorkStore(nextStore);
+    const updatedWorkItem = readResearchWorkStoreEntity<WorkStoreWorkItem>(nextStore, "workItems", workItemId);
+    const message = `Critic work item resolved ${workItemId}.`;
     return {
       handled: true,
       store: nextStore,
-      message: `Critic work item resolved ${workItemId}.`
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        readOnly: false,
+        message,
+        collection: "workItems",
+        query: { entityId: workItemId },
+        count: updatedWorkItem === null ? 0 : 1,
+        totalCount: nextStore.objects.workItems.length,
+        entity: updatedWorkItem === null ? null : entityPreviewForAgent(updatedWorkItem, nextStore),
+        stateDelta: { workItemsPatched: 1 },
+        nextHints: ["workspace.status", "release.verify", "workspace.list"]
+      })
     };
   }
 
@@ -2197,20 +2418,45 @@ async function executeResearchObjectToolAction(input: {
     });
     const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, claim, nowText);
     await writeResearchWorkStore(nextStore);
+    const message = `Claim created ${claim.id}.`;
     return {
       handled: true,
       store: nextStore,
-      message: `Claim created ${claim.id}.`
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        readOnly: false,
+        message,
+        collection: "claims",
+        count: 1,
+        totalCount: nextStore.objects.claims.length,
+        entity: entityPreviewForAgent(claim, nextStore),
+        stateDelta: { claimsCreated: 1 },
+        nextHints: ["claim.link_support", "section.link_claim", "workspace.read"]
+      })
     };
   }
 
   if (input.decision.action === "claim.patch") {
     const claimId = args.entityId;
     if (claimId === null) {
+      const message = "Claim patch skipped because no claim id was provided.";
       return {
         handled: true,
         store: input.store,
-      message: "Claim patch skipped because no claim id was provided."
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "noop",
+          readOnly: false,
+          message,
+          collection: "claims",
+          nextHints: ["workspace.list", "workspace.search"]
+        })
       };
     }
     const nextStore = patchResearchWorkStoreEntity(input.store, {
@@ -2219,10 +2465,26 @@ async function executeResearchObjectToolAction(input: {
       changes: args.changes
     }, nowText);
     await writeResearchWorkStore(nextStore);
+    const updatedClaim = readResearchWorkStoreEntity<WorkStoreClaim>(nextStore, "claims", claimId);
+    const message = `Claim patched ${claimId}.`;
     return {
       handled: true,
       store: nextStore,
-      message: `Claim patched ${claimId}.`
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        readOnly: false,
+        message,
+        collection: "claims",
+        query: { entityId: claimId },
+        count: updatedClaim === null ? 0 : 1,
+        totalCount: nextStore.objects.claims.length,
+        entity: updatedClaim === null ? null : entityPreviewForAgent(updatedClaim, nextStore),
+        stateDelta: { claimsPatched: 1 },
+        nextHints: ["claim.check_support", "section.patch", "release.verify"]
+      })
     };
   }
 
@@ -2230,10 +2492,22 @@ async function executeResearchObjectToolAction(input: {
     const claimId = args.entityId;
     const claim = claimId === null ? null : readResearchWorkStoreEntity<WorkStoreClaim>(input.store, "claims", claimId);
     if (claim === null) {
+      const message = "Claim support check skipped because the claim was not found.";
       return {
         handled: true,
         store: input.store,
-        message: "Claim support check skipped because the claim was not found."
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "noop",
+          readOnly: false,
+          message,
+          collection: "claims",
+          query: { entityId: claimId },
+          nextHints: ["workspace.list", "claim.create"]
+        })
       };
     }
     const supportReadiness = supportReadinessForWorkspace(input.store);
@@ -2249,10 +2523,37 @@ async function executeResearchObjectToolAction(input: {
       }
     }, nowText);
     await writeResearchWorkStore(nextStore);
+    const updatedClaim = readResearchWorkStoreEntity<WorkStoreClaim>(nextStore, "claims", claim.id);
+    const message = `Claim support checked ${claim.id}: ${supported ? "supported" : "weak"}.`;
     return {
       handled: true,
       store: nextStore,
-      message: `Claim support checked ${claim.id}: ${supported ? "supported" : "weak"}.`
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        status: supported ? "ok" : "blocked",
+        readOnly: false,
+        message,
+        collection: "claims",
+        query: { entityId: claim.id },
+        count: 1,
+        totalCount: nextStore.objects.claims.length,
+        entity: updatedClaim === null ? null : entityPreviewForAgent(updatedClaim, nextStore),
+        related: claimIssues.slice(0, 6).map((issue) => ({
+          id: `${issue.kind}-${issue.claimId ?? "claim"}`,
+          kind: `supportIssue:${issue.kind}`,
+          text: issue.message,
+          sourceId: issue.sourceId ?? undefined,
+          claimIds: issue.claimId === null ? [] : [issue.claimId],
+          fields: {
+            suggestedActions: issue.suggestedActions
+          }
+        })),
+        stateDelta: { claimsChecked: 1 },
+        nextHints: supported ? ["section.link_claim", "release.verify"] : ["workspace.list", "claim.link_support"]
+      })
     };
   }
 
@@ -2269,18 +2570,41 @@ async function executeResearchObjectToolAction(input: {
     ]);
     const sourceId = stringInput(args.entity.sourceId, sourceIds[0] ?? "");
     if (claimId === null || sourceId.length === 0) {
+      const message = "Claim support link skipped because claim id or source id was missing.";
       return {
         handled: true,
         store: input.store,
-        message: "Claim support link skipped because claim id or source id was missing."
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "noop",
+          readOnly: false,
+          message,
+          collection: "citations",
+          nextHints: ["workspace.list", "workspace.read", "claim.create"]
+        })
       };
     }
     const claim = readResearchWorkStoreEntity<WorkStoreClaim>(input.store, "claims", claimId);
     if (claim === null) {
+      const message = `Claim support link skipped because claim ${claimId} was not found.`;
       return {
         handled: true,
         store: input.store,
-        message: `Claim support link skipped because claim ${claimId} was not found.`
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "noop",
+          readOnly: false,
+          message,
+          collection: "claims",
+          query: { entityId: claimId },
+          nextHints: ["workspace.search", "claim.create"]
+        })
       };
     }
     const sectionIds = stringArrayInput(args.entity.sectionIds, 20);
@@ -2297,10 +2621,26 @@ async function executeResearchObjectToolAction(input: {
       relation: "supports"
     });
     if (citation === null) {
+      const message = `Claim support link skipped because claim ${claimId} or evidence cell ${evidenceCellId || "(auto)"} was not available.`;
       return {
         handled: true,
         store: input.store,
-        message: `Claim support link skipped because claim ${claimId} or evidence cell ${evidenceCellId || "(auto)"} was not available.`
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "noop",
+          readOnly: false,
+          message,
+          collection: "citations",
+          query: {
+            claimId,
+            sourceId,
+            evidenceCellId: evidenceCellId || null
+          },
+          nextHints: ["workspace.list", "evidence.create_cell", "claim.create"]
+        })
       };
     }
     let nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, citation, nowText);
@@ -2327,10 +2667,26 @@ async function executeResearchObjectToolAction(input: {
       }
     }, nowText);
     await writeResearchWorkStore(nextStore);
+    const updatedClaim = readResearchWorkStoreEntity<WorkStoreClaim>(nextStore, "claims", claimId);
+    const message = `Support link attached from ${citation.sourceTitle} to claim ${claimId}.`;
     return {
       handled: true,
       store: nextStore,
-      message: `Support link attached from ${citation.sourceTitle} to claim ${claimId}.`
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        readOnly: false,
+        message,
+        collection: "citations",
+        count: 1,
+        totalCount: nextStore.objects.citations.length,
+        entity: entityPreviewForAgent(citation, nextStore),
+        related: updatedClaim === null ? [] : [entityPreviewForAgent(updatedClaim, nextStore)],
+        stateDelta: { supportLinksCreated: 1 },
+        nextHints: ["section.link_claim", "claim.check_support", "release.verify"]
+      })
     };
   }
 
@@ -2536,10 +2892,26 @@ async function executeResearchObjectToolAction(input: {
     });
     const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, section, nowText);
     await writeResearchWorkStore(nextStore);
+    const message = `Section updated ${section.id}.`;
     return {
       handled: true,
       store: nextStore,
-      message: `Section updated ${section.id}.`
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        readOnly: false,
+        message,
+        collection: "manuscriptSections",
+        count: 1,
+        totalCount: nextStore.objects.manuscriptSections.length,
+        entity: entityPreviewForAgent(section, nextStore),
+        stateDelta: {
+          [input.decision.action === "section.create" ? "sectionsCreated" : "sectionsPatched"]: 1
+        },
+        nextHints: ["section.link_claim", "section.check_claims", "release.verify"]
+      })
     };
   }
 
@@ -2548,10 +2920,22 @@ async function executeResearchObjectToolAction(input: {
     const claimId = args.link?.toId ?? stringInput(args.entity.claimId, input.decision.inputs.paperIds[0] ?? "");
     const section = sectionId === null ? null : readResearchWorkStoreEntity<WorkStoreManuscriptSection>(input.store, "manuscriptSections", sectionId);
     if (section === null || claimId.length === 0) {
+      const message = "Section claim link skipped because section id or claim id was missing.";
       return {
         handled: true,
         store: input.store,
-        message: "Section claim link skipped because section id or claim id was missing."
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "noop",
+          readOnly: false,
+          message,
+          collection: "manuscriptSections",
+          query: { sectionId, claimId },
+          nextHints: ["workspace.list", "section.create", "claim.create"]
+        })
       };
     }
     const nextStore = patchResearchWorkStoreEntity(input.store, {
@@ -2562,10 +2946,29 @@ async function executeResearchObjectToolAction(input: {
       }
     }, nowText);
     await writeResearchWorkStore(nextStore);
+    const updatedSection = readResearchWorkStoreEntity<WorkStoreManuscriptSection>(nextStore, "manuscriptSections", section.id);
+    const message = `Section ${section.id} linked to claim ${claimId}.`;
     return {
       handled: true,
       store: nextStore,
-      message: `Section ${section.id} linked to claim ${claimId}.`
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        readOnly: false,
+        message,
+        collection: "manuscriptSections",
+        query: { sectionId: section.id, claimId },
+        count: updatedSection === null ? 0 : 1,
+        totalCount: nextStore.objects.manuscriptSections.length,
+        entity: updatedSection === null ? null : entityPreviewForAgent(updatedSection, nextStore),
+        related: nextStore.objects.claims
+          .filter((claim) => claim.id === claimId)
+          .map((claim) => entityPreviewForAgent(claim, nextStore)),
+        stateDelta: { sectionClaimLinksCreated: 1 },
+        nextHints: ["section.check_claims", "release.verify", "workspace.read"]
+      })
     };
   }
 
@@ -2582,7 +2985,9 @@ async function executeResearchObjectToolAction(input: {
     await writeJsonArtifact(input.run.artifacts.referencesPath, references);
     await writeJsonArtifact(input.run.artifacts.manuscriptChecksPath, checkBundle);
     const hardFailures = releaseChecks.filter((check) => check.status === "fail" && check.severity === "blocker");
-    const message = `Release verification wrote ${releaseChecks.length} check(s): ${hardFailures.length} hard invariant blocker(s).`;
+    const message = hardFailures.length > 0
+      ? `Release verification found ${hardFailures.length} hard invariant repair item(s); manuscript is not ready yet.`
+      : `Release verification wrote ${releaseChecks.length} check(s): ${hardFailures.length} hard invariant blocker(s).`;
     return {
       handled: true,
       store: nextStore,
@@ -2591,12 +2996,14 @@ async function executeResearchObjectToolAction(input: {
         run: input.run,
         action: input.decision.action,
         timestamp: nowText,
+        status: hardFailures.length > 0 ? "not_ready" : "ok",
         readOnly: false,
         message,
         collection: "releaseChecks",
         count: releaseChecks.length,
         totalCount: releaseChecks.length,
         items: releaseChecks.map((check) => entityPreviewForAgent(check, nextStore)),
+        related: hardFailures.length > 0 ? releaseRepairPreviews(hardFailures) : [],
         stateDelta: {
           releaseChecksCreated: releaseChecks.length,
           hardInvariantBlockers: hardFailures.length
@@ -2630,7 +3037,7 @@ async function executeResearchObjectToolAction(input: {
     await writeJsonArtifact(input.run.artifacts.paperJsonPath, paper);
 
     if (hardFailures.length > 0) {
-      const message = `Manuscript release blocked by ${hardFailures.length} hard invariant failure(s).`;
+      const message = `Manuscript release is not ready: ${hardFailures.length} hard invariant repair item(s) remain.`;
       await writeFile(
         input.run.artifacts.paperPath,
         [
@@ -2652,13 +3059,14 @@ async function executeResearchObjectToolAction(input: {
           run: input.run,
           action: input.decision.action,
           timestamp: nowText,
-          status: "blocked",
+          status: "not_ready",
           readOnly: false,
           message,
           collection: "releaseChecks",
           count: releaseChecks.length,
           totalCount: releaseChecks.length,
           items: releaseChecks.map((check) => entityPreviewForAgent(check, nextStore)),
+          related: releaseRepairPreviews(releaseChecks.filter((check) => check.status === "fail" && check.severity === "blocker")),
           stateDelta: {
             releaseChecksCreated: releaseChecks.length,
             hardInvariantBlockers: hardFailures.length,
@@ -2708,10 +3116,22 @@ async function executeResearchObjectToolAction(input: {
     const sectionId = args.entityId;
     const section = sectionId === null ? null : readResearchWorkStoreEntity<WorkStoreManuscriptSection>(input.store, "manuscriptSections", sectionId);
     if (section === null) {
+      const message = "Section claim check skipped because the section was not found.";
       return {
         handled: true,
         store: input.store,
-        message: "Section claim check skipped because the section was not found."
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "noop",
+          readOnly: false,
+          message,
+          collection: "manuscriptSections",
+          query: { entityId: sectionId },
+          nextHints: ["workspace.list", "section.create"]
+        })
       };
     }
     const claims = section.claimIds.flatMap((claimId) => {
@@ -2755,17 +3175,52 @@ async function executeResearchObjectToolAction(input: {
       nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(nextStore, workItem, nowText);
     }
     await writeResearchWorkStore(nextStore);
+    const updatedSection = readResearchWorkStoreEntity<WorkStoreManuscriptSection>(nextStore, "manuscriptSections", section.id);
+    const createdWorkItem = !sectionReady ? nextStore.objects.workItems[nextStore.objects.workItems.length - 1] : null;
+    const message = `Section checked ${section.id}: ${unsupportedClaimIds.length} unsupported claim(s).`;
     return {
       handled: true,
       store: nextStore,
-      message: `Section checked ${section.id}: ${unsupportedClaimIds.length} unsupported claim(s).`
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        status: sectionReady ? "ok" : "blocked",
+        readOnly: false,
+        message,
+        collection: "manuscriptSections",
+        query: { entityId: section.id },
+        count: 1,
+        totalCount: nextStore.objects.manuscriptSections.length,
+        entity: updatedSection === null ? null : entityPreviewForAgent(updatedSection, nextStore),
+        related: [
+          ...unsupported.slice(0, 6).map((claim) => entityPreviewForAgent(claim, nextStore)),
+          ...(createdWorkItem === null ? [] : [entityPreviewForAgent(createdWorkItem, nextStore)])
+        ],
+        stateDelta: {
+          sectionsChecked: 1,
+          workItemsCreated: sectionReady ? 0 : 1
+        },
+        nextHints: sectionReady ? ["release.verify", "manuscript.release"] : ["claim.link_support", "section.patch", "workspace.read"]
+      })
     };
   }
 
+  const message = `${input.decision.action} is recognized but did not require a mutation.`;
   return {
     handled: true,
     store: input.store,
-    message: `${input.decision.action} is recognized but did not require a mutation.`
+    message,
+    result: makeAgentToolResult({
+      run: input.run,
+      action: input.decision.action,
+      timestamp: nowText,
+      status: "noop",
+      readOnly: true,
+      message,
+      nextHints: ["workspace.status", "workspace.list"]
+    })
   };
 }
 
@@ -3126,22 +3581,41 @@ type ModelDrivenSessionOutcome = {
 function sessionObservations(input: {
   sourceState: ReturnType<SourceToolRuntime["state"]>;
   workStore: ResearchWorkStore;
+  step: number;
+  maxSteps: number;
 }): ResearchActionRequest["observations"] {
+  const canonicalSources = Math.max(input.sourceState.canonicalPapers, input.workStore.objects.canonicalSources.length);
+  const screenedInSources = Math.max(
+    input.sourceState.screenedSources,
+    input.workStore.objects.canonicalSources.filter((source) => source.screeningDecision === "include").length
+  );
+  const resolvedAccessSources = Math.max(
+    input.sourceState.resolvedPaperIds.length,
+    input.workStore.objects.canonicalSources.filter((source) => source.accessMode !== "metadata_only").length
+  );
+  const explicitlySelectedEvidenceSources = input.sourceState.selectedPapers;
+
   return {
-    canonicalPapers: Math.max(input.sourceState.canonicalPapers, input.workStore.objects.canonicalSources.length),
-    selectedPapers: Math.max(input.sourceState.selectedPapers, input.workStore.objects.canonicalSources.filter((source) => source.screeningDecision === "include").length),
+    sourceCandidates: Math.max(input.sourceState.rawSources, input.workStore.objects.sources.length),
+    canonicalSources,
+    screenedInSources,
+    explicitlySelectedEvidenceSources,
+    resolvedAccessSources,
+    canonicalPapers: canonicalSources,
+    selectedPapers: explicitlySelectedEvidenceSources,
     extractedPapers: input.workStore.objects.extractions.length,
     evidenceRows: input.workStore.objects.evidenceCells.length,
     evidenceInsights: 0,
     manuscriptReadiness: input.workStore.worker.paperReadiness,
-    sessionStepsUsed: 0,
-    sessionStepsRemaining: 0
+    sessionStepsUsed: Math.max(0, input.step - 1),
+    sessionStepsRemaining: Math.max(0, input.maxSteps - input.step + 1)
   };
 }
 
 function statusDecisionOutcome(input: {
   decision: ResearchActionDecision;
   store: ResearchWorkStore;
+  toolResults: AgentToolResult[];
 }): {
   workerStatus: ResearchWorkerStatus;
   statusReason: string;
@@ -3175,14 +3649,49 @@ function statusDecisionOutcome(input: {
     };
   }
 
+  const diagnosticNextActions = checkpointDiagnosticNextActions({
+    store: input.store,
+    toolResults: input.toolResults
+  });
+
   return {
     workerStatus: "working",
     statusReason: `Researcher checkpointed the model-driven session: ${statusReason}`,
     nextInternalActions: nextInternalActions.length > 0
       ? nextInternalActions
-      : ["Resume the model-driven research session with /go."],
+      : diagnosticNextActions,
     userBlockers: []
   };
+}
+
+function checkpointDiagnosticNextActions(input: {
+  store: ResearchWorkStore;
+  toolResults: AgentToolResult[];
+}): string[] {
+  const actions: string[] = [];
+  const lastNotReady = [...input.toolResults].reverse().find((result) => result.status === "not_ready" || result.status === "blocked" || result.status === "failed");
+  if (lastNotReady !== undefined) {
+    actions.push(`Inspect the last ${lastNotReady.status} tool result from ${lastNotReady.action}; it reported: ${lastNotReady.message}`);
+  }
+
+  const failedReleaseChecks = input.store.objects.releaseChecks.filter((check) => check.status === "fail" && check.severity === "blocker");
+  if (failedReleaseChecks.length > 0) {
+    actions.push(`Inspect release checks with workspace.list/read; ${failedReleaseChecks.length} hard invariant repair item(s) remain.`);
+  }
+
+  const supportReadiness = supportReadinessForWorkspace(input.store);
+  if (supportReadiness.unsupportedClaimIds.size > 0) {
+    actions.push(`Inspect claims and support links with workspace.list/read; ${supportReadiness.unsupportedClaimIds.size} claim(s) lack durable support.`);
+  }
+
+  const sectionsNeedingRevision = input.store.objects.manuscriptSections.filter((section) => section.status === "needs_revision" || section.claimIds.length === 0);
+  if (sectionsNeedingRevision.length > 0) {
+    actions.push(`Inspect manuscript sections with workspace.list/read; ${sectionsNeedingRevision.length} section(s) need claim links or revision.`);
+  }
+
+  return actions.length > 0
+    ? actions.slice(0, 5)
+    : ["Resume the model-driven research session with /go."];
 }
 
 function releaseSucceeded(result: AgentToolResult | null | undefined): boolean {
@@ -3230,7 +3739,7 @@ async function runModelDrivenResearchSession(input: {
         allowedActions: workspaceResearchActions(),
         brief: input.run.brief,
         plan: input.plan,
-        observations: sessionObservations({ sourceState, workStore }),
+        observations: sessionObservations({ sourceState, workStore, step, maxSteps }),
         sourceState: sourceStateForAgent(sourceSession),
         workStore: workStoreContextForAgent(workStore),
         guidance: guidanceContextForAgent({ brief: input.run.brief, plan: input.plan }),
@@ -3246,7 +3755,7 @@ async function runModelDrivenResearchSession(input: {
     });
 
     if (isStatusAction(decision.action)) {
-      const outcome = statusDecisionOutcome({ decision, store: workStore });
+      const outcome = statusDecisionOutcome({ decision, store: workStore, toolResults });
       await appendEvent(input.run, input.now, "next", outcome.statusReason);
       await appendStdout(input.run, `Research session checkpoint: ${outcome.statusReason}`);
       return {
@@ -3277,6 +3786,33 @@ async function runModelDrivenResearchSession(input: {
         await appendStdout(input.run, `Research tool observation: ${workspaceExecution.message}`);
       }
       if (decision.action === "manuscript.release" && releaseSucceeded(workspaceExecution.result)) {
+        const result = workspaceExecution.result;
+        await input.agent.record({
+          actor: "runtime",
+          phase: "release",
+          action: "manuscript.release_result",
+          status: "completed",
+          summary: result?.message ?? "Manuscript release completed.",
+          artifactPaths: [
+            input.run.artifacts.paperPath,
+            input.run.artifacts.paperJsonPath,
+            input.run.artifacts.referencesPath,
+            input.run.artifacts.manuscriptChecksPath
+          ],
+          counts: {
+            releaseChecksCreated: result?.stateDelta?.releaseChecksCreated ?? 0,
+            hardInvariantBlockers: result?.stateDelta?.hardInvariantBlockers ?? 0,
+            manuscriptExportsCreated: result?.stateDelta?.manuscriptExportsCreated ?? 1
+          },
+          metadata: {
+            toolAction: result?.action ?? decision.action,
+            toolStatus: result?.status ?? "ok",
+            collection: result?.collection ?? null,
+            count: result?.count ?? 0,
+            totalCount: result?.totalCount ?? 0,
+            nextHints: result?.nextHints ?? []
+          }
+        });
         return {
           workStore,
           gathered: await sourceSession.result(),
@@ -3340,7 +3876,7 @@ async function runModelDrivenResearchSession(input: {
     workerStatus: "checkpointed_budget_exhausted",
     statusReason: "The model-driven research session exhausted this segment budget and checkpointed durable workspace state for the next /go continuation.",
     paperReadiness: safeManuscriptReadiness(workStore.worker.paperReadiness),
-    nextInternalActions: ["Resume the model-driven research session with /go."],
+    nextInternalActions: checkpointDiagnosticNextActions({ store: workStore, toolResults }),
     userBlockers: [],
     checkpointedByBudget: true,
     terminalAction: null,
@@ -4491,6 +5027,8 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       now: now()
     });
     const workStoreSummary = summarizeResearchWorkStore(workStore);
+    const explicitlySelectedEvidencePapers = gathered.reviewWorkflow.counts.selectedForSynthesis;
+    const includedPapers = workStore.objects.canonicalSources.filter((source) => source.screeningDecision === "include").length;
     const completedAt = now();
     await writeResearchWorkerState({
       ...previousWorkerState,
@@ -4507,7 +5045,9 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       userBlockers: sessionOutcome.userBlockers,
       evidence: {
         canonicalPapers: workStore.objects.canonicalSources.length,
-        selectedPapers: workStore.objects.canonicalSources.filter((source) => source.screeningDecision === "include").length,
+        includedPapers,
+        explicitlySelectedEvidencePapers,
+        selectedPapers: explicitlySelectedEvidencePapers,
         extractedPapers: workStore.objects.extractions.length,
         evidenceRows: workStore.objects.evidenceCells.length,
         referencedPapers: new Set(workStore.objects.citations.map((citation) => citation.sourceId)).size
@@ -4533,7 +5073,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     );
     await appendStdout(
       run,
-      `Research work store checkpointed: ${workStoreSummary.canonicalSources} sources, ${workStoreSummary.openWorkItems} open work items.`
+      `Research work store checkpointed: ${workStoreSummary.canonicalSources} canonical sources, ${workStoreSummary.sources} source candidates, ${workStoreSummary.openWorkItems} open work items.`
     );
     await agent.record({
       phase: "checkpoint",
@@ -4546,7 +5086,8 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       ],
       counts: {
         canonicalPapers: workStore.objects.canonicalSources.length,
-        selectedPapers: workStore.objects.canonicalSources.filter((source) => source.screeningDecision === "include").length,
+        includedPapers,
+        selectedPapers: explicitlySelectedEvidencePapers,
         extractedPapers: workStore.objects.extractions.length,
         evidenceCells: workStore.objects.evidenceCells.length
       }
@@ -4559,10 +5100,10 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     run.workerPid = null;
     run.status = sessionOutcome.checkpointedByBudget ? "paused" : "completed";
     run.statusMessage = sessionOutcome.checkpointedByBudget
-      ? "Autonomous research worker segment checkpointed after exhausting the model-driven action budget."
+      ? "Worker segment checkpointed because the model-driven action budget was exhausted; the research objective remains active."
       : sessionOutcome.workerStatus === "release_ready"
-        ? "Autonomous research worker reached release-ready after explicit model-selected release."
-        : "Autonomous research worker segment checkpointed after model-selected research actions.";
+        ? "Research objective reached release-ready after explicit model-selected release."
+        : `Worker segment exited normally after model-selected action(s); research objective status is ${sessionOutcome.workerStatus}.`;
     await store.save(run);
     await appendEvent(run, now, "run", run.statusMessage);
     return 0;
