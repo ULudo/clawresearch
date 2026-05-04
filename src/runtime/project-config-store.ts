@@ -71,8 +71,7 @@ export type RuntimeLlmConfig = {
   extractionRetryBudget: number;
   agentControlMode: ResearchAgentControlMode;
   agentInvalidActionBudget: number;
-  totalRecoveryBudgetMs: number;
-  evidenceRecoveryMaxPasses: number;
+  agentSegmentMaxSteps: number;
 };
 
 export type ProjectConfigState = {
@@ -169,8 +168,7 @@ export const defaultRuntimeLlmConfig: RuntimeLlmConfig = {
   extractionRetryBudget: 24,
   agentControlMode: "auto",
   agentInvalidActionBudget: 2,
-  totalRecoveryBudgetMs: 1_800_000,
-  evidenceRecoveryMaxPasses: 3
+  agentSegmentMaxSteps: 24
 };
 
 export const defaultRuntimeModelConfig: RuntimeModelConfig = {
@@ -319,12 +317,7 @@ function normalizeRuntimeLlmConfig(raw: unknown): RuntimeLlmConfig {
     extractionRetryBudget: readPositiveInteger(record.extractionRetryBudget) ?? base.extractionRetryBudget,
     agentControlMode: readAgentControlMode(record.agentControlMode) ?? base.agentControlMode,
     agentInvalidActionBudget: readPositiveInteger(record.agentInvalidActionBudget) ?? base.agentInvalidActionBudget,
-    totalRecoveryBudgetMs: readPositiveInteger(record.totalRevisionBudgetMs)
-      ?? readPositiveInteger(record.totalRecoveryBudgetMs)
-      ?? base.totalRecoveryBudgetMs,
-    evidenceRecoveryMaxPasses: readPositiveInteger(record.evidenceRevisionMaxPasses)
-      ?? readPositiveInteger(record.evidenceRecoveryMaxPasses)
-      ?? base.evidenceRecoveryMaxPasses
+    agentSegmentMaxSteps: readPositiveInteger(record.agentSegmentMaxSteps) ?? base.agentSegmentMaxSteps
   };
 }
 
@@ -366,12 +359,8 @@ export function resolveRuntimeLlmConfig(
       ?? configured.agentControlMode,
     agentInvalidActionBudget: readEnvPositiveInteger(env, "CLAWRESEARCH_AGENT_INVALID_ACTION_BUDGET")
       ?? configured.agentInvalidActionBudget,
-    totalRecoveryBudgetMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_REVISION_BUDGET_MS")
-      ?? readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_RECOVERY_BUDGET_MS")
-      ?? configured.totalRecoveryBudgetMs,
-    evidenceRecoveryMaxPasses: readEnvPositiveInteger(env, "CLAWRESEARCH_EVIDENCE_REVISION_MAX_PASSES")
-      ?? readEnvPositiveInteger(env, "CLAWRESEARCH_EVIDENCE_RECOVERY_MAX_PASSES")
-      ?? configured.evidenceRecoveryMaxPasses
+    agentSegmentMaxSteps: readEnvPositiveInteger(env, "CLAWRESEARCH_AGENT_SEGMENT_MAX_STEPS")
+      ?? configured.agentSegmentMaxSteps
   };
 }
 

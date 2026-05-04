@@ -148,7 +148,7 @@ test("runtime llm config resolves env overrides over project defaults", async ()
       CLAWRESEARCH_LLM_AGENT_STEP_TIMEOUT_MS: "555000",
       CLAWRESEARCH_AGENT_CONTROL_MODE: "native_tool_calls",
       CLAWRESEARCH_AGENT_INVALID_ACTION_BUDGET: "3",
-      CLAWRESEARCH_EVIDENCE_REVISION_MAX_PASSES: "4"
+      CLAWRESEARCH_AGENT_SEGMENT_MAX_STEPS: "11"
     });
 
     assert.equal(resolved.planningTimeoutMs, 222_000);
@@ -160,7 +160,7 @@ test("runtime llm config resolves env overrides over project defaults", async ()
     assert.equal(resolved.agentStepTimeoutMs, 555_000);
     assert.equal(resolved.agentControlMode, "native_tool_calls");
     assert.equal(resolved.agentInvalidActionBudget, 3);
-    assert.equal(resolved.evidenceRecoveryMaxPasses, 4);
+    assert.equal(resolved.agentSegmentMaxSteps, 11);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

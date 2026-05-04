@@ -1,26 +1,9 @@
 import type { ResearchBrief } from "./session-store.js";
 import type { ResearchWorkerState } from "./research-state.js";
-import {
-  createMemoryRecordId,
-  type ProjectMemoryContext
-} from "./memory-store.js";
+import type { ProjectMemoryContext } from "./memory-store.js";
 import type {
-  CanonicalPaper,
   LiteratureContext
 } from "./literature-store.js";
-import {
-  type EvidenceMatrix,
-  type PaperClaimSupportStrength,
-  type PaperExtraction,
-  type PaperExtractionConfidence
-} from "./research-evidence.js";
-import {
-  normalizeCriticReview,
-  type CriticReviewArtifact,
-  type CriticReviewRequest,
-  type CriticReviewStage
-} from "./research-critic.js";
-import type { VerificationReport } from "./verifier.js";
 import {
   normalizeResearchActionDecision,
   type ResearchAgentControlMode,
@@ -44,14 +27,11 @@ export type {
   EvidenceMatrixInsightKind,
   EvidenceMatrixRow,
   PaperClaimSupportStrength,
-  PaperExtraction,
-  PaperExtractionConfidence
+  PaperExtraction
 } from "./research-evidence.js";
 
 const defaultHost = process.env.OLLAMA_HOST ?? "127.0.0.1:11434";
 const defaultModel = process.env.CLAWRESEARCH_OLLAMA_MODEL ?? "qwen3:14b";
-const defaultCriticHost = process.env.CLAWRESEARCH_OLLAMA_CRITIC_HOST ?? defaultHost;
-const defaultCriticModel = process.env.CLAWRESEARCH_OLLAMA_CRITIC_MODEL ?? defaultModel;
 
 export type ResearchMode =
   | "literature_synthesis"
@@ -150,35 +130,9 @@ export type ResearchPlanningRequest = {
   workerState?: ResearchWorkerState | null;
 };
 
-export type ResearchAgendaRequest = {
-  projectRoot: string;
-  brief: ResearchBrief;
-  plan: ResearchPlan;
-  papers: CanonicalPaper[];
-  paperExtractions: PaperExtraction[];
-  evidenceMatrix: EvidenceMatrix;
-  synthesis: ResearchSynthesis;
-  verification: VerificationReport;
-  memoryContext: ProjectMemoryContext;
-  literatureContext?: LiteratureContext;
-};
-
-export type PaperExtractionRequest = {
-  projectRoot: string;
-  runId: string;
-  brief: ResearchBrief;
-  plan: ResearchPlan;
-  papers: CanonicalPaper[];
-  literatureContext?: LiteratureContext;
-  compact?: boolean;
-};
-
 export type ResearchBackendOperation =
   | "planning"
   | "agent_step"
-  | "extraction"
-  | "synthesis"
-  | "agenda"
   | "critic";
 
 export type ResearchBackendCallOptions = {
@@ -243,9 +197,6 @@ export interface ResearchBackend {
   readonly capabilities?: ResearchBackendCapabilities;
   planResearch(request: ResearchPlanningRequest, options?: ResearchBackendCallOptions): Promise<ResearchPlan>;
   chooseResearchAction(request: ResearchActionRequest, options?: ResearchBackendCallOptions): Promise<ResearchActionDecision>;
-  extractReviewedPapers(request: PaperExtractionRequest, options?: ResearchBackendCallOptions): Promise<PaperExtraction[]>;
-  developResearchAgenda(request: ResearchAgendaRequest, options?: ResearchBackendCallOptions): Promise<ResearchAgenda>;
-  reviewResearchArtifact(request: CriticReviewRequest, options?: ResearchBackendCallOptions): Promise<CriticReviewArtifact>;
 }
 
 type OllamaToolCall = {
@@ -291,14 +242,6 @@ function hashString(text: string): string {
   return (hash >>> 0).toString(36);
 }
 
-function clampScore(value: unknown, fallback: number): number {
-  if (typeof value !== "number" || Number.isNaN(value)) {
-    return fallback;
-  }
-
-  return Math.max(1, Math.min(5, Math.round(value)));
-}
-
 function safeStringArray(value: unknown, limit = 8): string[] {
   if (!Array.isArray(value)) {
     return [];
@@ -310,18 +253,6 @@ function safeStringArray(value: unknown, limit = 8): string[] {
     .slice(0, limit);
 }
 
-function safeSourceIdArray(value: unknown): string[] {
-  return safeStringArray(value, 6);
-}
-
-function uniqueSourceIds(sourceIds: string[]): string[] {
-  return [...new Set(sourceIds)];
-}
-
-function uniqueClaimIds(claimIds: string[]): string[] {
-  return [...new Set(claimIds)];
-}
-
 function safeResearchMode(value: unknown): ResearchMode | null {
   switch (value) {
     case "literature_synthesis":
@@ -330,52 +261,6 @@ function safeResearchMode(value: unknown): ResearchMode | null {
     case "ablation":
     case "method_improvement":
     case "new_hypothesis":
-      return value;
-    default:
-      return null;
-  }
-}
-
-function safeGapKind(value: unknown): ResearchGapKind | null {
-  switch (value) {
-    case "missing_baseline":
-    case "confounder":
-    case "coverage_gap":
-    case "method_gap":
-    case "evidence_conflict":
-      return value;
-    default:
-      return null;
-  }
-}
-
-function safeGapSeverity(value: unknown): ResearchGapSeverity | null {
-  switch (value) {
-    case "low":
-    case "medium":
-    case "high":
-      return value;
-    default:
-      return null;
-  }
-}
-
-function safePaperClaimSupportStrength(value: unknown): PaperClaimSupportStrength | null {
-  switch (value) {
-    case "explicit":
-    case "partial":
-    case "implied":
-      return value;
-    default:
-      return null;
-  }
-}
-
-function safePaperExtractionConfidence(value: unknown): PaperExtractionConfidence | null {
-  switch (value) {
-    case "high":
-    case "medium":
-    case "low":
       return value;
     default:
       return null;
@@ -413,62 +298,6 @@ function parseOllamaContent(rawResponseText: string): string | null {
   return content.length > 0 ? content : null;
 }
 
-function editDistanceAtMostOne(left: string, right: string): boolean {
-  if (left === right) {
-    return true;
-  }
-
-  if (Math.abs(left.length - right.length) > 1) {
-    return false;
-  }
-
-  let i = 0;
-  let j = 0;
-  let edits = 0;
-
-  while (i < left.length && j < right.length) {
-    if (left[i] === right[j]) {
-      i += 1;
-      j += 1;
-      continue;
-    }
-
-    edits += 1;
-
-    if (edits > 1) {
-      return false;
-    }
-
-    if (left.length > right.length) {
-      i += 1;
-    } else if (right.length > left.length) {
-      j += 1;
-    } else {
-      i += 1;
-      j += 1;
-    }
-  }
-
-  if (i < left.length || j < right.length) {
-    edits += 1;
-  }
-
-  return edits <= 1;
-}
-
-function reconcileSourceIds(sourceIds: string[], allowedSourceIds: string[]): string[] {
-  const allowed = new Set(allowedSourceIds);
-
-  return uniqueSourceIds(sourceIds.flatMap((sourceId) => {
-    if (allowed.has(sourceId)) {
-      return [sourceId];
-    }
-
-    const closeMatches = allowedSourceIds.filter((candidate) => editDistanceAtMostOne(sourceId, candidate));
-    return closeMatches.length === 1 ? [closeMatches[0]!] : [];
-  }));
-}
-
 function extractJson(text: string): unknown {
   try {
     return JSON.parse(text);
@@ -499,251 +328,6 @@ function normalizePlan(raw: unknown, brief: ResearchBrief): ResearchPlan {
       ? safeStringArray(record.searchQueries, 5)
       : [fallbackTopic, fallbackQuestion],
     localFocus: safeStringArray(record.localFocus, 5)
-  };
-}
-
-function normalizeExtractionClaims(value: unknown): PaperExtraction["supportedClaims"] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value.flatMap((entry) => {
-    const record = typeof entry === "object" && entry !== null
-      ? entry as Record<string, unknown>
-      : {};
-    const claim = safeString(record.claim);
-
-    if (claim === null) {
-      return [];
-    }
-
-    return [{
-      claim,
-      support: safePaperClaimSupportStrength(record.support) ?? "implied"
-    }];
-  }).slice(0, 8);
-}
-
-function normalizePaperExtractions(raw: unknown, request: PaperExtractionRequest): PaperExtraction[] {
-  const record = typeof raw === "object" && raw !== null
-    ? raw as Record<string, unknown>
-    : {};
-  const rawExtractions = Array.isArray(record.extractions)
-    ? record.extractions
-    : Array.isArray(raw)
-      ? raw
-      : [];
-  const papersById = new Map(request.papers.map((paper) => [paper.id, paper]));
-
-  return rawExtractions.flatMap((entry, index) => {
-    const extraction = typeof entry === "object" && entry !== null
-      ? entry as Record<string, unknown>
-      : {};
-    const paperId = safeString(extraction.paperId);
-
-    if (paperId === null || !papersById.has(paperId)) {
-      return [];
-    }
-
-    return [{
-      id: safeString(extraction.id) ?? `extraction-${hashString(`${request.runId}:${paperId}:${index}`)}`,
-      paperId,
-      runId: request.runId,
-      problemSetting: safeString(extraction.problemSetting) ?? "",
-      systemType: safeString(extraction.systemType) ?? "",
-      architecture: safeString(extraction.architecture) ?? "",
-      toolsAndMemory: safeString(extraction.toolsAndMemory) ?? "",
-      planningStyle: safeString(extraction.planningStyle) ?? "",
-      evaluationSetup: safeString(extraction.evaluationSetup) ?? "",
-      successSignals: safeStringArray(extraction.successSignals, 8),
-      failureModes: safeStringArray(extraction.failureModes, 8),
-      limitations: safeStringArray(extraction.limitations, 8),
-      supportedClaims: normalizeExtractionClaims(extraction.supportedClaims),
-      confidence: safePaperExtractionConfidence(extraction.confidence) ?? "low",
-      evidenceNotes: safeStringArray(extraction.evidenceNotes, 8)
-    }];
-  });
-}
-
-function claimRecordIdFromClaimText(text: string): string {
-  return createMemoryRecordId("claim", text);
-}
-
-function claimIdsForSynthesis(synthesis: ResearchSynthesis): string[] {
-  return synthesis.claims.map((claim) => claimRecordIdFromClaimText(claim.claim));
-}
-
-function normalizeDirectionScores(
-  value: unknown,
-  claimIds: string[],
-  verification: VerificationReport
-): DirectionScores {
-  const record = typeof value === "object" && value !== null
-    ? value as Record<string, unknown>
-    : {};
-  const relatedClaims = verification.verifiedClaims.filter((claim) => claimIds.includes(claim.claimId));
-  const evidenceSignals = relatedClaims.filter((claim) => claim.supportStatus === "supported").length;
-  const conflictingSignals = relatedClaims.filter((claim) => claim.supportStatus !== "supported").length;
-  let evidenceBase = clampScore(record.evidenceBase, relatedClaims.length > 0 ? 3 : 2);
-
-  if (evidenceSignals >= 2) {
-    evidenceBase = Math.max(evidenceBase, 4);
-  } else if (evidenceSignals === 1) {
-    evidenceBase = Math.max(evidenceBase, 3);
-  } else {
-    evidenceBase = Math.min(evidenceBase, 2);
-  }
-
-  const tractability = clampScore(record.tractability, 3);
-  const expectedCost = clampScore(record.expectedCost, 3);
-  const risk = clampScore(record.risk, 3);
-  let novelty = clampScore(record.novelty, evidenceBase >= 3 ? 3 : 2);
-
-  if (evidenceBase <= 2) {
-    novelty = Math.min(novelty, 3);
-  }
-
-  let overall = Math.round((evidenceBase + novelty + tractability + (6 - expectedCost) + (6 - risk)) / 5);
-
-  if (conflictingSignals > 0) {
-    overall -= 1;
-  }
-
-  overall = Math.max(1, Math.min(5, overall));
-
-  return {
-    evidenceBase,
-    novelty,
-    tractability,
-    expectedCost,
-    risk,
-    overall
-  };
-}
-
-function normalizeGaps(
-  value: unknown,
-  allowedSourceIds: string[],
-  allowedClaimIds: string[]
-): ResearchGap[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value.flatMap((entry) => {
-    const record = typeof entry === "object" && entry !== null
-      ? entry as Record<string, unknown>
-      : {};
-    const title = safeString(record.title);
-    const summary = safeString(record.summary);
-
-    if (title === null || summary === null) {
-      return [];
-    }
-
-    return [{
-      id: safeString(record.id) ?? `gap-${hashString(`${title}:${summary}`)}`,
-      title,
-      summary,
-      sourceIds: reconcileSourceIds(safeSourceIdArray(record.sourceIds), allowedSourceIds),
-      claimIds: uniqueClaimIds(safeStringArray(record.claimIds, 8).filter((claimId) => allowedClaimIds.includes(claimId))),
-      severity: safeGapSeverity(record.severity) ?? "medium",
-      gapKind: safeGapKind(record.gapKind) ?? "coverage_gap"
-    }];
-  }).slice(0, 6);
-}
-
-function normalizeCandidateDirections(
-  value: unknown,
-  allowedSourceIds: string[],
-  allowedClaimIds: string[],
-  allowedGapIds: string[],
-  verification: VerificationReport
-): ResearchDirectionCandidate[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value.flatMap((entry) => {
-    const record = typeof entry === "object" && entry !== null
-      ? entry as Record<string, unknown>
-      : {};
-    const title = safeString(record.title);
-    const summary = safeString(record.summary);
-    const whyNow = safeString(record.whyNow);
-
-    if (title === null || summary === null || whyNow === null) {
-      return [];
-    }
-
-    const claimIds = uniqueClaimIds(
-      safeStringArray(record.claimIds, 8).filter((claimId) => allowedClaimIds.includes(claimId))
-    );
-
-    return [{
-      id: safeString(record.id) ?? `direction-${hashString(`${title}:${summary}`)}`,
-      title,
-      summary,
-      mode: safeResearchMode(record.mode) ?? "literature_synthesis",
-      whyNow,
-      sourceIds: reconcileSourceIds(safeSourceIdArray(record.sourceIds), allowedSourceIds),
-      claimIds,
-      gapIds: uniqueClaimIds(
-        safeStringArray(record.gapIds, 8).filter((gapId) => allowedGapIds.includes(gapId))
-      ),
-      scores: normalizeDirectionScores(record.scores, claimIds, verification)
-    }];
-  }).slice(0, 5);
-}
-
-function normalizeAgenda(raw: unknown, request: ResearchAgendaRequest): ResearchAgenda {
-  const record = typeof raw === "object" && raw !== null
-    ? raw as Record<string, unknown>
-    : {};
-  const allowedSourceIds = request.papers.map((paper) => paper.id);
-  const allowedClaimIds = claimIdsForSynthesis(request.synthesis);
-  const gaps = normalizeGaps(record.gaps, allowedSourceIds, allowedClaimIds);
-  const candidateDirections = normalizeCandidateDirections(
-    record.candidateDirections,
-    allowedSourceIds,
-    allowedClaimIds,
-    gaps.map((gap) => gap.id),
-    request.verification
-  );
-  let selectedDirectionId = safeString(record.selectedDirectionId);
-
-  if (selectedDirectionId !== null && !candidateDirections.some((direction) => direction.id === selectedDirectionId)) {
-    selectedDirectionId = null;
-  }
-
-  const effectiveSelectedDirectionId = selectedDirectionId ?? candidateDirections[0]?.id ?? null;
-  const holdReasons = safeStringArray(record.holdReasons, 6);
-  const verifiedSignals = request.verification.verifiedClaims.filter((claim) => claim.supportStatus === "supported").length;
-  const evidenceThin = request.evidenceMatrix.rowCount < 3 || verifiedSignals === 0;
-  const missingSelection = effectiveSelectedDirectionId === null;
-  const matrixHolds = request.evidenceMatrix.derivedInsights
-    .filter((insight) => insight.kind === "gap" || insight.kind === "conflict")
-    .map((insight) => insight.summary)
-    .slice(0, 2);
-
-  return {
-    executiveSummary: safeString(record.executiveSummary)
-      ?? `The reviewed literature suggests ${candidateDirections.length > 0 ? `${candidateDirections.length} candidate research directions` : "further literature work before direction selection"}.`,
-    gaps,
-    candidateDirections,
-    selectedDirectionId: evidenceThin || missingSelection ? null : effectiveSelectedDirectionId,
-    selectedWorkPackage: null,
-    holdReasons: evidenceThin || missingSelection
-      ? holdReasons.length > 0
-        ? [...holdReasons, ...matrixHolds].slice(0, 6)
-        : matrixHolds.length > 0
-          ? matrixHolds
-          : ["The reviewed evidence is still too thin or inconclusive to justify release readiness."]
-      : holdReasons,
-    recommendedHumanDecision: safeString(record.recommendedHumanDecision)
-      ?? (evidenceThin || missingSelection
-        ? "Continue autonomous evidence gathering unless a concrete external blocker requires user input."
-        : "Continue the autonomous research worker toward release readiness; candidate directions are internal planning context, not a user handoff.")
   };
 }
 
@@ -818,7 +402,7 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     "Do not invent tool names. Do not execute the action yourself. The runtime will validate and execute the chosen action.",
     "The phase value is only a milestone/progress label. It must not limit your tool choice.",
     "Use workspace.search/read/list/create/patch/link/unlink to inspect or update the durable SQLite research workspace.",
-    "Use source.search/merge/resolve_access/select_evidence for source discovery and evidence-set construction.",
+    "Use source.search, source.merge, source.resolve_access, and source.select_evidence for source discovery and evidence-set construction.",
     "Use claim.create/patch/check_support/link_support for claim-led synthesis.",
     "Use section.create/read/patch/link_claim/check_claims for section-level writing.",
     "Use work_item.create/patch when critic or check feedback becomes actionable research debt.",
@@ -840,7 +424,7 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     '    "searchQueries": ["only if revising/searching"],',
     '    "evidenceTargets": ["missing evidence targets"],',
     '    "paperIds": ["known paper ids only"],',
-    '    "criticStage": "protocol|source_selection|evidence|release|null",',
+    '    "criticScope": "protocol|sources|evidence|release|null",',
     '    "reason": "short status reason or null",',
     '    "workStore": {',
     '      "collection": "workItems|canonicalSources|extractions|claims|citations|manuscriptSections|releaseChecks|null",',
@@ -876,382 +460,6 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     `Critic reports: ${JSON.stringify(criticSummaries)}`,
     request.retryInstruction === undefined ? "Retry instruction: null" : `Retry instruction: ${request.retryInstruction}`
   ].join("\n");
-}
-
-function extractionInstruction(request: PaperExtractionRequest): string {
-  const literatureContext = request.literatureContext ?? {
-    available: false,
-    paperCount: 0,
-    themeCount: 0,
-    notebookCount: 0,
-    papers: [],
-    themes: [],
-    notebooks: [],
-    queryHints: []
-  };
-  const reviewedPapers = request.papers.map((paper) => ({
-    paperId: paper.id,
-    title: paper.title,
-    citation: paper.citation,
-    abstract: request.compact === true ? paper.abstract?.slice(0, 1_200) ?? null : paper.abstract,
-    year: paper.year,
-    venue: paper.venue,
-    authors: request.compact === true ? paper.authors.slice(0, 8) : paper.authors,
-    accessMode: paper.accessMode,
-    screeningStage: paper.screeningStage,
-    screeningDecision: paper.screeningDecision,
-    screeningRationale: paper.screeningRationale,
-    tags: request.compact === true ? paper.tags.slice(0, 8) : paper.tags
-  }));
-
-  return [
-    "You are ClawResearch's paper-extraction module for a console-first autonomous research runtime.",
-    "Extract paper-by-paper evidence only from the provided reviewed papers.",
-    request.compact === true
-      ? "Use compact mode: prefer short, conservative fields and return one sparse but valid extraction per paper."
-      : "Use normal mode: retain useful methodological and evidence detail while staying concise.",
-    "Do not fabricate detail. If a field is unclear, leave it as an empty string or empty array and lower confidence.",
-    "Supported claims must be short claim texts grounded in the paper itself.",
-    "",
-    "Allowed confidence values:",
-    "- high",
-    "- medium",
-    "- low",
-    "",
-    "Allowed supportedClaims support values:",
-    "- explicit",
-    "- partial",
-    "- implied",
-    "",
-    "Return JSON only with this exact shape:",
-    "{",
-    '  "extractions": [',
-    "    {",
-    '      "id": "string",',
-    '      "paperId": "string",',
-    '      "problemSetting": "string",',
-    '      "systemType": "string",',
-    '      "architecture": "string",',
-    '      "toolsAndMemory": "string",',
-    '      "planningStyle": "string",',
-    '      "evaluationSetup": "string",',
-    '      "successSignals": ["string"],',
-    '      "failureModes": ["string"],',
-    '      "limitations": ["string"],',
-    '      "supportedClaims": [',
-    '        { "claim": "string", "support": "explicit|partial|implied" }',
-    "      ],",
-    '      "confidence": "high|medium|low",',
-    '      "evidenceNotes": ["string"]',
-    "    }",
-    "  ]",
-    "}",
-    "",
-    `Project root: ${request.projectRoot}`,
-    `Run id: ${request.runId}`,
-    `Brief: ${JSON.stringify(request.brief)}`,
-    `Plan: ${JSON.stringify(request.plan)}`,
-    `Reviewed papers: ${JSON.stringify(reviewedPapers)}`,
-    `Literature memory context: ${JSON.stringify(literatureContext)}`
-  ].join("\n");
-}
-
-function agendaInstruction(request: ResearchAgendaRequest): string {
-  const literatureContext = request.literatureContext ?? {
-    available: false,
-    paperCount: 0,
-    themeCount: 0,
-    notebookCount: 0,
-    papers: [],
-    themes: [],
-    notebooks: [],
-    queryHints: []
-  };
-  const reviewedPapers = request.papers.map((paper) => ({
-    id: paper.id,
-    title: paper.title,
-    citation: paper.citation,
-    year: paper.year,
-    venue: paper.venue,
-    abstract: paper.abstract,
-    accessMode: paper.accessMode,
-    screeningDecision: paper.screeningDecision,
-    tags: paper.tags
-  }));
-  const claims = request.synthesis.claims.map((claim) => ({
-    id: claimRecordIdFromClaimText(claim.claim),
-    claim: claim.claim,
-    evidence: claim.evidence,
-    sourceIds: claim.sourceIds
-  }));
-
-  return [
-    "You are ClawResearch's research-agenda module for a console-first autonomous research runtime.",
-    "Convert the reviewed literature, verified claims, open questions, and project memory into an internal research agenda for a persistent autonomous research worker.",
-    "This is proposal ranking, not scientific proof. Do not treat polished text as evidence.",
-    "Use only the reviewed papers and verified-claim context provided here.",
-    "Use reviewer and source-quality diagnostics as visible context, not as hidden semantic gates.",
-    "If the evidence record is thin, record internal evidence-gathering or revision needs in gaps and holdReasons.",
-    "Prefer 2 to 5 concrete candidate directions.",
-    "Do not generate a selectedWorkPackage object. The worker continues internally through research actions rather than handing execution back to the user.",
-    "Always return selectedWorkPackage as null.",
-    "",
-    "Scoring guidance:",
-    "- strong evidence and replicated signals increase evidenceBase",
-    "- conflicting or weakly supported evidence lowers overall",
-    "- thin evidence cannot justify maximum novelty",
-    "- high-cost or unclear-evaluation directions should be penalized",
-    "",
-    "Allowed mode values:",
-    "- literature_synthesis",
-    "- replication",
-    "- benchmarking",
-    "- ablation",
-    "- method_improvement",
-    "- new_hypothesis",
-    "",
-    "Allowed gapKind values:",
-    "- missing_baseline",
-    "- confounder",
-    "- coverage_gap",
-    "- method_gap",
-    "- evidence_conflict",
-    "",
-    "Allowed severity values:",
-    "- low",
-    "- medium",
-    "- high",
-    "",
-    "Score every dimension from 1 to 5.",
-    "",
-    "Return JSON only with this exact shape:",
-    "{",
-    '  "executiveSummary": "string",',
-    '  "gaps": [',
-    '    {',
-    '      "id": "string",',
-    '      "title": "string",',
-    '      "summary": "string",',
-    '      "sourceIds": ["string"],',
-    '      "claimIds": ["string"],',
-    '      "severity": "low|medium|high",',
-    '      "gapKind": "missing_baseline|confounder|coverage_gap|method_gap|evidence_conflict"',
-    "    }",
-    "  ],",
-    '  "candidateDirections": [',
-    '    {',
-    '      "id": "string",',
-    '      "title": "string",',
-    '      "summary": "string",',
-    '      "mode": "literature_synthesis|replication|benchmarking|ablation|method_improvement|new_hypothesis",',
-    '      "whyNow": "string",',
-    '      "sourceIds": ["string"],',
-    '      "claimIds": ["string"],',
-    '      "gapIds": ["string"],',
-    '      "scores": {',
-    '        "evidenceBase": 1,',
-    '        "novelty": 1,',
-    '        "tractability": 1,',
-    '        "expectedCost": 1,',
-    '        "risk": 1,',
-    '        "overall": 1',
-    "      }",
-    "    }",
-    "  ],",
-    '  "selectedDirectionId": "string or null",',
-    '  "selectedWorkPackage": null,',
-    '  "holdReasons": ["string"],',
-    '  "recommendedHumanDecision": "string"',
-    "}",
-    "",
-    `Project root: ${request.projectRoot}`,
-    `Brief: ${JSON.stringify(request.brief)}`,
-    `Plan: ${JSON.stringify(request.plan)}`,
-    `Reviewed papers: ${JSON.stringify(reviewedPapers)}`,
-    `Paper extractions: ${JSON.stringify(request.paperExtractions)}`,
-    `Evidence matrix: ${JSON.stringify(request.evidenceMatrix)}`,
-    `Synthesis themes: ${JSON.stringify(request.synthesis.themes)}`,
-    `Claims: ${JSON.stringify(claims)}`,
-    `Next questions: ${JSON.stringify(request.synthesis.nextQuestions)}`,
-    `Verification: ${JSON.stringify(request.verification)}`,
-    `Project memory context: ${JSON.stringify(request.memoryContext)}`,
-    `Literature memory context: ${JSON.stringify(literatureContext)}`
-  ].join("\n");
-}
-
-function criticInstruction(request: CriticReviewRequest): string {
-  const selectedPapers = (request.selectedPapers ?? []).map((paper) => ({
-    id: paper.id,
-    title: paper.title,
-    citation: paper.citation,
-    year: paper.year,
-    venue: paper.venue,
-    abstract: paper.abstract,
-    accessMode: paper.accessMode,
-    screeningDecision: paper.screeningDecision,
-    screeningRationale: paper.screeningRationale
-  }));
-  const claimIds = [
-    ...(request.paper?.claims.map((claim) => claim.claimId) ?? []),
-    ...(request.verification?.verifiedClaims.map((claim) => claim.claimId) ?? [])
-  ];
-  const stageGuidance = criticStageGuidance(request.stage);
-  const packetLines = criticPacketLines(request, selectedPapers, claimIds);
-
-  return [
-    "You are ClawResearch's stateless critic reviewer.",
-    "You are newly instantiated for this single review. You have no memory, no tools, and no access to retrieval.",
-    "Your job is to falsify readiness, not to continue the research and not to rewrite the artifact.",
-    "Use only the evidence packet below. Do not invent papers, claims, citations, methods, or prior context.",
-    "Give concrete objections tied only to artifacts that are present and expected at this review stage.",
-    stageGuidance.releaseRule,
-    "",
-    "Stage-specific contract:",
-    ...stageGuidance.rules.map((rule) => `- ${rule}`),
-    "",
-    "Readiness rules:",
-    "- pass: no blocking or major evidence-readiness concern remains",
-    "- revise: the worker should revise strategy before release",
-    "- block: the artifact is unsafe to use as the basis for release",
-    "",
-    "Return JSON only with this exact shape:",
-    "{",
-    '  "readiness": "pass|revise|block",',
-    '  "confidence": 0.0,',
-    '  "objections": [',
-    '    {',
-    '      "code": "string",',
-    '      "severity": "blocking|major|minor",',
-    '      "target": "protocol|source_selection|extraction|evidence|synthesis|verification|manuscript|release",',
-    '      "message": "specific objection grounded in the provided packet",',
-    '      "affectedPaperIds": ["known selected paper id only"],',
-    '      "affectedClaimIds": ["known claim id only"],',
-    '      "suggestedRevision": "concrete revision advice or null"',
-    "    }",
-    "  ],",
-    '  "revisionAdvice": {',
-    '    "searchQueries": ["concrete query suggestions"],',
-    '    "evidenceTargets": ["missing evidence targets"],',
-    '    "papersToExclude": ["known selected paper id only"],',
-    '    "papersToPromote": ["known paper id from selected papers or relevance assessments"],',
-    '    "claimsToSoften": ["known claim id only"]',
-    "  }",
-    "}",
-    "",
-    `Review stage: ${request.stage}`,
-    `Run id: ${request.runId}`,
-    `Critic iteration: ${JSON.stringify(request.iteration ?? null)}`,
-    request.retryInstruction === undefined || request.retryInstruction === null
-      ? "Retry instruction: null"
-      : `Retry instruction: ${request.retryInstruction}`,
-    ...packetLines
-  ].join("\n");
-}
-
-function criticStageGuidance(stage: CriticReviewStage): { releaseRule: string; rules: string[] } {
-  switch (stage) {
-    case "protocol":
-      return {
-        releaseRule: "This review diagnoses whether the protocol is ready for autonomous retrieval; it creates visible objections rather than hidden runtime decisions.",
-        rules: [
-          "Review only the brief, plan, and review protocol.",
-          "No papers, selected sources, extractions, claims, synthesis, verification, or manuscript should exist yet.",
-          "Missing selected papers is expected and must not be an objection at the protocol stage.",
-          "Criticize unclear scope, bad inclusion/exclusion criteria, output-style constraints treated as evidence targets, unsafe search strategy, or contradictions that would make retrieval unreliable.",
-          "Use revise when concrete query, scope, or evidence-target changes could make retrieval stronger; use block only when the protocol cannot safely guide retrieval."
-        ]
-      };
-    case "source_selection":
-      return {
-        releaseRule: "This review diagnoses whether the selected sources are ready for extraction; the researcher decides how to revise.",
-        rules: [
-          "Review the brief, protocol, selected papers, relevance assessments, and retrieval diagnostics.",
-          "Do not require extracted evidence, synthesized claims, references, or a manuscript yet.",
-          "Object to off-topic selected papers, missing evidence targets, weak source fit, or selection/relevance contradictions.",
-          "If readiness is revise or block, you must provide at least one concrete objection with a specific message and suggested revision.",
-          "Revision advice may suggest search queries, evidence targets, or selected paper IDs to exclude, but must not introduce invented papers.",
-          "Avoid picky or stylistic objections; after repeated iterations, reserve block for severe evidence-set risks that would make extraction unsafe."
-        ]
-      };
-    case "evidence":
-      return {
-        releaseRule: "This review diagnoses whether extracted evidence is ready for synthesis; objections become work items or warnings.",
-        rules: [
-          "Review selected papers, relevance assessments, paper extractions, and the evidence matrix.",
-          "Do not require final prose, references, or release checks yet.",
-          "Object to missing extractions for selected papers, unsupported evidence rows, weak coverage, or extracted evidence that does not match the protocol.",
-          "If readiness is revise or block, you must provide at least one concrete objection with a specific message and suggested revision.",
-          "Avoid picky or stylistic objections; after repeated iterations, reserve block for severe evidence integrity risks."
-        ]
-      };
-    case "release":
-      return {
-        releaseRule: "This review diagnoses manuscript-release risks. Computable release invariants are checked separately by the runtime.",
-        rules: [
-          "Review the manuscript, references, verification, deterministic manuscript checks, protocol, and selected papers.",
-          "Object to unsupported claims, missing citations, off-topic evidence, failed checks, missing limitations, or mismatches between the paper and evidence matrix.",
-          "Do not ask for new research unless the provided manuscript cannot be safely released without it."
-        ]
-      };
-  }
-}
-
-function criticPacketLines(
-  request: CriticReviewRequest,
-  selectedPapers: Array<{
-    id: string;
-    title: string;
-    citation: string;
-    year: number | null;
-    venue: string | null;
-    abstract: string | null;
-    accessMode: string;
-    screeningDecision: string;
-    screeningRationale: string | null;
-  }>,
-  claimIds: string[]
-): string[] {
-  const common = [
-    `Brief: ${JSON.stringify(request.brief)}`,
-    `Protocol: ${JSON.stringify(request.protocol ?? null)}`,
-    `Plan objective: ${request.plan?.objective ?? null}`
-  ];
-
-  switch (request.stage) {
-    case "protocol":
-      return common;
-    case "source_selection":
-      return [
-        ...common,
-        `Selected papers: ${JSON.stringify(selectedPapers)}`,
-        `Known selected paper IDs: ${JSON.stringify(selectedPapers.map((paper) => paper.id))}`,
-        `Review workflow: ${JSON.stringify(request.gathered?.reviewWorkflow ?? null)}`,
-        `Relevance assessments: ${JSON.stringify(request.relevanceAssessments ?? [])}`
-      ];
-    case "evidence":
-      return [
-        ...common,
-        `Selected papers: ${JSON.stringify(selectedPapers)}`,
-        `Known selected paper IDs: ${JSON.stringify(selectedPapers.map((paper) => paper.id))}`,
-        `Relevance assessments: ${JSON.stringify(request.relevanceAssessments ?? [])}`,
-        `Paper extractions: ${JSON.stringify(request.paperExtractions ?? [])}`,
-        `Evidence matrix: ${JSON.stringify(request.evidenceMatrix ?? null)}`
-      ];
-    case "release":
-      return [
-        ...common,
-        `Selected papers: ${JSON.stringify(selectedPapers)}`,
-        `Known selected paper IDs: ${JSON.stringify(selectedPapers.map((paper) => paper.id))}`,
-        `Known claim IDs: ${JSON.stringify([...new Set(claimIds)])}`,
-        `Evidence matrix: ${JSON.stringify(request.evidenceMatrix ?? null)}`,
-        `Synthesis: ${JSON.stringify(request.synthesis ?? null)}`,
-        `Verification: ${JSON.stringify(request.verification ?? null)}`,
-        `Agenda hold reasons: ${JSON.stringify(request.agenda?.holdReasons ?? [])}`,
-        `Paper artifact: ${JSON.stringify(request.paper ?? null)}`,
-        `References: ${JSON.stringify(request.references ?? null)}`,
-        `Manuscript checks: ${JSON.stringify(request.manuscriptChecks ?? null)}`
-      ];
-  }
 }
 
 async function ollamaChatRaw(
@@ -1477,9 +685,9 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
                   type: "string"
                 }
               },
-              criticStage: {
+              criticScope: {
                 type: ["string", "null"],
-                enum: ["protocol", "source_selection", "evidence", "release", null]
+                enum: ["protocol", "sources", "evidence", "release", null]
               },
               reason: {
                 type: ["string", "null"]
@@ -1575,7 +783,7 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
                 required: ["collection", "entityId", "filters", "filterJson", "semanticQuery", "limit", "cursor", "changes", "entity", "patchJson", "payloadJson", "link"]
               }
             },
-            required: ["providerIds", "searchQueries", "evidenceTargets", "paperIds", "criticStage", "reason", "workStore"]
+            required: ["providerIds", "searchQueries", "evidenceTargets", "paperIds", "criticScope", "reason", "workStore"]
           },
           expectedOutcome: {
             type: "string"
@@ -1620,7 +828,7 @@ function nativeAgentStepInstruction(request: ResearchActionRequest): string {
     "Do not answer in prose. Do not invent tools. The runtime validates and executes the chosen action.",
     "The phase value is only a milestone/progress label. It must not limit your tool choice.",
     "Use workspace.search/read/list/create/patch/link/unlink to inspect or update the durable SQLite research workspace.",
-    "Use source.search/merge/resolve_access/select_evidence for source discovery and evidence-set construction.",
+    "Use source.search, source.merge, source.resolve_access, and source.select_evidence for source discovery and evidence-set construction.",
     "Use claim.create/patch/check_support/link_support for claim-led synthesis.",
     "Use section.create/read/patch/link_claim/check_claims for section-level writing.",
     "Use work_item.create/patch when critic or check feedback becomes actionable research debt.",
@@ -1758,13 +966,9 @@ export class OllamaResearchBackend implements ResearchBackend {
 
   constructor(
     private readonly host = defaultHost,
-    private readonly model = defaultModel,
-    private readonly criticHost = defaultCriticHost,
-    private readonly criticModel = defaultCriticModel
+    private readonly model = defaultModel
   ) {
-    this.label = this.criticModel === this.model && this.criticHost === this.host
-      ? `ollama:${this.model}`
-      : `ollama:${this.model};critic:${this.criticModel}`;
+    this.label = `ollama:${this.model}`;
   }
 
   async planResearch(request: ResearchPlanningRequest, options: ResearchBackendCallOptions = {
@@ -1837,47 +1041,6 @@ export class OllamaResearchBackend implements ResearchBackend {
     }
   }
 
-  async extractReviewedPapers(request: PaperExtractionRequest, options: ResearchBackendCallOptions = {
-    operation: "extraction",
-    timeoutMs: 300_000
-  }): Promise<PaperExtraction[]> {
-    const raw = await ollamaJsonCall<unknown>(
-      this.host,
-      this.model,
-      extractionInstruction(request),
-      options
-    );
-
-    return normalizePaperExtractions(raw, request);
-  }
-
-  async developResearchAgenda(request: ResearchAgendaRequest, options: ResearchBackendCallOptions = {
-    operation: "agenda",
-    timeoutMs: 300_000
-  }): Promise<ResearchAgenda> {
-    const raw = await ollamaJsonCall<unknown>(
-      this.host,
-      this.model,
-      agendaInstruction(request),
-      options
-    );
-
-    return normalizeAgenda(raw, request);
-  }
-
-  async reviewResearchArtifact(request: CriticReviewRequest, options: ResearchBackendCallOptions = {
-    operation: "critic",
-    timeoutMs: 300_000
-  }): Promise<CriticReviewArtifact> {
-    const raw = await ollamaJsonCall<unknown>(
-      this.criticHost,
-      this.criticModel,
-      criticInstruction(request),
-      options
-    );
-
-    return normalizeCriticReview(raw, request);
-  }
 }
 
 export class OpenAIResponsesResearchBackend implements ResearchBackend {
@@ -2006,44 +1169,6 @@ export class OpenAIResponsesResearchBackend implements ResearchBackend {
     }
   }
 
-  async extractReviewedPapers(request: PaperExtractionRequest, options: ResearchBackendCallOptions = {
-    operation: "extraction",
-    timeoutMs: 300_000
-  }): Promise<PaperExtraction[]> {
-    const raw = await modelJsonCall<unknown>(
-      this.client,
-      extractionInstruction(request),
-      options
-    );
-
-    return normalizePaperExtractions(raw, request);
-  }
-
-  async developResearchAgenda(request: ResearchAgendaRequest, options: ResearchBackendCallOptions = {
-    operation: "agenda",
-    timeoutMs: 300_000
-  }): Promise<ResearchAgenda> {
-    const raw = await modelJsonCall<unknown>(
-      this.client,
-      agendaInstruction(request),
-      options
-    );
-
-    return normalizeAgenda(raw, request);
-  }
-
-  async reviewResearchArtifact(request: CriticReviewRequest, options: ResearchBackendCallOptions = {
-    operation: "critic",
-    timeoutMs: 300_000
-  }): Promise<CriticReviewArtifact> {
-    const raw = await modelJsonCall<unknown>(
-      this.client,
-      criticInstruction(request),
-      options
-    );
-
-    return normalizeCriticReview(raw, request);
-  }
 }
 
 export function createDefaultResearchBackend(): ResearchBackend {
@@ -2060,9 +1185,7 @@ export async function createProjectResearchBackend(params: {
   if (runtimeModel.provider === "ollama") {
     return new OllamaResearchBackend(
       runtimeModel.host ?? defaultHost,
-      runtimeModel.model,
-      process.env.CLAWRESEARCH_OLLAMA_CRITIC_HOST ?? runtimeModel.host ?? defaultCriticHost,
-      process.env.CLAWRESEARCH_OLLAMA_CRITIC_MODEL ?? runtimeModel.model
+      runtimeModel.model
     );
   }
 

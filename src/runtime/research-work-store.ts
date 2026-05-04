@@ -3,19 +3,14 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import type { CanonicalPaper, LiteratureContext } from "./literature-store.js";
 import type { ProjectMemoryContext, MemoryRecordType } from "./memory-store.js";
-import type {
-  ManuscriptBundle,
-  ManuscriptCheck,
-  ReviewProtocol
-} from "./research-manuscript.js";
-import type { ResearchAgenda, ResearchPlan, ResearchSynthesis } from "./research-backend.js";
-import type { CriticReviewArtifact, CriticReviewStage } from "./research-critic.js";
-import type { EvidenceMatrix, EvidenceMatrixRow, PaperExtraction } from "./research-evidence.js";
+import type { ReviewProtocol } from "./research-manuscript.js";
+import type { ResearchPlan } from "./research-backend.js";
+import type { CriticReviewArtifact, CriticReviewScope } from "./research-critic.js";
+import type { EvidenceMatrixRow, PaperExtraction } from "./research-evidence.js";
 import type { ResearchSource, ResearchSourceSnapshot } from "./research-sources.js";
 import type { ResearchBrief } from "./session-store.js";
 import { runtimeDirectoryPath as runtimeDir } from "./session-store.js";
 import type { RunRecord } from "./run-store.js";
-import type { VerificationReport } from "./verifier.js";
 
 const require = createRequire(import.meta.url);
 
@@ -78,6 +73,7 @@ export type WorkItemSeverity =
 export type ResearchWorkerStatus =
   | "not_started"
   | "working"
+  | "checkpointed_budget_exhausted"
   | "paused"
   | "release_ready"
   | "needs_user_decision"
@@ -230,7 +226,7 @@ export type WorkStoreWorkItem = WorkStoreBaseEntity & {
   affectedSourceIds: string[];
   affectedClaimIds: string[];
   suggestedActions: string[];
-  source: "critic" | "checks" | "agenda" | "synthesis" | "runtime";
+  source: "critic" | "checks" | "runtime";
 };
 
 export type WorkStoreManuscriptSection = WorkStoreBaseEntity & {
@@ -425,6 +421,17 @@ CREATE TABLE IF NOT EXISTS extractions (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS evidence_cells (
+  id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL,
+  extraction_id TEXT NOT NULL,
+  run_id TEXT,
+  field TEXT NOT NULL,
+  confidence TEXT NOT NULL,
+  json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS claims (
   id TEXT PRIMARY KEY,
   run_id TEXT,
@@ -508,6 +515,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_sources_search ON sources(title, citation, venue, screening_decision);
 CREATE INDEX IF NOT EXISTS idx_extractions_source ON extractions(source_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_cells_source ON evidence_cells(source_id, extraction_id);
 CREATE INDEX IF NOT EXISTS idx_claims_status ON claims(support_status);
 CREATE INDEX IF NOT EXISTS idx_protocols_protocol_id ON protocols(protocol_id);
 CREATE INDEX IF NOT EXISTS idx_work_items_status ON work_items(status, severity);
@@ -613,6 +621,7 @@ function isResearchWorkerStatus(value: string | null): value is ResearchWorkerSt
   switch (value) {
     case "not_started":
     case "working":
+    case "checkpointed_budget_exhausted":
     case "paused":
     case "release_ready":
     case "needs_user_decision":
@@ -892,34 +901,6 @@ function generatedFullTextRecord(source: WorkStoreCanonicalSource): WorkStoreFul
   };
 }
 
-function evidenceCellsFromExtraction(entity: WorkStoreExtraction): WorkStoreEvidenceCell[] {
-  const fields: WorkStoreEvidenceCell["field"][] = [
-    "problemSetting",
-    "systemType",
-    "architecture",
-    "toolsAndMemory",
-    "planningStyle",
-    "evaluationSetup",
-    "successSignals",
-    "failureModes",
-    "limitations",
-    "confidence"
-  ];
-
-  return fields.map((field) => ({
-    id: stableId("evidence-cell", [entity.sourceId, entity.id, field]),
-    kind: "evidenceCell" as const,
-    runId: entity.runId,
-    createdAt: entity.createdAt,
-    updatedAt: entity.updatedAt,
-    sourceId: entity.sourceId,
-    extractionId: entity.id,
-    field,
-    value: entity.extraction[field],
-    confidence: entity.extraction.confidence
-  }));
-}
-
 function loadWorkspaceDatabase(input: {
   projectRoot: string;
   brief?: ResearchBrief | null;
@@ -935,6 +916,8 @@ function loadWorkspaceDatabase(input: {
       .flatMap((row) => rowJsonEntity<WorkStoreCanonicalSource>(row, "canonicalSource") ?? []);
     const extractions = statementRows<Record<string, unknown>>(database, "SELECT json FROM extractions ORDER BY updated_at, id")
       .flatMap((row) => rowJsonEntity<WorkStoreExtraction>(row, "extraction") ?? []);
+    const evidenceCells = statementRows<Record<string, unknown>>(database, "SELECT json FROM evidence_cells ORDER BY updated_at, id")
+      .flatMap((row) => rowJsonEntity<WorkStoreEvidenceCell>(row, "evidenceCell") ?? []);
     const claims = statementRows<Record<string, unknown>>(database, "SELECT json FROM claims ORDER BY updated_at, id")
       .flatMap((row) => rowJsonEntity<WorkStoreClaim>(row, "claim") ?? []);
     const citations = statementRows<Record<string, unknown>>(database, "SELECT json FROM support_links ORDER BY updated_at, id")
@@ -967,7 +950,7 @@ function loadWorkspaceDatabase(input: {
         screeningDecisions: sources.flatMap((source) => generatedScreeningDecision(source) ?? []),
         fullTextRecords: sources.map((source) => generatedFullTextRecord(source)),
         extractions,
-        evidenceCells: extractions.flatMap((extraction) => evidenceCellsFromExtraction(extraction)),
+        evidenceCells,
         claims,
         citations,
         protocols,
@@ -992,6 +975,7 @@ DELETE FROM meta;
 DELETE FROM worker_state;
 DELETE FROM sources;
 DELETE FROM extractions;
+DELETE FROM evidence_cells;
 DELETE FROM claims;
 DELETE FROM support_links;
 DELETE FROM protocols;
@@ -1036,6 +1020,21 @@ INSERT INTO sources (
       const insertExtraction = database.prepare("INSERT INTO extractions (id, source_id, run_id, json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)");
       for (const extraction of store.objects.extractions) {
         insertExtraction.run(extraction.id, extraction.sourceId, extraction.runId, jsonText(extraction), extraction.createdAt, extraction.updatedAt);
+      }
+
+      const insertEvidenceCell = database.prepare("INSERT INTO evidence_cells (id, source_id, extraction_id, run_id, field, confidence, json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const cell of store.objects.evidenceCells) {
+        insertEvidenceCell.run(
+          cell.id,
+          cell.sourceId,
+          cell.extractionId,
+          cell.runId,
+          cell.field,
+          cell.confidence,
+          jsonText(cell),
+          cell.createdAt,
+          cell.updatedAt
+        );
       }
 
       const insertClaim = database.prepare("INSERT INTO claims (id, run_id, text, evidence, support_status, confidence, risk, json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
@@ -1252,26 +1251,20 @@ export function upsertResearchWorkStoreEntities(
   let next = store;
 
   for (const entity of entities) {
-    const entitiesToUpsert = entity.kind === "extraction"
-      ? [entity, ...evidenceCellsFromExtraction(entity)]
-      : [entity];
-
-    for (const entityToUpsert of entitiesToUpsert) {
-      const collection = collectionNameForKind(entityToUpsert.kind);
-      const items = collectionFor(next, collection);
-      const existingIndex = items.findIndex((item) => item.id === entityToUpsert.id);
-      const nextEntity = {
-        ...entityToUpsert,
-        createdAt: entityToUpsert.createdAt || now,
-        updatedAt: now
-      } as WorkStoreEntity;
-      const nextItems = existingIndex === -1
-        ? [...items, nextEntity]
-        : items.map((item, index) => index === existingIndex
-          ? { ...item, ...nextEntity, createdAt: item.createdAt, updatedAt: now } as WorkStoreEntity
-          : item);
-      next = setCollection(next, collection, nextItems);
-    }
+    const collection = collectionNameForKind(entity.kind);
+    const items = collectionFor(next, collection);
+    const existingIndex = items.findIndex((item) => item.id === entity.id);
+    const nextEntity = {
+      ...entity,
+      createdAt: entity.createdAt || now,
+      updatedAt: now
+    } as WorkStoreEntity;
+    const nextItems = existingIndex === -1
+      ? [...items, nextEntity]
+      : items.map((item, index) => index === existingIndex
+        ? { ...item, ...nextEntity, createdAt: item.createdAt, updatedAt: now } as WorkStoreEntity
+        : item);
+    next = setCollection(next, collection, nextItems);
   }
 
   return {
@@ -1398,37 +1391,9 @@ function extractionEntity(run: RunRecord, extraction: PaperExtraction, now: stri
   };
 }
 
-function evidenceCellsFromMatrix(run: RunRecord, matrix: EvidenceMatrix, now: string): WorkStoreEvidenceCell[] {
-  const fields: WorkStoreEvidenceCell["field"][] = [
-    "problemSetting",
-    "systemType",
-    "architecture",
-    "toolsAndMemory",
-    "planningStyle",
-    "evaluationSetup",
-    "successSignals",
-    "failureModes",
-    "limitations",
-    "confidence"
-  ];
-
-  return matrix.rows.flatMap((row) => fields.map((field) => ({
-    id: stableId("evidence-cell", [run.id, row.paperId, row.extractionId, field]),
-    kind: "evidenceCell" as const,
-    runId: run.id,
-    createdAt: now,
-    updatedAt: now,
-    sourceId: row.paperId,
-    extractionId: row.extractionId,
-    field,
-    value: row[field],
-    confidence: row.confidence
-  })));
-}
-
 function targetKindFromCriticTarget(target: string): WorkStoreWorkItem["targetKind"] {
   switch (target) {
-    case "source_selection":
+    case "sources":
       return "canonicalSource";
     case "extraction":
       return "extraction";
@@ -1458,7 +1423,7 @@ export function workItemsFromCriticReports(run: RunRecord, reports: CriticReview
     type: "critic_objection",
     status: report.readiness === "pass" ? "resolved" : "open",
     severity: objection.severity,
-    title: `${criticStageLabel(report.stage)} critic: ${objection.code}`,
+    title: `${criticScopeLabel(report.stage)} critic: ${objection.code}`,
     description: objection.message,
     targetKind: targetKindFromCriticTarget(objection.target),
     targetId: objection.affectedPaperIds[0] ?? objection.affectedClaimIds[0] ?? null,
@@ -1476,112 +1441,8 @@ export function workItemsFromCriticReports(run: RunRecord, reports: CriticReview
   })));
 }
 
-function criticStageLabel(stage: CriticReviewStage): string {
+function criticScopeLabel(stage: CriticReviewScope): string {
   return stage.replace(/_/g, " ");
-}
-
-function workItemSeverityFromCheck(check: ManuscriptCheck): WorkItemSeverity {
-  return check.severity === "blocker" ? "blocking" : check.severity === "warning" ? "minor" : "minor";
-}
-
-function workItemTypeFromCheck(check: ManuscriptCheck): WorkItemType {
-  if (/citation|claim|support/i.test(`${check.id} ${check.title}`)) {
-    return "unsupported_claim";
-  }
-
-  if (/evidence|source|paper|facet|matrix/i.test(`${check.id} ${check.title}`)) {
-    return "evidence_gap";
-  }
-
-  return "manuscript_revision";
-}
-
-function workItemsFromChecks(run: RunRecord, bundle: ManuscriptBundle | null, now: string): WorkStoreWorkItem[] {
-  return (bundle?.checks.checks ?? [])
-    .filter((check) => check.status !== "pass")
-    .map((check) => ({
-      id: stableId("work-item", [run.id, "check", check.id]),
-      kind: "workItem",
-      runId: run.id,
-      createdAt: now,
-      updatedAt: now,
-      type: workItemTypeFromCheck(check),
-      status: "open",
-      severity: workItemSeverityFromCheck(check),
-      title: check.title,
-      description: check.message,
-      targetKind: "release",
-      targetId: check.id,
-      affectedSourceIds: [],
-      affectedClaimIds: [],
-      suggestedActions: [check.message],
-      source: "checks"
-    }));
-}
-
-function workItemsFromAgendaAndSynthesis(
-  run: RunRecord,
-  agenda: ResearchAgenda | null,
-  synthesis: ResearchSynthesis | null,
-  now: string
-): WorkStoreWorkItem[] {
-  const holdItems = (agenda?.holdReasons ?? []).map((reason, index) => ({
-    id: stableId("work-item", [run.id, "agenda", index, reason]),
-    kind: "workItem" as const,
-    runId: run.id,
-    createdAt: now,
-    updatedAt: now,
-    type: externalBlockerText(reason) ? "external_blocker" as const : "evidence_gap" as const,
-    status: "open" as const,
-    severity: externalBlockerText(reason) ? "blocking" as const : "major" as const,
-    title: externalBlockerText(reason) ? "External research blocker" : "Evidence work item",
-    description: reason,
-    targetKind: "agenda" as const,
-    targetId: null,
-    affectedSourceIds: [],
-    affectedClaimIds: [],
-    suggestedActions: [agenda?.recommendedHumanDecision ?? reason],
-    source: "agenda" as const
-  }));
-  const questionItems = (synthesis?.nextQuestions ?? []).map((question, index) => ({
-    id: stableId("work-item", [run.id, "question", index, question]),
-    kind: "workItem" as const,
-    runId: run.id,
-    createdAt: now,
-    updatedAt: now,
-    type: "open_question" as const,
-    status: "open" as const,
-    severity: "minor" as const,
-    title: "Open research question",
-    description: question,
-    targetKind: "unknown" as const,
-    targetId: null,
-    affectedSourceIds: [],
-    affectedClaimIds: [],
-    suggestedActions: [question],
-    source: "synthesis" as const
-  }));
-
-  return [...holdItems, ...questionItems];
-}
-
-function externalBlockerText(text: string): boolean {
-  return /\b(credential|api key|quota|rate limit|paywall|permission|access denied|forbidden|unauthori[sz]ed|license|tdm|missing required)\b/i.test(text);
-}
-
-function releaseCheckEntities(run: RunRecord, bundle: ManuscriptBundle | null, now: string): WorkStoreReleaseCheck[] {
-  return (bundle?.checks.checks ?? []).map((check) => ({
-    id: stableId("release-check", [run.id, check.id]),
-    kind: "releaseCheck",
-    runId: run.id,
-    createdAt: now,
-    updatedAt: now,
-    checkId: check.id,
-    title: check.title,
-    status: check.status,
-    severity: check.severity,
-    message: check.message
-  }));
 }
 
 export function mergeRunSegmentIntoResearchWorkStore(
@@ -1591,16 +1452,11 @@ export function mergeRunSegmentIntoResearchWorkStore(
     plan: ResearchPlan;
     gathered: ResearchSourceSnapshot | null;
     paperExtractions: PaperExtraction[];
-    evidenceMatrix: EvidenceMatrix | null;
-    synthesis: ResearchSynthesis | null;
-    verification: VerificationReport | null;
-    agenda: ResearchAgenda | null;
-    manuscriptBundle: ManuscriptBundle | null;
     criticReports: CriticReviewArtifact[];
     now: string;
   }
 ): ResearchWorkStore {
-  const { run, gathered, paperExtractions, evidenceMatrix, synthesis, agenda, manuscriptBundle, criticReports, now } = input;
+  const { run, gathered, paperExtractions, criticReports, now } = input;
   const canonicalPapers = gathered?.canonicalPapers ?? [];
   const entities: WorkStoreEntity[] = [
     ...providerRunsFromGathered(run, gathered, now),
@@ -1609,10 +1465,7 @@ export function mergeRunSegmentIntoResearchWorkStore(
     ...canonicalPapers.flatMap((paper) => screeningDecisionsFromPaper(run, paper, now)),
     ...canonicalPapers.map((paper) => fullTextRecordFromPaper(run, paper, now)),
     ...paperExtractions.map((extraction) => extractionEntity(run, extraction, now)),
-    ...workItemsFromCriticReports(run, criticReports, now),
-    ...workItemsFromChecks(run, manuscriptBundle, now),
-    ...workItemsFromAgendaAndSynthesis(run, agenda, synthesis, now),
-    ...releaseCheckEntities(run, manuscriptBundle, now)
+    ...workItemsFromCriticReports(run, criticReports, now)
   ];
 
   return {
@@ -1641,7 +1494,7 @@ function countsByMemoryType(store: ResearchWorkStore): Record<MemoryRecordType, 
     idea: store.objects.workItems.filter((item) => item.type === "agent_next_action").length,
     summary: store.worker.lastRunId === null ? 0 : 1,
     artifact: store.objects.releaseChecks.length + store.objects.manuscriptSections.length,
-    direction: store.objects.workItems.filter((item) => item.source === "agenda").length,
+    direction: store.objects.workItems.filter((item) => item.type === "agent_next_action").length,
     hypothesis: 0,
     method_plan: 0
   };
@@ -1703,7 +1556,7 @@ export function buildProjectMemoryContextFromWorkStore(store: ResearchWorkStore)
     summaries,
     artifacts: store.objects.releaseChecks.slice(-8).map((check) => contextEntry(check.id, check.title, check.message, check.runId)),
     directions: store.objects.workItems
-      .filter((item) => item.source === "agenda")
+      .filter((item) => item.type === "agent_next_action")
       .slice(-8)
       .map((item) => contextEntry(item.id, item.title, item.description, item.runId)),
     hypotheses: [],

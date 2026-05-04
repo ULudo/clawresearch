@@ -2346,6 +2346,8 @@ async function buildCompletedRunSummary(run: RunRecord): Promise<string> {
         return `Autonomous research worker paused. ${workerState.statusReason} ${workerState.userBlockers.join(" | ")}`;
       case "working":
         return `Autonomous research worker checkpointed this segment. ${workerState.statusReason}`;
+      case "checkpointed_budget_exhausted":
+        return `Autonomous research worker checkpointed after exhausting this segment budget. ${workerState.statusReason}`;
       case "paused":
         return `Autonomous research worker is paused. ${workerState.statusReason}`;
       case "not_started":

@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   runtimeDirectoryPath,
@@ -358,7 +358,10 @@ function mergeRunRecord(
 
 async function writeRunFile(projectRoot: string, run: RunRecord): Promise<void> {
   await mkdir(run.artifacts.runDirectory, { recursive: true });
-  await writeFile(runFilePath(projectRoot, run.id), `${JSON.stringify(run, null, 2)}\n`, "utf8");
+  const targetPath = runFilePath(projectRoot, run.id);
+  const tempPath = `${targetPath}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tempPath, `${JSON.stringify(run, null, 2)}\n`, "utf8");
+  await rename(tempPath, targetPath);
 }
 
 export class RunStore {

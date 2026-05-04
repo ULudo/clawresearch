@@ -11,9 +11,9 @@ import type {
 import type { ResearchBrief } from "./session-store.js";
 import type { VerificationReport } from "./verifier.js";
 
-export type CriticReviewStage =
+export type CriticReviewScope =
   | "protocol"
-  | "source_selection"
+  | "sources"
   | "evidence"
   | "release";
 
@@ -29,7 +29,7 @@ export type CriticObjectionSeverity =
 
 export type CriticObjectionTarget =
   | "protocol"
-  | "source_selection"
+  | "sources"
   | "extraction"
   | "evidence"
   | "synthesis"
@@ -58,7 +58,7 @@ export type CriticRevisionAdvice = {
 export type CriticReviewArtifact = {
   schemaVersion: 1;
   runId: string;
-  stage: CriticReviewStage;
+  stage: CriticReviewScope;
   reviewer: "ephemeral_critic";
   readiness: CriticReadiness;
   confidence: number;
@@ -69,11 +69,11 @@ export type CriticReviewArtifact = {
 export type CriticReviewRequest = {
   projectRoot: string;
   runId: string;
-  stage: CriticReviewStage;
+  stage: CriticReviewScope;
   iteration?: {
     attempt: number;
     maxAttempts: number;
-    revisionPassesUsed: number;
+    sessionStepsUsed: number;
   };
   retryInstruction?: string | null;
   brief: ResearchBrief;
@@ -156,13 +156,12 @@ function normalizeSeverity(value: unknown, readiness: CriticReadiness): CriticOb
   }
 }
 
-function normalizeTarget(value: unknown, stage: CriticReviewStage): CriticObjectionTarget {
+function normalizeTarget(value: unknown, stage: CriticReviewScope): CriticObjectionTarget {
   switch (readString(value)?.toLowerCase()) {
     case "protocol":
       return "protocol";
-    case "source_selection":
-    case "source selection":
-      return "source_selection";
+    case "sources":
+      return "sources";
     case "extraction":
       return "extraction";
     case "evidence":
@@ -176,7 +175,7 @@ function normalizeTarget(value: unknown, stage: CriticReviewStage): CriticObject
     case "release":
       return "release";
     default:
-      return stage === "source_selection" ? "source_selection" : stage;
+      return stage === "sources" ? "sources" : stage;
   }
 }
 

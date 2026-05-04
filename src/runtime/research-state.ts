@@ -117,6 +117,22 @@ export async function loadResearchWorkerState(
 }
 
 export async function writeResearchWorkerState(state: ResearchWorkerState): Promise<void> {
+  if (state.status === "needs_user_decision") {
+    const decisionText = [
+      state.statusReason,
+      ...state.userBlockers,
+      ...state.nextInternalActions
+    ].join("\n");
+    const hasDecision = /\b(decision|choose|approve|reject|option|alternative)\b/i.test(decisionText);
+    const hasOptions = state.userBlockers.length >= 2
+      || state.nextInternalActions.length >= 2
+      || /\b(option\s*[ab12]|approve\/reject|yes\/no|choose between)\b/i.test(decisionText);
+
+    if (!hasDecision || !hasOptions) {
+      throw new Error("needs_user_decision requires a concrete user decision with explicit options and a reason the model cannot choose alone.");
+    }
+  }
+
   const now = state.updatedAt || new Date().toISOString();
   const existing = await loadResearchWorkStore({
     projectRoot: state.projectRoot,

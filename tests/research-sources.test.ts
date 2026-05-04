@@ -152,7 +152,7 @@ test("source.search records provider runs and returns source previews", async ()
     const session = await SourceToolRuntime.create(sourceToolRequest(projectRoot));
     const observation = await session.queryProvider("openalex", ["autonomous research agents source tools"]);
 
-    assert.equal(observation.action, "query_provider");
+    assert.equal(observation.action, "source.search");
     assert.equal(observation.counts.newSources, 1);
     assert.equal(observation.items?.[0]?.title, "Source tools for autonomous research agents");
     assert.equal(session.state().providerYields[0]?.providerId, "openalex");
@@ -249,7 +249,7 @@ test("source result snapshots unmerged sources without automatic canonical merge
     assert.equal(result.sourceToolState?.canonicalMergeCompleted, false);
     assert.ok(result.sources.some((source) => /Checkpointed source observations/i.test(source.title)));
     assert.match(result.notes.join("\n"), /Canonical merge was not requested/i);
-    assert.equal(result.sourceToolState?.recentActions?.some((action) => action.action === "merge_sources"), false);
+    assert.equal(result.sourceToolState?.recentActions?.some((action) => action.action === "source.merge"), false);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });

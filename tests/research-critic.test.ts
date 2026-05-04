@@ -56,7 +56,7 @@ function request(): CriticReviewRequest {
   return {
     projectRoot: "/tmp/project",
     runId: "run-test",
-    stage: "source_selection",
+    stage: "sources",
     brief: {
       topic: "autonomous research agents",
       researchQuestion: "Which evidence supports literature-review automation?",
@@ -95,7 +95,7 @@ test("critic output normalization filters invented IDs and caps revision advice"
     confidence: 2,
     objections: [{
       severity: "major",
-      target: "source_selection",
+      target: "sources",
       message: "One selected paper is outside the scoped evidence target.",
       affectedPaperIds: ["paper-1", "invented-paper"],
       affectedClaimIds: ["claim-1", "invented-claim"],
@@ -135,7 +135,7 @@ test("protocol critic normalization drops premature missing-source objections", 
     objections: [{
       code: "no_selected_papers",
       severity: "blocking",
-      target: "source_selection",
+      target: "sources",
       message: "No papers have been selected for review, so evidence cannot be synthesized yet.",
       affectedPaperIds: [],
       affectedClaimIds: [],

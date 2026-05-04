@@ -572,9 +572,16 @@ test("handleGoCommand blocks unresolved user decisions but resumes after the bri
       activeRunId: null,
       lastRunId: "run-old",
       segmentCount: 1,
-      statusReason: "Evidence revision stalled for the current objective.",
+      statusReason: "Choose between two explicit research-continuation options before another segment can help.",
       paperReadiness: "needs_more_evidence",
-      userBlockers: ["Refine the objective or add source access before another segment can help."]
+      nextInternalActions: [
+        "Option A: refine the objective toward a narrower evidence target.",
+        "Option B: add source access credentials and keep the current objective."
+      ],
+      userBlockers: [
+        "Option A: refine the objective toward a narrower evidence target.",
+        "Option B: add source access credentials and keep the current objective."
+      ]
     });
 
     const runStore = new RunStore(projectRoot, "0.6.0", now);

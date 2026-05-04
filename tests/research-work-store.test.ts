@@ -19,7 +19,7 @@ import {
   type WorkStoreCreateInput,
   type WorkStoreWorkItem
 } from "../src/runtime/research-work-store.js";
-import type { ManuscriptBundle } from "../src/runtime/research-manuscript.js";
+import { writeResearchWorkerState } from "../src/runtime/research-state.js";
 
 test("research work store supports create, query, read, and patch operations", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-work-store-"));
@@ -156,7 +156,7 @@ test("work store semantic search returns no items instead of unrelated fallback 
   }
 });
 
-test("work store segment merge does not re-import rendered manuscript views as canonical objects", async () => {
+test("work store segment merge preserves explicit workspace objects without old rendered-view imports", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-work-store-merge-"));
 
   try {
@@ -210,52 +210,6 @@ test("work store segment merge does not re-import rendered manuscript views as c
       status: "checked"
     } satisfies WorkStoreCreateInput<WorkStoreManuscriptSection>, now);
 
-    const bundle = {
-      checks: {
-        schemaVersion: 1,
-        runId: "run-merge",
-        paperPath: "paper.md",
-        readinessStatus: "ready_for_revision",
-        blockerCount: 0,
-        warningCount: 0,
-        checks: [],
-        blockers: []
-      },
-      paper: {
-        schemaVersion: 1,
-        runId: "run-merge",
-        briefFingerprint: "fingerprint",
-        title: "Rendered paper view",
-        abstract: "Rendered from the work store.",
-        reviewType: "narrative_review",
-        structureRationale: "Rendered view only.",
-        scientificRoles: ["synthesis"],
-        sections: [{
-          id: "synthesis",
-          role: "synthesis",
-          title: "Synthesis",
-          markdown: "Rendered section text.",
-          sourceIds: ["paper-rendered-1"],
-          claimIds: ["claim-rendered-1"]
-        }],
-        claims: [{
-          claimId: "claim-rendered-1",
-          claim: "Rendered duplicate claim.",
-          evidence: "Rendered duplicate evidence.",
-          sourceIds: ["paper-rendered-1"]
-        }],
-        citationLinks: [{
-          sourceId: "paper-rendered-1",
-          claimIds: ["claim-rendered-1"],
-          sectionIds: ["synthesis"]
-        }],
-        referencedPaperIds: ["paper-rendered-1"],
-        evidenceTableIds: [],
-        limitations: [],
-        readinessStatus: "ready_for_revision"
-      }
-    } as unknown as ManuscriptBundle;
-
     const merged = mergeRunSegmentIntoResearchWorkStore(store, {
       run: {
         id: "run-merge",
@@ -265,20 +219,6 @@ test("work store segment merge does not re-import rendered manuscript views as c
       plan: {} as never,
       gathered: null,
       paperExtractions: [],
-      evidenceMatrix: null,
-      synthesis: {
-        executiveSummary: "Rendered synthesis should not become canonical state.",
-        themes: [],
-        claims: [{
-          claim: "Rendered duplicate claim.",
-          evidence: "Rendered duplicate evidence.",
-          sourceIds: ["paper-rendered-1"]
-        }],
-        nextQuestions: []
-      },
-      verification: null,
-      agenda: null,
-      manuscriptBundle: bundle,
       criticReports: [],
       now: "2026-01-01T00:00:01.000Z"
     });
@@ -287,6 +227,39 @@ test("work store segment merge does not re-import rendered manuscript views as c
     assert.deepEqual(merged.objects.citations.map((citation) => citation.id), ["citation-tool-1"]);
     assert.deepEqual(merged.objects.manuscriptSections.map((section) => section.id), ["section-tool-1"]);
     assert.equal(merged.objects.releaseChecks.length, 0);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("architecture contract: needs_user_decision requires explicit options and a concrete decision record", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-work-store-user-decision-contract-"));
+
+  try {
+    await assert.rejects(
+      writeResearchWorkerState({
+        schemaVersion: 1,
+        projectRoot,
+        brief: {
+          topic: "Autonomous research agents",
+          researchQuestion: "When may the worker ask the user to decide?",
+          researchDirection: "User decisions require concrete options and a reason the model cannot choose.",
+          successCriterion: "Do not mark needs_user_decision from a vague status string."
+        },
+        status: "needs_user_decision",
+        activeRunId: null,
+        lastRunId: "run-user-decision-contract",
+        segmentCount: 1,
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        statusReason: "Need user decision.",
+        paperReadiness: null,
+        nextInternalActions: [],
+        userBlockers: ["Need user decision."],
+        evidence: null,
+        critic: null
+      }),
+      /user decision|option/i
+    );
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

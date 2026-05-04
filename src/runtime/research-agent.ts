@@ -3,38 +3,6 @@ import type { ResearchPlan } from "./research-backend.js";
 import type { CriticReviewArtifact } from "./research-critic.js";
 import type { ResearchGuidanceContext } from "./research-guidance.js";
 
-export type LegacyResearchActionName =
-  | "revise_protocol"
-  | "revise_search_strategy"
-  | "search_sources"
-  | "screen_sources"
-  | "merge_sources"
-  | "resolve_access"
-  | "select_sources"
-  | "select_evidence_set"
-  | "extract_papers"
-  | "build_evidence_matrix"
-  | "ask_critic"
-  | "work_store.query"
-  | "work_store.read"
-  | "work_store.create"
-  | "work_store.patch"
-  | "evidence.revise_strategy"
-  | "evidence.extract"
-  | "evidence.build_matrix"
-  | "evidence.update_cell"
-  | "evidence.find_support"
-  | "evidence.find_contradictions"
-  | "claim.revise"
-  | "claim.attach_citation"
-  | "critic.create_work_item"
-  | "critic.resolve_work_item"
-  | "manuscript.read_section"
-  | "manuscript.patch_section"
-  | "manuscript.add_paragraph"
-  | "manuscript.check_section_claims"
-  | "manuscript.status";
-
 export type ResearchWorkspaceToolName =
   | "protocol.create_or_revise"
   | "workspace.search"
@@ -49,6 +17,9 @@ export type ResearchWorkspaceToolName =
   | "source.merge"
   | "source.resolve_access"
   | "source.select_evidence"
+  | "extraction.create"
+  | "evidence.create_cell"
+  | "evidence.matrix_view"
   | "claim.create"
   | "claim.patch"
   | "claim.check_support"
@@ -68,8 +39,11 @@ export type ResearchWorkspaceToolName =
   | "release.verify"
   | "manuscript.release";
 
-export type ResearchActionName = LegacyResearchActionName | ResearchWorkspaceToolName;
+export type ResearchActionName = ResearchWorkspaceToolName;
 
+// This is the production tool surface for the model-owned researcher loop.
+// It is intentionally a flat lab-instrument list: milestones may influence
+// observations, but they must not narrow which action the researcher can choose.
 export const researchWorkspaceToolActions: ResearchWorkspaceToolName[] = [
   "protocol.create_or_revise",
   "workspace.search",
@@ -83,6 +57,9 @@ export const researchWorkspaceToolActions: ResearchWorkspaceToolName[] = [
   "source.merge",
   "source.resolve_access",
   "source.select_evidence",
+  "extraction.create",
+  "evidence.create_cell",
+  "evidence.matrix_view",
   "claim.create",
   "claim.patch",
   "claim.check_support",
@@ -167,11 +144,7 @@ export type AgentToolResult = {
 };
 
 export type ResearchAgentPhase =
-  | "protocol"
-  | "source_selection"
-  | "evidence"
-  | "synthesis"
-  | "release";
+  | "research";
 
 export type ResearchActionDecision = {
   schemaVersion: number;
@@ -183,7 +156,7 @@ export type ResearchActionDecision = {
     searchQueries: string[];
     evidenceTargets: string[];
     paperIds: string[];
-    criticStage: string | null;
+    criticScope: string | null;
     reason: string | null;
     workStore?: {
       collection: string | null;
@@ -229,8 +202,8 @@ export type ResearchActionRequest = {
     evidenceRows: number;
     evidenceInsights: number;
     manuscriptReadiness: string | null;
-    revisionPassesUsed: number;
-    revisionPassesRemaining: number;
+    sessionStepsUsed: number;
+    sessionStepsRemaining: number;
   };
   sourceState?: {
     availableProviderIds: string[];
@@ -483,7 +456,7 @@ export function normalizeResearchActionDecision(
       searchQueries: safeStringArray(inputs.searchQueries),
       evidenceTargets: safeStringArray(inputs.evidenceTargets),
       paperIds: safeStringArray(inputs.paperIds),
-      criticStage: safeString(inputs.criticStage),
+      criticScope: safeString(inputs.criticScope),
       reason: safeString(inputs.reason),
       workStore: {
         collection: safeString(workStore.collection),
@@ -524,9 +497,7 @@ export function modelUnsuitableActionDecision(
 
   const fallbackAction = request.allowedActions.includes("workspace.status")
     ? "workspace.status"
-    : request.allowedActions.includes("manuscript.status")
-      ? "manuscript.status"
-      : "workspace.status";
+    : "workspace.status";
 
   return {
     schemaVersion: 1,
@@ -538,7 +509,7 @@ export function modelUnsuitableActionDecision(
       searchQueries: [],
       evidenceTargets: [],
       paperIds: [],
-      criticStage: null,
+      criticScope: null,
       reason: recent.length > 0 ? recent : "Structured action selection failed.",
       workStore: {
         collection: null,

@@ -345,7 +345,7 @@ export interface ResearchSourceToolAdapter {
 }
 
 export type SourceToolObservation = {
-  action: "query_provider" | "merge_sources" | "resolve_access" | "select_evidence_set";
+  action: "source.search" | "source.merge" | "source.resolve_access" | "source.select_evidence";
   message: string;
   counts: {
     providerCalls?: number;
@@ -2989,7 +2989,7 @@ function screeningDecision(
     if (quality.severeConcern) {
       return {
         decision: "uncertain",
-        rationale: `Directly readable at full text. Source-quality concerns (${quality.signals.join(", ")}) keep this paper out of the reviewed synthesis subset for now.`
+        rationale: `Directly readable at full text. Source-quality concerns (${quality.signals.join(", ")}) keep this paper out of the selected evidence subset for now.`
       };
     }
 
@@ -3105,9 +3105,9 @@ function selectionReasonForAssessment(
     case "excluded":
       return status === "excluded"
         ? "Marked as advisory out-of-scope diagnostic by protocol review."
-        : "Excluded because its source role is not suitable for the current synthesis.";
+        : "Excluded because its source role is not suitable for the current selected evidence set.";
     case "deferred":
-      return `Deferred from the current synthesis set after role-aware selection (${role.replace(/_/g, " ")}).`;
+      return `Deferred from the current selected evidence set after role-aware selection (${role.replace(/_/g, " ")}).`;
   }
 }
 
@@ -3127,7 +3127,7 @@ function finalizeRelevanceAssessments(
       ...assessment,
       selectionDecision,
       selectionReason: criticExcluded
-        ? "Excluded from the revised synthesis set because the critic explicitly requested removal."
+        ? "Excluded from the selected evidence set because the critic explicitly requested removal."
         : selectionReasonForAssessment(assessment.status, assessment.sourceRole, selectionDecision),
       criticConcerns: criticExcluded
         ? uniqueStrings([...assessment.criticConcerns, "Critic requested exclusion from the selected evidence set."])
@@ -4159,7 +4159,7 @@ export class SourceToolRuntime {
     }
 
     const matchingAttempts = this.actionHistory
-      .filter((entry) => entry.action === "query_provider" && entry.queryKey === queryKey);
+      .filter((entry) => entry.action === "source.search" && entry.queryKey === queryKey);
     const previousNoProgressAttempts = matchingAttempts.filter((entry) => entry.newSources === 0 || entry.error !== null).length;
 
     if ((input.newSources === 0 || input.error !== null) && previousNoProgressAttempts >= 1) {
@@ -4167,7 +4167,7 @@ export class SourceToolRuntime {
     }
 
     this.recordAction({
-      action: "query_provider",
+      action: "source.search",
       providerId: input.providerId,
       queryKey,
       rawCandidates: input.rawCandidates,
@@ -4202,7 +4202,7 @@ export class SourceToolRuntime {
         message: this.lastObservation
       });
       return {
-        action: "query_provider",
+        action: "source.search",
         message: this.lastObservation,
         counts: {}
       };
@@ -4220,7 +4220,7 @@ export class SourceToolRuntime {
         message: this.lastObservation
       });
       return {
-        action: "query_provider",
+        action: "source.search",
         message: this.lastObservation,
         counts: {
           newSources: 0,
@@ -4240,7 +4240,7 @@ export class SourceToolRuntime {
         message: this.lastObservation
       });
       return {
-        action: "query_provider",
+        action: "source.search",
         message: this.lastObservation,
         counts: {
           newSources: 0,
@@ -4290,7 +4290,7 @@ export class SourceToolRuntime {
           message: this.lastObservation
         });
         return {
-          action: "query_provider",
+          action: "source.search",
           message: this.lastObservation,
           counts: {
             providerCalls: providerResult.providerCalls,
@@ -4345,7 +4345,7 @@ export class SourceToolRuntime {
         message: this.lastObservation
       });
       return {
-        action: "query_provider",
+        action: "source.search",
         message: this.lastObservation,
         counts: {
           providerCalls: providerResult.providerCalls,
@@ -4381,7 +4381,7 @@ export class SourceToolRuntime {
         message
       });
       return {
-        action: "query_provider",
+        action: "source.search",
         message,
         counts: {}
       };
@@ -4404,7 +4404,7 @@ export class SourceToolRuntime {
     });
     this.lastObservation = `Merged ${this.scholarlySources.length} screened scholarly sources into ${this.canonicalReview.canonicalPapers.length} canonical papers.`;
     const observation: SourceToolObservation = {
-      action: "merge_sources",
+      action: "source.merge",
       message: this.lastObservation,
       counts: {
         scholarlySources: this.scholarlySources.length,
@@ -4420,7 +4420,7 @@ export class SourceToolRuntime {
     if (this.canonicalReview === null) {
       this.lastObservation = "source.resolve_access requires canonical papers from an explicit source.merge action; no automatic merge was performed.";
       const observation: SourceToolObservation = {
-        action: "resolve_access",
+        action: "source.resolve_access",
         message: this.lastObservation,
         counts: {
           scholarlySources: this.scholarlySources.length,
@@ -4438,7 +4438,7 @@ export class SourceToolRuntime {
     if (requestedPaperIds.length === 0) {
       this.lastObservation = "Access resolution requires explicit known paper ids from the researcher; no automatic access target was selected.";
       const observation: SourceToolObservation = {
-        action: "resolve_access",
+        action: "source.resolve_access",
         message: this.lastObservation,
         counts: {
           canonicalPapers: this.canonicalReview!.canonicalPapers.length,
@@ -4464,7 +4464,7 @@ export class SourceToolRuntime {
 
     this.lastObservation = `Resolved access for ${targetPaperIds.length} agent-selected candidate papers; ${this.canonicalReview.canonicalPapers.length} canonical papers remain available.`;
     const observation: SourceToolObservation = {
-      action: "resolve_access",
+      action: "source.resolve_access",
       message: this.lastObservation,
       counts: {
         canonicalPapers: this.canonicalReview.canonicalPapers.length,
@@ -4483,7 +4483,7 @@ export class SourceToolRuntime {
     if (this.canonicalReview === null) {
       this.lastObservation = "source.select_evidence requires canonical papers from an explicit source.merge action; no automatic merge or evidence selection was performed.";
       const observation: SourceToolObservation = {
-        action: "select_evidence_set",
+        action: "source.select_evidence",
         message: this.lastObservation,
         counts: {
           scholarlySources: this.scholarlySources.length,
@@ -4536,8 +4536,8 @@ export class SourceToolRuntime {
     this.canonicalReview = canonicalReview;
 
     this.lastObservation = requestedPaperIds.length > 0
-      ? `Selected ${canonicalReview.reviewedPapers.length} researcher-requested papers for synthesis from ${canonicalReview.canonicalPapers.length} canonical papers.`
-      : `Selected ${canonicalReview.reviewedPapers.length} papers for synthesis from ${canonicalReview.canonicalPapers.length} canonical papers.`;
+      ? `Selected ${canonicalReview.reviewedPapers.length} researcher-requested papers for the evidence set from ${canonicalReview.canonicalPapers.length} canonical papers.`
+      : `Selected ${canonicalReview.reviewedPapers.length} papers for the evidence set from ${canonicalReview.canonicalPapers.length} canonical papers.`;
     await emitSourceProgress(this.request.progress, {
       phase: "review_selection",
       status: "completed",
@@ -4549,7 +4549,7 @@ export class SourceToolRuntime {
       }
     });
     const observation: SourceToolObservation = {
-      action: "select_evidence_set",
+      action: "source.select_evidence",
       message: this.lastObservation,
       counts: {
         canonicalPapers: canonicalReview.canonicalPapers.length,
@@ -4616,7 +4616,7 @@ export class SourceToolRuntime {
       canonicalPapers,
       reviewedPapers,
       notes: [
-        "Source tool loop active.",
+        "Source tool runtime active.",
         `Model-selected providers attempted: ${[...this.attemptedProviderIds].join(", ") || "none"}.`,
         this.canonicalReview === null
           ? `Canonical merge was not requested; ${this.scholarlySources.length} screened scholarly discovery hit(s) remain unmerged.`
@@ -4639,7 +4639,7 @@ export class SourceToolRuntime {
     await emitSourceProgress(this.request.progress, {
       phase: "completed",
       status: "completed",
-      message: `Source tool loop checkpointed with ${snapshot.canonicalPapers.length} canonical papers and ${snapshot.reviewedPapers.length} selected papers.`,
+      message: `Source tool runtime checkpointed with ${snapshot.canonicalPapers.length} canonical papers and ${snapshot.reviewedPapers.length} selected papers.`,
       counts: {
         rawSources: snapshot.sources.length,
         canonicalPapers: snapshot.canonicalPapers.length,

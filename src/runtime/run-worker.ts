@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   buildLiteratureContext,
@@ -12,10 +12,7 @@ import {
 } from "./literature-store.js";
 import {
   buildProjectMemoryContext,
-  createMemoryRecordId,
-  MemoryStore,
-  type MemoryLink,
-  type MemoryRecordInput
+  MemoryStore
 } from "./memory-store.js";
 import { applyCredentialsToEnvironment, CredentialStore } from "./credential-store.js";
 import {
@@ -29,13 +26,8 @@ import {
   type RuntimeLlmConfig
 } from "./project-config-store.js";
 import type {
-  ResearchAgenda,
   ResearchBackend,
-  ResearchClaim,
-  ResearchPlan,
-  ResearchSynthesis,
-  ResearchTheme,
-  ResearchDirectionCandidate
+  ResearchPlan
 } from "./research-backend.js";
 import {
   modelUnsuitableActionDecision,
@@ -49,41 +41,34 @@ import {
 } from "./research-agent.js";
 import {
   createProjectResearchBackend,
-  ResearchBackendError,
-  type ResearchBackendOperation
+  ResearchBackendError
 } from "./research-backend.js";
 import {
-  buildEvidenceMatrix,
-  briefFingerprint,
-  type EvidenceMatrix,
-  type EvidenceMatrixInsight,
-  type PaperExtraction
-} from "./research-evidence.js";
-import {
-  applyCriticReportsToManuscriptBundle,
   buildReviewProtocol,
   reviewProtocolMarkdown,
-  type ManuscriptBundle,
   type ManuscriptCheck,
+  type ManuscriptChecksArtifact,
   type ManuscriptReadinessState,
-  type PaperOutline,
   type ReferenceRecord,
   type ReferencesArtifact,
-  type ReviewProtocol,
-  type ReviewPaperArtifact
+  type ReviewPaperArtifact,
+  type ReviewProtocol
 } from "./research-manuscript.js";
 import {
-  criticReviewPassed,
-  criticUnavailableReview,
-  type CriticReviewArtifact,
-  type CriticReviewRequest,
-  type CriticReviewStage
+  briefFingerprint,
+  buildEvidenceMatrix,
+  type PaperClaimSupportStrength,
+  type PaperExtraction,
+  type PaperExtractionConfidence
+} from "./research-evidence.js";
+import {
+  normalizeCriticReview,
+  type CriticReviewScope
 } from "./research-critic.js";
 import {
   SourceToolRuntime,
   collectResearchLocalFileHints,
   type SourceToolState,
-  type ResearchSource,
   type ResearchSourceToolRequest,
   type SourceToolProgressEvent,
   type ResearchSourceToolAdapter,
@@ -105,15 +90,9 @@ import {
   createResearchWorkerState,
   loadResearchWorkerState,
   writeResearchWorkerState,
-  type ResearchWorkerState,
-  type ResearchWorkerStatus
+  type ResearchWorkerState
 } from "./research-state.js";
 import type { ResearchBrief } from "./session-store.js";
-import {
-  verifyResearchClaims,
-  type VerificationReport,
-  type VerifiedClaim
-} from "./verifier.js";
 import {
   buildLiteratureContextFromWorkStore,
   buildProjectMemoryContextFromWorkStore,
@@ -139,6 +118,7 @@ import {
   type WorkStoreManuscriptSection,
   type WorkStoreProtocol,
   type WorkStoreReleaseCheck,
+  type ResearchWorkerStatus,
   type WorkStoreWorkItem
 } from "./research-work-store.js";
 import {
@@ -160,19 +140,6 @@ type WorkerOptions = {
 
 type JsonValue = boolean | number | string | null | JsonValue[] | { [key: string]: JsonValue };
 
-type PaperExtractionsArtifact = {
-  schemaVersion: number;
-  runId: string;
-  briefFingerprint: string;
-  status?: "pending" | "in_progress" | "completed" | "failed";
-  paperCount: number;
-  extractionCount: number;
-  completedPaperIds?: string[];
-  failedPaperIds?: string[];
-  batchAttempts?: ExtractionBatchAttempt[];
-  extractions: PaperExtraction[];
-};
-
 type ArtifactStatus = {
   schemaVersion: number;
   runId: string;
@@ -187,25 +154,6 @@ type ArtifactStatus = {
     kind: string;
     operation: string | null;
   } | null;
-};
-
-type ExtractionBatchAttempt = {
-  attempt: number;
-  paperIds: string[];
-  batchSize: number;
-  status: "succeeded" | "failed";
-  compact: boolean;
-  errorKind: string | null;
-  errorMessage: string | null;
-  timeoutMs: number;
-};
-
-type ClaimsArtifact = {
-  schemaVersion: number;
-  runId: string;
-  briefFingerprint: string;
-  claimCount: number;
-  claims: ResearchClaim[];
 };
 
 type AgentStepStatus =
@@ -274,7 +222,7 @@ function runLoopCommand(runId: string): string[] {
     "--run-id",
     runId,
     "--mode",
-    "provider-aware-literature-loop"
+    "model-driven-research-session"
   ];
 }
 
@@ -329,9 +277,7 @@ function sourceProgressMessage(event: SourceToolProgressEvent): string {
 async function writeSourceToolCheckpoint(input: {
   run: RunRecord;
   now: () => string;
-  evidencePass: number;
-  revisionPasses: number;
-  maxRevisionPasses: number;
+  sessionSegment: number;
   event: SourceToolProgressEvent;
   sourceState?: SourceToolState | null;
 }): Promise<void> {
@@ -341,10 +287,8 @@ async function writeSourceToolCheckpoint(input: {
     status: input.event.phase === "completed" && input.event.status === "completed" ? "completed" : "in_progress",
     stage: "source_tools",
     updatedAt: input.now(),
-    autonomousEvidence: {
-      pass: input.evidencePass,
-      revisionPasses: input.revisionPasses,
-      maxRevisionPasses: input.maxRevisionPasses
+    modelDrivenSession: {
+      segment: input.sessionSegment
     },
     progress: input.event,
     sourceState: input.sourceState ?? null
@@ -479,28 +423,23 @@ function workStoreContextForAgent(store: ResearchWorkStore): ResearchActionReque
 }
 
 function isSourceSearchAction(action: ResearchActionDecision["action"]): boolean {
-  return action === "source.search"
-    || action === "search_sources"
-    || action === "revise_search_strategy"
-    || action === "evidence.revise_strategy";
+  return action === "source.search";
 }
 
 function isSourceMergeAction(action: ResearchActionDecision["action"]): boolean {
-  return action === "source.merge" || action === "merge_sources";
+  return action === "source.merge";
 }
 
 function isSourceResolveAccessAction(action: ResearchActionDecision["action"]): boolean {
-  return action === "source.resolve_access" || action === "resolve_access";
+  return action === "source.resolve_access";
 }
 
 function isSourceSelectEvidenceAction(action: ResearchActionDecision["action"]): boolean {
-  return action === "source.select_evidence"
-    || action === "select_evidence_set"
-    || action === "select_sources";
+  return action === "source.select_evidence";
 }
 
 function isStatusAction(action: ResearchActionDecision["action"]): boolean {
-  return action === "workspace.status" || action === "manuscript.status";
+  return action === "workspace.status";
 }
 
 function isGuidanceToolAction(action: ResearchActionDecision["action"]): boolean {
@@ -516,24 +455,19 @@ function isWorkStoreToolAction(action: ResearchActionDecision["action"]): boolea
     || action === "workspace.create"
     || action === "workspace.patch"
     || action === "workspace.link"
-    || action === "workspace.unlink"
-    || action === "work_store.query"
-    || action === "work_store.read"
-    || action === "work_store.create"
-    || action === "work_store.patch";
+    || action === "workspace.unlink";
 }
 
 function isResearchObjectToolAction(action: ResearchActionDecision["action"]): boolean {
   return action === "protocol.create_or_revise"
     || action === "claim.create"
     || action === "claim.patch"
-    || action === "claim.revise"
     || action === "claim.check_support"
     || action === "claim.link_support"
-    || action === "claim.attach_citation"
-    || action === "evidence.update_cell"
-    || action === "evidence.find_support"
-    || action === "evidence.find_contradictions"
+    || action === "extraction.create"
+    || action === "evidence.create_cell"
+    || action === "evidence.matrix_view"
+    || action === "critic.review"
     || action === "section.create"
     || action === "section.read"
     || action === "section.patch"
@@ -543,24 +477,15 @@ function isResearchObjectToolAction(action: ResearchActionDecision["action"]): b
     || action === "work_item.patch"
     || action === "check.run"
     || action === "release.verify"
-    || action === "manuscript.read_section"
-    || action === "manuscript.patch_section"
-    || action === "manuscript.add_paragraph"
-    || action === "manuscript.check_section_claims"
-    || action === "critic.create_work_item"
-    || action === "critic.resolve_work_item";
+    || action === "manuscript.release";
 }
 
 function isReadOnlyWorkspaceAction(action: ResearchActionDecision["action"]): boolean {
   return action === "workspace.search"
     || action === "workspace.read"
     || action === "workspace.list"
-    || action === "work_store.query"
-    || action === "work_store.read"
-    || action === "evidence.find_support"
-    || action === "evidence.find_contradictions"
+    || action === "evidence.matrix_view"
     || action === "section.read"
-    || action === "manuscript.read_section"
     || action === "guidance.search"
     || action === "guidance.read"
     || action === "guidance.recommend";
@@ -905,19 +830,6 @@ function rememberAgentToolResult(results: AgentToolResult[], result: AgentToolRe
   return [...results, result].slice(-6);
 }
 
-function canonicalSourceToolAction(action: SourceToolObservation["action"]): string {
-  switch (action) {
-    case "query_provider":
-      return "source.search";
-    case "merge_sources":
-      return "source.merge";
-    case "resolve_access":
-      return "source.resolve_access";
-    case "select_evidence_set":
-      return "source.select_evidence";
-  }
-}
-
 function sourceToolStatus(observation: SourceToolObservation): AgentToolResult["status"] {
   if (/\b(failed|not available)\b/i.test(observation.message)) {
     return "failed";
@@ -949,13 +861,13 @@ function sourceToolTotalCount(observation: SourceToolObservation): number {
 
 function sourceToolNextHints(observation: SourceToolObservation): string[] {
   switch (observation.action) {
-    case "query_provider":
+    case "source.search":
       return ["source.search", "source.merge", "workspace.list"];
-    case "merge_sources":
+    case "source.merge":
       return ["workspace.read", "source.resolve_access", "source.select_evidence"];
-    case "resolve_access":
+    case "source.resolve_access":
       return ["workspace.read", "source.select_evidence", "claim.create"];
-    case "select_evidence_set":
+    case "source.select_evidence":
       return ["workspace.read", "claim.create", "section.create"];
   }
 }
@@ -987,7 +899,7 @@ function sourceToolResultFromObservation(input: {
   providerId?: SourceProviderId;
 }): AgentToolResult {
   const timestamp = input.now();
-  const action = canonicalSourceToolAction(input.observation.action);
+  const action = input.observation.action;
   const items = sourceToolItemsForAgent(input.observation);
   const providerIds = input.providerId === undefined
     ? input.decision.inputs.providerIds
@@ -1512,6 +1424,140 @@ function safeEvidenceCellField(value: unknown): WorkStoreEvidenceCell["field"] {
     : "successSignals";
 }
 
+function safeCriticReviewScope(value: unknown): CriticReviewScope {
+  return value === "protocol"
+    || value === "sources"
+    || value === "evidence"
+    || value === "release"
+    ? value
+    : "release";
+}
+
+function safeManuscriptReadiness(value: unknown): ManuscriptReadinessState | null {
+  return value === "not_started"
+    || value === "drafted"
+    || value === "needs_more_evidence"
+    || value === "needs_human_review"
+    || value === "ready_for_revision"
+    || value === "blocked"
+    ? value
+    : null;
+}
+
+function safePaperExtractionConfidence(value: unknown): PaperExtractionConfidence {
+  return value === "high" || value === "medium" || value === "low"
+    ? value
+    : "medium";
+}
+
+function safePaperClaimSupportStrength(value: unknown): PaperClaimSupportStrength {
+  return value === "explicit" || value === "partial" || value === "implied"
+    ? value
+    : "partial";
+}
+
+function knownSourceFromToolInput(input: {
+  store: ResearchWorkStore;
+  decision: ResearchActionDecision;
+  entity: Record<string, unknown>;
+}): WorkStoreCanonicalSource | null {
+  const candidateIds = uniqueStrings([
+    stringInput(input.entity.sourceId, ""),
+    stringInput(input.entity.paperId, ""),
+    ...input.decision.inputs.paperIds,
+    ...stringArrayInput(input.entity.sourceIds, 20)
+  ]);
+
+  for (const sourceId of candidateIds) {
+    const source = canonicalSourceForId(input.store, sourceId);
+    if (source !== null) {
+      return source;
+    }
+  }
+
+  return null;
+}
+
+function supportedClaimsFromToolInput(value: unknown, decision: ResearchActionDecision): PaperExtraction["supportedClaims"] {
+  if (!Array.isArray(value)) {
+    const targets = decision.inputs.evidenceTargets.length > 0
+      ? decision.inputs.evidenceTargets
+      : [decision.expectedOutcome];
+    return targets
+      .map((claim) => compactPreviewText(claim, 260))
+      .filter((claim) => claim.length > 0)
+      .slice(0, 12)
+      .map((claim) => ({ claim, support: "partial" }));
+  }
+
+  return value.flatMap((entry) => {
+    if (typeof entry === "string") {
+      const claim = compactPreviewText(entry, 260);
+      return claim.length === 0 ? [] : [{ claim, support: "partial" as const }];
+    }
+    const record = objectInput(entry);
+    if (record === null) {
+      return [];
+    }
+    const claim = stringInput(record.claim ?? record.text, "");
+    return claim.length === 0
+      ? []
+      : [{
+        claim: compactPreviewText(claim, 260),
+        support: safePaperClaimSupportStrength(record.support)
+      }];
+  }).slice(0, 20);
+}
+
+function paperExtractionFromToolInput(input: {
+  run: RunRecord;
+  now: string;
+  decision: ResearchActionDecision;
+  store: ResearchWorkStore;
+}): { extraction: WorkStoreEntity; source: WorkStoreCanonicalSource } | null {
+  const entity = input.decision.inputs.workStore?.entity ?? {};
+  const source = knownSourceFromToolInput({
+    store: input.store,
+    decision: input.decision,
+    entity
+  });
+  if (source === null) {
+    return null;
+  }
+
+  const problemSetting = stringInput(entity.problemSetting ?? entity.problem, input.decision.expectedOutcome);
+  const paperExtraction: PaperExtraction = {
+    id: stringInput(entity.id ?? entity.extractionId, generatedToolEntityId("extraction", input.run, input.now, source.id)),
+    paperId: source.id,
+    runId: input.run.id,
+    problemSetting,
+    systemType: stringInput(entity.systemType, "model-authored extraction"),
+    architecture: stringInput(entity.architecture, ""),
+    toolsAndMemory: stringInput(entity.toolsAndMemory, ""),
+    planningStyle: stringInput(entity.planningStyle, ""),
+    evaluationSetup: stringInput(entity.evaluationSetup, ""),
+    successSignals: stringArrayInput(entity.successSignals ?? entity.findings, 40),
+    failureModes: stringArrayInput(entity.failureModes, 40),
+    limitations: stringArrayInput(entity.limitations, 40),
+    supportedClaims: supportedClaimsFromToolInput(entity.supportedClaims ?? entity.claims, input.decision),
+    confidence: safePaperExtractionConfidence(entity.confidence),
+    evidenceNotes: stringArrayInput(entity.evidenceNotes ?? entity.notes, 40)
+  };
+
+  return {
+    source,
+    extraction: {
+      id: paperExtraction.id,
+      kind: "extraction",
+      runId: input.run.id,
+      createdAt: input.now,
+      updatedAt: input.now,
+      sourceId: source.id,
+      extraction: paperExtraction
+    }
+  };
+}
+
 function claimFromToolInput(input: {
   run: RunRecord;
   now: string;
@@ -1544,22 +1590,37 @@ function evidenceCellFromToolInput(input: {
   run: RunRecord;
   now: string;
   decision: ResearchActionDecision;
-}): WorkStoreEvidenceCell {
+  store: ResearchWorkStore;
+}): WorkStoreEvidenceCell | null {
   const entity = input.decision.inputs.workStore?.entity ?? {};
-  const sourceId = stringInput(entity.sourceId, input.decision.inputs.paperIds[0] ?? "unknown-source");
+  const source = knownSourceFromToolInput({
+    store: input.store,
+    decision: input.decision,
+    entity
+  });
+  if (source === null) {
+    return null;
+  }
+  const requestedExtractionId = stringInput(entity.extractionId, "");
+  const extraction = requestedExtractionId.length > 0
+    ? readResearchWorkStoreEntity(input.store, "extractions", requestedExtractionId)
+    : input.store.objects.extractions.find((candidate) => sourceEquivalentIds(input.store, source.id).includes(candidate.sourceId)) ?? null;
+  if (extraction === null) {
+    return null;
+  }
   const field = safeEvidenceCellField(entity.field);
   const value = Array.isArray(entity.value)
     ? stringArrayInput(entity.value, 40)
     : stringInput(entity.value, input.decision.inputs.evidenceTargets.join("; ") || input.decision.expectedOutcome);
 
   return {
-    id: stringInput(entity.id, generatedToolEntityId("evidence-cell", input.run, input.now, `${sourceId}-${field}`)),
+    id: stringInput(entity.id, generatedToolEntityId("evidence-cell", input.run, input.now, `${source.id}-${field}`)),
     kind: "evidenceCell",
     runId: input.run.id,
     createdAt: input.now,
     updatedAt: input.now,
-    sourceId,
-    extractionId: stringInput(entity.extractionId, `extraction-${sourceId}`),
+    sourceId: source.id,
+    extractionId: extraction.id,
     field,
     value,
     confidence: stringInput(entity.confidence, "medium")
@@ -1582,10 +1643,7 @@ function manuscriptSectionFromToolInput(input: {
     entity.paragraph ?? entity.markdown ?? changes.paragraph ?? changes.markdown,
     input.decision.inputs.reason ?? input.decision.expectedOutcome
   );
-  const existingMarkdown = input.existing?.markdown ?? "";
-  const markdown = input.decision.action === "manuscript.add_paragraph" && existingMarkdown.trim().length > 0
-    ? `${existingMarkdown.trim()}\n\n${paragraph}`
-    : paragraph;
+  const markdown = paragraph;
 
   return {
     id: input.existing?.id ?? stringInput(entity.id, generatedToolEntityId("section", input.run, input.now, sectionId)),
@@ -1608,6 +1666,19 @@ function manuscriptSectionFromToolInput(input: {
     ]),
     status: "needs_revision"
   };
+}
+
+function criticReviewArtifactPath(run: RunRecord, stage: CriticReviewScope): string {
+  switch (stage) {
+    case "protocol":
+      return run.artifacts.criticProtocolReviewPath;
+    case "sources":
+      return run.artifacts.criticSourceSelectionPath;
+    case "evidence":
+      return run.artifacts.criticEvidenceReviewPath;
+    case "release":
+      return run.artifacts.criticReleaseReviewPath;
+  }
 }
 
 function guidancePreviewForAgent(item: {
@@ -1733,7 +1804,7 @@ async function executeWorkStoreToolAction(input: {
   const args = input.decision.inputs.workStore ?? defaultWorkStoreArgs();
   const collection = safeWorkStoreCollection(args.collection);
 
-  if (input.decision.action === "workspace.search" || input.decision.action === "workspace.list" || input.decision.action === "work_store.query") {
+  if (input.decision.action === "workspace.search" || input.decision.action === "workspace.list") {
     const queryCollection = collection ?? "workItems";
     const timestamp = input.now();
     const result = queryResearchWorkStore(input.store, {
@@ -1774,7 +1845,7 @@ async function executeWorkStoreToolAction(input: {
     };
   }
 
-  if (input.decision.action === "workspace.read" || input.decision.action === "work_store.read") {
+  if (input.decision.action === "workspace.read") {
     const timestamp = input.now();
     if (collection === null || args.entityId === null) {
       const message = "Workspace read skipped because collection or entityId was missing.";
@@ -1822,7 +1893,7 @@ async function executeWorkStoreToolAction(input: {
     };
   }
 
-  if (input.decision.action === "workspace.patch" || input.decision.action === "work_store.patch") {
+  if (input.decision.action === "workspace.patch") {
     if (collection === null || args.entityId === null || Object.keys(args.changes).length === 0) {
       return {
         handled: true,
@@ -1987,7 +2058,98 @@ async function executeResearchObjectToolAction(input: {
     };
   }
 
-  if (input.decision.action === "critic.create_work_item" || input.decision.action === "work_item.create") {
+  if (input.decision.action === "critic.review") {
+    const stage = safeCriticReviewScope(args.entity.stage ?? input.decision.inputs.criticScope);
+    const rawReview = objectInput(args.entity.review)
+      ?? objectInput(args.entity.criticReview)
+      ?? (
+        "readiness" in args.entity || "objections" in args.entity || "recoveryAdvice" in args.entity || "revisionAdvice" in args.entity
+          ? args.entity
+          : null
+      );
+    if (rawReview === null) {
+      const message = "Critic review was not run because no critic review payload was provided and no critic backend transport is wired for this explicit tool yet.";
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "noop",
+          readOnly: false,
+          message,
+          collection: "workItems",
+          count: 0,
+          totalCount: input.store.objects.workItems.length,
+          nextHints: ["work_item.create", "workspace.read", "check.run"]
+        })
+      };
+    }
+
+    const references = referencesFromWorkStore(input.run, input.store);
+    const checks = workspaceManuscriptChecks({ run: input.run, store: input.store, references });
+    const paper = workspacePaperArtifact({
+      run: input.run,
+      store: input.store,
+      references,
+      readinessStatus: checks.readinessStatus
+    });
+    const review = normalizeCriticReview(rawReview, {
+      projectRoot: input.run.projectRoot,
+      runId: input.run.id,
+      stage,
+      brief: input.run.brief,
+      selectedPapers: [],
+      relevanceAssessments: input.store.objects.canonicalSources.map((source) => ({
+        paperId: source.id,
+        title: source.title,
+        status: "in_scope",
+        sourceRole: "background",
+        selectionDecision: "selected_supporting",
+        selectionReason: "Source is visible in the canonical workspace.",
+        criticConcerns: [],
+        requiredForManuscript: false,
+        reviewer: "advisory_protocol_review",
+        matchedCriteria: [],
+        missingCriteria: [],
+        reason: "Workspace source made visible to explicit critic.review."
+      })),
+      paper,
+      references,
+      manuscriptChecks: checks
+    });
+    const workItems = workItemsFromCriticReports(input.run, [review], nowText);
+    const nextStore = upsertResearchWorkStoreEntities(input.store, workItems, nowText);
+    await writeResearchWorkStore(nextStore);
+    await writeJsonArtifact(criticReviewArtifactPath(input.run, stage), review);
+    const message = `Critic review ${stage} persisted ${workItems.length} work item(s); readiness ${review.readiness}.`;
+    return {
+      handled: true,
+      store: nextStore,
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        readOnly: false,
+        message,
+        collection: "workItems",
+        count: workItems.length,
+        totalCount: nextStore.objects.workItems.length,
+        items: workItems.map((item) => entityPreviewForAgent(item, nextStore)),
+        stateDelta: {
+          criticWorkItemsCreated: workItems.length
+        },
+        nextHints: review.readiness === "pass"
+          ? ["release.verify", "workspace.status"]
+          : ["workspace.read", "work_item.patch", "claim.patch", "source.search"]
+      })
+    };
+  }
+
+  if (input.decision.action === "work_item.create") {
     const workItem = agentWorkItemFromCreateInput({
       run: input.run,
       now: nowText,
@@ -2003,7 +2165,7 @@ async function executeResearchObjectToolAction(input: {
     };
   }
 
-  if (input.decision.action === "critic.resolve_work_item" || input.decision.action === "work_item.patch") {
+  if (input.decision.action === "work_item.patch") {
     const workItemId = args.entityId ?? input.decision.inputs.paperIds[0] ?? null;
     if (workItemId === null) {
       return {
@@ -2042,7 +2204,7 @@ async function executeResearchObjectToolAction(input: {
     };
   }
 
-  if (input.decision.action === "claim.patch" || input.decision.action === "claim.revise") {
+  if (input.decision.action === "claim.patch") {
     const claimId = args.entityId;
     if (claimId === null) {
       return {
@@ -2094,7 +2256,7 @@ async function executeResearchObjectToolAction(input: {
     };
   }
 
-  if (input.decision.action === "claim.link_support" || input.decision.action === "claim.attach_citation") {
+  if (input.decision.action === "claim.link_support") {
     const claimId = args.entityId;
     const evidenceCellId = stringInput(args.entity.evidenceCellId, stringArrayInput(args.entity.evidenceCellIds, 1)[0] ?? "");
     const evidenceCell = evidenceCellId.length === 0
@@ -2172,31 +2334,145 @@ async function executeResearchObjectToolAction(input: {
     };
   }
 
-  if (input.decision.action === "evidence.update_cell") {
-    const cell = evidenceCellFromToolInput({
+  if (input.decision.action === "extraction.create") {
+    const extractionResult = paperExtractionFromToolInput({
       run: input.run,
       now: nowText,
-      decision: input.decision
+      decision: input.decision,
+      store: input.store
     });
-    const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, cell, nowText);
+    if (extractionResult === null) {
+      const message = "Extraction create blocked because no known canonical source id was provided.";
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "blocked",
+          readOnly: false,
+          message,
+          collection: "extractions",
+          count: 0,
+          totalCount: input.store.objects.extractions.length,
+          nextHints: ["workspace.list", "source.search", "source.merge"]
+        })
+      };
+    }
+    const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, extractionResult.extraction, nowText);
     await writeResearchWorkStore(nextStore);
+    const message = `Extraction created for source ${extractionResult.source.title}.`;
     return {
       handled: true,
       store: nextStore,
-      message: `Evidence cell updated ${cell.id}.`
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        readOnly: false,
+        message,
+        collection: "extractions",
+        count: 1,
+        totalCount: nextStore.objects.extractions.length,
+        entity: entityPreviewForAgent(extractionResult.extraction, nextStore),
+        stateDelta: {
+          extractionsCreated: 1
+        },
+        nextHints: ["evidence.create_cell", "workspace.read", "claim.create"]
+      })
     };
   }
 
-  if (input.decision.action === "evidence.find_support" || input.decision.action === "evidence.find_contradictions") {
-    const timestamp = input.now();
-    const semanticQuery = args.semanticQuery ?? input.decision.inputs.evidenceTargets.join(" ");
-    const result = queryResearchWorkStore(input.store, {
-      collection: "evidenceCells",
-      semanticQuery,
-      limit: args.limit ?? 12,
-      cursor: args.cursor ?? null
+  if (input.decision.action === "evidence.create_cell") {
+    const cell = evidenceCellFromToolInput({
+      run: input.run,
+      now: nowText,
+      decision: input.decision,
+      store: input.store
     });
-    const message = `${input.decision.action} found ${result.count}/${result.totalCount} evidence cell(s).${result.hasMore ? ` More available with cursor ${result.nextCursor}.` : ""}`;
+    if (cell === null) {
+      const message = "Evidence cell create blocked because it requires a known source id and an existing extraction for that source.";
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "blocked",
+          readOnly: false,
+          message,
+          collection: "evidenceCells",
+          count: 0,
+          totalCount: input.store.objects.evidenceCells.length,
+          nextHints: ["extraction.create", "workspace.list", "workspace.read"]
+        })
+      };
+    }
+    const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, cell, nowText);
+    await writeResearchWorkStore(nextStore);
+    const message = `Evidence cell created ${cell.id}.`;
+    return {
+      handled: true,
+      store: nextStore,
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        readOnly: false,
+        message,
+        collection: "evidenceCells",
+        count: 1,
+        totalCount: nextStore.objects.evidenceCells.length,
+        entity: entityPreviewForAgent(cell, nextStore),
+        stateDelta: {
+          evidenceCellsCreated: 1
+        },
+        nextHints: ["claim.create", "claim.link_support", "evidence.matrix_view"]
+      })
+    };
+  }
+
+  if (input.decision.action === "evidence.matrix_view") {
+    const timestamp = input.now();
+    const matrix = buildEvidenceMatrix({
+      runId: input.run.id,
+      brief: input.run.brief,
+      paperExtractions: input.store.objects.extractions.map((entry) => entry.extraction)
+    });
+    const rowItems = matrix.rows.slice(0, 20).map((row): AgentVisibleEntityPreview => ({
+      id: row.extractionId,
+      kind: "evidenceMatrixRow",
+      sourceId: row.paperId,
+      sourceTitle: previewSourceTitle(input.store, row.paperId),
+      confidence: row.confidence,
+      snippet: compactPreviewText(row.problemSetting),
+      fields: {
+        problemSetting: compactPreviewText(row.problemSetting),
+        architecture: compactPreviewText(row.architecture),
+        evaluationSetup: compactPreviewText(row.evaluationSetup),
+        successSignals: compactPreviewList(row.successSignals),
+        limitations: compactPreviewList(row.limitations),
+        claimCount: row.claimCount
+      }
+    }));
+    const insightItems = matrix.derivedInsights.slice(0, 12).map((insight): AgentVisibleEntityPreview => ({
+      id: insight.id,
+      kind: `evidenceMatrixInsight:${insight.kind}`,
+      title: insight.title,
+      sourceIds: insight.paperIds.slice(0, 12),
+      text: insight.summary,
+      snippet: compactPreviewText(insight.summary),
+      fields: {
+        claimTexts: insight.claimTexts.slice(0, 6)
+      }
+    }));
+    const message = `Evidence matrix view returned ${matrix.rowCount} row(s) and ${matrix.derivedInsights.length} derived insight(s) without mutating workspace state.`;
     return {
       handled: true,
       store: input.store,
@@ -2208,23 +2484,18 @@ async function executeResearchObjectToolAction(input: {
         readOnly: true,
         message,
         collection: "evidenceCells",
-        query: {
-          semanticQuery,
-          limit: args.limit ?? 12,
-          cursor: args.cursor ?? null
+        count: rowItems.length,
+        totalCount: matrix.rowCount,
+        items: [...rowItems, ...insightItems],
+        stateDelta: {
+          evidenceCellsCreated: 0
         },
-        count: result.count,
-        totalCount: result.totalCount,
-        cursor: result.cursor,
-        hasMore: result.hasMore,
-        nextCursor: result.nextCursor,
-        items: result.items.map((entity) => entityPreviewForAgent(entity, input.store)),
-        nextHints: ["claim.create", "claim.link_support", "workspace.read"]
+        nextHints: ["claim.create", "workspace.read", "evidence.create_cell"]
       })
     };
   }
 
-  if (input.decision.action === "section.read" || input.decision.action === "manuscript.read_section") {
+  if (input.decision.action === "section.read") {
     const timestamp = input.now();
     const sectionId = args.entityId;
     const section = sectionId === null ? null : readResearchWorkStoreEntity<WorkStoreManuscriptSection>(input.store, "manuscriptSections", sectionId);
@@ -2254,7 +2525,7 @@ async function executeResearchObjectToolAction(input: {
     };
   }
 
-  if (input.decision.action === "section.create" || input.decision.action === "section.patch" || input.decision.action === "manuscript.patch_section" || input.decision.action === "manuscript.add_paragraph") {
+  if (input.decision.action === "section.create" || input.decision.action === "section.patch") {
     const sectionId = args.entityId;
     const existing = sectionId === null ? null : readResearchWorkStoreEntity<WorkStoreManuscriptSection>(input.store, "manuscriptSections", sectionId);
     const section = manuscriptSectionFromToolInput({
@@ -2305,20 +2576,11 @@ async function executeResearchObjectToolAction(input: {
       store: input.store,
       references
     });
-    const releaseChecks = checkBundle.checks.map((check): WorkStoreReleaseCheck => ({
-      id: `release-check-${numericTextIdPart(check.id)}-${input.run.id}`,
-      kind: "releaseCheck",
-      runId: input.run.id,
-      createdAt: nowText,
-      updatedAt: nowText,
-      checkId: check.id,
-      title: check.title,
-      status: check.status,
-      severity: check.severity,
-      message: check.message
-    }));
+    const releaseChecks = releaseCheckEntitiesFromChecks(input.run, checkBundle.checks, nowText);
     const nextStore = upsertResearchWorkStoreEntities(input.store, releaseChecks, nowText);
     await writeResearchWorkStore(nextStore);
+    await writeJsonArtifact(input.run.artifacts.referencesPath, references);
+    await writeJsonArtifact(input.run.artifacts.manuscriptChecksPath, checkBundle);
     const hardFailures = releaseChecks.filter((check) => check.status === "fail" && check.severity === "blocker");
     const message = `Release verification wrote ${releaseChecks.length} check(s): ${hardFailures.length} hard invariant blocker(s).`;
     return {
@@ -2346,7 +2608,103 @@ async function executeResearchObjectToolAction(input: {
     };
   }
 
-  if (input.decision.action === "section.check_claims" || input.decision.action === "manuscript.check_section_claims" || input.decision.action === "check.run") {
+  if (input.decision.action === "manuscript.release") {
+    const references = referencesFromWorkStore(input.run, input.store);
+    const checkBundle = workspaceManuscriptChecks({
+      run: input.run,
+      store: input.store,
+      references
+    });
+    const releaseChecks = releaseCheckEntitiesFromChecks(input.run, checkBundle.checks, nowText);
+    const paper = workspacePaperArtifact({
+      run: input.run,
+      store: input.store,
+      references,
+      readinessStatus: checkBundle.readinessStatus
+    });
+    const hardFailures = checkBundle.checks.filter((check) => check.status === "fail" && check.severity === "blocker");
+    const nextStore = upsertResearchWorkStoreEntities(input.store, releaseChecks, nowText);
+    await writeResearchWorkStore(nextStore);
+    await writeJsonArtifact(input.run.artifacts.referencesPath, references);
+    await writeJsonArtifact(input.run.artifacts.manuscriptChecksPath, checkBundle);
+    await writeJsonArtifact(input.run.artifacts.paperJsonPath, paper);
+
+    if (hardFailures.length > 0) {
+      const message = `Manuscript release blocked by ${hardFailures.length} hard invariant failure(s).`;
+      await writeFile(
+        input.run.artifacts.paperPath,
+        [
+          "# Review Paper",
+          "",
+          "Manuscript release was explicitly requested, but computable release invariants failed.",
+          "",
+          "## Blocking Invariants",
+          "",
+          ...hardFailures.map((check) => `- ${check.message}`)
+        ].join("\n"),
+        "utf8"
+      );
+      return {
+        handled: true,
+        store: nextStore,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "blocked",
+          readOnly: false,
+          message,
+          collection: "releaseChecks",
+          count: releaseChecks.length,
+          totalCount: releaseChecks.length,
+          items: releaseChecks.map((check) => entityPreviewForAgent(check, nextStore)),
+          stateDelta: {
+            releaseChecksCreated: releaseChecks.length,
+            hardInvariantBlockers: hardFailures.length,
+            manuscriptExportsCreated: 0
+          },
+          nextHints: ["workspace.read", "claim.link_support", "section.link_claim", "release.verify"]
+        })
+      };
+    }
+
+    const markdown = renderWorkspacePaperMarkdown(paper, references);
+    await writeFile(input.run.artifacts.paperPath, `${markdown}\n`, "utf8");
+    const message = `Manuscript released from workspace state with ${paper.sections.length} section(s) and ${references.referenceCount} reference(s).`;
+    return {
+      handled: true,
+      store: nextStore,
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        readOnly: false,
+        message,
+        collection: "manuscriptSections",
+        count: paper.sections.length,
+        totalCount: paper.sections.length,
+        items: paper.sections.map((section): AgentVisibleEntityPreview => ({
+          id: section.id,
+          kind: "manuscriptSection",
+          title: section.title,
+          sourceIds: section.sourceIds.slice(0, 12),
+          claimIds: section.claimIds.slice(0, 12),
+          snippet: compactPreviewText(section.markdown),
+          status: "released"
+        })),
+        stateDelta: {
+          releaseChecksCreated: releaseChecks.length,
+          hardInvariantBlockers: 0,
+          manuscriptExportsCreated: 1
+        },
+        nextHints: ["workspace.status"]
+      })
+    };
+  }
+
+  if (input.decision.action === "section.check_claims" || input.decision.action === "check.run") {
     const sectionId = args.entityId;
     const section = sectionId === null ? null : readResearchWorkStoreEntity<WorkStoreManuscriptSection>(input.store, "manuscriptSections", sectionId);
     if (section === null) {
@@ -2487,16 +2845,13 @@ async function checkpointSourceToolState(input: {
   run: RunRecord;
   now: () => string;
   session: SourceToolRuntime;
-  evidencePassNumber: number;
-  maxRevisionPasses: number;
+  sessionSegment: number;
   message: string;
 }): Promise<void> {
   await writeSourceToolCheckpoint({
     run: input.run,
     now: input.now,
-    evidencePass: input.evidencePassNumber,
-    revisionPasses: Math.max(0, input.evidencePassNumber - 1),
-    maxRevisionPasses: input.maxRevisionPasses,
+    sessionSegment: input.sessionSegment,
     sourceState: input.session.state(),
     event: {
       phase: "provider_query",
@@ -2519,11 +2874,6 @@ async function persistSourceToolWorkspaceSnapshot(input: {
     plan: input.plan,
     gathered: input.session.snapshot(),
     paperExtractions: [],
-    evidenceMatrix: null,
-    synthesis: null,
-    verification: null,
-    agenda: null,
-    manuscriptBundle: null,
     criticReports: [],
     now: timestamp
   });
@@ -2531,312 +2881,470 @@ async function persistSourceToolWorkspaceSnapshot(input: {
   return nextStore;
 }
 
-async function runSourceToolLoop(input: {
+type SourceActionExecutionResult = {
+  handled: boolean;
+  store: ResearchWorkStore;
+  message: string | null;
+  results: AgentToolResult[];
+};
+
+function sourceNoopToolResult(input: {
+  run: RunRecord;
+  now: () => string;
+  decision: ResearchActionDecision;
+  message: string;
+}): AgentToolResult {
+  return sourceToolResultFromObservation({
+    run: input.run,
+    now: input.now,
+    decision: input.decision,
+    observation: {
+      action: "source.search",
+      message: input.message,
+      counts: {
+        newSources: 0
+      },
+      items: []
+    }
+  });
+}
+
+async function executeSourceToolAction(input: {
+  run: RunRecord;
+  now: () => string;
+  decision: ResearchActionDecision;
+  session: SourceToolRuntime;
+  plan: ResearchPlan;
+  workStore: ResearchWorkStore;
+  sessionSegment: number;
+}): Promise<SourceActionExecutionResult> {
+  const persistSourceWorkspace = async (): Promise<void> => {
+    input.workStore = await persistSourceToolWorkspaceSnapshot({
+      run: input.run,
+      now: input.now,
+      plan: input.plan,
+      session: input.session,
+      workStore: input.workStore
+    });
+  };
+
+  if (isSourceMergeAction(input.decision.action)) {
+    const observation = await input.session.mergeSources();
+    await persistSourceWorkspace();
+    await appendEvent(input.run, input.now, "source", observation.message);
+    await appendStdout(input.run, `Source tool observation: ${observation.message}`);
+    await checkpointSourceToolState({
+      run: input.run,
+      now: input.now,
+      session: input.session,
+      sessionSegment: input.sessionSegment,
+      message: observation.message
+    });
+    return {
+      handled: true,
+      store: input.workStore,
+      message: observation.message,
+      results: [sourceToolResultFromObservation({
+        run: input.run,
+        now: input.now,
+        decision: input.decision,
+        observation
+      })]
+    };
+  }
+
+  if (isSourceResolveAccessAction(input.decision.action)) {
+    const observation = await input.session.resolveAccess(input.decision.inputs.paperIds);
+    await persistSourceWorkspace();
+    await appendEvent(input.run, input.now, "source", observation.message);
+    await appendStdout(input.run, `Source tool observation: ${observation.message}`);
+    await checkpointSourceToolState({
+      run: input.run,
+      now: input.now,
+      session: input.session,
+      sessionSegment: input.sessionSegment,
+      message: observation.message
+    });
+    return {
+      handled: true,
+      store: input.workStore,
+      message: observation.message,
+      results: [sourceToolResultFromObservation({
+        run: input.run,
+        now: input.now,
+        decision: input.decision,
+        observation
+      })]
+    };
+  }
+
+  if (isSourceSelectEvidenceAction(input.decision.action)) {
+    const observation = await input.session.selectEvidenceSet(input.decision.inputs.paperIds);
+    await persistSourceWorkspace();
+    await appendEvent(input.run, input.now, "source", observation.message);
+    await appendStdout(input.run, `Source tool observation: ${observation.message}`);
+    await checkpointSourceToolState({
+      run: input.run,
+      now: input.now,
+      session: input.session,
+      sessionSegment: input.sessionSegment,
+      message: observation.message
+    });
+    return {
+      handled: true,
+      store: input.workStore,
+      message: observation.message,
+      results: [sourceToolResultFromObservation({
+        run: input.run,
+        now: input.now,
+        decision: input.decision,
+        observation
+      })]
+    };
+  }
+
+  if (!isSourceSearchAction(input.decision.action)) {
+    return {
+      handled: false,
+      store: input.workStore,
+      message: null,
+      results: []
+    };
+  }
+
+  const providers = validSourceProviderChoices(input.decision, input.session);
+  const queries = sourceQueriesForAction(input.decision, input.session);
+  const reconsiderationReason = sourceSearchReconsiderationReason({
+    decision: input.decision,
+    session: input.session,
+    providerIds: providers,
+    queries
+  });
+  if (reconsiderationReason !== null) {
+    await appendEvent(input.run, input.now, "next", `Source dashboard observation: ${reconsiderationReason}`);
+    await appendStdout(input.run, `Source dashboard: ${reconsiderationReason}`);
+  }
+
+  if (queries.length === 0) {
+    const message = "Source search skipped because the researcher did not provide explicit search query text.";
+    await appendEvent(input.run, input.now, "next", message);
+    await appendStdout(input.run, `Source tool observation: ${message}`);
+    return {
+      handled: true,
+      store: input.workStore,
+      message,
+      results: [sourceNoopToolResult({
+        run: input.run,
+        now: input.now,
+        decision: input.decision,
+        message
+      })]
+    };
+  }
+
+  if (providers.length === 0) {
+    const message = "Source search skipped because the researcher did not provide explicit valid provider ids; no fallback provider was selected.";
+    await appendEvent(input.run, input.now, "next", message);
+    await appendStdout(input.run, `Source tool observation: ${message}`);
+    return {
+      handled: true,
+      store: input.workStore,
+      message,
+      results: [sourceNoopToolResult({
+        run: input.run,
+        now: input.now,
+        decision: input.decision,
+        message
+      })]
+    };
+  }
+
+  const executableProviderOrder = providers
+    .filter((providerId) => !input.session.isSearchExhausted(providerId, queries));
+  if (executableProviderOrder.length === 0) {
+    const message = "No executable source search target remained after filtering low-yield choices; checkpointing current source state without automatic merge or selection.";
+    await appendEvent(input.run, input.now, "next", message);
+    await appendStdout(input.run, `Source tool observation: ${message}`);
+    return {
+      handled: true,
+      store: input.workStore,
+      message,
+      results: [sourceNoopToolResult({
+        run: input.run,
+        now: input.now,
+        decision: input.decision,
+        message
+      })]
+    };
+  }
+
+  const results: AgentToolResult[] = [];
+  let lastMessage: string | null = null;
+  for (const providerId of executableProviderOrder.slice(0, 2)) {
+    const observation = await input.session.queryProvider(providerId, queries);
+    await persistSourceWorkspace();
+    await appendEvent(input.run, input.now, "source", observation.message);
+    await appendStdout(input.run, `Source tool observation: ${observation.message}`);
+    await checkpointSourceToolState({
+      run: input.run,
+      now: input.now,
+      session: input.session,
+      sessionSegment: input.sessionSegment,
+      message: observation.message
+    });
+    results.push(sourceToolResultFromObservation({
+      run: input.run,
+      now: input.now,
+      decision: input.decision,
+      observation,
+      providerId
+    }));
+    lastMessage = observation.message;
+  }
+
+  return {
+    handled: true,
+    store: input.workStore,
+    message: lastMessage,
+    results
+  };
+}
+
+type ModelDrivenSessionOutcome = {
+  workStore: ResearchWorkStore;
+  gathered: ResearchSourceSnapshot;
+  workerStatus: ResearchWorkerStatus;
+  statusReason: string;
+  paperReadiness: ManuscriptReadinessState | null;
+  nextInternalActions: string[];
+  userBlockers: string[];
+  checkpointedByBudget: boolean;
+  terminalAction: string | null;
+  stepsUsed: number;
+};
+
+function sessionObservations(input: {
+  sourceState: ReturnType<SourceToolRuntime["state"]>;
+  workStore: ResearchWorkStore;
+}): ResearchActionRequest["observations"] {
+  return {
+    canonicalPapers: Math.max(input.sourceState.canonicalPapers, input.workStore.objects.canonicalSources.length),
+    selectedPapers: Math.max(input.sourceState.selectedPapers, input.workStore.objects.canonicalSources.filter((source) => source.screeningDecision === "include").length),
+    extractedPapers: input.workStore.objects.extractions.length,
+    evidenceRows: input.workStore.objects.evidenceCells.length,
+    evidenceInsights: 0,
+    manuscriptReadiness: input.workStore.worker.paperReadiness,
+    sessionStepsUsed: 0,
+    sessionStepsRemaining: 0
+  };
+}
+
+function statusDecisionOutcome(input: {
+  decision: ResearchActionDecision;
+  store: ResearchWorkStore;
+}): {
+  workerStatus: ResearchWorkerStatus;
+  statusReason: string;
+  nextInternalActions: string[];
+  userBlockers: string[];
+} {
+  const entity = input.decision.inputs.workStore?.entity ?? {};
+  const requestedStatus = stringInput(entity.status, "");
+  const statusReason = stringInput(entity.statusReason ?? entity.reason, input.decision.inputs.reason ?? input.decision.rationale);
+  const nextInternalActions = stringArrayInput(entity.nextInternalActions ?? entity.options ?? entity.choices, 12);
+  const userBlockers = stringArrayInput(entity.userBlockers ?? entity.blockers, 12);
+  const openExternalBlockers = input.store.objects.workItems
+    .filter((item) => item.status === "open" && item.severity === "blocking" && (item.type === "external_blocker" || item.type === "source_access"))
+    .map((item) => item.description);
+
+  if (requestedStatus === "externally_blocked" && (openExternalBlockers.length > 0 || userBlockers.some(isExternalBlockerMessage))) {
+    return {
+      workerStatus: "externally_blocked",
+      statusReason,
+      nextInternalActions: [],
+      userBlockers: openExternalBlockers.length > 0 ? openExternalBlockers : userBlockers
+    };
+  }
+
+  if (requestedStatus === "needs_user_decision" && nextInternalActions.length >= 2) {
+    return {
+      workerStatus: "needs_user_decision",
+      statusReason,
+      nextInternalActions,
+      userBlockers: userBlockers.length > 0 ? userBlockers : [statusReason]
+    };
+  }
+
+  return {
+    workerStatus: "working",
+    statusReason: `Researcher checkpointed the model-driven session: ${statusReason}`,
+    nextInternalActions: nextInternalActions.length > 0
+      ? nextInternalActions
+      : ["Resume the model-driven research session with /go."],
+    userBlockers: []
+  };
+}
+
+function releaseSucceeded(result: AgentToolResult | null | undefined): boolean {
+  return result?.status !== "blocked"
+    && result?.stateDelta?.manuscriptExportsCreated === 1
+    && result.stateDelta.hardInvariantBlockers === 0;
+}
+
+async function runModelDrivenResearchSession(input: {
   run: RunRecord;
   now: () => string;
   researchBackend: ResearchBackend;
   runtimeConfig: RuntimeLlmConfig;
   agent: AgentStepRecorder;
-  request: ResearchSourceToolRequest;
+  sourceRequest: ResearchSourceToolRequest;
   diagnostics: ResearchActionDiagnostic[];
   actionTransports: AgentActionTransportRecord[];
-  evidencePassNumber: number;
+  plan: ResearchPlan;
   workStore: ResearchWorkStore;
-}): Promise<{ gathered: ResearchSourceSnapshot; workStore: ResearchWorkStore }> {
-  const {
-    run,
-    now,
-    researchBackend,
-    runtimeConfig,
-    agent,
-    request,
-    diagnostics,
-    actionTransports,
-    evidencePassNumber
-  } = input;
+}): Promise<ModelDrivenSessionOutcome> {
+  // This is only the execution shell around model decisions. It must not become
+  // a research workflow: each iteration observes state, asks the model for one
+  // tool action, executes exactly that action, persists the result, and repeats.
   let workStore = input.workStore;
   let toolResults: AgentToolResult[] = [];
-  const session = await SourceToolRuntime.create(request);
-  const maxSourceToolSteps = 10;
-  const rememberSourceObservation = (
-    decision: ResearchActionDecision,
-    observation: SourceToolObservation,
-    providerId?: SourceProviderId
-  ): void => {
-    toolResults = rememberAgentToolResult(toolResults, sourceToolResultFromObservation({
-      run,
-      now,
-      decision,
-      observation,
-      providerId
-    }));
-  };
-  const rememberSourceNoop = (decision: ResearchActionDecision, message: string): void => {
-    rememberSourceObservation(decision, {
-      action: "query_provider",
-      message,
-      counts: {
-        newSources: 0
-      },
-      items: []
-    });
-  };
-  const persistSourceWorkspace = async (): Promise<void> => {
-    workStore = await persistSourceToolWorkspaceSnapshot({
-      run,
-      now,
-      plan: request.plan,
-      session,
-      workStore
-    });
-  };
+  const sourceSession = await SourceToolRuntime.create(input.sourceRequest);
+  const maxSteps = Math.max(1, input.runtimeConfig.agentSegmentMaxSteps);
+  const sessionSegment = 1;
+  await appendStdout(input.run, "Model-driven research session active; every step is selected by the researcher model from the full tool surface.");
 
-  for (let step = 1; step <= maxSourceToolSteps; step += 1) {
-    const state = session.state();
-    let decision = await chooseResearchActionStrict({
-      run,
-      now,
-      researchBackend,
-      runtimeConfig,
-      agent,
-      diagnostics,
-      actionTransports,
+  for (let step = 1; step <= maxSteps; step += 1) {
+    const sourceState = sourceSession.state();
+    const decision = await chooseResearchActionStrict({
+      run: input.run,
+      now: input.now,
+      researchBackend: input.researchBackend,
+      runtimeConfig: input.runtimeConfig,
+      agent: input.agent,
+      diagnostics: input.diagnostics,
+      actionTransports: input.actionTransports,
       request: {
-        projectRoot: run.projectRoot,
-        runId: run.id,
-        phase: "source_selection",
+        projectRoot: input.run.projectRoot,
+        runId: input.run.id,
+        phase: "research",
         allowedActions: workspaceResearchActions(),
-        brief: run.brief,
-        plan: request.plan,
-        observations: {
-          canonicalPapers: state.canonicalPapers,
-          selectedPapers: state.selectedPapers,
-          extractedPapers: 0,
-          evidenceRows: 0,
-          evidenceInsights: 0,
-          manuscriptReadiness: null,
-          revisionPassesUsed: evidencePassNumber - 1,
-          revisionPassesRemaining: Math.max(0, runtimeConfig.evidenceRecoveryMaxPasses - (evidencePassNumber - 1))
-        },
-        sourceState: sourceStateForAgent(session),
+        brief: input.run.brief,
+        plan: input.plan,
+        observations: sessionObservations({ sourceState, workStore }),
+        sourceState: sourceStateForAgent(sourceSession),
         workStore: workStoreContextForAgent(workStore),
-        guidance: guidanceContextForAgent({ brief: run.brief, plan: request.plan }),
+        guidance: guidanceContextForAgent({ brief: input.run.brief, plan: input.plan }),
         toolResults,
         criticReports: [],
         retryInstruction: [
-          "Use the stable workspace tool surface. The source_selection milestone is progress context, not a restricted menu.",
-          "Use source.search with providerIds and searchQueries to query specific databases.",
-          "Use source.merge, source.resolve_access, and source.select_evidence when those operations fit the current work-store/source state.",
-          "Use workspace.search/read/list/patch/create when you need to inspect or update durable research state before choosing a source operation.",
-          "Do not ask the runtime to query every provider unless the observations justify it."
+          "This is a state-driven research session, not a phase workflow.",
+          "Inspect the current workspace/source/tool observations, choose exactly one next action, and let the runtime execute only that action.",
+          "All production tools are available regardless of milestone; do not stop for machine-actionable source, evidence, claim, critic, section, check, or release work.",
+          "Use workspace.status only for a true checkpoint, external blocker, or user decision that cannot be resolved with tools."
         ].join(" ")
       }
     });
-    let providers = validSourceProviderChoices(decision, session);
-    let queries = sourceQueriesForAction(decision, session);
-    const reconsiderationReason = sourceSearchReconsiderationReason({
-      decision,
-      session,
-      providerIds: providers,
-      queries
-    });
 
-    if (reconsiderationReason !== null) {
-      await appendEvent(run, now, "next", `Source dashboard asks the research agent to reconsider a low-yield search: ${reconsiderationReason}`);
-      await appendStdout(run, `Source dashboard: ${reconsiderationReason}`);
-      decision = await chooseResearchActionStrict({
-        run,
-        now,
-        researchBackend,
-        runtimeConfig,
-        agent,
-        diagnostics,
-        actionTransports,
-        request: {
-          projectRoot: run.projectRoot,
-          runId: run.id,
-          phase: "source_selection",
-          allowedActions: workspaceResearchActions(),
-          brief: run.brief,
-          plan: request.plan,
-          observations: {
-            canonicalPapers: session.state().canonicalPapers,
-            selectedPapers: session.state().selectedPapers,
-            extractedPapers: 0,
-            evidenceRows: 0,
-            evidenceInsights: 0,
-            manuscriptReadiness: null,
-            revisionPassesUsed: evidencePassNumber - 1,
-            revisionPassesRemaining: Math.max(0, runtimeConfig.evidenceRecoveryMaxPasses - (evidencePassNumber - 1))
-          },
-          sourceState: sourceStateForAgent(session),
-          workStore: workStoreContextForAgent(workStore),
-          guidance: guidanceContextForAgent({ brief: run.brief, plan: request.plan }),
-          toolResults,
-          criticReports: [],
-          retryInstruction: [
-            reconsiderationReason,
-            "You may still choose source.search, but only with a provider/query combination that is not exhausted and a concrete missing evidence target.",
-            "If the current screened sources are enough for this pass, choose source.merge, source.resolve_access, or source.select_evidence."
-          ].join(" ")
-        }
-      });
-      providers = validSourceProviderChoices(decision, session);
-      queries = sourceQueriesForAction(decision, session);
+    if (isStatusAction(decision.action)) {
+      const outcome = statusDecisionOutcome({ decision, store: workStore });
+      await appendEvent(input.run, input.now, "next", outcome.statusReason);
+      await appendStdout(input.run, `Research session checkpoint: ${outcome.statusReason}`);
+      return {
+        workStore,
+        gathered: await sourceSession.result(),
+        workerStatus: outcome.workerStatus,
+        statusReason: outcome.statusReason,
+        paperReadiness: safeManuscriptReadiness(workStore.worker.paperReadiness),
+        nextInternalActions: outcome.nextInternalActions,
+        userBlockers: outcome.userBlockers,
+        checkpointedByBudget: false,
+        terminalAction: decision.action,
+        stepsUsed: step
+      };
     }
 
-    const workStoreExecution = await executeWorkspaceToolAction({
-      run,
-      now,
+    const workspaceExecution = await executeWorkspaceToolAction({
+      run: input.run,
+      now: input.now,
       decision,
       store: workStore
     });
-    if (workStoreExecution.handled) {
-      workStore = workStoreExecution.store;
-      toolResults = rememberAgentToolResult(toolResults, workStoreExecution.result);
-      if (workStoreExecution.message !== null) {
-        await appendEvent(run, now, "memory", workStoreExecution.message);
-        await appendStdout(run, `Work store tool observation: ${workStoreExecution.message}`);
+    if (workspaceExecution.handled) {
+      workStore = workspaceExecution.store;
+      toolResults = rememberAgentToolResult(toolResults, workspaceExecution.result);
+      if (workspaceExecution.message !== null) {
+        await appendEvent(input.run, input.now, "memory", workspaceExecution.message);
+        await appendStdout(input.run, `Research tool observation: ${workspaceExecution.message}`);
+      }
+      if (decision.action === "manuscript.release" && releaseSucceeded(workspaceExecution.result)) {
+        return {
+          workStore,
+          gathered: await sourceSession.result(),
+          workerStatus: "release_ready",
+          statusReason: "Manuscript release completed after explicit model-selected release action and hard invariant checks passed.",
+          paperReadiness: "ready_for_revision",
+          nextInternalActions: [],
+          userBlockers: [],
+          checkpointedByBudget: false,
+          terminalAction: decision.action,
+          stepsUsed: step
+        };
       }
       continue;
     }
 
-    if (isSourceMergeAction(decision.action)) {
-      const observation = await session.mergeSources();
-      rememberSourceObservation(decision, observation);
-      await persistSourceWorkspace();
-      await appendEvent(run, now, "source", observation.message);
-      await appendStdout(run, `Source tool observation: ${observation.message}`);
-      await checkpointSourceToolState({
-        run,
-        now,
-        session,
-        evidencePassNumber,
-        maxRevisionPasses: runtimeConfig.evidenceRecoveryMaxPasses,
-        message: observation.message
-      });
+    const sourceExecution = await executeSourceToolAction({
+      run: input.run,
+      now: input.now,
+      decision,
+      session: sourceSession,
+      plan: input.plan,
+      workStore,
+      sessionSegment
+    });
+    if (sourceExecution.handled) {
+      workStore = sourceExecution.store;
+      for (const result of sourceExecution.results) {
+        toolResults = rememberAgentToolResult(toolResults, result);
+      }
       continue;
     }
 
-    if (isSourceResolveAccessAction(decision.action)) {
-      const observation = await session.resolveAccess(decision.inputs.paperIds);
-      rememberSourceObservation(decision, observation);
-      await persistSourceWorkspace();
-      await appendEvent(run, now, "source", observation.message);
-      await appendStdout(run, `Source tool observation: ${observation.message}`);
-      await checkpointSourceToolState({
-        run,
-        now,
-        session,
-        evidencePassNumber,
-        maxRevisionPasses: runtimeConfig.evidenceRecoveryMaxPasses,
-        message: observation.message
-      });
-      continue;
-    }
-
-    if (isSourceSelectEvidenceAction(decision.action)) {
-      const observation = await session.selectEvidenceSet(decision.inputs.paperIds);
-      rememberSourceObservation(decision, observation);
-      await persistSourceWorkspace();
-      await appendEvent(run, now, "source", observation.message);
-      await appendStdout(run, `Source tool observation: ${observation.message}`);
-      await checkpointSourceToolState({
-        run,
-        now,
-        session,
-        evidencePassNumber,
-        maxRevisionPasses: runtimeConfig.evidenceRecoveryMaxPasses,
-        message: observation.message
-      });
-      return {
-        gathered: await session.result(),
-        workStore
-      };
-    }
-
-    if (isStatusAction(decision.action)) {
-      await appendEvent(run, now, "next", "Research agent ended source tool loop with a status-report action; checkpointing current source state without automatic merge or selection.");
-      await persistSourceWorkspace();
-      return {
-        gathered: await session.result(),
-        workStore
-      };
-    }
-
-    if (!isSourceSearchAction(decision.action)) {
-      await appendEvent(
-        run,
-        now,
-        "next",
-        `Research agent chose ${decision.action}, but the source milestone has no direct executor for that tool yet; continuing with source state inspection.`
-      );
-      await appendStdout(
-        run,
-        `Source tool observation: ${decision.action} is not directly executable before an evidence set exists; choose a source or workspace tool next.`
-      );
-      continue;
-    }
-
-    if (queries.length === 0) {
-      const message = "Source search skipped because the researcher did not provide explicit search query text.";
-      rememberSourceNoop(decision, message);
-      await appendEvent(run, now, "next", message);
-      await appendStdout(run, `Source tool observation: ${message}`);
-      continue;
-    }
-
-    const providerOrder = providers;
-
-    if (providerOrder.length === 0) {
-      const message = "Source search skipped because the researcher did not provide explicit valid provider ids; no fallback provider was selected.";
-      rememberSourceNoop(decision, message);
-      await appendEvent(run, now, "next", message);
-      await appendStdout(run, `Source tool observation: ${message}`);
-      continue;
-    }
-
-    const executableProviderOrder = providerOrder
-      .filter((providerId) => !session.isSearchExhausted(providerId, queries));
-
-    if (executableProviderOrder.length === 0 && session.state().mergeReadiness.ready) {
-      const message = "All chosen source searches are low-yield or exhausted; current screened sources are available, but the runtime will not merge them unless the researcher explicitly calls source.merge.";
-      rememberSourceNoop(decision, message);
-      await appendEvent(run, now, "next", message);
-      await appendStdout(run, `Source tool observation: ${message}`);
-      continue;
-    }
-
-    if (executableProviderOrder.length === 0) {
-      const message = "No executable source search target remained after filtering low-yield choices; checkpointing current source state without automatic merge or selection.";
-      rememberSourceNoop(decision, message);
-      await appendEvent(run, now, "next", message);
-      await appendStdout(run, `Source tool observation: ${message}`);
-      continue;
-    }
-
-    for (const providerId of executableProviderOrder.slice(0, 2)) {
-      const observation = await session.queryProvider(providerId, queries);
-      rememberSourceObservation(decision, observation, providerId);
-      await persistSourceWorkspace();
-      await appendEvent(run, now, "source", observation.message);
-      await appendStdout(run, `Source tool observation: ${observation.message}`);
-      await checkpointSourceToolState({
-        run,
-        now,
-        session,
-        evidencePassNumber,
-        maxRevisionPasses: runtimeConfig.evidenceRecoveryMaxPasses,
-        message: observation.message
-      });
-    }
+    const message = `${decision.action} is available in the action surface but has no executor yet; checkpointed as visible runtime diagnostic.`;
+    const result = makeAgentToolResult({
+      run: input.run,
+      action: decision.action,
+      timestamp: input.now(),
+      status: "noop",
+      readOnly: true,
+      message,
+      nextHints: ["workspace.status", "workspace.read", "work_item.create"]
+    });
+    toolResults = rememberAgentToolResult(toolResults, result);
+    await appendEvent(input.run, input.now, "next", message);
+    await appendStdout(input.run, `Research tool observation: ${message}`);
   }
 
-  await appendEvent(run, now, "next", "Source tool loop reached its step budget; checkpointing current source state without automatic merge or selection.");
-  await persistSourceWorkspace();
-  return {
-    gathered: await session.result(),
+  await appendEvent(input.run, input.now, "next", "Model-driven research session reached its segment step budget; checkpointing current workspace state.");
+  await appendStdout(input.run, "Model-driven research session reached its segment step budget; checkpointing current workspace state.");
+  workStore = await persistSourceToolWorkspaceSnapshot({
+    run: input.run,
+    now: input.now,
+    plan: input.plan,
+    session: sourceSession,
     workStore
+  });
+  return {
+    workStore,
+    gathered: await sourceSession.result(),
+    workerStatus: "checkpointed_budget_exhausted",
+    statusReason: "The model-driven research session exhausted this segment budget and checkpointed durable workspace state for the next /go continuation.",
+    paperReadiness: safeManuscriptReadiness(workStore.worker.paperReadiness),
+    nextInternalActions: ["Resume the model-driven research session with /go."],
+    userBlockers: [],
+    checkpointedByBudget: true,
+    terminalAction: null,
+    stepsUsed: maxSteps
   };
 }
 
@@ -2907,41 +3415,6 @@ function pendingAgentState(run: RunRecord, timestamp: string): AgentStateArtifac
   };
 }
 
-function paperExtractionsArtifact(
-  run: RunRecord,
-  paperCount: number,
-  extractions: PaperExtraction[],
-  options: {
-    status?: "pending" | "in_progress" | "completed" | "failed";
-    completedPaperIds?: string[];
-    failedPaperIds?: string[];
-    batchAttempts?: ExtractionBatchAttempt[];
-  } = {}
-): PaperExtractionsArtifact {
-  return {
-    schemaVersion: 1,
-    runId: run.id,
-    briefFingerprint: briefFingerprint(run.brief),
-    status: options.status ?? (extractions.length >= paperCount ? "completed" : "in_progress"),
-    paperCount,
-    extractionCount: extractions.length,
-    completedPaperIds: options.completedPaperIds ?? extractions.map((extraction) => extraction.paperId),
-    failedPaperIds: options.failedPaperIds ?? [],
-    batchAttempts: options.batchAttempts ?? [],
-    extractions
-  };
-}
-
-function claimsArtifact(run: RunRecord, claims: ResearchClaim[]): ClaimsArtifact {
-  return {
-    schemaVersion: 1,
-    runId: run.id,
-    briefFingerprint: briefFingerprint(run.brief),
-    claimCount: claims.length,
-    claims
-  };
-}
-
 function uniqueStrings(values: Array<string | null | undefined>): string[] {
   const seen = new Set<string>();
   const result: string[] = [];
@@ -2965,283 +3438,6 @@ function uniqueStrings(values: Array<string | null | undefined>): string[] {
   }
 
   return result;
-}
-
-const recoveryQueryStopWords = new Set([
-  "about",
-  "after",
-  "against",
-  "also",
-  "and",
-  "are",
-  "because",
-  "before",
-  "between",
-  "comprehensive",
-  "comprehensiveness",
-  "could",
-  "does",
-  "evidence",
-  "expected",
-  "from",
-  "have",
-  "high-quality",
-  "into",
-  "including",
-  "meet",
-  "meets",
-  "more",
-  "needs",
-  "paper",
-  "papers",
-  "review",
-  "reviewed",
-  "selected",
-  "should",
-  "source",
-  "sources",
-  "standard",
-  "standards",
-  "that",
-  "the",
-  "this",
-  "typically",
-  "search",
-  "with"
-]);
-
-function normalizedRecoveryQueryKey(query: string): string {
-  return query.toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
-}
-
-function isFileLikeResearchTerm(text: string): boolean {
-  const compact = text.trim();
-  return /(^|[/\\])[\w.-]+\.(txt|md|json|jsonl|log|csv|ts|tsx|js|jsx|py|yaml|yml)$/i.test(compact)
-    || /^[\w.-]+\.(txt|md|json|jsonl|log|csv|ts|tsx|js|jsx|py|yaml|yml)$/i.test(compact);
-}
-
-function isUnsafeRevisionQueryText(text: string): boolean {
-  const compact = text.replace(/\s+/g, " ").trim();
-  if (compact.length === 0) {
-    return true;
-  }
-
-  return [
-    /\bdid not provide (?:a )?structured objection\b/i,
-    /\brevise the prior research stage\b/i,
-    /\bmore focused evidence before release\b/i,
-    /\bcritic review was unavailable\b/i,
-    /\bworking critic backend\b/i,
-    /\bbefore releasing a full manuscript\b/i,
-    /\bfull manuscript\b/i,
-    /\bstatus-only\b/i,
-    /\bquality report\b/i,
-    /\bmanuscript checks?\b/i,
-    /\bpaper artifacts?\b/i,
-    /\b(?:protocol|source-selection|source selection|evidence|release) critic (?:did not pass|returned|still had concerns)\b/i
-  ].some((pattern) => pattern.test(compact));
-}
-
-function compactRecoveryQuery(text: string | null | undefined, limit = 12): string | null {
-  if (typeof text !== "string") {
-    return null;
-  }
-  if (isFileLikeResearchTerm(text)) {
-    return null;
-  }
-  if (isUnsafeRevisionQueryText(text)) {
-    return null;
-  }
-
-  const queryText = text
-    .replace(/^\s*(?:search|find|retrieve|collect|seek)\s+(?:for\s+)?/i, "")
-    .replace(/^\s*(?:run|rerun)\s+retrieval\s+(?:with|for)\s+/i, "");
-  const tokens = queryText.toLowerCase().match(/[a-z0-9][a-z0-9-]*/g) ?? [];
-  const filtered = tokens
-    .filter((token) => token.length > 1)
-    .filter((token) => !recoveryQueryStopWords.has(token));
-
-  const compact = filtered.length > 0 ? filtered.slice(0, limit).join(" ") : null;
-  return compact !== null
-    && !isUnsafeRevisionQueryText(compact)
-    ? compact
-    : null;
-}
-
-function stripRecoveryQueryCommand(text: string): string {
-  return text
-    .replace(/^\s*(?:search|find|retrieve|collect|seek)\s+(?:for\s+)?/i, "")
-    .replace(/^\s*(?:run|rerun)\s+retrieval\s+(?:with|for)\s+/i, "")
-    .replace(/\s+/g, " ")
-    .replace(/[.!?;:]+$/g, "")
-    .trim();
-}
-
-function sanitizeRecoveryQuery(query: string | null | undefined, limit = 12): string | null {
-  if (typeof query !== "string") {
-    return null;
-  }
-  if (isFileLikeResearchTerm(query) || isUnsafeRevisionQueryText(query)) {
-    return null;
-  }
-
-  const direct = stripRecoveryQueryCommand(query);
-  if (
-    direct.length > 0
-    && !isFileLikeResearchTerm(direct)
-    && !isUnsafeRevisionQueryText(direct)
-  ) {
-    const tokenCount = direct.match(/[a-z0-9][a-z0-9-]*/gi)?.length ?? 0;
-    const looksLikeDiagnosticSentence = /\b(?:lacks?|missing|needs?|should|revise|revised?|prior|stage|release|manuscript|artifact|critic)\b/i.test(direct);
-
-    if (tokenCount > 1 && tokenCount <= limit && !looksLikeDiagnosticSentence) {
-      return direct;
-    }
-  }
-
-  const compact = compactRecoveryQuery(direct, limit);
-  return compact === null ? null : compact;
-}
-
-function sanitizeRecoveryQueries(queries: Array<string | null | undefined>, limit = 12): string[] {
-  return uniqueStrings(queries.flatMap((query) => {
-    const sanitized = sanitizeRecoveryQuery(query, limit);
-    return sanitized === null ? [] : [sanitized];
-  }));
-}
-
-function evidenceRecoveryPlanUpdate(
-  plan: ResearchPlan,
-  queries: string[],
-  focusTerms: string[]
-): { plan: ResearchPlan; recoveryQueries: string[] } | null {
-  const existingQueryKeys = new Set(plan.searchQueries.map(normalizedRecoveryQueryKey));
-  const recoveryQueries = sanitizeRecoveryQueries(queries, 12)
-    .filter((query) => !existingQueryKeys.has(normalizedRecoveryQueryKey(query)))
-    .slice(0, 12);
-
-  if (recoveryQueries.length === 0) {
-    return null;
-  }
-
-  const rationaleSuffix = "Autonomous evidence revision may expand retrieval when manuscript checks require more evidence.";
-
-  return {
-    recoveryQueries,
-    plan: {
-      ...plan,
-      rationale: plan.rationale.includes(rationaleSuffix)
-        ? plan.rationale
-        : `${plan.rationale} ${rationaleSuffix}`,
-      searchQueries: uniqueStrings([...plan.searchQueries, ...recoveryQueries]).slice(0, 28),
-      localFocus: uniqueStrings([...plan.localFocus, ...focusTerms])
-        .filter((focus) => compactRecoveryQuery(focus, 8) !== null)
-        .slice(0, 16)
-    }
-  };
-}
-
-function evidenceRecoveryBudgetExhausted(startedAtMs: number, runtimeConfig: RuntimeLlmConfig): boolean {
-  return Date.now() - startedAtMs >= runtimeConfig.totalRecoveryBudgetMs;
-}
-
-function criticArtifactPath(run: RunRecord, stage: CriticReviewStage): string {
-  switch (stage) {
-    case "protocol":
-      return run.artifacts.criticProtocolReviewPath;
-    case "source_selection":
-      return run.artifacts.criticSourceSelectionPath;
-    case "evidence":
-      return run.artifacts.criticEvidenceReviewPath;
-    case "release":
-      return run.artifacts.criticReleaseReviewPath;
-  }
-}
-
-function criticStructuredRetryNeeded(report: CriticReviewArtifact): boolean {
-  return report.readiness !== "pass"
-    && report.objections.length === 1
-    && report.objections[0]?.code === `critic-${report.stage}-nonpass`;
-}
-
-function criticRevisionIsActionable(report: CriticReviewArtifact): boolean {
-  if (criticReviewPassed(report)) {
-    return true;
-  }
-
-  const substantiveObjections = report.objections.filter((objection) => (
-    objection.code !== `critic-${report.stage}-nonpass`
-    && !isUnsafeRevisionQueryText(objection.message)
-    && (objection.suggestedRevision === null || !isUnsafeRevisionQueryText(objection.suggestedRevision))
-  ));
-  const actionableText = [
-    ...report.revisionAdvice.searchQueries,
-    ...report.revisionAdvice.evidenceTargets,
-    ...report.revisionAdvice.claimsToSoften,
-    ...report.objections.flatMap((objection) => objection.suggestedRevision === null ? [] : [objection.suggestedRevision])
-  ].some((text) => !isUnsafeRevisionQueryText(text) && compactRecoveryQuery(text, 8) !== null);
-  const actionableSourceSetChange = report.revisionAdvice.papersToExclude.length > 0
-    || report.revisionAdvice.papersToPromote.length > 0;
-
-  return substantiveObjections.length > 0 || actionableText || actionableSourceSetChange;
-}
-
-async function reviewWithCritic(input: {
-  run: RunRecord;
-  now: () => string;
-  researchBackend: ResearchBackend;
-  runtimeConfig: RuntimeLlmConfig;
-  request: CriticReviewRequest;
-}): Promise<CriticReviewArtifact> {
-  const { run, now, researchBackend, runtimeConfig, request } = input;
-  await appendEvent(run, now, "next", `Run ${request.stage.replace(/_/g, " ")} critic review.`);
-
-  try {
-    let report = await researchBackend.reviewResearchArtifact(request, {
-      operation: "critic",
-      timeoutMs: runtimeConfig.criticTimeoutMs
-    });
-    if (criticStructuredRetryNeeded(report) && request.retryInstruction === undefined) {
-      await appendEvent(
-        run,
-        now,
-        "next",
-        `${request.stage.replace(/_/g, " ")} critic returned no structured objections; retrying once for precise feedback.`
-      );
-      report = await researchBackend.reviewResearchArtifact({
-        ...request,
-        retryInstruction: "Your previous critic response did not include structured objections. Return JSON with concrete objections, precise affected criteria or paper IDs when known, and actionable revision advice. If no severe issue remains, return pass."
-      }, {
-        operation: "critic",
-        timeoutMs: runtimeConfig.criticTimeoutMs
-      });
-    }
-    await writeJsonArtifact(criticArtifactPath(run, request.stage), report);
-    await appendEvent(
-      run,
-      now,
-      report.readiness === "pass" ? "summary" : "stderr",
-      `${request.stage.replace(/_/g, " ")} critic returned ${report.readiness}.`
-    );
-    for (const objection of report.objections.slice(0, 4)) {
-      await appendStdout(run, `Critic ${request.stage}: ${objection.severity} - ${objection.message}`);
-    }
-    return report;
-  } catch (error) {
-    const report = criticUnavailableReview(request, errorMessage(error));
-    await writeJsonArtifact(criticArtifactPath(run, request.stage), report);
-    await appendEvent(run, now, "stderr", `${request.stage.replace(/_/g, " ")} critic unavailable: ${errorMessage(error)}`);
-    await appendStdout(run, `Critic ${request.stage} unavailable: ${errorMessage(error)}`);
-    return report;
-  }
-}
-
-function researchActionDiagnosticKind(error: unknown): ResearchActionDiagnostic["kind"] {
-  if (error instanceof ResearchBackendError) {
-    return error.kind === "malformed_json" ? "malformed_action" : "provider_failure";
-  }
-
-  return /action/i.test(errorMessage(error)) ? "invalid_action" : "provider_failure";
 }
 
 async function chooseResearchActionStrict(input: {
@@ -3366,731 +3562,8 @@ async function chooseResearchActionStrict(input: {
   return fallback;
 }
 
-async function runProtocolWorkspaceLoop(input: {
-  run: RunRecord;
-  now: () => string;
-  researchBackend: ResearchBackend;
-  runtimeConfig: RuntimeLlmConfig;
-  agent: AgentStepRecorder;
-  diagnostics: ResearchActionDiagnostic[];
-  actionTransports: AgentActionTransportRecord[];
-  plan: ResearchPlan;
-  workStore: ResearchWorkStore;
-}): Promise<ResearchWorkStore> {
-  let workStore = input.workStore;
-  let toolResults: AgentToolResult[] = [];
-  const maxToolSteps = 4;
-
-  if (workspaceProtocolEntity(workStore) !== null) {
-    return workStore;
-  }
-
-  await appendEvent(input.run, input.now, "memory", "Ask the research agent to author the durable ResearchProtocol workspace object.");
-
-  for (let step = 1; step <= maxToolSteps; step += 1) {
-    const decision = await chooseResearchActionStrict({
-      run: input.run,
-      now: input.now,
-      researchBackend: input.researchBackend,
-      runtimeConfig: input.runtimeConfig,
-      agent: input.agent,
-      diagnostics: input.diagnostics,
-      actionTransports: input.actionTransports,
-      request: {
-        projectRoot: input.run.projectRoot,
-        runId: input.run.id,
-        phase: "protocol",
-        allowedActions: workspaceResearchActions(),
-        brief: input.run.brief,
-        plan: input.plan,
-        observations: {
-          canonicalPapers: workStore.objects.canonicalSources.length,
-          selectedPapers: 0,
-          extractedPapers: workStore.objects.extractions.length,
-          evidenceRows: workStore.objects.evidenceCells.length,
-          evidenceInsights: 0,
-          manuscriptReadiness: null,
-          revisionPassesUsed: 0,
-          revisionPassesRemaining: input.runtimeConfig.evidenceRecoveryMaxPasses
-        },
-        workStore: workStoreContextForAgent(workStore),
-        guidance: guidanceContextForAgent({ brief: input.run.brief, plan: input.plan }),
-        toolResults,
-        criticReports: [],
-        retryInstruction: [
-          "Create or revise the model-authored ResearchProtocol as durable workspace state before provider/source work begins.",
-          "Use protocol.create_or_revise when the current brief and plan are enough to define scope, inclusion/exclusion criteria, evidence targets, and manuscript constraints.",
-          "Guidance and workspace read/list/search tools may be used first if you need inspectable context.",
-          "Do not turn output-style requirements into evidence targets; semantic choices belong in the protocol object and can be revised later."
-        ].join(" ")
-      }
-    });
-
-    if (isStatusAction(decision.action)) {
-      const message = decision.inputs.reason ?? decision.rationale;
-      await appendEvent(input.run, input.now, "next", `Research agent did not author a protocol yet: ${message}`);
-      await appendStdout(input.run, `Protocol tool observation: ${message}`);
-      break;
-    }
-
-    const protocolStageExecutable = isGuidanceToolAction(decision.action)
-      || isWorkStoreToolAction(decision.action)
-      || decision.action === "protocol.create_or_revise"
-      || decision.action === "work_item.create"
-      || decision.action === "work_item.patch";
-
-    if (!protocolStageExecutable) {
-      const timestamp = input.now();
-      const message = `${decision.action} was deferred until a ResearchProtocol exists.`;
-      const result = makeAgentToolResult({
-        run: input.run,
-        action: decision.action,
-        timestamp,
-        status: "noop",
-        readOnly: true,
-        message,
-        count: 0,
-        totalCount: 0,
-        nextHints: ["protocol.create_or_revise", "guidance.recommend", "workspace.read"]
-      });
-      toolResults = rememberAgentToolResult(toolResults, result);
-      await appendEvent(input.run, input.now, "next", message);
-      await appendStdout(input.run, `Protocol tool observation: ${message}`);
-      continue;
-    }
-
-    const execution = await executeWorkspaceToolAction({
-      run: input.run,
-      now: input.now,
-      decision,
-      store: workStore
-    });
-
-    if (execution.handled) {
-      workStore = execution.store;
-      toolResults = rememberAgentToolResult(toolResults, execution.result);
-      if (execution.message !== null) {
-        await appendEvent(input.run, input.now, "memory", execution.message);
-        await appendStdout(input.run, `Protocol tool observation: ${execution.message}`);
-      }
-      if (workspaceProtocolEntity(workStore) !== null) {
-        await input.agent.record({
-          phase: "protocol",
-          action: "persist_research_protocol",
-          status: "completed",
-          summary: "Researcher-authored protocol is now canonical workspace state.",
-          artifactPaths: [
-            researchWorkStoreFilePath(input.run.projectRoot),
-            input.run.artifacts.reviewProtocolPath
-          ],
-          counts: {
-            protocols: workStore.objects.protocols.length
-          }
-        });
-        return workStore;
-      }
-      continue;
-    }
-
-    const message = `${decision.action} is not executable during the protocol checkpoint.`;
-    const result = makeAgentToolResult({
-      run: input.run,
-      action: decision.action,
-      timestamp: input.now(),
-      status: "noop",
-      readOnly: true,
-      message,
-      count: 0,
-      totalCount: 0,
-      nextHints: ["protocol.create_or_revise"]
-    });
-    toolResults = rememberAgentToolResult(toolResults, result);
-    await appendEvent(input.run, input.now, "next", message);
-    await appendStdout(input.run, `Protocol tool observation: ${message}`);
-  }
-
-  await appendEvent(
-    input.run,
-    input.now,
-    "memory",
-    "No researcher-authored protocol was persisted during the protocol checkpoint; using a neutral model-plan protocol shell without runtime-derived semantic requirements."
-  );
-  return workStore;
-}
-
-async function runManuscriptWorkspaceLoop(input: {
-  run: RunRecord;
-  now: () => string;
-  researchBackend: ResearchBackend;
-  runtimeConfig: RuntimeLlmConfig;
-  agent: AgentStepRecorder;
-  diagnostics: ResearchActionDiagnostic[];
-  actionTransports: AgentActionTransportRecord[];
-  plan: ResearchPlan;
-  gathered: ResearchSourceSnapshot;
-  paperExtractions: PaperExtraction[];
-  evidenceMatrix: EvidenceMatrix;
-  workStore: ResearchWorkStore;
-  revisionPassesUsed: number;
-}): Promise<{
-  workStore: ResearchWorkStore;
-  requestedRevision: boolean;
-  revisionQueries: string[];
-  revisionFocusTerms: string[];
-  stopReason: string | null;
-}> {
-  let workStore = input.workStore;
-  let toolResults: AgentToolResult[] = [];
-  let consecutiveReadOnlyActions = 0;
-  const maxToolSteps = 12;
-
-  for (let step = 1; step <= maxToolSteps; step += 1) {
-    const citationRepair = repairWorkspaceCitationsFromClaimSources({
-      run: input.run,
-      now: input.now(),
-      store: workStore
-    });
-    if (citationRepair.repairedCount > 0) {
-      workStore = citationRepair.store;
-      await writeResearchWorkStore(workStore);
-      await appendEvent(input.run, input.now, "memory", `Repaired ${citationRepair.repairedCount} missing workspace citation/support link(s) from claim source ids.`);
-      await appendStdout(input.run, `Workspace citation repair: ${citationRepair.repairedCount} support link(s) created from existing claim-source provenance.`);
-    }
-
-    const checks = workspaceManuscriptChecks({
-      run: input.run,
-      store: workStore,
-      references: referencesFromWorkStore(input.run, workStore),
-      gathered: input.gathered,
-      evidenceMatrix: input.evidenceMatrix
-    });
-    if (checks.readinessStatus === "ready_for_revision") {
-      await appendEvent(input.run, input.now, "summary", "Workspace manuscript checks passed; release review can run.");
-      return {
-        workStore,
-        requestedRevision: false,
-        revisionQueries: [],
-        revisionFocusTerms: [],
-        stopReason: null
-      };
-    }
-
-    const readOnlyProgressInstruction = consecutiveReadOnlyActions >= 3
-      ? [
-        `${consecutiveReadOnlyActions} consecutive read-only workspace actions have already returned agent-visible tool results.`,
-        "Use those returned ids, extraction/evidence previews, snippets, and source titles to mutate the workspace with claim.create, claim.link_support, section.create, section.link_claim, section.check_claims, work_item.patch, or read one specific entity id if a precise drill-down is needed.",
-        "Do not repeat another broad workspace.list/search/read unless the query is materially narrower and uses a cursor or entity id from recent tool results."
-      ].join(" ")
-      : null;
-    const decision = await chooseResearchActionStrict({
-      run: input.run,
-      now: input.now,
-      researchBackend: input.researchBackend,
-      runtimeConfig: input.runtimeConfig,
-      agent: input.agent,
-      diagnostics: input.diagnostics,
-      actionTransports: input.actionTransports,
-      request: {
-        projectRoot: input.run.projectRoot,
-        runId: input.run.id,
-        phase: "synthesis",
-        allowedActions: workspaceResearchActions(),
-        brief: input.run.brief,
-        plan: input.plan,
-        observations: {
-          canonicalPapers: input.gathered.canonicalPapers.length,
-          selectedPapers: input.gathered.reviewedPapers.length,
-          extractedPapers: input.paperExtractions.length,
-          evidenceRows: input.evidenceMatrix.rowCount,
-          evidenceInsights: input.evidenceMatrix.derivedInsights.length,
-          manuscriptReadiness: checks.readinessStatus,
-          revisionPassesUsed: input.revisionPassesUsed,
-          revisionPassesRemaining: Math.max(0, input.runtimeConfig.evidenceRecoveryMaxPasses - input.revisionPassesUsed)
-        },
-        workStore: workStoreContextForAgent(workStore),
-        guidance: guidanceContextForAgent({ brief: input.run.brief, plan: input.plan }),
-        toolResults,
-        criticReports: [],
-        retryInstruction: [
-          "Construct the manuscript through first-class research objects only.",
-          "Use claim.create/patch/check_support/link_support, section.create/read/patch/link_claim/check_claims, work_item.create/patch, and workspace.search/read/list/link.",
-          "Do not choose old high-level synthesis or report-writing actions.",
-          "Use source.search only when the workspace lacks evidence that can be gathered autonomously.",
-          "Use workspace.status only for a genuine external blocker.",
-          readOnlyProgressInstruction
-        ].filter((instruction): instruction is string => instruction !== null).join(" ")
-      }
-    });
-
-    if (decision.action === "source.search" || decision.action === "evidence.revise_strategy") {
-      const revisionQueries = uniqueStrings(decision.inputs.searchQueries);
-      if (revisionQueries.length === 0) {
-        const timestamp = input.now();
-        const result = makeAgentToolResult({
-          run: input.run,
-          action: decision.action,
-          timestamp,
-          status: "noop",
-          readOnly: true,
-          message: "Source revision skipped because the researcher did not provide explicit search query text.",
-          count: 0,
-          totalCount: 0,
-          nextHints: ["source.search", "workspace.search", "work_item.create"]
-        });
-        toolResults = rememberAgentToolResult(toolResults, result);
-        await appendEvent(input.run, input.now, "next", result.message);
-        await appendStdout(input.run, `Workspace tool observation: ${result.message}`);
-        continue;
-      }
-      return {
-        workStore,
-        requestedRevision: true,
-        revisionQueries,
-        revisionFocusTerms: decision.inputs.evidenceTargets,
-        stopReason: decision.rationale
-      };
-    }
-
-    if (isStatusAction(decision.action)) {
-      return {
-        workStore,
-        requestedRevision: false,
-        revisionQueries: [],
-        revisionFocusTerms: [],
-        stopReason: decision.inputs.reason ?? decision.rationale
-      };
-    }
-
-    if (decision.action === "manuscript.release") {
-      return {
-        workStore,
-        requestedRevision: false,
-        revisionQueries: [],
-        revisionFocusTerms: [],
-        stopReason: null
-      };
-    }
-
-    const execution = await executeWorkspaceToolAction({
-      run: input.run,
-      now: input.now,
-      decision,
-      store: workStore
-    });
-
-    if (execution.handled) {
-      workStore = execution.store;
-      toolResults = rememberAgentToolResult(toolResults, execution.result);
-      consecutiveReadOnlyActions = isReadOnlyWorkspaceAction(decision.action)
-        ? consecutiveReadOnlyActions + 1
-        : 0;
-      if (execution.message !== null) {
-        await appendEvent(input.run, input.now, "memory", execution.message);
-        await appendStdout(input.run, `Workspace tool observation: ${execution.message}`);
-      }
-      continue;
-    }
-
-    await appendEvent(input.run, input.now, "next", `No workspace executor is available for ${decision.action}; asking for another first-class tool.`);
-  }
-
-  return {
-    workStore,
-    requestedRevision: false,
-    revisionQueries: [],
-    revisionFocusTerms: [],
-    stopReason: "The manuscript workspace loop reached its tool-step budget before release checks passed."
-  };
-}
-
-function emptyGatheredResult(plan: ResearchPlan): ResearchSourceSnapshot {
-  return {
-    notes: [],
-    sources: [],
-    canonicalPapers: [],
-    reviewedPapers: [],
-    routing: {
-      domain: "mixed",
-      plannedQueries: plan.searchQueries,
-      discoveryProviderIds: [],
-      resolverProviderIds: [],
-      acquisitionProviderIds: []
-    },
-    mergeDiagnostics: [],
-    authStatus: [],
-    reviewWorkflow: {
-      titleScreenedPaperIds: [],
-      abstractScreenedPaperIds: [],
-      fulltextScreenedPaperIds: [],
-      includedPaperIds: [],
-      excludedPaperIds: [],
-      uncertainPaperIds: [],
-      blockedPaperIds: [],
-      synthesisPaperIds: [],
-      deferredPaperIds: [],
-      counts: {
-        titleScreened: 0,
-        abstractScreened: 0,
-        fulltextScreened: 0,
-        included: 0,
-        excluded: 0,
-        uncertain: 0,
-        blocked: 0,
-        selectedForSynthesis: 0,
-        deferred: 0
-      },
-      notes: []
-    }
-  };
-}
-
-type EvidenceQualitySnapshot = {
-  inScopeIds: Set<string>;
-  inScopeCount: number;
-  borderlineCount: number;
-  excludedCount: number;
-  selectedCount: number;
-  score: number;
-};
-
-function evidenceQualitySnapshot(gathered: ResearchSourceSnapshot): EvidenceQualitySnapshot {
-  const relevanceAssessments = gathered.relevanceAssessments ?? [];
-  const inScopeIds = new Set(relevanceAssessments
-    .filter((assessment) => assessment.status === "in_scope")
-    .map((assessment) => assessment.paperId));
-  const inScopeCount = inScopeIds.size;
-  const borderlineCount = relevanceAssessments.filter((assessment) => assessment.status === "borderline").length;
-  const excludedCount = relevanceAssessments.filter((assessment) => assessment.status === "excluded").length;
-  const selectedCount = gathered.reviewedPapers.length;
-
-  return {
-    inScopeIds,
-    inScopeCount,
-    borderlineCount,
-    excludedCount,
-    selectedCount,
-    score: inScopeCount * 20 + selectedCount * 5 - borderlineCount * 3 - excludedCount
-  };
-}
-
-function evidenceQualityImproved(previous: EvidenceQualitySnapshot | null, next: EvidenceQualitySnapshot): boolean {
-  if (previous === null) {
-    return true;
-  }
-
-  return [...next.inScopeIds].some((paperId) => !previous.inScopeIds.has(paperId))
-    || next.score > previous.score;
-}
-
-type CriticIterationSummary = {
-  stage: CriticReviewStage;
-  iterations: number;
-  finalReadiness: string;
-  finalConfidence: number;
-  objectionCount: number;
-  topObjections: string[];
-};
-
-function finalCriticIterationSummaries(
-  reportsByStage: Map<CriticReviewStage, CriticReviewArtifact[]>
-): CriticIterationSummary[] {
-  return (["protocol", "source_selection", "evidence", "release"] as CriticReviewStage[])
-    .flatMap((stage) => {
-      const reports = reportsByStage.get(stage) ?? [];
-      const finalReport = reports.at(-1);
-      if (finalReport === undefined) {
-        return [];
-      }
-
-      return [{
-        stage,
-        iterations: reports.length,
-        finalReadiness: finalReport.readiness,
-        finalConfidence: finalReport.confidence,
-        objectionCount: finalReport.objections.length,
-        topObjections: finalReport.objections.slice(0, 4).map((objection) => objection.message)
-      }];
-    });
-}
-
-function modelSuitabilityRating(input: {
-  reviewedPaperCount: number;
-  selectedPaperCount: number;
-  extractionCount: number;
-  evidenceRowCount: number;
-  manuscriptReadiness: string;
-  criticSummaries: CriticIterationSummary[];
-  actionDiagnostics: ResearchActionDiagnostic[];
-}): { score: number; label: "strong" | "adequate" | "limited" | "poor"; rationale: string[] } {
-  const rationale: string[] = [];
-  let score = 100;
-  const nonPassingCritics = input.criticSummaries.filter((summary) => summary.finalReadiness !== "pass");
-
-  if (input.selectedPaperCount < 3) {
-    score -= 25;
-    rationale.push("Fewer than three papers were selected for synthesis.");
-  } else if (input.selectedPaperCount < 8) {
-    score -= 10;
-    rationale.push("The selected evidence set is modest.");
-  }
-
-  if (input.extractionCount < input.selectedPaperCount) {
-    score -= 20;
-    rationale.push("Not every selected paper was extracted.");
-  }
-
-  if (input.evidenceRowCount < 3) {
-    score -= 20;
-    rationale.push("The evidence matrix remained thin.");
-  }
-
-  if (nonPassingCritics.length > 0) {
-    score -= Math.min(30, nonPassingCritics.length * 10);
-    rationale.push(`Critic review ended with unresolved ${nonPassingCritics.map((summary) => `${summary.stage}:${summary.finalReadiness}`).join(", ")} status.`);
-  }
-
-  if (input.actionDiagnostics.length > 0) {
-    score -= Math.min(35, input.actionDiagnostics.length * 15);
-    rationale.push(`Research-agent action control had ${input.actionDiagnostics.length} structured-output issue(s).`);
-  }
-
-  if (input.manuscriptReadiness !== "ready_for_revision") {
-    score -= input.manuscriptReadiness === "needs_human_review" ? 10 : 20;
-    rationale.push(`Manuscript readiness ended as ${input.manuscriptReadiness}.`);
-  }
-
-  const boundedScore = Math.max(0, Math.min(100, score));
-  const label = boundedScore >= 80
-    ? "strong"
-    : boundedScore >= 60
-    ? "adequate"
-    : boundedScore >= 40
-    ? "limited"
-    : "poor";
-
-  return {
-    score: boundedScore,
-    label,
-    rationale: rationale.length > 0 ? rationale : ["The run completed with sufficient evidence, extraction, and critic agreement signals."]
-  };
-}
-
-function buildQualityReport(input: {
-  run: RunRecord;
-  backendLabel: string;
-  gathered: ResearchSourceSnapshot | null;
-  paperExtractions: PaperExtraction[];
-  evidenceMatrix: EvidenceMatrix;
-  manuscriptBundle: ManuscriptBundle;
-  criticReportsByStage: Map<CriticReviewStage, CriticReviewArtifact[]>;
-  agentActionDiagnostics?: ResearchActionDiagnostic[];
-  agentActionTransports?: AgentActionTransportRecord[];
-  agentControlMode?: RuntimeLlmConfig["agentControlMode"];
-  autonomousRevisionPasses: number;
-  revisionBudgetPasses: number;
-}): Record<string, unknown> {
-  const criticIterations = finalCriticIterationSummaries(input.criticReportsByStage);
-  const actionDiagnostics = input.agentActionDiagnostics ?? [];
-  const actionTransports = input.agentActionTransports ?? [];
-  const transportCounts = actionTransports.reduce<Record<string, number>>((counts, record) => {
-    counts[record.transport] = (counts[record.transport] ?? 0) + 1;
-    return counts;
-  }, {});
-  const reviewedPaperCount = input.gathered?.reviewedPapers.length ?? 0;
-  const selectedPaperCount = input.gathered?.reviewWorkflow.counts.selectedForSynthesis ?? reviewedPaperCount;
-  const suitability = modelSuitabilityRating({
-    reviewedPaperCount,
-    selectedPaperCount,
-    extractionCount: input.paperExtractions.length,
-    evidenceRowCount: input.evidenceMatrix.rowCount,
-    manuscriptReadiness: input.manuscriptBundle.checks.readinessStatus,
-    criticSummaries: criticIterations,
-    actionDiagnostics
-  });
-
-  return {
-    schemaVersion: 1,
-    runId: input.run.id,
-    status: "completed",
-    backend: input.backendLabel,
-    evidence: {
-      rawSources: input.gathered?.sources.length ?? 0,
-      canonicalPapers: input.gathered?.canonicalPapers.length ?? 0,
-      titleScreened: input.gathered?.reviewWorkflow.counts.titleScreened ?? 0,
-      abstractScreened: input.gathered?.reviewWorkflow.counts.abstractScreened ?? 0,
-      fulltextScreened: input.gathered?.reviewWorkflow.counts.fulltextScreened ?? 0,
-      includedPapers: input.gathered?.reviewWorkflow.counts.included ?? 0,
-      selectedForSynthesis: selectedPaperCount,
-      reviewedPapers: reviewedPaperCount,
-      extractedPapers: input.paperExtractions.length,
-      evidenceRows: input.evidenceMatrix.rowCount,
-      referencedPapers: input.manuscriptBundle.references.referenceCount
-    },
-    critic: {
-      autonomousRevisionPasses: input.autonomousRevisionPasses,
-      revisionBudgetPasses: input.revisionBudgetPasses,
-      iterations: criticIterations,
-      finalSatisfaction: criticIterations.every((summary) => summary.finalReadiness === "pass") ? "pass" : "unresolved"
-    },
-    agentControl: {
-      mode: input.agentControlMode ?? "strict_json",
-      transportCounts,
-      actions: actionTransports.slice(-20),
-      invalidActionCount: actionDiagnostics.length,
-      diagnostics: actionDiagnostics
-    },
-    manuscript: {
-      readinessStatus: input.manuscriptBundle.checks.readinessStatus,
-      blockerCount: input.manuscriptBundle.checks.blockerCount,
-      warningCount: input.manuscriptBundle.checks.warningCount,
-      fullManuscriptReleased: input.manuscriptBundle.checks.readinessStatus === "ready_for_revision"
-    },
-    modelSuitability: suitability
-  };
-}
-
-function externalBlockersFromManuscript(bundle: ManuscriptBundle): string[] {
-  const blockerText = [
-    ...bundle.checks.blockers,
-    ...bundle.checks.checks
-      .filter((check) => check.status === "fail")
-      .map((check) => check.message)
-  ];
-
-  return blockerText.filter((text) => (
-    /\b(credential|api key|quota|rate limit|paywall|permission|access denied|forbidden|unauthori[sz]ed|license|tdm|missing required)\b/i.test(text)
-  )).slice(0, 8);
-}
-
-function internalActionsFromRun(input: {
-  synthesis: ResearchSynthesis;
-  agenda: ResearchAgenda;
-  manuscriptBundle: ManuscriptBundle;
-  criticReportsByStage: Map<CriticReviewStage, CriticReviewArtifact[]>;
-}): string[] {
-  const criticActions = finalCriticIterationSummaries(input.criticReportsByStage)
-    .filter((summary) => summary.finalReadiness !== "pass")
-    .flatMap((summary) => summary.topObjections.map((objection) => `${summary.stage}: ${objection}`));
-  const failedChecks = input.manuscriptBundle.checks.checks
-    .filter((check) => check.status !== "pass")
-    .map((check) => `${check.title}: ${check.message}`);
-
-  return uniqueStrings([
-    ...criticActions,
-    ...failedChecks,
-    ...input.synthesis.nextQuestions,
-    ...input.agenda.holdReasons
-  ]).slice(0, 16);
-}
-
-function researchWorkerStatusFromRun(input: {
-  manuscriptBundle: ManuscriptBundle;
-  internalActions: string[];
-  externalBlockers: string[];
-}): ResearchWorkerStatus {
-  if (input.manuscriptBundle.checks.readinessStatus === "ready_for_revision") {
-    return "release_ready";
-  }
-
-  if (input.externalBlockers.length > 0) {
-    return "externally_blocked";
-  }
-
-  return "working";
-}
-
-function researchWorkerStatusReason(status: ResearchWorkerStatus, readiness: string): string {
-  switch (status) {
-    case "release_ready":
-      return "The current evidence, synthesis, references, and manuscript checks are ready for scientific revision.";
-    case "externally_blocked":
-      return "The autonomous worker needs external access, credentials, quota, or permission before it can continue safely.";
-    case "needs_user_decision":
-      return "The autonomous worker needs a genuine research-direction decision before continuing.";
-    case "working":
-      return `The latest run segment ended with ${readiness}; remaining work is machine-actionable and should continue internally.`;
-    case "paused":
-      return "The autonomous research worker is paused.";
-    case "not_started":
-      return "No autonomous research worker segment has started yet.";
-  }
-}
-
-async function writeWorkerStateForRun(input: {
-  run: RunRecord;
-  previousState: ResearchWorkerState | null;
-  gathered: ResearchSourceSnapshot | null;
-  paperExtractions: PaperExtraction[];
-  evidenceMatrix: EvidenceMatrix;
-  synthesis: ResearchSynthesis;
-  agenda: ResearchAgenda;
-  manuscriptBundle: ManuscriptBundle;
-  criticReportsByStage: Map<CriticReviewStage, CriticReviewArtifact[]>;
-  revisionPasses: number;
-  revisionBudgetPasses: number;
-  continuationLimitReason?: string | null;
-  now: string;
-}): Promise<ResearchWorkerState> {
-  const internalActions = internalActionsFromRun({
-    synthesis: input.synthesis,
-    agenda: input.agenda,
-    manuscriptBundle: input.manuscriptBundle,
-    criticReportsByStage: input.criticReportsByStage
-  });
-  const externalBlockers = externalBlockersFromManuscript(input.manuscriptBundle);
-  const status = researchWorkerStatusFromRun({
-    manuscriptBundle: input.manuscriptBundle,
-    internalActions,
-    externalBlockers
-  });
-  const criticIterations = finalCriticIterationSummaries(input.criticReportsByStage);
-  const state: ResearchWorkerState = {
-    schemaVersion: 1,
-    projectRoot: input.run.projectRoot,
-    brief: input.run.brief,
-    status,
-    activeRunId: null,
-    lastRunId: input.run.id,
-    segmentCount: (input.previousState?.segmentCount ?? 0) + 1,
-    updatedAt: input.now,
-    statusReason: status === "needs_user_decision" && input.continuationLimitReason !== null && input.continuationLimitReason !== undefined
-      ? input.continuationLimitReason
-      : researchWorkerStatusReason(status, input.manuscriptBundle.checks.readinessStatus),
-    paperReadiness: input.manuscriptBundle.checks.readinessStatus,
-    nextInternalActions: status === "working" ? internalActions : [],
-    userBlockers: status === "externally_blocked" || status === "needs_user_decision"
-      ? externalBlockers.length > 0 ? externalBlockers : internalActions
-      : [],
-    evidence: {
-      canonicalPapers: input.gathered?.canonicalPapers.length ?? 0,
-      selectedPapers: input.gathered?.reviewedPapers.length ?? 0,
-      extractedPapers: input.paperExtractions.length,
-      evidenceRows: input.evidenceMatrix.rowCount,
-      referencedPapers: input.manuscriptBundle.references.referenceCount
-    },
-    critic: {
-      finalSatisfaction: criticIterations.every((summary) => summary.finalReadiness === "pass") ? "pass" : "unresolved",
-      unresolvedStages: criticIterations
-        .filter((summary) => summary.finalReadiness !== "pass")
-        .map((summary) => summary.stage),
-      objections: criticIterations.flatMap((summary) => summary.topObjections).slice(0, 12)
-    }
-  };
-
-  await writeResearchWorkerState(state);
-  return state;
-}
-
-async function writeResearchDirection(
-  run: RunRecord,
-  agenda: ResearchAgenda,
-  acceptedAt: string,
-  sourceRun: RunRecord | null = run
-): Promise<void> {
-  await writeJsonArtifact(
-    researchDirectionPath(run.projectRoot),
-    createResearchDirectionState(agenda, run, acceptedAt, { sourceRun })
-  );
+function isExternalBlockerMessage(text: string): boolean {
+  return /\b(credential|api key|quota|rate limit|paywall|permission|access denied|forbidden|unauthori[sz]ed|license|tdm|missing required|provider outage|required external resource)\b/i.test(text);
 }
 
 function pendingArtifactStatus(run: RunRecord, artifactKind: string, timestamp: string): ArtifactStatus {
@@ -4160,323 +3633,6 @@ function relativeArtifactPath(projectRoot: string, targetPath: string): string {
   return relativePath.length === 0 ? "." : relativePath;
 }
 
-function summarizeSource(source: ResearchSource): string {
-  const locator = source.locator ?? "no external locator";
-  return `${source.id}: ${source.title} (${source.kind}; ${locator})`;
-}
-
-function summarizeReviewedPaper(paper: CanonicalPaper): string {
-  const venue = paper.venue ?? "unknown venue";
-  return `${paperEntityId(paper)}: ${paper.title} (${venue}; ${paper.accessMode}; ${paper.screeningDecision})`;
-}
-
-function summarizeClaim(claim: ResearchClaim): string {
-  const sources = claim.sourceIds.length > 0
-    ? ` [${claim.sourceIds.join(", ")}]`
-    : "";
-  return `${claim.claim}${sources}`;
-}
-
-function summarizeVerifiedClaim(claim: VerifiedClaim): string {
-  return `${claim.supportStatus} (${claim.confidence}): ${claim.claim}`;
-}
-
-function reviewWorkflowLines(gathered: ResearchSourceSnapshot): string[] {
-  return [
-    `- Title screened: ${gathered.reviewWorkflow.counts.titleScreened}`,
-    `- Abstract screened: ${gathered.reviewWorkflow.counts.abstractScreened}`,
-    `- Full-text screened: ${gathered.reviewWorkflow.counts.fulltextScreened}`,
-    `- Included after review: ${gathered.reviewWorkflow.counts.included}`,
-    `- Blocked or credential-limited: ${gathered.reviewWorkflow.counts.blocked}`,
-    `- Selected for synthesis: ${gathered.reviewWorkflow.counts.selectedForSynthesis}`,
-    `- Deferred included papers: ${gathered.reviewWorkflow.counts.deferred}`
-  ];
-}
-
-function researchSummaryMarkdown(
-  run: RunRecord,
-  plan: ResearchPlan,
-  gathered: ResearchSourceSnapshot,
-  paperExtractions: PaperExtraction[],
-  evidenceMatrix: EvidenceMatrix,
-  synthesis: ResearchSynthesis,
-  verification: VerificationReport
-): string {
-  const lines = [
-    "# Run Summary",
-    "",
-    `- Topic: ${run.brief.topic ?? "<missing>"}`,
-    `- Research mode: ${plan.researchMode}`,
-    `- Objective: ${plan.objective}`,
-    `- Raw sources gathered: ${gathered.sources.length}`,
-    `- Canonical papers retained: ${gathered.canonicalPapers.length}`,
-    `- Reviewed papers selected for synthesis: ${gathered.reviewedPapers.length}`,
-    `- Paper extractions written: ${paperExtractions.length}`,
-    `- Evidence matrix rows: ${evidenceMatrix.rowCount}`,
-    "",
-    "## Executive Summary",
-    "",
-    synthesis.executiveSummary,
-    "",
-    "## Verification",
-    "",
-    verification.summary,
-    "",
-    "## Review Workflow",
-    "",
-    ...reviewWorkflowLines(gathered),
-    "",
-    "## Main Themes",
-    ""
-  ];
-
-  if (synthesis.themes.length === 0) {
-    lines.push("- No stable themes were extracted.");
-  } else {
-    for (const theme of synthesis.themes) {
-      lines.push(`- ${theme.title}: ${theme.summary}`);
-    }
-  }
-
-  lines.push("", "## Evidence Highlights", "");
-
-  if (evidenceMatrix.derivedInsights.length === 0) {
-    lines.push("- No stable cross-paper evidence insights were derived.");
-  } else {
-    for (const insight of evidenceMatrix.derivedInsights.slice(0, 6)) {
-      lines.push(`- ${insight.kind}: ${insight.title} (${insight.paperIds.join(", ") || "no linked papers"})`);
-    }
-  }
-
-  lines.push("", "## Next-Step Questions", "");
-
-  if (synthesis.nextQuestions.length === 0) {
-    lines.push("- No concrete next-step questions were generated.");
-  } else {
-    for (const question of synthesis.nextQuestions) {
-      lines.push(`- ${question}`);
-    }
-  }
-
-  return lines.join("\n");
-}
-
-function synthesisMarkdown(
-  run: RunRecord,
-  plan: ResearchPlan,
-  gathered: ResearchSourceSnapshot,
-  paperExtractions: PaperExtraction[],
-  evidenceMatrix: EvidenceMatrix,
-  synthesis: ResearchSynthesis,
-  verification: VerificationReport
-): string {
-  const lines = [
-    "# Research Synthesis",
-    "",
-    "## Brief",
-    "",
-    `- Topic: ${run.brief.topic ?? "<missing>"}`,
-    `- Research question: ${run.brief.researchQuestion ?? "<missing>"}`,
-    `- Research direction: ${run.brief.researchDirection ?? "<missing>"}`,
-    `- Success criterion: ${run.brief.successCriterion ?? "<missing>"}`,
-    "",
-    "## Planned Research Mode",
-    "",
-    `- Mode: ${plan.researchMode}`,
-    `- Objective: ${plan.objective}`,
-    `- Rationale: ${plan.rationale}`,
-    "",
-    "## Retrieval Overview",
-    "",
-    `- Domain routing: ${gathered.routing.domain}`,
-    `- Discovery providers: ${gathered.routing.discoveryProviderIds.join(", ") || "none"}`,
-    `- Resolver providers: ${gathered.routing.resolverProviderIds.join(", ") || "none"}`,
-    `- Raw sources gathered: ${gathered.sources.length}`,
-    `- Canonical papers retained: ${gathered.canonicalPapers.length}`,
-    `- Reviewed papers selected for synthesis: ${gathered.reviewedPapers.length}`,
-    `- Paper extractions written: ${paperExtractions.length}`,
-    `- Evidence matrix rows: ${evidenceMatrix.rowCount}`,
-    "",
-    "## Review Workflow",
-    "",
-    ...reviewWorkflowLines(gathered),
-    "",
-    "## Executive Summary",
-    "",
-    synthesis.executiveSummary,
-    "",
-    "## Verification",
-    "",
-    `- Overall status: ${verification.overallStatus}`,
-    `- Summary: ${verification.summary}`,
-    `- Supported claims: ${verification.counts.supported}`,
-    `- Partially supported claims: ${verification.counts.partiallySupported}`,
-    `- Unverified claims: ${verification.counts.unverified}`,
-    `- Explicit unknowns: ${verification.counts.unknown}`,
-    "",
-    "## Themes",
-    ""
-  ];
-
-  if (synthesis.themes.length === 0) {
-    lines.push("- No themes were extracted from the current canonical paper set.");
-  } else {
-    for (const theme of synthesis.themes) {
-      const sources = theme.sourceIds.length > 0
-        ? ` Sources: ${theme.sourceIds.join(", ")}.`
-        : "";
-      lines.push(`- ${theme.title}: ${theme.summary}${sources}`);
-    }
-  }
-
-  lines.push("", "## Claims and Evidence", "");
-
-  if (synthesis.claims.length === 0) {
-    lines.push("- No source-grounded claims were extracted.");
-  } else {
-    for (const claim of synthesis.claims) {
-      const sources = claim.sourceIds.length > 0
-        ? ` Sources: ${claim.sourceIds.join(", ")}.`
-        : "";
-      lines.push(`- Claim: ${claim.claim}`);
-      lines.push(`  Evidence: ${claim.evidence}${sources}`);
-    }
-  }
-
-  lines.push("", "## Evidence Matrix Insights", "");
-
-  if (evidenceMatrix.derivedInsights.length === 0) {
-    lines.push("- No evidence-matrix insights were derived.");
-  } else {
-    for (const insight of evidenceMatrix.derivedInsights) {
-      lines.push(`- ${insight.kind}: ${insight.title} - ${insight.summary}`);
-    }
-  }
-
-  lines.push("", "## Paper Extractions", "");
-
-  if (paperExtractions.length === 0) {
-    lines.push("- No paper-by-paper extraction records were produced.");
-  } else {
-    for (const extraction of paperExtractions.slice(0, 12)) {
-      lines.push(`- ${extraction.paperId}: confidence ${extraction.confidence}; system type "${extraction.systemType || "<unspecified>"}"; planning "${extraction.planningStyle || "<unspecified>"}"`);
-    }
-  }
-
-  lines.push("", "## Reviewed Papers", "");
-
-  if (gathered.reviewedPapers.length === 0) {
-    lines.push("- No reviewed papers were selected for synthesis.");
-  } else {
-    for (const paper of gathered.reviewedPapers) {
-      lines.push(`- ${paperEntityId(paper)}: ${paper.citation} [${paper.accessMode}]`);
-    }
-  }
-
-  if (gathered.reviewWorkflow.counts.deferred > 0) {
-    lines.push("", "## Deferred Included Papers", "");
-    lines.push(`- ${gathered.reviewWorkflow.counts.deferred} additional included papers were kept in the review backlog for later synthesis passes.`);
-  }
-
-  lines.push("", "## Next-Step Questions", "");
-
-  if (synthesis.nextQuestions.length === 0) {
-    lines.push("- No next-step questions were generated.");
-  } else {
-    for (const question of synthesis.nextQuestions) {
-      lines.push(`- ${question}`);
-    }
-  }
-
-  if (verification.unverifiedClaims.length > 0 || verification.unknowns.length > 0) {
-    lines.push("", "## Verification Gaps", "");
-
-    for (const claim of verification.unverifiedClaims) {
-      lines.push(`- ${claim.claim}: ${claim.reason}`);
-    }
-
-    for (const unknown of verification.unknowns) {
-      lines.push(`- ${unknown}`);
-    }
-  }
-
-  return lines.join("\n");
-}
-
-async function readJsonArtifactOrNull<T>(filePath: string): Promise<T | null> {
-  try {
-    const contents = await readFile(filePath, "utf8");
-    return JSON.parse(contents) as T;
-  } catch {
-    return null;
-  }
-}
-
-function agendaMarkdown(
-  run: RunRecord,
-  plan: ResearchPlan,
-  agenda: ResearchAgenda
-): string {
-  const lines = [
-    "# Research Agenda",
-    "",
-    `- Run id: ${run.id}`,
-    `- Stage: ${run.stage}`,
-    `- Research mode: ${plan.researchMode}`,
-    `- Objective: ${plan.objective}`,
-    "",
-    "## Executive Summary",
-    "",
-    agenda.executiveSummary,
-    "",
-    "## Gaps",
-    ""
-  ];
-
-  if (agenda.gaps.length === 0) {
-    lines.push("- No explicit gaps were extracted from the current reviewed evidence.");
-  } else {
-    for (const gap of agenda.gaps) {
-      const evidence = gap.sourceIds.length > 0
-        ? ` Sources: ${gap.sourceIds.join(", ")}.`
-        : "";
-      const claims = gap.claimIds.length > 0
-        ? ` Claims: ${gap.claimIds.join(", ")}.`
-        : "";
-      lines.push(`- ${gap.title} [${gap.gapKind}; ${gap.severity}]: ${gap.summary}${evidence}${claims}`);
-    }
-  }
-
-  lines.push("", "## Candidate Directions", "");
-
-  if (agenda.candidateDirections.length === 0) {
-    lines.push("- No candidate directions were selected from the current evidence.");
-  } else {
-    for (const candidate of agenda.candidateDirections) {
-      const marker = candidate.id === agenda.selectedDirectionId ? " (selected)" : "";
-      lines.push(`- ${candidate.title}${marker}`);
-      lines.push(`  Mode: ${candidate.mode}`);
-      lines.push(`  Summary: ${candidate.summary}`);
-      lines.push(`  Why now: ${candidate.whyNow}`);
-      lines.push(`  Scores: evidence ${candidate.scores.evidenceBase}/5, novelty ${candidate.scores.novelty}/5, tractability ${candidate.scores.tractability}/5, cost ${candidate.scores.expectedCost}/5, risk ${candidate.scores.risk}/5, overall ${candidate.scores.overall}/5`);
-    }
-  }
-
-  lines.push("", "## Internal Continuation", "");
-  lines.push("- Candidate directions and gaps are used as internal planning context for the autonomous worker.");
-  lines.push("- No separate handoff artifact is generated for the user to execute.");
-
-  if (agenda.holdReasons.length > 0) {
-    lines.push("", "## Hold Reasons", "");
-    for (const reason of agenda.holdReasons) {
-      lines.push(`- ${reason}`);
-    }
-  }
-
-  lines.push("", "## Recommended Human Decision", "", agenda.recommendedHumanDecision);
-  return lines.join("\n");
-}
-
 function paperEntityId(paper: CanonicalPaper): string {
   return createLiteratureEntityId("paper", paper.key);
 }
@@ -4493,18 +3649,6 @@ function canonicalPaperIdMap(papers: CanonicalPaper[]): Map<string, string> {
   return mapping;
 }
 
-function paperLookupByAnyId(papers: CanonicalPaper[]): Map<string, CanonicalPaper> {
-  const lookup = new Map<string, CanonicalPaper>();
-
-  for (const paper of papers) {
-    const canonicalId = paperEntityId(paper);
-    lookup.set(paper.id, paper);
-    lookup.set(canonicalId, paper);
-  }
-
-  return lookup;
-}
-
 function remapPaperIds(sourceIds: string[], canonicalIdByAnyId: Map<string, string>): string[] {
   return [...new Set(sourceIds.map((sourceId) => canonicalIdByAnyId.get(sourceId) ?? sourceId))];
 }
@@ -4518,67 +3662,6 @@ function canonicalizePaper(paper: CanonicalPaper): CanonicalPaper {
 
 function canonicalizePapers(papers: CanonicalPaper[]): CanonicalPaper[] {
   return papers.map((paper) => canonicalizePaper(paper));
-}
-
-function remapPaperExtractions(
-  paperExtractions: PaperExtraction[],
-  canonicalIdByAnyId: Map<string, string>
-): PaperExtraction[] {
-  return paperExtractions.map((extraction) => ({
-    ...extraction,
-    paperId: canonicalIdByAnyId.get(extraction.paperId) ?? extraction.paperId
-  }));
-}
-
-function remapEvidenceMatrix(
-  evidenceMatrix: EvidenceMatrix,
-  canonicalIdByAnyId: Map<string, string>
-): EvidenceMatrix {
-  return {
-    ...evidenceMatrix,
-    rows: evidenceMatrix.rows.map((row) => ({
-      ...row,
-      paperId: canonicalIdByAnyId.get(row.paperId) ?? row.paperId
-    })),
-    derivedInsights: evidenceMatrix.derivedInsights.map((insight) => ({
-      ...insight,
-      paperIds: remapPaperIds(insight.paperIds, canonicalIdByAnyId)
-    }))
-  };
-}
-
-function remapSynthesisSourceIds(
-  synthesis: ResearchSynthesis,
-  canonicalIdByAnyId: Map<string, string>
-): ResearchSynthesis {
-  return {
-    ...synthesis,
-    themes: synthesis.themes.map((theme) => ({
-      ...theme,
-      sourceIds: remapPaperIds(theme.sourceIds, canonicalIdByAnyId)
-    })),
-    claims: synthesis.claims.map((claim) => ({
-      ...claim,
-      sourceIds: remapPaperIds(claim.sourceIds, canonicalIdByAnyId)
-    }))
-  };
-}
-
-function remapAgendaSourceIds(
-  agenda: ResearchAgenda,
-  canonicalIdByAnyId: Map<string, string>
-): ResearchAgenda {
-  return {
-    ...agenda,
-    gaps: agenda.gaps.map((gap) => ({
-      ...gap,
-      sourceIds: remapPaperIds(gap.sourceIds, canonicalIdByAnyId)
-    })),
-    candidateDirections: agenda.candidateDirections.map((direction) => ({
-      ...direction,
-      sourceIds: remapPaperIds(direction.sourceIds, canonicalIdByAnyId)
-    }))
-  };
 }
 
 function remapReviewWorkflow(
@@ -4597,271 +3680,6 @@ function remapReviewWorkflow(
     synthesisPaperIds: remapPaperIds(reviewWorkflow.synthesisPaperIds, canonicalIdByAnyId),
     deferredPaperIds: remapPaperIds(reviewWorkflow.deferredPaperIds, canonicalIdByAnyId)
   };
-}
-
-function targetKindForId(targetId: string): MemoryLink["targetKind"] {
-  if (targetId.startsWith("paper-")) {
-    return "paper";
-  }
-
-  if (targetId.startsWith("theme-")) {
-    return "theme";
-  }
-
-  if (targetId.startsWith("notebook-")) {
-    return "notebook";
-  }
-
-  return "memory";
-}
-
-function link(type: MemoryLink["type"], targetId: string): MemoryLink {
-  return {
-    type,
-    targetKind: targetKindForId(targetId),
-    targetId
-  };
-}
-
-function claimRecordId(claim: ResearchClaim): string {
-  return createMemoryRecordId("claim", claim.claim);
-}
-
-function findingRecordKey(theme: ResearchTheme): string {
-  return `${theme.title} | ${theme.summary}`;
-}
-
-function findingRecordId(theme: ResearchTheme): string {
-  return createMemoryRecordId("finding", findingRecordKey(theme));
-}
-
-function questionRecordId(question: string): string {
-  return createMemoryRecordId("question", question);
-}
-
-function ideaRecordId(key: string): string {
-  return createMemoryRecordId("idea", key);
-}
-
-function summaryRecordId(runId: string): string {
-  return createMemoryRecordId("summary", `run:${runId}:summary`);
-}
-
-function relatedClaimIdsForTheme(theme: ResearchTheme, claims: ResearchClaim[]): string[] {
-  const themeSources = new Set(theme.sourceIds);
-
-  return claims.flatMap((claim) => claim.sourceIds.some((sourceId) => themeSources.has(sourceId))
-    ? [claimRecordId(claim)]
-    : []);
-}
-
-function fallbackFinding(
-  gathered: ResearchSourceSnapshot,
-  summaryText: string,
-  failureMessage: string | null
-): ResearchTheme {
-  return {
-    title: failureMessage === null ? "Provisional finding" : "Evidence gap",
-    summary: failureMessage ?? summaryText,
-    sourceIds: gathered.canonicalPapers.slice(0, 3).map((paper) => paperEntityId(paper))
-  };
-}
-
-function buildIdeaRecords(
-  run: RunRecord,
-  plan: ResearchPlan,
-  questionIds: string[],
-  failureMessage: string | null
-): MemoryRecordInput[] {
-  if (failureMessage !== null) {
-    return [{
-      type: "idea",
-      key: `run:${run.id}:retrieval-revision`,
-      title: "Broaden literature retrieval",
-      text: `Refine the query plan, provider routing, or access configuration before the next research pass on ${run.brief.topic ?? "this project"}.`,
-      runId: run.id,
-      links: questionIds.map((targetId) => link("refines", targetId)),
-      data: {
-        researchMode: plan.researchMode,
-        objective: plan.objective
-      }
-    }];
-  }
-
-  return [{
-    type: "idea",
-    key: `run:${run.id}:follow-up`,
-    title: "Follow-up direction",
-    text: `Use the canonical paper set from this run to continue the bounded ${plan.researchMode} program around ${plan.objective}.`,
-    runId: run.id,
-    links: questionIds.slice(0, 2).map((targetId) => link("refines", targetId)),
-    data: {
-      researchMode: plan.researchMode,
-      objective: plan.objective
-    }
-  }];
-}
-
-function buildArtifactRecords(
-  run: RunRecord,
-  sourceIds: string[],
-  claimIds: string[],
-  findingIds: string[],
-  questionIds: string[],
-  ideaIds: string[],
-  summaryId: string
-): MemoryRecordInput[] {
-  const artifactSpecs = [
-    {
-      path: run.artifacts.planPath,
-      title: "Research plan artifact",
-      text: `Saved explicit research plan for ${run.id}.`,
-      linkIds: ideaIds.length > 0 ? ideaIds : [summaryId]
-    },
-    {
-      path: run.artifacts.sourcesPath,
-      title: "Raw retrieval artifact",
-      text: `Saved raw provider hits, routing notes, and merge diagnostics for ${run.id}.`,
-      linkIds: sourceIds
-    },
-    {
-      path: run.artifacts.literaturePath,
-      title: "Literature review artifact",
-      text: `Saved the run-level literature review snapshot for ${run.id}.`,
-      linkIds: sourceIds
-    },
-    {
-      path: run.artifacts.reviewProtocolPath,
-      title: "Review protocol artifact",
-      text: `Saved the review protocol for ${run.id}.`,
-      linkIds: sourceIds.length > 0 ? sourceIds : [summaryId]
-    },
-    {
-      path: run.artifacts.reviewProtocolMarkdownPath,
-      title: "Review protocol summary artifact",
-      text: `Saved the human-readable review protocol for ${run.id}.`,
-      linkIds: sourceIds.length > 0 ? sourceIds : [summaryId]
-    },
-    {
-      path: run.artifacts.paperExtractionsPath,
-      title: "Paper extractions artifact",
-      text: `Saved paper-by-paper extraction records for ${run.id}.`,
-      linkIds: sourceIds
-    },
-    {
-      path: run.artifacts.verificationPath,
-      title: "Verification artifact",
-      text: `Saved verification report for ${run.id}.`,
-      linkIds: claimIds.length > 0 ? claimIds : [summaryId]
-    },
-    {
-      path: run.artifacts.paperPath,
-      title: "Review paper draft artifact",
-      text: `Saved the review-paper draft for ${run.id}.`,
-      linkIds: [
-        summaryId,
-        ...findingIds,
-        ...claimIds
-      ]
-    },
-    {
-      path: run.artifacts.paperJsonPath,
-      title: "Structured review paper artifact",
-      text: `Saved the structured paper representation for ${run.id}.`,
-      linkIds: claimIds.length > 0 ? claimIds : [summaryId]
-    },
-    {
-      path: run.artifacts.manuscriptChecksPath,
-      title: "Manuscript checks artifact",
-      text: `Saved manuscript readiness checks for ${run.id}.`,
-      linkIds: claimIds.length > 0 ? claimIds : [summaryId]
-    },
-    {
-      path: run.artifacts.nextQuestionsPath,
-      title: "Next questions artifact",
-      text: `Saved follow-up questions for ${run.id}.`,
-      linkIds: questionIds
-    },
-    {
-      path: run.artifacts.agendaPath,
-      title: "Research agenda artifact",
-      text: `Saved the ranked research agenda for ${run.id}.`,
-      linkIds: ideaIds.length > 0 ? ideaIds : [summaryId]
-    },
-    {
-      path: run.artifacts.memoryPath,
-      title: "Research workspace database",
-      text: `Saved canonical SQLite research workspace state for ${run.id}.`,
-      linkIds: [
-        summaryId,
-        ...findingIds,
-        ...claimIds,
-        ...questionIds
-      ]
-    }
-  ];
-
-  return artifactSpecs.map((artifact) => ({
-    type: "artifact",
-    key: relativeArtifactPath(run.projectRoot, artifact.path),
-    title: artifact.title,
-    text: artifact.text,
-    runId: run.id,
-    links: artifact.linkIds.map((targetId) => link("contains", targetId)),
-    data: {
-      path: relativeArtifactPath(run.projectRoot, artifact.path)
-    }
-  }));
-}
-
-function themeFromInsight(insight: EvidenceMatrixInsight): ResearchTheme {
-  return {
-    title: insight.title,
-    summary: insight.summary,
-    sourceIds: insight.paperIds
-  };
-}
-
-function questionFromInsight(insight: EvidenceMatrixInsight): string {
-  return insight.kind === "gap"
-    ? `Which bounded follow-up would best close this evidence gap: ${insight.title.toLowerCase()}?`
-    : `What evidence or comparison would best resolve this conflict: ${insight.title.toLowerCase()}?`;
-}
-
-function completePaperExtractions(
-  run: RunRecord,
-  reviewedPapers: CanonicalPaper[],
-  paperExtractions: PaperExtraction[]
-): PaperExtraction[] {
-  const byPaperId = new Map(paperExtractions.map((extraction) => [extraction.paperId, extraction]));
-
-  for (const paper of reviewedPapers) {
-    if (byPaperId.has(paper.id)) {
-      continue;
-    }
-
-    byPaperId.set(paper.id, {
-      id: `extraction-${paper.id}`,
-      paperId: paper.id,
-      runId: run.id,
-      problemSetting: "",
-      systemType: "",
-      architecture: "",
-      toolsAndMemory: "",
-      planningStyle: "",
-      evaluationSetup: "",
-      successSignals: [],
-      failureModes: [],
-      limitations: [],
-      supportedClaims: [],
-      confidence: "low",
-      evidenceNotes: ["No structured extraction was completed for this reviewed paper; the record remains intentionally sparse."]
-    });
-  }
-
-  return reviewedPapers
-    .map((paper) => byPaperId.get(paper.id))
-    .filter((extraction): extraction is PaperExtraction => extraction !== undefined);
 }
 
 function errorMessage(error: unknown): string {
@@ -4890,234 +3708,17 @@ function recoveryFailureKind(error: unknown): string {
   return "unexpected";
 }
 
-function isRecoverableExtractionError(error: unknown): boolean {
-  return ["timeout", "malformed_json", "empty_result"].includes(recoveryFailureKind(error));
-}
-
-class ResearchStageBlockedError extends Error {
-  constructor(
-    message: string,
-    public readonly operation: ResearchBackendOperation,
-    public readonly attempts: ExtractionBatchAttempt[]
-  ) {
-    super(message);
-    this.name = "ResearchStageBlockedError";
-  }
-}
-
-async function writeExtractionCheckpoint(
-  run: RunRecord,
-  reviewedPapers: CanonicalPaper[],
-  extractions: PaperExtraction[],
-  attempts: ExtractionBatchAttempt[],
-  status: "in_progress" | "completed" | "failed",
-  failedPaperIds: string[] = []
-): Promise<void> {
-  await writeJsonArtifact(run.artifacts.paperExtractionsPath, paperExtractionsArtifact(
-    run,
-    reviewedPapers.length,
-    extractions,
-    {
-      status,
-      completedPaperIds: [...new Set(extractions.map((extraction) => extraction.paperId))],
-      failedPaperIds,
-      batchAttempts: attempts
-    }
-  ));
-}
-
-async function extractReviewedPapersWithRecovery(options: {
-  run: RunRecord;
-  now: () => string;
-  researchBackend: ResearchBackend;
-  runtimeConfig: RuntimeLlmConfig;
-  plan: ResearchPlan;
-  papers: CanonicalPaper[];
-  literatureContext: Parameters<ResearchBackend["extractReviewedPapers"]>[0]["literatureContext"];
-}): Promise<{
-  extractions: PaperExtraction[];
-  attempts: ExtractionBatchAttempt[];
-}> {
-  const {
-    run,
-    now,
-    researchBackend,
-    runtimeConfig,
-    plan,
-    papers,
-    literatureContext
-  } = options;
-  const attempts: ExtractionBatchAttempt[] = [];
-  const extractions: PaperExtraction[] = [];
-  let cursor = 0;
-  let batchSize = Math.max(
-    runtimeConfig.extractionMinBatchSize,
-    Math.min(runtimeConfig.extractionInitialBatchSize, Math.max(1, papers.length))
-  );
-  const minBatchSize = Math.max(1, runtimeConfig.extractionMinBatchSize);
-  const startedAt = Date.now();
-
-  await writeExtractionCheckpoint(run, papers, extractions, attempts, "in_progress");
-
-  while (cursor < papers.length) {
-    if (attempts.filter((attempt) => attempt.status === "failed").length >= runtimeConfig.extractionRetryBudget) {
-      const failedPaperIds = papers.slice(cursor).map((paper) => paper.id);
-      await writeExtractionCheckpoint(run, papers, extractions, attempts, "failed", failedPaperIds);
-      throw new ResearchStageBlockedError(
-        `Extraction retry budget exhausted before all selected papers were extracted (${cursor}/${papers.length} batches complete).`,
-        "extraction",
-        attempts
-      );
-    }
-
-    if (Date.now() - startedAt > runtimeConfig.totalRecoveryBudgetMs) {
-      const failedPaperIds = papers.slice(cursor).map((paper) => paper.id);
-      await writeExtractionCheckpoint(run, papers, extractions, attempts, "failed", failedPaperIds);
-      throw new ResearchStageBlockedError(
-        `Extraction retry time budget exhausted before all selected papers were extracted (${cursor}/${papers.length} papers complete).`,
-        "extraction",
-        attempts
-      );
-    }
-
-    const batch = papers.slice(cursor, Math.min(papers.length, cursor + batchSize));
-    const compact = batchSize <= minBatchSize && attempts.some((attempt) => (
-      attempt.status === "failed"
-      && attempt.paperIds.join("\0") === batch.map((paper) => paper.id).join("\0")
-    ));
-    const attemptBase = {
-      attempt: attempts.length + 1,
-      paperIds: batch.map((paper) => paper.id),
-      batchSize,
-      compact,
-      timeoutMs: runtimeConfig.extractionTimeoutMs
-    };
-
-    await appendEvent(
-      run,
-      now,
-      "next",
-      `Extracting reviewed paper batch ${cursor + 1}-${cursor + batch.length} of ${papers.length} (${batch.length} papers${compact ? ", compact prompt" : ""}).`
-    );
-
-    try {
-      const batchExtractions = await researchBackend.extractReviewedPapers({
-        projectRoot: run.projectRoot,
-        runId: run.id,
-        brief: run.brief,
-        plan,
-        papers: batch,
-        literatureContext,
-        compact
-      }, {
-        operation: "extraction",
-        timeoutMs: runtimeConfig.extractionTimeoutMs
-      });
-
-      if (batchExtractions.length === 0 && batch.length > 0) {
-        throw new Error("empty extraction result");
-      }
-
-      attempts.push({
-        ...attemptBase,
-        status: "succeeded",
-        errorKind: null,
-        errorMessage: null
-      });
-      extractions.push(...batchExtractions);
-      cursor += batch.length;
-      await writeExtractionCheckpoint(run, papers, extractions, attempts, "in_progress");
-      await appendStdout(run, `Extraction batch succeeded: ${cursor}/${papers.length} selected papers processed.`);
-    } catch (error) {
-      const kind = recoveryFailureKind(error);
-      const message = errorMessage(error);
-      attempts.push({
-        ...attemptBase,
-        status: "failed",
-        errorKind: kind,
-        errorMessage: message
-      });
-      await writeExtractionCheckpoint(run, papers, extractions, attempts, "in_progress", batch.map((paper) => paper.id));
-      await appendEvent(
-        run,
-        now,
-        "stderr",
-        `Extraction batch failed (${kind}): ${message}`
-      );
-
-      if (!isRecoverableExtractionError(error)) {
-        await writeExtractionCheckpoint(run, papers, extractions, attempts, "failed", batch.map((paper) => paper.id));
-        throw new ResearchStageBlockedError(
-          `Extraction failed with an unrecoverable ${kind}: ${message}`,
-          "extraction",
-          attempts
-        );
-      }
-
-      if (batchSize > minBatchSize) {
-        batchSize = Math.max(minBatchSize, Math.ceil(batchSize / 2));
-        await appendEvent(
-          run,
-          now,
-          "next",
-          `Retrying extraction by shrinking the next batch size to ${batchSize}.`
-        );
-        continue;
-      }
-
-      if (!compact) {
-        await appendEvent(run, now, "next", "Retrying extraction with a compact single-paper prompt.");
-        continue;
-      }
-
-      await writeExtractionCheckpoint(run, papers, extractions, attempts, "failed", batch.map((paper) => paper.id));
-      throw new ResearchStageBlockedError(
-        `Extraction could not complete after retries for selected paper ${batch[0]?.id ?? "<unknown>"}: ${message}`,
-        "extraction",
-        attempts
-      );
-    }
+function researchActionDiagnosticKind(error: unknown): ResearchActionDiagnostic["kind"] {
+  if (error instanceof ResearchBackendError) {
+    return "provider_failure";
   }
 
-  await writeExtractionCheckpoint(run, papers, extractions, attempts, "completed");
-  return {
-    extractions,
-    attempts
-  };
-}
+  const message = errorMessage(error);
+  if (/invalid|unknown|unsupported action/i.test(message)) {
+    return "invalid_action";
+  }
 
-function workspaceSynthesisFromStore(input: {
-  run: RunRecord;
-  store: ResearchWorkStore;
-}): ResearchSynthesis {
-  const claims: ResearchClaim[] = input.store.objects.claims.map((claim) => ({
-    claim: claim.text,
-    evidence: claim.evidence,
-    sourceIds: claim.sourceIds
-  }));
-  const themes: ResearchTheme[] = input.store.objects.evidenceCells
-    .filter((cell) => ["architecture", "toolsAndMemory", "planningStyle", "evaluationSetup", "successSignals", "failureModes", "limitations"].includes(cell.field))
-    .slice(0, 12)
-    .map((cell) => ({
-      title: `${cell.field} evidence`,
-      summary: Array.isArray(cell.value) ? cell.value.join("; ") : cell.value,
-      sourceIds: [cell.sourceId]
-    }));
-  const nextQuestions = uniqueStrings([
-    ...input.store.objects.workItems
-      .filter((item) => item.status === "open")
-      .map((item) => item.description),
-    ...input.store.worker.nextInternalActions
-  ]).slice(0, 10);
-
-  return {
-    executiveSummary: claims.length > 0
-      ? `The workspace contains ${claims.length} claim-led synthesis item(s) grounded in ${input.store.objects.evidenceCells.length} evidence cell(s).`
-      : "The workspace does not yet contain claim-led synthesis items.",
-    themes,
-    claims,
-    nextQuestions
-  };
+  return "malformed_action";
 }
 
 function referenceFromCanonicalSource(source: ResearchWorkStore["objects"]["canonicalSources"][number]): ReferenceRecord {
@@ -5151,6 +3752,129 @@ function referencesFromWorkStore(run: RunRecord, store: ResearchWorkStore): Refe
   };
 }
 
+function workspacePaperArtifact(input: {
+  run: RunRecord;
+  store: ResearchWorkStore;
+  references: ReferencesArtifact;
+  readinessStatus: ManuscriptReadinessState;
+}): ReviewPaperArtifact {
+  const title = stringInput(
+    input.run.brief.researchQuestion ?? input.run.brief.topic,
+    "Workspace research paper"
+  );
+  const claims = input.store.objects.claims.map((claim) => ({
+    claimId: claim.id,
+    claim: claim.text,
+    evidence: claim.evidence,
+    sourceIds: claim.sourceIds
+  }));
+  const sections = input.store.objects.manuscriptSections.map((section) => ({
+    id: section.id,
+    role: section.role,
+    title: section.title,
+    markdown: section.markdown,
+    sourceIds: section.sourceIds,
+    claimIds: section.claimIds
+  }));
+  const citationLinks = input.store.objects.citations.map((citation) => ({
+    sourceId: citation.sourceId,
+    sourceTitle: citation.sourceTitle,
+    evidenceCellId: citation.evidenceCellId,
+    supportSnippet: citation.supportSnippet,
+    confidence: citation.confidence,
+    relevance: citation.relevance,
+    claimIds: citation.claimIds,
+    sectionIds: citation.sectionIds
+  }));
+  const limitations = uniqueStrings([
+    ...input.store.objects.extractions.flatMap((extraction) => extraction.extraction.limitations),
+    ...input.store.objects.claims.flatMap((claim) => claim.risk === null ? [] : [claim.risk]),
+    ...input.store.objects.workItems
+      .filter((item) => item.status === "open" && item.severity !== "minor")
+      .map((item) => item.description)
+  ]).slice(0, 20);
+
+  return {
+    schemaVersion: 1,
+    runId: input.run.id,
+    briefFingerprint: briefFingerprint(input.run.brief),
+    title,
+    abstract: sections.length > 0
+      ? "This manuscript export is rendered from durable workspace sections, claims, support links, and references."
+      : "No manuscript sections are available for export yet.",
+    reviewType: "narrative_review",
+    structureRationale: "This artifact is an explicit manuscript.release export from workspace state, not a hidden synthesis step.",
+    scientificRoles: ["workspace_export"],
+    sections,
+    claims,
+    citationLinks,
+    referencedPaperIds: input.references.references.map((reference) => reference.sourceId),
+    evidenceTableIds: input.store.objects.evidenceCells.map((cell) => cell.id),
+    limitations,
+    readinessStatus: input.readinessStatus
+  };
+}
+
+function renderWorkspacePaperMarkdown(paper: ReviewPaperArtifact, references: ReferencesArtifact): string {
+  const lines = [
+    `# ${paper.title}`,
+    "",
+    "## Abstract",
+    "",
+    paper.abstract,
+    "",
+    "## Manuscript Structure",
+    "",
+    paper.structureRationale,
+    ""
+  ];
+
+  for (const section of paper.sections) {
+    lines.push(`## ${section.title}`, "", section.markdown, "");
+  }
+
+  if (paper.claims.length > 0) {
+    lines.push("## Claim Ledger", "");
+    for (const claim of paper.claims) {
+      const sources = claim.sourceIds.length > 0
+        ? ` Sources: ${claim.sourceIds.map((sourceId) => `[${sourceId}]`).join(", ")}.`
+        : "";
+      lines.push(`- ${claim.claim} ${claim.evidence}${sources}`);
+    }
+    lines.push("");
+  }
+
+  if (paper.limitations.length > 0) {
+    lines.push("## Limitations", "", ...paper.limitations.map((limitation) => `- ${limitation}`), "");
+  }
+
+  lines.push("## References", "");
+  if (references.references.length === 0) {
+    lines.push("- No renderable references are available from workspace support links.");
+  } else {
+    for (const reference of references.references) {
+      lines.push(`- [${reference.sourceId}] ${reference.citation}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+function releaseCheckEntitiesFromChecks(run: RunRecord, checks: ManuscriptCheck[], now: string): WorkStoreReleaseCheck[] {
+  return checks.map((check): WorkStoreReleaseCheck => ({
+    id: `release-check-${numericTextIdPart(check.id)}-${run.id}`,
+    kind: "releaseCheck",
+    runId: run.id,
+    createdAt: now,
+    updatedAt: now,
+    checkId: check.id,
+    title: check.title,
+    status: check.status,
+    severity: check.severity,
+    message: check.message
+  }));
+}
+
 function manuscriptReadinessFromWorkspace(input: {
   store: ResearchWorkStore;
   checks: ManuscriptCheck[];
@@ -5171,9 +3895,7 @@ function workspaceManuscriptChecks(input: {
   run: RunRecord;
   store: ResearchWorkStore;
   references: ReferencesArtifact;
-  gathered?: ResearchSourceSnapshot;
-  evidenceMatrix?: EvidenceMatrix;
-}): ManuscriptBundle["checks"] {
+}): ManuscriptChecksArtifact {
   const claims = input.store.objects.claims;
   const sections = input.store.objects.manuscriptSections;
   const openBlockingWorkItems = input.store.objects.workItems
@@ -5186,7 +3908,7 @@ function workspaceManuscriptChecks(input: {
   const unsupportedSectionCount = sections.filter((section) => (
     section.claimIds.length === 0 || section.claimIds.some((claimId) => !supportReadiness.supportedClaimIds.has(claimId))
   )).length;
-  const evidenceRows = input.evidenceMatrix?.rowCount ?? input.store.objects.extractions.length;
+  const evidenceRows = input.store.objects.extractions.length;
   const checks: ManuscriptCheck[] = [
     {
       id: "workspace-sources",
@@ -5299,132 +4021,6 @@ function workspaceManuscriptChecks(input: {
   };
 }
 
-function workspacePaperOutline(input: {
-  run: RunRecord;
-  store: ResearchWorkStore;
-  synthesis: ResearchSynthesis;
-}): PaperOutline {
-  const title = input.run.brief.topic ?? input.run.brief.researchQuestion ?? "ClawResearch Review";
-  return {
-    schemaVersion: 1,
-    runId: input.run.id,
-    briefFingerprint: briefFingerprint(input.run.brief),
-    title,
-    reviewType: "technical_survey",
-    structureRationale: "The outline is derived from work-store manuscript sections, claims, and evidence cells.",
-    abstractClaims: input.synthesis.claims.slice(0, 3).map((claim) => claim.claim),
-    rhetoricalPlan: input.store.objects.manuscriptSections.map((section) => ({
-      id: section.sectionId,
-      role: section.role,
-      title: section.title,
-      intent: `Develop ${section.role} using checked workspace claims and citations.`,
-      evidenceIds: section.sourceIds,
-      claimIds: section.claimIds
-    })),
-    keyThemes: input.synthesis.themes.map((theme) => theme.title).slice(0, 8),
-    evidenceTablesToCite: input.store.objects.evidenceCells.map((cell) => cell.id).slice(0, 12),
-    openQuestions: input.synthesis.nextQuestions,
-    limitations: input.store.objects.workItems
-      .filter((item) => item.status === "open")
-      .map((item) => item.description)
-      .slice(0, 8),
-    agendaImplications: input.store.worker.nextInternalActions.slice(0, 8)
-  };
-}
-
-function workspacePaperArtifact(input: {
-  run: RunRecord;
-  store: ResearchWorkStore;
-  outline: PaperOutline;
-  references: ReferencesArtifact;
-  checks: ManuscriptBundle["checks"];
-}): ReviewPaperArtifact {
-  const claims = input.store.objects.claims.map((claim) => ({
-    claimId: claim.id,
-    claim: claim.text,
-    evidence: claim.evidence,
-    sourceIds: claim.sourceIds
-  }));
-  const citationLinks = input.store.objects.citations.map((citation) => ({
-    sourceId: citation.sourceId,
-    sourceTitle: citation.sourceTitle,
-    evidenceCellId: citation.evidenceCellId,
-    supportSnippet: citation.supportSnippet,
-    confidence: citation.confidence,
-    relevance: citation.relevance,
-    claimIds: citation.claimIds,
-    sectionIds: citation.sectionIds
-  }));
-  const referencedPaperIds = uniqueStrings([
-    ...input.references.references.map((reference) => reference.sourceId),
-    ...claims.flatMap((claim) => claim.sourceIds)
-  ]);
-
-  return {
-    schemaVersion: 1,
-    runId: input.run.id,
-    briefFingerprint: briefFingerprint(input.run.brief),
-    title: input.outline.title,
-    abstract: claims.length > 0
-      ? claims.slice(0, 3).map((claim) => claim.claim).join(" ")
-      : "The workspace does not yet contain enough checked claims for a professional abstract.",
-    reviewType: input.outline.reviewType,
-    structureRationale: input.outline.structureRationale,
-    scientificRoles: uniqueStrings(input.store.objects.manuscriptSections.map((section) => section.role)),
-    sections: input.store.objects.manuscriptSections.map((section) => ({
-      id: section.sectionId,
-      role: section.role,
-      title: section.title,
-      markdown: section.markdown,
-      sourceIds: section.sourceIds,
-      claimIds: section.claimIds
-    })),
-    claims,
-    citationLinks,
-    referencedPaperIds,
-    evidenceTableIds: input.store.objects.evidenceCells.map((cell) => cell.id),
-    limitations: input.checks.blockers,
-    readinessStatus: input.checks.readinessStatus
-  };
-}
-
-function renderWorkspacePaperMarkdown(paper: ReviewPaperArtifact, references: ReferencesArtifact): string {
-  if (paper.readinessStatus !== "ready_for_revision") {
-    return [
-      `# ${paper.title}`,
-      "",
-      `Readiness: ${paper.readinessStatus}`,
-      "",
-      "No full review manuscript was released because the workspace checks did not pass.",
-      "",
-      "Current evidence-backed state:",
-      ...paper.claims.map((claim) => `- ${claim.claim} [${claim.sourceIds.join(", ")}]`),
-      "",
-      "Open blockers:",
-      ...paper.limitations.map((limitation) => `- ${limitation}`)
-    ].join("\n");
-  }
-
-  const referenceLines = references.references.map((reference) => `- [${reference.sourceId}] ${reference.citation}`);
-  return [
-    `# ${paper.title}`,
-    "",
-    "## Abstract",
-    "",
-    paper.abstract,
-    "",
-    ...paper.sections.flatMap((section) => [
-      `## ${section.title}`,
-      "",
-      section.markdown,
-      ""
-    ]),
-    "## References",
-    "",
-    ...(referenceLines.length > 0 ? referenceLines : ["- No references rendered."])
-  ].join("\n").trim();
-}
-
 function workspaceProtocolEntity(store: ResearchWorkStore): WorkStoreProtocol | null {
   return store.objects.protocols
     .slice()
@@ -5490,393 +4086,19 @@ function reviewProtocolFromWorkspace(input: {
   };
 }
 
-function workspaceManuscriptBundle(input: {
-  run: RunRecord;
-  plan: ResearchPlan;
-  store: ResearchWorkStore;
-  synthesis: ResearchSynthesis;
-  scholarlyDiscoveryProviders: string[];
-  publisherFullTextProviders: string[];
-  oaRetrievalHelperProviders: string[];
-  generalWebProviders: string[];
-  localContextEnabled: boolean;
-  gathered: ResearchSourceSnapshot;
-  evidenceMatrix?: EvidenceMatrix;
-}): ManuscriptBundle {
-  const fallbackProtocol = buildReviewProtocol({
-    run: input.run,
-    plan: input.plan,
-    scholarlyDiscoveryProviders: input.scholarlyDiscoveryProviders,
-    publisherFullTextProviders: input.publisherFullTextProviders,
-    oaRetrievalHelperProviders: input.oaRetrievalHelperProviders,
-    generalWebProviders: input.generalWebProviders,
-    localContextEnabled: input.localContextEnabled,
-    gathered: input.gathered
-  });
-  const protocol = reviewProtocolFromWorkspace({
-    fallback: fallbackProtocol,
-    store: input.store
-  });
-  const references = referencesFromWorkStore(input.run, input.store);
-  const checks = workspaceManuscriptChecks({
-    run: input.run,
-    store: input.store,
-    references,
-    gathered: input.gathered,
-    evidenceMatrix: input.evidenceMatrix
-  });
-  const outline = workspacePaperOutline({
-    run: input.run,
-    store: input.store,
-    synthesis: input.synthesis
-  });
-  const paper = workspacePaperArtifact({
-    run: input.run,
-    store: input.store,
-    outline,
-    references,
-    checks
-  });
-
-  return {
-    protocol,
-    protocolMarkdown: reviewProtocolMarkdown(protocol),
-    outline,
-    paper,
-    paperMarkdown: renderWorkspacePaperMarkdown(paper, references),
-    references,
-    checks
-  };
-}
-
-function buildMemoryInputs(
-  run: RunRecord,
-  plan: ResearchPlan,
-  gathered: ResearchSourceSnapshot,
-  evidenceMatrix: EvidenceMatrix,
-  summaryText: string,
-  themes: ResearchTheme[],
-  claims: ResearchClaim[],
-  verification: VerificationReport,
-  nextQuestions: string[],
-  failureMessage: string | null
-): MemoryRecordInput[] {
-  const matrixThemes = evidenceMatrix.derivedInsights
-    .filter((insight) => insight.kind === "pattern" || insight.kind === "anti_pattern" || insight.kind === "conflict")
-    .map((insight) => themeFromInsight(insight));
-  const effectiveThemes = matrixThemes.length > 0
-    ? matrixThemes
-    : themes.length > 0
-      ? themes
-      : [fallbackFinding(gathered, summaryText, failureMessage)];
-  const effectiveQuestions = nextQuestions.length > 0
-    ? nextQuestions
-    : evidenceMatrix.derivedInsights
-      .filter((insight) => insight.kind === "gap" || insight.kind === "conflict")
-      .map((insight) => questionFromInsight(insight))
-      .slice(0, 6);
-  const summaryId = summaryRecordId(run.id);
-  const paperByAnyId = paperLookupByAnyId(gathered.canonicalPapers);
-  const paperIds = gathered.canonicalPapers.map(paperEntityId);
-
-  const verificationByClaimId = new Map(
-    verification.verifiedClaims.map((claim) => [claim.claimId, claim])
-  );
-  const claimRecords: MemoryRecordInput[] = claims.flatMap((claim) => {
-    const verifiedClaim = verificationByClaimId.get(claimRecordId(claim));
-    const supportStatus = verifiedClaim?.supportStatus ?? "unverified";
-    const linkedPaperIds = claim.sourceIds.flatMap((sourceId) => {
-      const paper = paperByAnyId.get(sourceId);
-      return paper === undefined ? [] : [paperEntityId(paper)];
-    });
-
-    if (
-      linkedPaperIds.length === 0
-      || (supportStatus !== "supported" && supportStatus !== "partially_supported")
-    ) {
-      return [];
-    }
-
-    return [{
-      type: "claim",
-      key: claim.claim,
-      title: claim.claim,
-      text: claim.evidence,
-      runId: run.id,
-      links: linkedPaperIds.map((paperId) => link("supported_by", paperId)),
-      data: {
-        paperIds: linkedPaperIds,
-        supportStatus,
-        confidence: verifiedClaim?.confidence ?? "unknown",
-        verificationNotes: verifiedClaim?.verificationNotes ?? []
-      }
-    }];
-  });
-  const claimIds = claimRecords.map((record) => createMemoryRecordId(record.type, record.key));
-  const claimIdSet = new Set(claimIds);
-
-  const findingRecords: MemoryRecordInput[] = effectiveThemes.map((theme) => ({
-    type: "finding",
-    key: findingRecordKey(theme),
-    title: theme.title,
-    text: theme.summary,
-    runId: run.id,
-      links: [
-      ...theme.sourceIds.flatMap((sourceId) => {
-        const paper = paperByAnyId.get(sourceId);
-        return paper === undefined ? [] : [link("supported_by", paperEntityId(paper))];
-      }),
-      ...relatedClaimIdsForTheme(theme, claims)
-        .filter((targetId) => claimIdSet.has(targetId))
-        .map((targetId) => link("derived_from", targetId))
-    ],
-    data: {
-      paperIds: theme.sourceIds.flatMap((sourceId) => {
-        const paper = paperByAnyId.get(sourceId);
-        return paper === undefined ? [] : [paperEntityId(paper)];
-      })
-    }
-  }));
-  const findingIds = effectiveThemes.map(findingRecordId);
-
-  const questionRecords: MemoryRecordInput[] = effectiveQuestions.map((question) => ({
-    type: "question",
-    key: question,
-    title: question,
-    text: question,
-    runId: run.id,
-    links: findingIds.slice(0, 3).map((targetId) => link("derived_from", targetId)),
-    data: {
-      researchMode: plan.researchMode
-    }
-  }));
-  const questionIds = effectiveQuestions.map(questionRecordId);
-
-  const ideaRecords = buildIdeaRecords(run, plan, questionIds, failureMessage);
-  const ideaIds = ideaRecords.map((record) => ideaRecordId(record.key));
-
-  const summaryRecord: MemoryRecordInput = {
-    type: "summary",
-    key: `run:${run.id}:summary`,
-    title: `Run ${run.id} summary`,
-    text: summaryText,
-    runId: run.id,
-    links: [
-      ...findingIds.map((targetId) => link("summarizes", targetId)),
-      ...claimIds.map((targetId) => link("summarizes", targetId)),
-      ...questionIds.map((targetId) => link("summarizes", targetId)),
-      ...ideaIds.map((targetId) => link("summarizes", targetId))
-    ],
-    data: {
-      researchMode: plan.researchMode,
-      objective: plan.objective,
-      failure: failureMessage,
-      verificationStatus: verification.overallStatus
-    }
-  };
-
-  const artifactRecords = buildArtifactRecords(
-    run,
-    paperIds,
-    claimIds,
-    findingIds,
-    questionIds,
-    ideaIds,
-    summaryId
-  );
-
-  return [
-    ...claimRecords,
-    ...findingRecords,
-    ...questionRecords,
-    ...ideaRecords,
-    summaryRecord,
-    ...artifactRecords
-  ];
-}
-
-function buildAgendaMemoryInputs(
-  run: RunRecord,
-  agenda: ResearchAgenda
-): MemoryRecordInput[] {
-  const directionRecords: MemoryRecordInput[] = agenda.candidateDirections.map((direction) => ({
-    type: "direction",
-    key: `${direction.mode}:${direction.title}`,
-    title: direction.title,
-    text: direction.summary,
-    runId: run.id,
-    links: direction.claimIds.map((targetId) => link("derived_from", targetId)),
-    data: {
-      status: direction.id === agenda.selectedDirectionId ? "selected" : "candidate",
-      mode: direction.mode,
-      whyNow: direction.whyNow,
-      overallScore: String(direction.scores.overall),
-      sourceIds: direction.sourceIds,
-      gapIds: direction.gapIds
-    }
-  }));
-
-  return directionRecords;
-}
-
-function buildLiteratureInputs(
-  run: RunRecord,
-  plan: ResearchPlan,
-  gathered: ResearchSourceSnapshot,
-  summaryText: string,
-  themes: ResearchTheme[],
-  claims: ResearchClaim[],
-  nextQuestions: string[]
-): {
-  papers: CanonicalPaperInput[];
-  themes: LiteratureThemeInput[];
-  notebooks: LiteratureNotebookInput[];
-} {
-  const storePaperIdByAnyPaperId = canonicalPaperIdMap(gathered.canonicalPapers);
-  const themeInputs: LiteratureThemeInput[] = themes.map((theme) => ({
-    key: theme.title,
-    title: theme.title,
-    summary: theme.summary,
-    runId: run.id,
-    paperIds: theme.sourceIds.flatMap((sourceId) => {
-      const storePaperId = storePaperIdByAnyPaperId.get(sourceId);
-      return storePaperId === undefined ? [] : [storePaperId];
-    }),
-    claimIds: relatedClaimIdsForTheme(theme, claims),
-    questionTexts: nextQuestions
-  }));
-  const themeIds = themeInputs.map((theme) => createLiteratureEntityId("theme", theme.key));
-  const paperInputs: CanonicalPaperInput[] = gathered.canonicalPapers.map((paper) => ({
-    key: paper.key,
-    title: paper.title,
-    citation: paper.citation,
-    abstract: paper.abstract,
-    year: paper.year,
-    authors: paper.authors,
-    venue: paper.venue,
-    discoveredVia: paper.discoveredVia,
-    identifiers: paper.identifiers,
-    discoveryRecords: paper.discoveryRecords,
-    accessCandidates: paper.accessCandidates,
-    bestAccessUrl: paper.bestAccessUrl,
-    bestAccessProvider: paper.bestAccessProvider,
-    accessMode: paper.accessMode,
-    fulltextFormat: paper.fulltextFormat,
-    license: paper.license,
-    tdmAllowed: paper.tdmAllowed,
-    contentStatus: paper.contentStatus,
-    screeningHistory: paper.screeningHistory,
-    screeningStage: paper.screeningStage,
-    screeningDecision: paper.screeningDecision,
-    screeningRationale: paper.screeningRationale,
-    accessErrors: paper.accessErrors,
-    runId: run.id,
-    linkedThemeIds: themeInputs
-      .filter((theme) => theme.paperIds.includes(storePaperIdByAnyPaperId.get(paper.id) ?? paperEntityId(paper)))
-      .map((theme) => createLiteratureEntityId("theme", theme.key)),
-    linkedClaimIds: claims.flatMap((claim) => claim.sourceIds.includes(storePaperIdByAnyPaperId.get(paper.id) ?? paperEntityId(paper))
-      ? [claimRecordId(claim)]
-      : [])
-  }));
-  const notebook: LiteratureNotebookInput = {
-    key: `run:${run.id}`,
-    title: `Literature notebook for ${run.id}`,
-    runId: run.id,
-    objective: plan.objective,
-    summary: summaryText,
-    paperIds: gathered.canonicalPapers.map((paper) => storePaperIdByAnyPaperId.get(paper.id) ?? paperEntityId(paper)),
-    themeIds,
-    claimIds: claims.map(claimRecordId),
-    nextQuestions,
-    providerIds: gathered.routing.discoveryProviderIds
-  };
-
-  return {
-    papers: paperInputs,
-    themes: themeInputs,
-    notebooks: [notebook]
-  };
-}
-
-async function writeLiteratureSnapshot(
-  run: RunRecord,
-  literatureStore: LiteratureStore,
-  result: LiteratureUpsertResult,
-  gathered: ResearchSourceSnapshot
-): Promise<void> {
-  const canonicalIdByAnyId = canonicalPaperIdMap(gathered.canonicalPapers);
-  await writeJsonArtifact(run.artifacts.literaturePath, {
-    storePath: relativeArtifactPath(run.projectRoot, literatureStore.filePath),
-    paperCount: gathered.canonicalPapers.length,
-    reviewedPaperCount: gathered.reviewedPapers.length,
-    papers: canonicalizePapers(gathered.canonicalPapers),
-    reviewedPapers: canonicalizePapers(gathered.reviewedPapers),
-    reviewWorkflow: remapReviewWorkflow(gathered.reviewWorkflow, canonicalIdByAnyId),
-    relevanceAssessments: gathered.relevanceAssessments ?? [],
-    mergeDiagnostics: gathered.mergeDiagnostics,
-    authStatus: gathered.authStatus,
-    retrievalDiagnostics: gathered.retrievalDiagnostics ?? null,
-    inserted: result.inserted,
-    updated: result.updated,
-    stateCounts: {
-      papers: result.state.paperCount,
-      themes: result.state.themeCount,
-      notebooks: result.state.notebookCount
-    }
-  });
-}
-
-async function writeManuscriptArtifacts(
-  run: RunRecord,
-  bundle: ManuscriptBundle
-): Promise<void> {
-  await writeJsonArtifact(run.artifacts.reviewProtocolPath, bundle.protocol);
-  await writeFile(run.artifacts.reviewProtocolMarkdownPath, `${bundle.protocolMarkdown}\n`, "utf8");
-  await writeFile(run.artifacts.paperPath, `${bundle.paperMarkdown}\n`, "utf8");
-  await writeJsonArtifact(run.artifacts.paperJsonPath, bundle.paper);
-  await writeJsonArtifact(run.artifacts.manuscriptChecksPath, bundle.checks);
-}
-
-async function writeMemorySnapshot(
-  run: RunRecord,
-  memoryStore: MemoryStore,
-  records: MemoryRecordInput[]
-): Promise<{ inserted: number; updated: number; recordCount: number }> {
-  const result = await memoryStore.upsert(records);
-
-  return {
-    inserted: result.inserted,
-    updated: result.updated,
-    recordCount: result.records.length
-  };
-}
-
 async function commitWorkStoreSegment(input: {
   store: ResearchWorkStore;
   run: RunRecord;
   plan: ResearchPlan;
   gathered: ResearchSourceSnapshot | null;
-  paperExtractions: PaperExtraction[];
-  evidenceMatrix: EvidenceMatrix | null;
-  synthesis: ResearchSynthesis | null;
-  verification: VerificationReport | null;
-  agenda: ResearchAgenda | null;
-  manuscriptBundle: ManuscriptBundle | null;
-  criticReportsByStage: Map<CriticReviewStage, CriticReviewArtifact[]>;
   now: string;
 }): Promise<ResearchWorkStore> {
-  const criticReports = [...input.criticReportsByStage.values()].flat();
   const nextStore = mergeRunSegmentIntoResearchWorkStore(input.store, {
     run: input.run,
     plan: input.plan,
     gathered: input.gathered,
-    paperExtractions: input.paperExtractions,
-    evidenceMatrix: input.evidenceMatrix,
-    synthesis: input.synthesis,
-    verification: input.verification,
-    agenda: input.agenda,
-    manuscriptBundle: input.manuscriptBundle,
-    criticReports,
+    paperExtractions: [],
+    criticReports: [],
     now: input.now
   });
 
@@ -5903,152 +4125,6 @@ async function commitWorkStoreSegment(input: {
   return nextStore;
 }
 
-function insufficientEvidenceNextQuestions(plan: ResearchPlan, gathered?: ResearchSourceSnapshot): string[] {
-  const diagnostics = gathered?.retrievalDiagnostics;
-  const suggestedQueries = diagnostics?.suggestedNextQueries.slice(0, 3) ?? [];
-  const providerErrors = diagnostics?.providerAttempts
-    .filter((attempt) => attempt.error !== null)
-    .map((attempt) => `${attempt.providerId}: ${attempt.error}`)
-    .slice(0, 2) ?? [];
-  const accessLimitations = diagnostics?.accessLimitations.slice(0, 2) ?? [];
-  const diagnosticQuestions = [
-    suggestedQueries.length > 0
-      ? `Which of these revision queries should be tried next: ${suggestedQueries.join(" | ")}?`
-      : null,
-    providerErrors.length > 0
-      ? `Which provider failure should be addressed first: ${providerErrors.join(" | ")}?`
-      : null,
-    accessLimitations.length > 0
-      ? `Which access limitation should be configured first: ${accessLimitations.join(" | ")}?`
-      : null
-  ].filter((question): question is string => question !== null);
-
-  return [
-    ...diagnosticQuestions,
-    "Which terminology, entity names, or domain cues should be refined to improve scholarly retrieval quality?",
-    "Which provider configuration or credentials are still limiting access to relevant papers?",
-    `Which of these planned queries should be refined first: ${plan.searchQueries.slice(0, 3).join(" | ") || "no queries were generated"}?`
-  ].slice(0, 5);
-}
-
-function insufficientEvidenceAgenda(
-  run: RunRecord,
-  plan: ResearchPlan,
-  nextQuestions: string[],
-  failureMessage: string
-): ResearchAgenda {
-  return {
-    executiveSummary: failureMessage,
-    gaps: [{
-      id: `gap-${run.id}-evidence`,
-      title: "Evidence base too thin",
-      summary: failureMessage,
-      sourceIds: [],
-      claimIds: [],
-      severity: "high",
-      gapKind: "coverage_gap"
-    }],
-    candidateDirections: [],
-    selectedDirectionId: null,
-    selectedWorkPackage: null,
-    holdReasons: [
-      failureMessage,
-      ...nextQuestions.slice(0, 2)
-    ],
-    recommendedHumanDecision: `Continue autonomous literature revision internally. Start with: ${nextQuestions[0] ?? "inspect retrieval settings and revise the retrieval strategy."}`
-  };
-}
-
-function retrievalDiagnosticHoldReasons(gathered: ResearchSourceSnapshot): string[] {
-  const diagnostics = gathered.retrievalDiagnostics;
-
-  if (diagnostics === undefined) {
-    return [];
-  }
-
-  const providerFailures = diagnostics.providerAttempts
-    .filter((attempt) => attempt.error !== null)
-    .map((attempt) => `${attempt.providerId} failed: ${attempt.error}`)
-    .slice(0, 2);
-  const revisionPasses = diagnostics.revisionPasses ?? diagnostics.recoveryPasses ?? 0;
-  const recoverySummary = revisionPasses > 0
-    ? [`${revisionPasses} revision retrieval pass${revisionPasses === 1 ? "" : "es"} ran, but only ${gathered.reviewedPapers.length} reviewed papers were selected for synthesis.`]
-    : [];
-  const accessLimitations = diagnostics.accessLimitations.slice(0, 2);
-  const suggestedQueries = diagnostics.suggestedNextQueries.length > 0
-    ? [`Potential next retrieval queries: ${diagnostics.suggestedNextQueries.slice(0, 3).join(" | ")}.`]
-    : [];
-
-  return [
-    ...recoverySummary,
-    ...providerFailures,
-    ...accessLimitations,
-    ...suggestedQueries
-  ];
-}
-
-function agendaWithRetrievalHoldReasons(
-  agenda: ResearchAgenda,
-  gathered: ResearchSourceSnapshot,
-  evidenceMatrix: EvidenceMatrix
-): ResearchAgenda {
-  if (evidenceMatrix.rowCount >= 3) {
-    return agenda;
-  }
-
-  const extraReasons = retrievalDiagnosticHoldReasons(gathered);
-
-  if (extraReasons.length === 0) {
-    return agenda;
-  }
-
-  return {
-    ...agenda,
-    holdReasons: [...new Set([...agenda.holdReasons, ...extraReasons])].slice(0, 6),
-    recommendedHumanDecision: agenda.recommendedHumanDecision.length > 0
-      ? agenda.recommendedHumanDecision
-      : "Inspect retrieval diagnostics, refine the query plan or provider setup, and rerun the literature pass before continuing."
-  };
-}
-
-function insufficientEvidenceSynthesisMarkdown(
-  run: RunRecord,
-  plan: ResearchPlan,
-  gathered: ResearchSourceSnapshot,
-  nextQuestions: string[],
-  failureMessage: string
-): string {
-  return [
-    "# Research Synthesis",
-    "",
-    "## Outcome",
-    "",
-    failureMessage,
-    "",
-    "## Why The Run Stopped",
-    "",
-    "The current run did not retain any sufficiently reviewed papers to support paper-grounded synthesis, so it stopped before generating claims.",
-    "",
-    "## Review Workflow",
-    "",
-    ...reviewWorkflowLines(gathered),
-    "",
-    "## Planned Research Mode",
-    "",
-    `- Mode: ${plan.researchMode}`,
-    `- Objective: ${plan.objective}`,
-    `- Rationale: ${plan.rationale}`,
-    "",
-    "## Retrieval Notes",
-    "",
-    ...gathered.notes.map((note) => `- ${note}`),
-    "",
-    "## Next-Step Questions",
-    "",
-    ...nextQuestions.map((question) => `- ${question}`)
-  ].join("\n");
-}
-
 function failedArtifactStatus(
   run: RunRecord,
   artifactKind: string,
@@ -6067,12 +4143,8 @@ function failedArtifactStatus(
     counts: {},
     error: {
       message: errorMessage(error),
-      kind: error instanceof ResearchStageBlockedError
-        ? "stage_blocked"
-        : backendError?.kind ?? recoveryFailureKind(error),
-      operation: error instanceof ResearchStageBlockedError
-        ? error.operation
-        : backendError?.operation ?? null
+      kind: backendError?.kind ?? recoveryFailureKind(error),
+      operation: backendError?.operation ?? null
     }
   };
 }
@@ -6105,8 +4177,6 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
   const now = options.now ?? (() => new Date().toISOString());
   const store = new RunStore(options.projectRoot, options.version, now);
   const run = await store.load(options.runId);
-  const useSourceToolLoop = options.sourceToolAdapter === undefined;
-  const injectedSourceToolAdapter = options.sourceToolAdapter ?? null;
   const projectConfigStore = new ProjectConfigStore(options.projectRoot, now);
   const projectConfig = await projectConfigStore.load();
   const researchBackend = options.researchBackend ?? await createProjectResearchBackend({
@@ -6143,7 +4213,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     run.workerPid = process.pid;
     run.status = "running";
     run.startedAt = run.startedAt ?? now();
-    run.statusMessage = "Run worker started and is preparing the provider-aware research loop.";
+    run.statusMessage = "Run worker started and is preparing the model-driven research session.";
     if (run.job.command.length === 0) {
       run.job.command = runLoopCommand(run.id);
     }
@@ -6255,29 +4325,11 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       }
     });
 
-    const criticReportsByStage = new Map<CriticReviewStage, CriticReviewArtifact[]>();
-    const unresolvedNonTerminalCriticReports: CriticReviewArtifact[] = [];
     const agentActionDiagnostics: ResearchActionDiagnostic[] = [];
     const agentActionTransports: AgentActionTransportRecord[] = [];
-    const rememberCriticReport = (report: CriticReviewArtifact): void => {
-      const reports = criticReportsByStage.get(report.stage) ?? [];
-      reports.push(report);
-      criticReportsByStage.set(report.stage, reports);
-    };
 
     await writeJsonArtifact(run.artifacts.planPath, plan);
-    workStore = await runProtocolWorkspaceLoop({
-      run,
-      now,
-      researchBackend,
-      runtimeConfig: runtimeLlmConfig,
-      agent,
-      diagnostics: agentActionDiagnostics,
-      actionTransports: agentActionTransports,
-      plan,
-      workStore
-    });
-    const currentProtocol = reviewProtocolFromWorkspace({
+    let currentProtocol = reviewProtocolFromWorkspace({
       fallback: neutralReviewProtocolShell({
         run,
         plan,
@@ -6292,104 +4344,29 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     await writeJsonArtifact(run.artifacts.reviewProtocolPath, currentProtocol);
     await writeFile(run.artifacts.reviewProtocolMarkdownPath, `${reviewProtocolMarkdown(currentProtocol)}\n`, "utf8");
 
-    const protocolCritic = await reviewWithCritic({
+    await writeJsonArtifact(run.artifacts.criticProtocolReviewPath, skippedArtifactStatus(
       run,
-      now,
-      researchBackend,
-      runtimeConfig: runtimeLlmConfig,
-      request: {
-        projectRoot: run.projectRoot,
-        runId: run.id,
-        stage: "protocol",
-        iteration: {
-          attempt: 1,
-          maxAttempts: Math.max(1, runtimeLlmConfig.evidenceRecoveryMaxPasses + 1),
-          revisionPassesUsed: 0
-        },
-        brief: run.brief,
-        protocol: currentProtocol,
-        plan
-      }
-    });
-    rememberCriticReport(protocolCritic);
-    const protocolCriticWorkItems = workItemsFromCriticReports(run, [protocolCritic], now());
-    if (protocolCriticWorkItems.length > 0) {
-      workStore = upsertResearchWorkStoreEntities(workStore, protocolCriticWorkItems, now());
-      await writeResearchWorkStore(workStore);
-      await appendEvent(
-        run,
-        now,
-        "memory",
-        `Protocol critic created ${protocolCriticWorkItems.length} visible workspace work item(s).`
-      );
-    }
-    await agent.record({
-      actor: "critic",
-      phase: "protocol",
-      action: "review_protocol",
-      status: criticReviewPassed(protocolCritic) ? "completed" : "revising",
-      summary: `Protocol critic returned ${protocolCritic.readiness}.`,
-      artifactPaths: [run.artifacts.reviewProtocolPath, run.artifacts.criticProtocolReviewPath],
-      counts: {
-        objections: protocolCritic.objections.length,
-        attempt: 1
-      }
-    });
-
-    if (!criticReviewPassed(protocolCritic)) {
-      unresolvedNonTerminalCriticReports.push(protocolCritic);
-      await appendEvent(
-        run,
-        now,
-        "literature",
-        criticRevisionIsActionable(protocolCritic)
-          ? "Protocol critic concerns were recorded as visible work items; the researcher agent owns any protocol revision."
-          : "Protocol critic did not provide actionable revision advice; continuing to retrieval and recording the concern as a quality warning."
-      );
-      await appendStdout(
-        run,
-        criticRevisionIsActionable(protocolCritic)
-          ? "Protocol critic concerns were converted into workspace work items; no protocol search query was invented by the runtime."
-          : "Protocol critic gave non-actionable feedback; continuing to retrieval so later concrete checks can validate the actual work."
-      );
-    }
+      "critic-protocol-review",
+      now(),
+      "Critic review is model-selected; the runtime does not run mandatory semantic critic phases."
+    ));
     await appendTrace(run, now, `Selected research mode: ${plan.researchMode}`);
     await appendEvent(run, now, "summary", `Selected research mode ${plan.researchMode}: ${plan.objective}`);
     await appendStdout(run, `Selected research mode: ${plan.researchMode}`);
     await appendStdout(run, `Planning rationale: ${plan.rationale}`);
-    await appendEvent(run, now, "next", "Gather provider-aware scholarly sources and merge them into canonical papers.");
+    await appendEvent(run, now, "next", "Starting model-driven research session from the current workspace state.");
 
-    let pendingRecoveryQueries: string[] = [];
-    let autonomousRecoveryPasses = 0;
-    const evidenceRecoveryStartedAtMs = Date.now();
-    let finalAgenda: ResearchAgenda | null = null;
-    let finalManuscriptBundle: ManuscriptBundle | null = null;
-    let finalGathered: ResearchSourceSnapshot | null = null;
-    let finalPaperExtractions: PaperExtraction[] = [];
-    let finalEvidenceMatrix: EvidenceMatrix | null = null;
-    let finalSynthesis: ResearchSynthesis | null = null;
-    let finalContinuationLimitReason: string | null = null;
-    let previousEvidenceQuality: EvidenceQualitySnapshot | null = null;
-    let bestUsefulGathered: ResearchSourceSnapshot | null = null;
-    let nonImprovingEvidencePasses = 0;
-
-    while (true) {
+    const sessionSegment = 1;
     await writeJsonArtifact(run.artifacts.planPath, plan);
-    const evidencePassNumber = autonomousRecoveryPasses + 1;
-    await appendEvent(run, now, "literature", `Starting evidence pass ${evidencePassNumber}.`);
-    if (pendingRecoveryQueries.length > 0) {
-      await appendStdout(run, `Autonomous evidence revision queries: ${pendingRecoveryQueries.join(" | ")}`);
-    }
+    await appendEvent(run, now, "literature", `Starting model-driven research session ${sessionSegment}.`);
     await writeSourceToolCheckpoint({
       run,
       now,
-      evidencePass: evidencePassNumber,
-      revisionPasses: autonomousRecoveryPasses,
-      maxRevisionPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses,
+      sessionSegment,
       event: {
         phase: "setup",
         status: "started",
-        message: `Starting incremental source tool pass ${evidencePassNumber}.`
+        message: `Starting model-driven research session ${sessionSegment}.`
       }
     });
 
@@ -6399,7 +4376,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       plan,
       memoryContext,
       literatureContext,
-      revisionQueries: pendingRecoveryQueries,
+      revisionQueries: [],
       criticExcludedPaperIds: [],
       criticPromotedPaperIds: [],
       scholarlyProviderIds: scholarlyProviders,
@@ -6414,67 +4391,28 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
         await writeSourceToolCheckpoint({
           run,
           now,
-          evidencePass: evidencePassNumber,
-          revisionPasses: autonomousRecoveryPasses,
-          maxRevisionPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses,
+          sessionSegment,
           event
         });
       }
     };
-    const sourceLoopResult = useSourceToolLoop
-      ? await runSourceToolLoop({
-        run,
-        now,
-        researchBackend,
-        runtimeConfig: runtimeLlmConfig,
-        agent,
-        request: sourceRequest,
-        diagnostics: agentActionDiagnostics,
-        actionTransports: agentActionTransports,
-        evidencePassNumber,
-        workStore
-      })
-      : null;
-    if (sourceLoopResult !== null) {
-      workStore = sourceLoopResult.workStore;
+    if (options.sourceToolAdapter !== undefined) {
+      await appendEvent(run, now, "summary", "Ignoring injected source tool adapter because the model-driven session executes only model-selected source tools.");
     }
-    if (sourceLoopResult === null && injectedSourceToolAdapter === null) {
-      throw new Error("Source tool execution requires the source tool loop or an explicitly injected test adapter.");
-    }
-    if (sourceLoopResult === null) {
-      await appendEvent(run, now, "summary", "Using explicitly injected source tool adapter; production/default execution uses the source tool loop.");
-    }
-    let gathered = sourceLoopResult?.gathered ?? await injectedSourceToolAdapter!.run(sourceRequest);
-    if ((gathered.canonicalPapers.length === 0 || gathered.reviewedPapers.length === 0) && bestUsefulGathered !== null) {
-      await appendEvent(
-        run,
-        now,
-        "literature",
-        "Candidate evidence revision produced no selected sources; preserving the current useful evidence set from the workspace."
-      );
-      await appendStdout(
-        run,
-        `Evidence revision candidate produced ${gathered.canonicalPapers.length} canonical papers and ${gathered.reviewedPapers.length} selected papers; preserving ${bestUsefulGathered.canonicalPapers.length} canonical papers and ${bestUsefulGathered.reviewedPapers.length} selected papers.`
-      );
-      gathered = bestUsefulGathered;
-    }
-    pendingRecoveryQueries = [];
-    const currentEvidenceQuality = evidenceQualitySnapshot(gathered);
-    const evidenceImproved = evidenceQualityImproved(previousEvidenceQuality, currentEvidenceQuality);
-    if (previousEvidenceQuality !== null) {
-      if (evidenceImproved) {
-        nonImprovingEvidencePasses = 0;
-        await appendEvent(run, now, "literature", "Evidence revision expanded the selected source set or improved source continuity.");
-        await appendStdout(run, "Evidence revision improved the source-set continuity score.");
-      } else {
-        nonImprovingEvidencePasses += 1;
-        await appendEvent(run, now, "literature", "Evidence revision did not improve the selected source set.");
-        await appendStdout(run, "Evidence revision did not improve the source-set continuity score.");
-      }
-    }
-    previousEvidenceQuality = currentEvidenceQuality;
-    const canonicalIdByAnyPaperId = canonicalPaperIdMap(gathered.canonicalPapers);
-    const canonicalReviewedPapers = canonicalizePapers(gathered.reviewedPapers);
+    const sessionOutcome = await runModelDrivenResearchSession({
+      run,
+      now,
+      researchBackend,
+      runtimeConfig: runtimeLlmConfig,
+      agent,
+      sourceRequest,
+      diagnostics: agentActionDiagnostics,
+      actionTransports: agentActionTransports,
+      plan,
+      workStore
+    });
+    workStore = sessionOutcome.workStore;
+    const gathered = sessionOutcome.gathered;
 
     await writeJsonArtifact(run.artifacts.sourcesPath, {
       sourceConfig: {
@@ -6490,10 +4428,8 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
             fields: state.configuredFieldIds
           }))
       },
-      autonomousEvidence: {
-        pass: evidencePassNumber,
-        revisionPasses: autonomousRecoveryPasses,
-        maxRevisionPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses
+      modelDrivenSession: {
+        segment: sessionSegment
       },
       scholarlyProviders,
       generalWebProviders,
@@ -6508,8 +4444,8 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       mergeDiagnostics: gathered.mergeDiagnostics,
       literatureReview: gathered.literatureReview ?? null
     });
-    await appendTrace(run, now, `Evidence pass ${evidencePassNumber} gathered ${gathered.sources.length} raw sources and ${gathered.canonicalPapers.length} canonical papers.`);
-    await appendEvent(run, now, "summary", `Evidence pass ${evidencePassNumber} gathered ${gathered.canonicalPapers.length} canonical papers for synthesis.`);
+    await appendTrace(run, now, `Model-driven research session ${sessionSegment} gathered ${gathered.sources.length} raw sources and ${gathered.canonicalPapers.length} canonical papers.`);
+    await appendEvent(run, now, "summary", `Model-driven research session ${sessionSegment} observed ${gathered.canonicalPapers.length} canonical papers.`);
     await appendEvent(
       run,
       now,
@@ -6517,13 +4453,13 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       `Review workflow: title ${gathered.reviewWorkflow.counts.titleScreened}, abstract ${gathered.reviewWorkflow.counts.abstractScreened}, full-text ${gathered.reviewWorkflow.counts.fulltextScreened}, included ${gathered.reviewWorkflow.counts.included}, selected ${gathered.reviewWorkflow.counts.selectedForSynthesis}.`
     );
     await agent.record({
-      phase: "evidence",
-      action: "gather_and_screen_sources",
+      phase: "research",
+      action: "model_driven_research_session",
       status: "completed",
-      summary: `Evidence pass ${evidencePassNumber} gathered and screened candidate literature.`,
+      summary: `Model-driven research session executed ${sessionOutcome.stepsUsed} researcher-selected action(s).`,
       artifactPaths: [run.artifacts.sourcesPath],
       counts: {
-        pass: evidencePassNumber,
+        steps: sessionOutcome.stepsUsed,
         rawSources: gathered.sources.length,
         canonicalPapers: gathered.canonicalPapers.length,
         includedPapers: gathered.reviewWorkflow.counts.included,
@@ -6531,7 +4467,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       }
     });
 
-    const currentProtocol = reviewProtocolFromWorkspace({
+    currentProtocol = reviewProtocolFromWorkspace({
       fallback: neutralReviewProtocolShell({
         run,
         plan,
@@ -6547,710 +4483,92 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     await writeJsonArtifact(run.artifacts.reviewProtocolPath, currentProtocol);
     await writeFile(run.artifacts.reviewProtocolMarkdownPath, `${reviewProtocolMarkdown(currentProtocol)}\n`, "utf8");
 
-    const sourceSelectionCritic = await reviewWithCritic({
-      run,
-      now,
-      researchBackend,
-      runtimeConfig: runtimeLlmConfig,
-      request: {
-        projectRoot: run.projectRoot,
-        runId: run.id,
-        stage: "source_selection",
-        iteration: {
-          attempt: autonomousRecoveryPasses + 1,
-          maxAttempts: runtimeLlmConfig.evidenceRecoveryMaxPasses + 1,
-          revisionPassesUsed: autonomousRecoveryPasses
-        },
-        brief: run.brief,
-        protocol: currentProtocol,
-        plan,
-        selectedPapers: canonicalReviewedPapers,
-        relevanceAssessments: gathered.relevanceAssessments ?? [],
-        gathered: {
-          reviewWorkflow: gathered.reviewWorkflow,
-          retrievalDiagnostics: gathered.retrievalDiagnostics,
-          notes: gathered.notes
-        }
-      }
-    });
-    rememberCriticReport(sourceSelectionCritic);
-    const sourceCriticWorkItems = workItemsFromCriticReports(run, [sourceSelectionCritic], now());
-    if (sourceCriticWorkItems.length > 0) {
-      workStore = upsertResearchWorkStoreEntities(workStore, sourceCriticWorkItems, now());
-      await writeResearchWorkStore(workStore);
-      await appendEvent(
-        run,
-        now,
-        "memory",
-        `Source-selection critic created ${sourceCriticWorkItems.length} visible workspace work item(s).`
-      );
-    }
-    await agent.record({
-      actor: "critic",
-      phase: "source_selection",
-      action: "review_selected_sources",
-      status: criticReviewPassed(sourceSelectionCritic) ? "completed" : "revising",
-      summary: `Source-selection critic returned ${sourceSelectionCritic.readiness}.`,
-      artifactPaths: [run.artifacts.criticSourceSelectionPath],
-      counts: {
-        objections: sourceSelectionCritic.objections.length,
-        revisionPasses: autonomousRecoveryPasses
-      }
-    });
-
-    if (!criticReviewPassed(sourceSelectionCritic)) {
-      const criticActionable = criticRevisionIsActionable(sourceSelectionCritic);
-      unresolvedNonTerminalCriticReports.push(sourceSelectionCritic);
-      await appendEvent(
-        run,
-        now,
-        "next",
-        criticActionable
-          ? "Source-selection critic concerns were recorded as visible work items; the researcher agent will decide whether to search, exclude, promote, or revise."
-          : "Source-selection critic did not provide actionable revision advice; continuing to extraction and recording the concern as a quality warning."
-      );
-      await appendStdout(
-        run,
-        criticActionable
-          ? "Source-selection critic concerns were converted into workspace work items; no source set was mutated by the runtime."
-          : "Source-selection critic gave non-actionable feedback; continuing so evidence, synthesis, and final checks can produce concrete diagnostics."
-      );
-    }
-
-    for (const note of gathered.notes) {
-      await appendStdout(run, note);
-    }
-
-    const previewPapers = gathered.reviewedPapers.length > 0
-      ? gathered.reviewedPapers.slice(0, 4)
-      : gathered.canonicalPapers.slice(0, 4);
-
-    for (const paper of previewPapers) {
-      await appendEvent(run, now, "source", summarizeReviewedPaper(paper));
-      await appendStdout(run, `Reviewed paper: ${summarizeReviewedPaper(paper)}`);
-    }
-
-    if (gathered.canonicalPapers.length === 0 || gathered.reviewedPapers.length === 0) {
-      const nextQuestions = insufficientEvidenceNextQuestions(plan, gathered);
-      const failureMessage = gathered.canonicalPapers.length === 0
-        ? "Literature retrieval did not retain any canonical papers that could ground synthesis."
-        : "The review workflow did not retain any sufficiently reviewed papers for synthesis.";
-      const terminalFailureMessage = `${failureMessage} The runtime recorded this as machine-actionable research debt rather than inventing replacement search queries.`;
-      const paperExtractions: PaperExtraction[] = [];
-      const evidenceMatrix = buildEvidenceMatrix({
-        runId: run.id,
-        brief: run.brief,
-        paperExtractions
-      });
-      const verification = verifyResearchClaims({
-        brief: run.brief,
-        papers: [],
-        claims: []
-      });
-
-      await writeJsonArtifact(run.artifacts.paperExtractionsPath, paperExtractionsArtifact(run, canonicalReviewedPapers.length, paperExtractions));
-      await writeJsonArtifact(run.artifacts.verificationPath, verification);
-      await writeJsonArtifact(run.artifacts.nextQuestionsPath, nextQuestions);
-      const agenda = agendaWithRetrievalHoldReasons(
-        insufficientEvidenceAgenda(run, plan, nextQuestions, terminalFailureMessage),
-        gathered,
-        evidenceMatrix
-      );
-      const insufficientSynthesis: ResearchSynthesis = {
-        executiveSummary: terminalFailureMessage,
-        themes: [],
-        claims: [],
-        nextQuestions
-      };
-      workStore = await commitWorkStoreSegment({
-        store: workStore,
-        run,
-        plan,
-        gathered,
-        paperExtractions,
-        evidenceMatrix,
-        synthesis: null,
-        verification: null,
-        agenda: null,
-        manuscriptBundle: null,
-        criticReportsByStage,
-        now: now()
-      });
-      let manuscriptBundle = workspaceManuscriptBundle({
-        run,
-        plan,
-        store: workStore,
-        synthesis: insufficientSynthesis,
-        scholarlyDiscoveryProviders,
-        publisherFullTextProviders,
-        oaRetrievalHelperProviders,
-        generalWebProviders,
-        localContextEnabled: localEnabled,
-        gathered,
-        evidenceMatrix
-      });
-      if (unresolvedNonTerminalCriticReports.length > 0) {
-        manuscriptBundle = applyCriticReportsToManuscriptBundle(
-          run,
-          manuscriptBundle,
-          unresolvedNonTerminalCriticReports
-        );
-      }
-      await writeJsonArtifact(run.artifacts.agendaPath, agenda);
-      await writeResearchDirection(run, agenda, now());
-      await writeFile(run.artifacts.agendaMarkdownPath, `${agendaMarkdown(run, plan, agenda)}\n`, "utf8");
-      await writeManuscriptArtifacts(run, manuscriptBundle);
-      await writeJsonArtifact(run.artifacts.qualityReportPath, buildQualityReport({
-        run,
-        backendLabel: researchBackend.label,
-        gathered,
-        paperExtractions,
-        evidenceMatrix,
-        manuscriptBundle,
-        criticReportsByStage,
-        agentActionDiagnostics,
-        agentActionTransports,
-        agentControlMode: runtimeLlmConfig.agentControlMode,
-        autonomousRevisionPasses: autonomousRecoveryPasses,
-        revisionBudgetPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses
-      }));
-      await appendEvent(run, now, "summary", "Insufficient evidence state was persisted in the workspace and quality artifacts.");
-      workStore = await commitWorkStoreSegment({
-        store: workStore,
-        run,
-        plan,
-        gathered,
-        paperExtractions,
-        evidenceMatrix,
-        synthesis: insufficientSynthesis,
-        verification,
-        agenda,
-        manuscriptBundle,
-        criticReportsByStage,
-        now: now()
-      });
-      const workStoreSummary = summarizeResearchWorkStore(workStore);
-
-      await appendStderr(run, terminalFailureMessage);
-      await appendTrace(run, now, terminalFailureMessage);
-      await appendEvent(run, now, "summary", terminalFailureMessage);
-      await appendEvent(run, now, "verify", verification.summary);
-      await appendStdout(run, `Verification: ${verification.summary}`);
-      await appendEvent(
-        run,
-        now,
-        "memory",
-        `Updated research work store: ${workStoreSummary.canonicalSources} canonical sources, ${workStoreSummary.evidenceCells} evidence cells, ${workStoreSummary.openWorkItems} open work items.`
-      );
-      await appendStdout(
-        run,
-        `Research work store updated: ${workStoreSummary.canonicalSources} sources, ${workStoreSummary.openWorkItems} open work items.`
-      );
-
-      for (const question of nextQuestions) {
-        await appendEvent(run, now, "next", question);
-      }
-
-      await appendEvent(run, now, "plan", "Agenda generation completed with a hold after autonomous evidence revision was exhausted.");
-      await appendStdout(run, `Agenda hold: ${agenda.recommendedHumanDecision}`);
-      await appendEvent(run, now, "summary", `Manuscript status: ${manuscriptBundle.checks.readinessStatus}.`);
-      await appendStdout(run, `Paper artifact: ${relativeArtifactPath(run.projectRoot, run.artifacts.paperPath)} (${manuscriptBundle.checks.readinessStatus})`);
-      const workerState = await writeWorkerStateForRun({
-        run,
-        previousState: previousWorkerState,
-        gathered,
-        paperExtractions,
-        evidenceMatrix,
-        synthesis: insufficientSynthesis,
-        agenda,
-        manuscriptBundle,
-        criticReportsByStage,
-        revisionPasses: autonomousRecoveryPasses,
-        revisionBudgetPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses,
-        continuationLimitReason: terminalFailureMessage,
-        now: now()
-      });
-      await agent.record({
-        phase: "release",
-        action: "write_status_only_artifacts",
-        status: "completed",
-        summary: "Wrote status-only artifacts because autonomous evidence revision could not produce a sufficient reviewed set.",
-        artifactPaths: [
-          run.artifacts.paperPath,
-          run.artifacts.paperJsonPath,
-          run.artifacts.manuscriptChecksPath,
-          run.artifacts.qualityReportPath,
-          researchWorkStoreFilePath(run.projectRoot)
-        ],
-        counts: {
-          reviewedPapers: canonicalReviewedPapers.length,
-          extractedPapers: paperExtractions.length,
-          revisionPasses: autonomousRecoveryPasses
-        }
-      });
-
-      run.job.finishedAt = now();
-      run.finishedAt = now();
-      run.job.exitCode = 0;
-      run.job.signal = null;
-      run.workerPid = null;
-      run.status = "completed";
-      run.statusMessage = workerState.status === "externally_blocked"
-        ? "Autonomous research worker segment paused because external access or credentials are required."
-        : workerState.status === "needs_user_decision"
-          ? "Autonomous research worker segment paused because a user research decision is required."
-          : "Autonomous research worker segment checkpointed; remaining evidence work is machine-actionable.";
-      await store.save(run);
-      await appendEvent(run, now, "run", run.statusMessage);
-      return 0;
-    }
-
-    await appendEvent(run, now, "next", "Extract structured paper records from the reviewed paper set.");
-    await agent.record({
-      phase: "extraction",
-      action: "extract_selected_papers",
-      status: "started",
-      summary: `Extract structured records for ${canonicalReviewedPapers.length} selected reviewed papers.`,
-      artifactPaths: [run.artifacts.paperExtractionsPath],
-      counts: {
-        selectedPapers: canonicalReviewedPapers.length
-      }
-    });
-
-    const extractionResult = await extractReviewedPapersWithRecovery({
-      run,
-      now,
-      researchBackend,
-      runtimeConfig: runtimeLlmConfig,
-      plan,
-      papers: canonicalReviewedPapers,
-      literatureContext
-    });
-    const paperExtractions = completePaperExtractions(
-      run,
-      canonicalReviewedPapers,
-      remapPaperExtractions(extractionResult.extractions, canonicalIdByAnyPaperId)
-    );
-
-    await writeJsonArtifact(run.artifacts.paperExtractionsPath, paperExtractionsArtifact(
-      run,
-      canonicalReviewedPapers.length,
-      paperExtractions,
-      {
-        status: "completed",
-        completedPaperIds: paperExtractions.map((extraction) => extraction.paperId),
-        failedPaperIds: [],
-        batchAttempts: extractionResult.attempts
-      }
-    ));
-    await appendEvent(run, now, "summary", `Extracted ${paperExtractions.length} paper records from the reviewed set.`);
-    await appendStdout(run, `Paper extractions written: ${paperExtractions.length}`);
-    await agent.record({
-      phase: "extraction",
-      action: "checkpoint_extractions",
-      status: "completed",
-      summary: `Extracted ${paperExtractions.length}/${canonicalReviewedPapers.length} selected papers with adaptive batches.`,
-      artifactPaths: [run.artifacts.paperExtractionsPath],
-      counts: {
-        extractedPapers: paperExtractions.length,
-        selectedPapers: canonicalReviewedPapers.length,
-        attempts: extractionResult.attempts.length
-      }
-    });
-
-    await appendEvent(run, now, "next", "Build the cross-paper evidence matrix from the reviewed extractions.");
-
-    const evidenceMatrix = buildEvidenceMatrix({
-      runId: run.id,
-      brief: run.brief,
-      paperExtractions
-    });
-    const normalizedEvidenceMatrix = remapEvidenceMatrix(evidenceMatrix, canonicalIdByAnyPaperId);
-    if (paperExtractions.length > 0 && normalizedEvidenceMatrix.rowCount > 0) {
-      bestUsefulGathered = gathered;
-    }
-
-    await appendEvent(run, now, "memory", `Evidence matrix view updated in workspace from ${normalizedEvidenceMatrix.rowCount} extraction row(s).`);
-    await appendStdout(run, `Evidence matrix rows: ${normalizedEvidenceMatrix.rowCount}`);
-    await agent.record({
-      phase: "evidence",
-      action: "build_evidence_matrix",
-      status: "completed",
-      summary: "Built the cross-paper evidence matrix from selected-paper extractions.",
-      artifactPaths: [researchWorkStoreFilePath(run.projectRoot)],
-      counts: {
-        rows: normalizedEvidenceMatrix.rowCount,
-        insights: normalizedEvidenceMatrix.derivedInsights.length
-      }
-    });
-
-    const evidenceCritic = await reviewWithCritic({
-      run,
-      now,
-      researchBackend,
-      runtimeConfig: runtimeLlmConfig,
-      request: {
-        projectRoot: run.projectRoot,
-        runId: run.id,
-        stage: "evidence",
-        iteration: {
-          attempt: autonomousRecoveryPasses + 1,
-          maxAttempts: runtimeLlmConfig.evidenceRecoveryMaxPasses + 1,
-          revisionPassesUsed: autonomousRecoveryPasses
-        },
-        brief: run.brief,
-        protocol: currentProtocol,
-        plan,
-        selectedPapers: canonicalReviewedPapers,
-        relevanceAssessments: gathered.relevanceAssessments ?? [],
-        paperExtractions,
-        evidenceMatrix: normalizedEvidenceMatrix
-      }
-    });
-    rememberCriticReport(evidenceCritic);
-    await agent.record({
-      actor: "critic",
-      phase: "evidence",
-      action: "review_evidence_matrix",
-      status: criticReviewPassed(evidenceCritic) ? "completed" : "revising",
-      summary: `Evidence critic returned ${evidenceCritic.readiness}.`,
-      artifactPaths: [run.artifacts.criticEvidenceReviewPath, researchWorkStoreFilePath(run.projectRoot)],
-      counts: {
-        objections: evidenceCritic.objections.length,
-        rows: normalizedEvidenceMatrix.rowCount,
-        revisionPasses: autonomousRecoveryPasses
-      }
-    });
-
-    if (!criticReviewPassed(evidenceCritic)) {
-      const criticActionable = criticRevisionIsActionable(evidenceCritic);
-      unresolvedNonTerminalCriticReports.push(evidenceCritic);
-      await appendEvent(
-        run,
-        now,
-        "next",
-        criticActionable
-          ? "Evidence critic concerns were recorded as visible work items; the researcher agent will decide whether to search, re-extract, revise claims, or continue."
-          : "Evidence critic did not provide actionable revision advice; continuing to synthesis and recording the concern as a quality warning."
-      );
-      await appendStdout(
-        run,
-        criticActionable
-          ? "Evidence critic concerns were converted into workspace work items; no search query was invented by the runtime."
-          : "Evidence critic gave non-actionable feedback; continuing to synthesis so deterministic manuscript checks can produce concrete diagnostics."
-      );
-    }
-
     workStore = await commitWorkStoreSegment({
       store: workStore,
       run,
       plan,
       gathered,
-      paperExtractions,
-      evidenceMatrix: normalizedEvidenceMatrix,
-      synthesis: null,
-      verification: null,
-      agenda: null,
-      manuscriptBundle: null,
-      criticReportsByStage,
-      now: now()
-    });
-
-    const manuscriptLoop = await runManuscriptWorkspaceLoop({
-      run,
-      now,
-      researchBackend,
-      runtimeConfig: runtimeLlmConfig,
-      agent,
-      diagnostics: agentActionDiagnostics,
-      actionTransports: agentActionTransports,
-      plan,
-      gathered,
-      paperExtractions,
-      evidenceMatrix: normalizedEvidenceMatrix,
-      workStore,
-      revisionPassesUsed: autonomousRecoveryPasses
-    });
-    workStore = manuscriptLoop.workStore;
-
-    if (manuscriptLoop.requestedRevision) {
-      const recoveryUpdate = evidenceRecoveryPlanUpdate(
-        plan,
-        manuscriptLoop.revisionQueries,
-        manuscriptLoop.revisionFocusTerms
-      );
-      if (
-        recoveryUpdate !== null
-        && autonomousRecoveryPasses < runtimeLlmConfig.evidenceRecoveryMaxPasses
-        && !evidenceRecoveryBudgetExhausted(evidenceRecoveryStartedAtMs, runtimeLlmConfig)
-        && nonImprovingEvidencePasses < 2
-      ) {
-        autonomousRecoveryPasses += 1;
-        plan = recoveryUpdate.plan;
-        pendingRecoveryQueries = recoveryUpdate.recoveryQueries;
-        await appendEvent(
-          run,
-          now,
-          `next`,
-          `Manuscript workspace requested more evidence; continuing autonomously with evidence revision pass ${autonomousRecoveryPasses}.`
-        );
-        await appendStdout(run, `Evidence revision pass ${autonomousRecoveryPasses}: ${pendingRecoveryQueries.join(" | ")}`);
-        continue;
-      }
-      finalContinuationLimitReason = "The manuscript workspace requested more evidence, but no useful revision budget or unused query plan remained.";
-      await appendEvent(run, now, "next", finalContinuationLimitReason);
-    }
-
-    const normalizedSynthesis = remapSynthesisSourceIds(workspaceSynthesisFromStore({
-      run,
-      store: workStore
-    }), canonicalIdByAnyPaperId);
-    const verification = verifyResearchClaims({
-      brief: run.brief,
-      papers: canonicalReviewedPapers,
-      claims: normalizedSynthesis.claims
-    });
-    const agenda = await researchBackend.developResearchAgenda({
-      projectRoot: run.projectRoot,
-      brief: run.brief,
-      plan,
-      papers: canonicalReviewedPapers,
-      paperExtractions,
-      evidenceMatrix: normalizedEvidenceMatrix,
-      synthesis: normalizedSynthesis,
-      verification,
-      memoryContext,
-      literatureContext
-    }, {
-      operation: "agenda",
-      timeoutMs: runtimeLlmConfig.agendaTimeoutMs
-    });
-    const normalizedAgenda = agendaWithRetrievalHoldReasons(
-      remapAgendaSourceIds(agenda, canonicalIdByAnyPaperId),
-      gathered,
-      normalizedEvidenceMatrix
-    );
-    let manuscriptBundle = workspaceManuscriptBundle({
-      run,
-      plan,
-      scholarlyDiscoveryProviders,
-      publisherFullTextProviders,
-      oaRetrievalHelperProviders,
-      generalWebProviders,
-      localContextEnabled: localEnabled,
-        gathered,
-        store: workStore,
-        synthesis: normalizedSynthesis,
-        evidenceMatrix: normalizedEvidenceMatrix
-      });
-
-    if (manuscriptBundle.checks.readinessStatus === "ready_for_revision") {
-      const releaseCritic = await reviewWithCritic({
-        run,
-        now,
-        researchBackend,
-        runtimeConfig: runtimeLlmConfig,
-        request: {
-          projectRoot: run.projectRoot,
-          runId: run.id,
-          stage: "release",
-          iteration: {
-            attempt: 1,
-            maxAttempts: 1,
-            revisionPassesUsed: autonomousRecoveryPasses
-          },
-          brief: run.brief,
-          protocol: manuscriptBundle.protocol,
-          plan,
-          selectedPapers: canonicalReviewedPapers,
-          relevanceAssessments: gathered.relevanceAssessments ?? [],
-          paperExtractions,
-          evidenceMatrix: normalizedEvidenceMatrix,
-          synthesis: normalizedSynthesis,
-          verification,
-          agenda: normalizedAgenda,
-          paper: manuscriptBundle.paper,
-          references: manuscriptBundle.references,
-          manuscriptChecks: manuscriptBundle.checks
-        }
-      });
-      rememberCriticReport(releaseCritic);
-      const releaseCriticPassed = criticReviewPassed(releaseCritic);
-      await agent.record({
-        actor: "critic",
-        phase: "release",
-        action: "review_release_candidate",
-        status: releaseCriticPassed ? "completed" : "revising",
-        summary: `Release critic returned ${releaseCritic.readiness}.`,
-        artifactPaths: [run.artifacts.criticReleaseReviewPath, run.artifacts.manuscriptChecksPath],
-        counts: {
-          objections: releaseCritic.objections.length,
-          revisionPasses: autonomousRecoveryPasses
-        }
-      });
-      manuscriptBundle = applyCriticReportsToManuscriptBundle(
-        run,
-        manuscriptBundle,
-        [releaseCritic]
-      );
-      if (!releaseCriticPassed) {
-        await appendEvent(run, now, "next", "Release critic diagnostics were recorded as visible warnings/work items; they do not override computable release invariants.");
-      }
-    } else {
-      await writeJsonArtifact(run.artifacts.criticReleaseReviewPath, skippedArtifactStatus(
-        run,
-        "critic-release-review",
-        now(),
-        "Release critic only runs after deterministic manuscript checks are ready for revision."
-      ));
-    }
-
-    if (manuscriptBundle.checks.readinessStatus === "needs_more_evidence") {
-      finalContinuationLimitReason = "Manuscript checks still need more evidence; the runtime recorded this as internal research work instead of deriving replacement search queries.";
-      await appendEvent(run, now, "next", finalContinuationLimitReason);
-    }
-
-    if (unresolvedNonTerminalCriticReports.length > 0) {
-      manuscriptBundle = applyCriticReportsToManuscriptBundle(
-        run,
-        manuscriptBundle,
-        unresolvedNonTerminalCriticReports
-      );
-    }
-
-    await writeJsonArtifact(run.artifacts.nextQuestionsPath, normalizedSynthesis.nextQuestions);
-    await writeJsonArtifact(run.artifacts.verificationPath, verification);
-    await writeJsonArtifact(run.artifacts.agendaPath, normalizedAgenda);
-    await writeResearchDirection(run, normalizedAgenda, now());
-    await writeFile(run.artifacts.agendaMarkdownPath, `${agendaMarkdown(run, plan, normalizedAgenda)}\n`, "utf8");
-    await writeManuscriptArtifacts(run, manuscriptBundle);
-    await writeJsonArtifact(run.artifacts.qualityReportPath, buildQualityReport({
-      run,
-      backendLabel: researchBackend.label,
-      gathered,
-      paperExtractions,
-      evidenceMatrix: normalizedEvidenceMatrix,
-      manuscriptBundle,
-      criticReportsByStage,
-      agentActionDiagnostics,
-      agentActionTransports,
-      agentControlMode: runtimeLlmConfig.agentControlMode,
-      autonomousRevisionPasses: autonomousRecoveryPasses,
-      revisionBudgetPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses
-    }));
-    await appendEvent(run, now, "summary", "Synthesis state was persisted through workspace claims, support links, sections, and final paper exports.");
-    await agent.record({
-      phase: "release",
-      action: "write_workspace_artifacts",
-      status: manuscriptBundle.checks.readinessStatus === "blocked" ? "blocked" : "completed",
-      summary: `Derived artifacts written from work-store claims, evidence, citations, and manuscript sections with readiness ${manuscriptBundle.checks.readinessStatus}.`,
-      artifactPaths: [
-        run.artifacts.paperPath,
-        run.artifacts.paperJsonPath,
-        run.artifacts.manuscriptChecksPath,
-        run.artifacts.qualityReportPath
-      ],
-      counts: {
-        blockerCount: manuscriptBundle.checks.blockerCount,
-        warningCount: manuscriptBundle.checks.warningCount,
-        claims: normalizedSynthesis.claims.length
-      }
-    });
-    workStore = await commitWorkStoreSegment({
-      store: workStore,
-      run,
-      plan,
-      gathered,
-      paperExtractions,
-      evidenceMatrix: normalizedEvidenceMatrix,
-      synthesis: normalizedSynthesis,
-      verification,
-      agenda: normalizedAgenda,
-      manuscriptBundle,
-      criticReportsByStage,
       now: now()
     });
     const workStoreSummary = summarizeResearchWorkStore(workStore);
-
-    await appendTrace(run, now, "Workspace manuscript construction completed.");
-    await appendEvent(run, now, "summary", normalizedSynthesis.executiveSummary);
-    await appendEvent(run, now, "summary", `Manuscript status: ${manuscriptBundle.checks.readinessStatus}.`);
-    await appendEvent(run, now, "verify", verification.summary);
-    await appendStdout(run, `Verification: ${verification.summary}`);
-    await appendStdout(run, `Paper artifact: ${relativeArtifactPath(run.projectRoot, run.artifacts.paperPath)} (${manuscriptBundle.checks.readinessStatus})`);
-    for (const verifiedClaim of verification.verifiedClaims.slice(0, 4)) {
-      await appendStdout(run, `Verification detail: ${summarizeVerifiedClaim(verifiedClaim)}`);
-    }
+    const completedAt = now();
+    await writeResearchWorkerState({
+      ...previousWorkerState,
+      projectRoot: run.projectRoot,
+      brief: run.brief,
+      status: sessionOutcome.workerStatus,
+      activeRunId: null,
+      lastRunId: run.id,
+      segmentCount: (previousWorkerState.segmentCount ?? 0) + 1,
+      updatedAt: completedAt,
+      statusReason: sessionOutcome.statusReason,
+      paperReadiness: sessionOutcome.paperReadiness,
+      nextInternalActions: sessionOutcome.nextInternalActions,
+      userBlockers: sessionOutcome.userBlockers,
+      evidence: {
+        canonicalPapers: workStore.objects.canonicalSources.length,
+        selectedPapers: workStore.objects.canonicalSources.filter((source) => source.screeningDecision === "include").length,
+        extractedPapers: workStore.objects.extractions.length,
+        evidenceRows: workStore.objects.evidenceCells.length,
+        referencedPapers: new Set(workStore.objects.citations.map((citation) => citation.sourceId)).size
+      },
+      critic: {
+        finalSatisfaction: workStore.objects.workItems.some((item) => item.source === "critic" && item.status === "open")
+          ? "unresolved"
+          : workStore.objects.workItems.some((item) => item.source === "critic")
+            ? "pass"
+            : null,
+        unresolvedStages: [],
+        objections: workStore.objects.workItems
+          .filter((item) => item.source === "critic" && item.status === "open")
+          .map((item) => item.description)
+          .slice(0, 12)
+      }
+    });
     await appendEvent(
       run,
       now,
       "memory",
-      `Updated research work store: ${workStoreSummary.canonicalSources} canonical sources, ${workStoreSummary.claims} claims, ${workStoreSummary.openWorkItems} open work items.`
+      `Checkpointed research work store after source/tool actions: ${workStoreSummary.canonicalSources} canonical sources, ${workStoreSummary.extractions} extractions, ${workStoreSummary.evidenceCells} evidence cells.`
     );
     await appendStdout(
       run,
-      `Research work store updated: ${workStoreSummary.canonicalSources} sources, ${workStoreSummary.claims} claims, ${workStoreSummary.openWorkItems} open work items.`
+      `Research work store checkpointed: ${workStoreSummary.canonicalSources} sources, ${workStoreSummary.openWorkItems} open work items.`
     );
-
-    for (const claim of normalizedSynthesis.claims.slice(0, 4)) {
-      await appendEvent(run, now, "claim", summarizeClaim(claim));
-      await appendStdout(run, `Claim recorded: ${summarizeClaim(claim)}`);
-    }
-
-    for (const question of normalizedSynthesis.nextQuestions) {
-      await appendEvent(run, now, "next", question);
-    }
-
-    await appendEvent(run, now, "plan", `Agenda generated with ${normalizedAgenda.candidateDirections.length} candidate directions.`);
-
-    finalAgenda = normalizedAgenda;
-    finalManuscriptBundle = manuscriptBundle;
-    finalGathered = gathered;
-    finalPaperExtractions = paperExtractions;
-    finalEvidenceMatrix = normalizedEvidenceMatrix;
-    finalSynthesis = normalizedSynthesis;
-    break;
-    }
-
-    if (finalAgenda === null || finalManuscriptBundle === null || finalEvidenceMatrix === null || finalSynthesis === null) {
-      throw new Error("Literature review loop ended without a final agenda and manuscript bundle.");
-    }
-
-    const completedAt = now();
-    const workerState = await writeWorkerStateForRun({
-      run,
-      previousState: previousWorkerState,
-      gathered: finalGathered,
-      paperExtractions: finalPaperExtractions,
-      evidenceMatrix: finalEvidenceMatrix,
-      synthesis: finalSynthesis,
-      agenda: finalAgenda,
-      manuscriptBundle: finalManuscriptBundle,
-      criticReportsByStage,
-      revisionPasses: autonomousRecoveryPasses,
-      revisionBudgetPasses: runtimeLlmConfig.evidenceRecoveryMaxPasses,
-      continuationLimitReason: finalContinuationLimitReason,
-      now: completedAt
+    await agent.record({
+      phase: "checkpoint",
+      action: sessionOutcome.checkpointedByBudget ? "checkpoint_budget_exhausted" : sessionOutcome.workerStatus === "release_ready" ? "release_ready" : "checkpoint_workspace_state",
+      status: sessionOutcome.checkpointedByBudget ? "warning" : "completed",
+      summary: sessionOutcome.statusReason,
+      artifactPaths: [
+        run.artifacts.sourcesPath,
+        researchWorkStoreFilePath(run.projectRoot)
+      ],
+      counts: {
+        canonicalPapers: workStore.objects.canonicalSources.length,
+        selectedPapers: workStore.objects.canonicalSources.filter((source) => source.screeningDecision === "include").length,
+        extractedPapers: workStore.objects.extractions.length,
+        evidenceCells: workStore.objects.evidenceCells.length
+      }
     });
-    await appendEvent(run, now, "run", `Autonomous worker state: ${workerState.status}.`);
+
     run.job.finishedAt = completedAt;
     run.finishedAt = completedAt;
     run.job.exitCode = 0;
     run.job.signal = null;
     run.workerPid = null;
-    run.status = "completed";
-    run.statusMessage = workerState.status === "release_ready"
-      ? "Autonomous research worker segment completed with a release-ready manuscript artifact."
-      : workerState.status === "externally_blocked"
-        ? "Autonomous research worker segment paused because external access or credentials are required."
-        : workerState.status === "needs_user_decision"
-          ? "Autonomous research worker segment paused because a user research decision is required."
-          : "Autonomous research worker segment checkpointed; remaining work is machine-actionable.";
+    run.status = sessionOutcome.checkpointedByBudget ? "paused" : "completed";
+    run.statusMessage = sessionOutcome.checkpointedByBudget
+      ? "Autonomous research worker segment checkpointed after exhausting the model-driven action budget."
+      : sessionOutcome.workerStatus === "release_ready"
+        ? "Autonomous research worker reached release-ready after explicit model-selected release."
+        : "Autonomous research worker segment checkpointed after model-selected research actions.";
     await store.save(run);
     await appendEvent(run, now, "run", run.statusMessage);
     return 0;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const externalBlocker = isExternalBlockerMessage(message);
     const finishedAt = now();
     run.job.finishedAt = now();
     run.finishedAt = finishedAt;
@@ -7264,17 +4582,17 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       ...previousWorkerState,
       projectRoot: run.projectRoot,
       brief: run.brief,
-      status: error instanceof ResearchStageBlockedError ? "externally_blocked" : "working",
+      status: externalBlocker ? "externally_blocked" : "working",
       activeRunId: null,
       lastRunId: run.id,
       segmentCount: (previousWorkerState.segmentCount ?? 0) + 1,
       updatedAt: finishedAt,
-      statusReason: error instanceof ResearchStageBlockedError
+      statusReason: externalBlocker
         ? `Autonomous research worker hit an external blocker: ${message}`
         : `Autonomous research worker segment failed; retry or inspect diagnostics: ${message}`,
       paperReadiness: null,
-      nextInternalActions: error instanceof ResearchStageBlockedError ? [] : [`Inspect failed run diagnostics and retry the autonomous worker segment: ${message}`],
-      userBlockers: error instanceof ResearchStageBlockedError ? [message] : [],
+      nextInternalActions: externalBlocker ? [] : [`Inspect failed run diagnostics and retry the autonomous worker segment: ${message}`],
+      userBlockers: externalBlocker ? [message] : [],
       evidence: previousWorkerState.evidence,
       critic: previousWorkerState.critic
     });
