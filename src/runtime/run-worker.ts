@@ -30,7 +30,6 @@ import type {
   ResearchPlan
 } from "./research-backend.js";
 import {
-  modelUnsuitableActionDecision,
   workspaceResearchActions,
   type AgentToolResult,
   type AgentVisibleEntityPreview,
@@ -81,8 +80,6 @@ import {
 import type { SourceProviderId } from "./provider-registry.js";
 import { appendRunEvent, type RunEventKind } from "./run-events.js";
 import {
-  createResearchDirectionState,
-  researchDirectionPath,
   RunStore,
   type RunRecord
 } from "./run-store.js";
@@ -439,6 +436,7 @@ function workStoreContextForAgent(store: ResearchWorkStore): ResearchActionReque
     })),
     recentSections: store.objects.manuscriptSections.slice(-8).map((section) => ({
       id: section.id,
+      sectionId: section.sectionId,
       title: section.title,
       status: section.status,
       claimIds: section.claimIds.slice(0, 8),
@@ -1733,6 +1731,125 @@ function manuscriptSectionFromToolInput(input: {
   };
 }
 
+function stringCandidates(...values: unknown[]): string[] {
+  const candidates: string[] = [];
+
+  for (const value of values) {
+    if (typeof value === "string" && value.trim().length > 0) {
+      candidates.push(value.trim());
+      continue;
+    }
+
+    candidates.push(...stringArrayInput(value, 20));
+  }
+
+  return uniqueStrings(candidates);
+}
+
+function resolveSectionReference(store: ResearchWorkStore, candidates: string[]): WorkStoreManuscriptSection | null {
+  for (const candidate of candidates) {
+    const byId = readResearchWorkStoreEntity<WorkStoreManuscriptSection>(store, "manuscriptSections", candidate);
+    if (byId !== null) {
+      return byId;
+    }
+  }
+
+  for (const candidate of candidates) {
+    const bySectionId = store.objects.manuscriptSections.find((section) => section.sectionId === candidate);
+    if (bySectionId !== undefined) {
+      return bySectionId;
+    }
+  }
+
+  return candidates.length === 0 && store.objects.manuscriptSections.length === 1
+    ? store.objects.manuscriptSections[0] ?? null
+    : null;
+}
+
+function resolveClaimReference(store: ResearchWorkStore, candidates: string[]): WorkStoreClaim | null {
+  for (const candidate of candidates) {
+    const byId = readResearchWorkStoreEntity<WorkStoreClaim>(store, "claims", candidate);
+    if (byId !== null) {
+      return byId;
+    }
+  }
+
+  return candidates.length === 0 && store.objects.claims.length === 1
+    ? store.objects.claims[0] ?? null
+    : null;
+}
+
+function sectionClaimLinkTargets(input: {
+  decision: ResearchActionDecision;
+  store: ResearchWorkStore;
+}): {
+  section: WorkStoreManuscriptSection | null;
+  claim: WorkStoreClaim | null;
+  sectionCandidates: string[];
+  claimCandidates: string[];
+} {
+  const args = input.decision.inputs.workStore;
+  if (args === undefined) {
+    const sectionCandidates: string[] = [];
+    const claimCandidates: string[] = [];
+    return {
+      section: resolveSectionReference(input.store, sectionCandidates),
+      claim: resolveClaimReference(input.store, claimCandidates),
+      sectionCandidates,
+      claimCandidates
+    };
+  }
+  const entity = args.entity;
+  const changes = args.changes;
+  const link = args.link ?? {
+    fromId: null,
+    toId: null
+  };
+  const sectionCandidates = stringCandidates(
+    args.entityId,
+    link.fromId,
+    entity.sectionId,
+    entity.manuscriptSectionId,
+    entity.section_id,
+    entity.id,
+    entity.fromId,
+    entity.from,
+    changes.sectionId,
+    changes.manuscriptSectionId
+  );
+  const claimCandidates = stringCandidates(
+    link.toId,
+    entity.claimId,
+    entity.claim_id,
+    entity.claimIds,
+    entity.toId,
+    entity.to,
+    changes.claimId,
+    changes.claimIds,
+    input.decision.inputs.paperIds
+  );
+  const directSection = resolveSectionReference(input.store, sectionCandidates);
+  const directClaim = resolveClaimReference(input.store, claimCandidates);
+
+  if (directSection !== null && directClaim !== null) {
+    return {
+      section: directSection,
+      claim: directClaim,
+      sectionCandidates,
+      claimCandidates
+    };
+  }
+
+  const swappedSection = resolveSectionReference(input.store, claimCandidates);
+  const swappedClaim = resolveClaimReference(input.store, sectionCandidates);
+  return {
+    section: directSection ?? swappedSection,
+    claim: directClaim ?? swappedClaim,
+    sectionCandidates,
+    claimCandidates
+  };
+}
+
 function criticReviewArtifactPath(run: RunRecord, stage: CriticReviewScope): string {
   switch (stage) {
     case "protocol":
@@ -2916,11 +3033,18 @@ async function executeResearchObjectToolAction(input: {
   }
 
   if (input.decision.action === "section.link_claim") {
-    const sectionId = args.entityId ?? args.link?.fromId ?? null;
-    const claimId = args.link?.toId ?? stringInput(args.entity.claimId, input.decision.inputs.paperIds[0] ?? "");
-    const section = sectionId === null ? null : readResearchWorkStoreEntity<WorkStoreManuscriptSection>(input.store, "manuscriptSections", sectionId);
-    if (section === null || claimId.length === 0) {
-      const message = "Section claim link skipped because section id or claim id was missing.";
+    const targets = sectionClaimLinkTargets({
+      decision: input.decision,
+      store: input.store
+    });
+    if (targets.section === null || targets.claim === null) {
+      const availableSections = input.store.objects.manuscriptSections.slice(-8).map((section) => entityPreviewForAgent(section, input.store));
+      const availableClaims = input.store.objects.claims.slice(-8).map((claim) => entityPreviewForAgent(claim, input.store));
+      const missingParts = [
+        targets.section === null ? "known section id" : null,
+        targets.claim === null ? "known claim id" : null
+      ].filter((part): part is string => part !== null);
+      const message = `Section claim link skipped because ${missingParts.join(" and ")} could not be resolved. Use a manuscript section id/sectionId and a claim id from the related previews.`;
       return {
         handled: true,
         store: input.store,
@@ -2933,21 +3057,36 @@ async function executeResearchObjectToolAction(input: {
           readOnly: false,
           message,
           collection: "manuscriptSections",
-          query: { sectionId, claimId },
-          nextHints: ["workspace.list", "section.create", "claim.create"]
+          query: {
+            sectionCandidates: targets.sectionCandidates,
+            claimCandidates: targets.claimCandidates
+          },
+          items: availableSections,
+          related: availableClaims,
+          nextHints: ["workspace.list", "workspace.read", "section.link_claim"]
         })
       };
     }
-    const nextStore = patchResearchWorkStoreEntity(input.store, {
+    const section = targets.section;
+    const claim = targets.claim;
+    const sectionPatched = patchResearchWorkStoreEntity(input.store, {
       collection: "manuscriptSections",
       id: section.id,
       changes: {
-        claimIds: uniqueStrings([...section.claimIds, claimId])
+        claimIds: uniqueStrings([...section.claimIds, claim.id])
+      }
+    }, nowText);
+    const nextStore = patchResearchWorkStoreEntity(sectionPatched, {
+      collection: "claims",
+      id: claim.id,
+      changes: {
+        usedInSections: uniqueStrings([...claim.usedInSections, section.id])
       }
     }, nowText);
     await writeResearchWorkStore(nextStore);
     const updatedSection = readResearchWorkStoreEntity<WorkStoreManuscriptSection>(nextStore, "manuscriptSections", section.id);
-    const message = `Section ${section.id} linked to claim ${claimId}.`;
+    const updatedClaim = readResearchWorkStoreEntity<WorkStoreClaim>(nextStore, "claims", claim.id);
+    const message = `Section ${section.id} linked to claim ${claim.id}.`;
     return {
       handled: true,
       store: nextStore,
@@ -2959,13 +3098,11 @@ async function executeResearchObjectToolAction(input: {
         readOnly: false,
         message,
         collection: "manuscriptSections",
-        query: { sectionId: section.id, claimId },
+        query: { sectionId: section.id, claimId: claim.id },
         count: updatedSection === null ? 0 : 1,
         totalCount: nextStore.objects.manuscriptSections.length,
         entity: updatedSection === null ? null : entityPreviewForAgent(updatedSection, nextStore),
-        related: nextStore.objects.claims
-          .filter((claim) => claim.id === claimId)
-          .map((claim) => entityPreviewForAgent(claim, nextStore)),
+        related: updatedClaim === null ? [] : [entityPreviewForAgent(updatedClaim, nextStore)],
         stateDelta: { sectionClaimLinksCreated: 1 },
         nextHints: ["section.check_claims", "release.verify", "workspace.read"]
       })
@@ -3280,7 +3417,7 @@ function sourceSearchReconsiderationReason(input: {
       ? state.mergeReadiness.reason
       : null,
     exhaustedChosenProviders.length > 0
-      ? `Chosen provider/query targets are already low-yield or exhausted: ${exhaustedChosenProviders.join(", ")}.`
+      ? `Chosen provider/query targets have already been low-yield: ${exhaustedChosenProviders.join(", ")}.`
       : null,
     state.consecutiveNoProgressSearches >= 2
       ? `${state.consecutiveNoProgressSearches} consecutive source searches added no new screened sources.`
@@ -3291,7 +3428,7 @@ function sourceSearchReconsiderationReason(input: {
     return null;
   }
 
-  const recommended = "If you still search, choose a not-yet-exhausted provider/query and name the missing evidence target; otherwise explicitly choose source.merge or another source/workspace tool.";
+  const recommended = "Use this as advisory context only: you may retry deliberately, change provider/query, or choose another source/workspace tool.";
 
   return `${reasons.join(" ")} ${recommended}`;
 }
@@ -3514,28 +3651,9 @@ async function executeSourceToolAction(input: {
     };
   }
 
-  const executableProviderOrder = providers
-    .filter((providerId) => !input.session.isSearchExhausted(providerId, queries));
-  if (executableProviderOrder.length === 0) {
-    const message = "No executable source search target remained after filtering low-yield choices; checkpointing current source state without automatic merge or selection.";
-    await appendEvent(input.run, input.now, "next", message);
-    await appendStdout(input.run, `Source tool observation: ${message}`);
-    return {
-      handled: true,
-      store: input.workStore,
-      message,
-      results: [sourceNoopToolResult({
-        run: input.run,
-        now: input.now,
-        decision: input.decision,
-        message
-      })]
-    };
-  }
-
   const results: AgentToolResult[] = [];
   let lastMessage: string | null = null;
-  for (const providerId of executableProviderOrder.slice(0, 2)) {
+  for (const providerId of providers) {
     const observation = await input.session.queryProvider(providerId, queries);
     await persistSourceWorkspace();
     await appendEvent(input.run, input.now, "source", observation.message);
@@ -3573,7 +3691,6 @@ type ModelDrivenSessionOutcome = {
   paperReadiness: ManuscriptReadinessState | null;
   nextInternalActions: string[];
   userBlockers: string[];
-  checkpointedByBudget: boolean;
   terminalAction: string | null;
   stepsUsed: number;
 };
@@ -3582,7 +3699,6 @@ function sessionObservations(input: {
   sourceState: ReturnType<SourceToolRuntime["state"]>;
   workStore: ResearchWorkStore;
   step: number;
-  maxSteps: number;
 }): ResearchActionRequest["observations"] {
   const canonicalSources = Math.max(input.sourceState.canonicalPapers, input.workStore.objects.canonicalSources.length);
   const screenedInSources = Math.max(
@@ -3607,8 +3723,7 @@ function sessionObservations(input: {
     evidenceRows: input.workStore.objects.evidenceCells.length,
     evidenceInsights: 0,
     manuscriptReadiness: input.workStore.worker.paperReadiness,
-    sessionStepsUsed: Math.max(0, input.step - 1),
-    sessionStepsRemaining: Math.max(0, input.maxSteps - input.step + 1)
+    sessionStepsUsed: Math.max(0, input.step - 1)
   };
 }
 
@@ -3617,10 +3732,14 @@ function statusDecisionOutcome(input: {
   store: ResearchWorkStore;
   toolResults: AgentToolResult[];
 }): {
+  terminal: boolean;
   workerStatus: ResearchWorkerStatus;
   statusReason: string;
   nextInternalActions: string[];
   userBlockers: string[];
+  observationStatus: AgentToolResult["status"];
+  message: string;
+  nextHints: string[];
 } {
   const entity = input.decision.inputs.workStore?.entity ?? {};
   const requestedStatus = stringInput(entity.status, "");
@@ -3630,37 +3749,64 @@ function statusDecisionOutcome(input: {
   const openExternalBlockers = input.store.objects.workItems
     .filter((item) => item.status === "open" && item.severity === "blocking" && (item.type === "external_blocker" || item.type === "source_access"))
     .map((item) => item.description);
-
-  if (requestedStatus === "externally_blocked" && (openExternalBlockers.length > 0 || userBlockers.some(isExternalBlockerMessage))) {
-    return {
-      workerStatus: "externally_blocked",
-      statusReason,
-      nextInternalActions: [],
-      userBlockers: openExternalBlockers.length > 0 ? openExternalBlockers : userBlockers
-    };
-  }
-
-  if (requestedStatus === "needs_user_decision" && nextInternalActions.length >= 2) {
-    return {
-      workerStatus: "needs_user_decision",
-      statusReason,
-      nextInternalActions,
-      userBlockers: userBlockers.length > 0 ? userBlockers : [statusReason]
-    };
-  }
-
   const diagnosticNextActions = checkpointDiagnosticNextActions({
     store: input.store,
     toolResults: input.toolResults
   });
 
+  if (requestedStatus === "externally_blocked" && (openExternalBlockers.length > 0 || userBlockers.some(isExternalBlockerMessage))) {
+    const blockers = openExternalBlockers.length > 0 ? openExternalBlockers : userBlockers;
+    return {
+      terminal: true,
+      workerStatus: "externally_blocked",
+      statusReason,
+      nextInternalActions: [],
+      userBlockers: blockers,
+      observationStatus: "ok",
+      message: `Validated external blocker status: ${blockers.join(" | ")}`,
+      nextHints: []
+    };
+  }
+
+  if (requestedStatus === "needs_user_decision" && nextInternalActions.length >= 2) {
+    const combinedNextActions = uniqueStrings([
+      ...nextInternalActions,
+      ...diagnosticNextActions
+    ]).slice(0, 12);
+    return {
+      terminal: true,
+      workerStatus: "needs_user_decision",
+      statusReason,
+      nextInternalActions: combinedNextActions,
+      userBlockers: userBlockers.length > 0 ? userBlockers : [statusReason],
+      observationStatus: "ok",
+      message: `Validated user-decision status: ${statusReason}`,
+      nextHints: []
+    };
+  }
+
+  const invalidTerminalRequest = requestedStatus === "externally_blocked"
+    || requestedStatus === "needs_user_decision"
+    || requestedStatus === "release_ready"
+    || requestedStatus === "paused";
+  const diagnosticActions = nextInternalActions.length > 0
+    ? nextInternalActions
+    : diagnosticNextActions;
+  const message = invalidTerminalRequest
+    ? `workspace.status did not stop the worker because "${requestedStatus}" was not validated. Continue with machine-actionable tools or provide the required structured blocker/decision data.`
+    : `Workspace status noted without stopping the worker: ${statusReason}`;
+
   return {
+    terminal: false,
     workerStatus: "working",
-    statusReason: `Researcher checkpointed the model-driven session: ${statusReason}`,
-    nextInternalActions: nextInternalActions.length > 0
-      ? nextInternalActions
-      : diagnosticNextActions,
-    userBlockers: []
+    statusReason: message,
+    nextInternalActions: diagnosticActions,
+    userBlockers: [],
+    observationStatus: invalidTerminalRequest ? "not_ready" : "ok",
+    message,
+    nextHints: diagnosticActions.length > 0
+      ? ["workspace.read", "workspace.list", "work_item.create"]
+      : ["workspace.list", "source.search", "release.verify"]
   };
 }
 
@@ -3691,7 +3837,7 @@ function checkpointDiagnosticNextActions(input: {
 
   return actions.length > 0
     ? actions.slice(0, 5)
-    : ["Resume the model-driven research session with /go."];
+    : ["Continue with the next machine-actionable research tool."];
 }
 
 function releaseSucceeded(result: AgentToolResult | null | undefined): boolean {
@@ -3718,11 +3864,10 @@ async function runModelDrivenResearchSession(input: {
   let workStore = input.workStore;
   let toolResults: AgentToolResult[] = [];
   const sourceSession = await SourceToolRuntime.create(input.sourceRequest);
-  const maxSteps = Math.max(1, input.runtimeConfig.agentSegmentMaxSteps);
   const sessionSegment = 1;
   await appendStdout(input.run, "Model-driven research session active; every step is selected by the researcher model from the full tool surface.");
 
-  for (let step = 1; step <= maxSteps; step += 1) {
+  for (let step = 1; ; step += 1) {
     const sourceState = sourceSession.state();
     const decision = await chooseResearchActionStrict({
       run: input.run,
@@ -3739,7 +3884,7 @@ async function runModelDrivenResearchSession(input: {
         allowedActions: workspaceResearchActions(),
         brief: input.run.brief,
         plan: input.plan,
-        observations: sessionObservations({ sourceState, workStore, step, maxSteps }),
+        observations: sessionObservations({ sourceState, workStore, step }),
         sourceState: sourceStateForAgent(sourceSession),
         workStore: workStoreContextForAgent(workStore),
         guidance: guidanceContextForAgent({ brief: input.run.brief, plan: input.plan }),
@@ -3749,7 +3894,7 @@ async function runModelDrivenResearchSession(input: {
           "This is a state-driven research session, not a phase workflow.",
           "Inspect the current workspace/source/tool observations, choose exactly one next action, and let the runtime execute only that action.",
           "All production tools are available regardless of milestone; do not stop for machine-actionable source, evidence, claim, critic, section, check, or release work.",
-          "Use workspace.status only for a true checkpoint, external blocker, or user decision that cannot be resolved with tools."
+          "Use workspace.status only for a validated external blocker or real user decision that cannot be resolved with tools; otherwise continue working."
         ].join(" ")
       }
     });
@@ -3757,19 +3902,34 @@ async function runModelDrivenResearchSession(input: {
     if (isStatusAction(decision.action)) {
       const outcome = statusDecisionOutcome({ decision, store: workStore, toolResults });
       await appendEvent(input.run, input.now, "next", outcome.statusReason);
-      await appendStdout(input.run, `Research session checkpoint: ${outcome.statusReason}`);
-      return {
-        workStore,
-        gathered: await sourceSession.result(),
-        workerStatus: outcome.workerStatus,
-        statusReason: outcome.statusReason,
-        paperReadiness: safeManuscriptReadiness(workStore.worker.paperReadiness),
-        nextInternalActions: outcome.nextInternalActions,
-        userBlockers: outcome.userBlockers,
-        checkpointedByBudget: false,
-        terminalAction: decision.action,
-        stepsUsed: step
-      };
+      await appendStdout(input.run, `Research status observation: ${outcome.statusReason}`);
+      const result = makeAgentToolResult({
+        run: input.run,
+        action: decision.action,
+        timestamp: input.now(),
+        status: outcome.observationStatus,
+        readOnly: true,
+        message: outcome.message,
+        stateDelta: {
+          terminalStateAccepted: outcome.terminal ? 1 : 0
+        },
+        nextHints: outcome.nextHints
+      });
+      toolResults = rememberAgentToolResult(toolResults, result);
+      if (outcome.terminal) {
+        return {
+          workStore,
+          gathered: await sourceSession.result(),
+          workerStatus: outcome.workerStatus,
+          statusReason: outcome.statusReason,
+          paperReadiness: safeManuscriptReadiness(workStore.worker.paperReadiness),
+          nextInternalActions: outcome.nextInternalActions,
+          userBlockers: outcome.userBlockers,
+          terminalAction: decision.action,
+          stepsUsed: step
+        };
+      }
+      continue;
     }
 
     const workspaceExecution = await executeWorkspaceToolAction({
@@ -3821,7 +3981,6 @@ async function runModelDrivenResearchSession(input: {
           paperReadiness: "ready_for_revision",
           nextInternalActions: [],
           userBlockers: [],
-          checkpointedByBudget: false,
           terminalAction: decision.action,
           stepsUsed: step
         };
@@ -3860,28 +4019,6 @@ async function runModelDrivenResearchSession(input: {
     await appendEvent(input.run, input.now, "next", message);
     await appendStdout(input.run, `Research tool observation: ${message}`);
   }
-
-  await appendEvent(input.run, input.now, "next", "Model-driven research session reached its segment step budget; checkpointing current workspace state.");
-  await appendStdout(input.run, "Model-driven research session reached its segment step budget; checkpointing current workspace state.");
-  workStore = await persistSourceToolWorkspaceSnapshot({
-    run: input.run,
-    now: input.now,
-    plan: input.plan,
-    session: sourceSession,
-    workStore
-  });
-  return {
-    workStore,
-    gathered: await sourceSession.result(),
-    workerStatus: "checkpointed_budget_exhausted",
-    statusReason: "The model-driven research session exhausted this segment budget and checkpointed durable workspace state for the next /go continuation.",
-    paperReadiness: safeManuscriptReadiness(workStore.worker.paperReadiness),
-    nextInternalActions: checkpointDiagnosticNextActions({ store: workStore, toolResults }),
-    userBlockers: [],
-    checkpointedByBudget: true,
-    terminalAction: null,
-    stepsUsed: maxSteps
-  };
 }
 
 class AgentStepRecorder {
@@ -4070,32 +4207,22 @@ async function chooseResearchActionStrict(input: {
     }
   }
 
-  const fallback = modelUnsuitableActionDecision({
-    ...request,
-    attempt: maxAttempts,
-    maxAttempts
-  }, diagnostics);
-  actionTransports.push({
-    phase: request.phase,
-    action: fallback.action,
-    attempt: maxAttempts,
-    transport: "runtime_fallback"
-  });
+  const invalidActions = diagnostics.filter((diagnostic) => diagnostic.phase === request.phase).length;
   await agent.record({
     phase: request.phase,
-    action: fallback.action,
-    status: "warning",
-    summary: fallback.rationale,
+    action: "agent_action_selection_failed",
+    status: "blocked",
+    summary: `Research agent could not produce a reliable structured action after ${invalidActions} attempt(s).`,
     artifactPaths: [run.artifacts.agentStatePath],
     counts: {
-      invalidActions: diagnostics.filter((diagnostic) => diagnostic.phase === request.phase).length
+      invalidActions
     },
     metadata: {
-      transport: "runtime_fallback"
+      transport: "none"
     }
   });
-  await appendEvent(run, now, "next", "Research agent could not produce a reliable structured action; finalizing status-only diagnostics.");
-  return fallback;
+  await appendEvent(run, now, "stderr", "Research agent could not produce a reliable structured action; aborting this worker process instead of fabricating a terminal status.");
+  throw new Error(`Research agent could not produce a reliable structured action after ${invalidActions} attempt(s).`);
 }
 
 function isExternalBlockerMessage(text: string): boolean {
@@ -4116,24 +4243,6 @@ function pendingArtifactStatus(run: RunRecord, artifactKind: string, timestamp: 
   };
 }
 
-function skippedArtifactStatus(run: RunRecord, artifactKind: string, timestamp: string, reason: string): ArtifactStatus {
-  return {
-    schemaVersion: 1,
-    runId: run.id,
-    artifactKind,
-    status: "skipped",
-    stage: run.stage,
-    createdAt: run.startedAt ?? run.createdAt,
-    updatedAt: timestamp,
-    counts: {},
-    error: {
-      message: reason,
-      kind: "skipped",
-      operation: "critic"
-    }
-  };
-}
-
 async function writeRunArtifacts(run: RunRecord): Promise<void> {
   await mkdir(run.artifacts.runDirectory, { recursive: true });
   const createdAt = run.startedAt ?? run.createdAt;
@@ -4146,76 +4255,13 @@ async function writeRunArtifacts(run: RunRecord): Promise<void> {
   await writeFile(run.artifacts.agentStepsPath, "", "utf8");
   await writeJsonArtifact(run.artifacts.planPath, pendingArtifactStatus(run, "plan", createdAt));
   await writeJsonArtifact(run.artifacts.sourcesPath, pendingArtifactStatus(run, "sources", createdAt));
-  await writeJsonArtifact(run.artifacts.literaturePath, pendingArtifactStatus(run, "literature-review", createdAt));
   await writeJsonArtifact(run.artifacts.reviewProtocolPath, pendingArtifactStatus(run, "review-protocol", createdAt));
   await writeFile(run.artifacts.reviewProtocolMarkdownPath, "# Review Protocol\n\nStatus: pending.\n", "utf8");
-  await writeJsonArtifact(run.artifacts.criticProtocolReviewPath, pendingArtifactStatus(run, "critic-protocol-review", createdAt));
-  await writeJsonArtifact(run.artifacts.criticSourceSelectionPath, pendingArtifactStatus(run, "critic-source-selection", createdAt));
-  await writeJsonArtifact(run.artifacts.criticEvidenceReviewPath, pendingArtifactStatus(run, "critic-evidence-review", createdAt));
-  await writeJsonArtifact(run.artifacts.criticReleaseReviewPath, pendingArtifactStatus(run, "critic-release-review", createdAt));
-  await writeJsonArtifact(run.artifacts.paperExtractionsPath, pendingArtifactStatus(run, "paper-extractions", createdAt));
-  await writeJsonArtifact(run.artifacts.verificationPath, pendingArtifactStatus(run, "verification", createdAt));
-  await writeFile(run.artifacts.paperPath, "# Review Paper\n\nStatus: pending.\n", "utf8");
-  await writeJsonArtifact(run.artifacts.paperJsonPath, pendingArtifactStatus(run, "paper", createdAt));
-  await writeJsonArtifact(run.artifacts.manuscriptChecksPath, pendingArtifactStatus(run, "manuscript-checks", createdAt));
-  await writeJsonArtifact(run.artifacts.qualityReportPath, pendingArtifactStatus(run, "quality-report", createdAt));
-  await writeJsonArtifact(run.artifacts.nextQuestionsPath, pendingArtifactStatus(run, "next-questions", createdAt));
-  await writeJsonArtifact(run.artifacts.agendaPath, pendingArtifactStatus(run, "agenda", createdAt));
-  await writeFile(run.artifacts.agendaMarkdownPath, "# Research Agenda\n\nStatus: pending.\n", "utf8");
 }
 
 function relativeArtifactPath(projectRoot: string, targetPath: string): string {
   const relativePath = path.relative(projectRoot, targetPath);
   return relativePath.length === 0 ? "." : relativePath;
-}
-
-function paperEntityId(paper: CanonicalPaper): string {
-  return createLiteratureEntityId("paper", paper.key);
-}
-
-function canonicalPaperIdMap(papers: CanonicalPaper[]): Map<string, string> {
-  const mapping = new Map<string, string>();
-
-  for (const paper of papers) {
-    const canonicalId = paperEntityId(paper);
-    mapping.set(paper.id, canonicalId);
-    mapping.set(canonicalId, canonicalId);
-  }
-
-  return mapping;
-}
-
-function remapPaperIds(sourceIds: string[], canonicalIdByAnyId: Map<string, string>): string[] {
-  return [...new Set(sourceIds.map((sourceId) => canonicalIdByAnyId.get(sourceId) ?? sourceId))];
-}
-
-function canonicalizePaper(paper: CanonicalPaper): CanonicalPaper {
-  return {
-    ...paper,
-    id: paperEntityId(paper)
-  };
-}
-
-function canonicalizePapers(papers: CanonicalPaper[]): CanonicalPaper[] {
-  return papers.map((paper) => canonicalizePaper(paper));
-}
-
-function remapReviewWorkflow(
-  reviewWorkflow: ResearchSourceSnapshot["reviewWorkflow"],
-  canonicalIdByAnyId: Map<string, string>
-): ResearchSourceSnapshot["reviewWorkflow"] {
-  return {
-    ...reviewWorkflow,
-    titleScreenedPaperIds: remapPaperIds(reviewWorkflow.titleScreenedPaperIds, canonicalIdByAnyId),
-    abstractScreenedPaperIds: remapPaperIds(reviewWorkflow.abstractScreenedPaperIds, canonicalIdByAnyId),
-    fulltextScreenedPaperIds: remapPaperIds(reviewWorkflow.fulltextScreenedPaperIds, canonicalIdByAnyId),
-    includedPaperIds: remapPaperIds(reviewWorkflow.includedPaperIds, canonicalIdByAnyId),
-    excludedPaperIds: remapPaperIds(reviewWorkflow.excludedPaperIds, canonicalIdByAnyId),
-    uncertainPaperIds: remapPaperIds(reviewWorkflow.uncertainPaperIds, canonicalIdByAnyId),
-    blockedPaperIds: remapPaperIds(reviewWorkflow.blockedPaperIds, canonicalIdByAnyId),
-    synthesisPaperIds: remapPaperIds(reviewWorkflow.synthesisPaperIds, canonicalIdByAnyId),
-    deferredPaperIds: remapPaperIds(reviewWorkflow.deferredPaperIds, canonicalIdByAnyId)
-  };
 }
 
 function errorMessage(error: unknown): string {
@@ -4639,25 +4685,6 @@ async function commitWorkStoreSegment(input: {
   });
 
   await writeResearchWorkStore(nextStore);
-  if (input.gathered !== null) {
-    const canonicalIdByAnyId = canonicalPaperIdMap(input.gathered.canonicalPapers);
-    await writeJsonArtifact(input.run.artifacts.literaturePath, {
-      schemaVersion: 1,
-      runId: input.run.id,
-      artifactKind: "source-review-checkpoint",
-      storePath: relativeArtifactPath(input.run.projectRoot, researchWorkStoreFilePath(input.run.projectRoot)),
-      paperCount: input.gathered.canonicalPapers.length,
-      reviewedPaperCount: input.gathered.reviewedPapers.length,
-      papers: canonicalizePapers(input.gathered.canonicalPapers),
-      reviewedPapers: canonicalizePapers(input.gathered.reviewedPapers),
-      reviewWorkflow: remapReviewWorkflow(input.gathered.reviewWorkflow, canonicalIdByAnyId),
-      relevanceAssessments: input.gathered.relevanceAssessments ?? [],
-      mergeDiagnostics: input.gathered.mergeDiagnostics,
-      authStatus: input.gathered.authStatus,
-      retrievalDiagnostics: input.gathered.retrievalDiagnostics ?? null,
-      stateCounts: summarizeResearchWorkStore(nextStore)
-    });
-  }
   return nextStore;
 }
 
@@ -4880,12 +4907,6 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     await writeJsonArtifact(run.artifacts.reviewProtocolPath, currentProtocol);
     await writeFile(run.artifacts.reviewProtocolMarkdownPath, `${reviewProtocolMarkdown(currentProtocol)}\n`, "utf8");
 
-    await writeJsonArtifact(run.artifacts.criticProtocolReviewPath, skippedArtifactStatus(
-      run,
-      "critic-protocol-review",
-      now(),
-      "Critic review is model-selected; the runtime does not run mandatory semantic critic phases."
-    ));
     await appendTrace(run, now, `Selected research mode: ${plan.researchMode}`);
     await appendEvent(run, now, "summary", `Selected research mode ${plan.researchMode}: ${plan.objective}`);
     await appendStdout(run, `Selected research mode: ${plan.researchMode}`);
@@ -5077,8 +5098,8 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     );
     await agent.record({
       phase: "checkpoint",
-      action: sessionOutcome.checkpointedByBudget ? "checkpoint_budget_exhausted" : sessionOutcome.workerStatus === "release_ready" ? "release_ready" : "checkpoint_workspace_state",
-      status: sessionOutcome.checkpointedByBudget ? "warning" : "completed",
+      action: sessionOutcome.workerStatus === "release_ready" ? "release_ready" : "checkpoint_workspace_state",
+      status: "completed",
       summary: sessionOutcome.statusReason,
       artifactPaths: [
         run.artifacts.sourcesPath,
@@ -5098,10 +5119,8 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     run.job.exitCode = 0;
     run.job.signal = null;
     run.workerPid = null;
-    run.status = sessionOutcome.checkpointedByBudget ? "paused" : "completed";
-    run.statusMessage = sessionOutcome.checkpointedByBudget
-      ? "Worker segment checkpointed because the model-driven action budget was exhausted; the research objective remains active."
-      : sessionOutcome.workerStatus === "release_ready"
+    run.status = "completed";
+    run.statusMessage = sessionOutcome.workerStatus === "release_ready"
         ? "Research objective reached release-ready after explicit model-selected release."
         : `Worker segment exited normally after model-selected action(s); research objective status is ${sessionOutcome.workerStatus}.`;
     await store.save(run);

@@ -105,7 +105,7 @@ The intake chat gradually clarifies and captures:
 - research direction
 - success criterion
 
-If the consultant proposes a concrete first-pass brief, `/go` can accept that draft directly, start a detached literature-review run, stream live progress in the terminal, and persist the run artifacts under the project runtime directory. A successful literature run now writes a ranked research agenda and, when possible, a selected next research focus. If you revise the brief after reading the outcome, run `/go` again so ClawResearch continues from the updated project state instead of switching to a separate continuation command.
+If the consultant proposes a concrete first-pass brief, `/go` can accept that draft directly, start or resume the autonomous research worker, stream live progress in the terminal, and persist checkpoints under the project runtime directory. A run is one execution segment of the persistent worker, not the whole research process.
 
 After a run exists, the chat shifts from pure intake into a project-aware research assistant. It can summarize the latest run, explain the current blocker or next step, answer questions about the active project state, and react to requested changes in the research direction. When you materially change the brief after a saved run, ClawResearch will keep the updated brief and nudge you to run `/go` again so the artifacts catch up with the new direction.
 
@@ -113,7 +113,6 @@ Useful slash commands inside the console:
 
 - `/help`
 - `/status`
-- `/agenda`
 - `/sources`
 - `/go`
 - `/pause`
@@ -157,15 +156,17 @@ Minimal runtime state is persisted locally in:
 .clawresearch/session.json
 ```
 
-Run artifacts now include:
+Run artifacts are intentionally small. The canonical workspace is the database; run files are logs, checkpoints, and explicit exports such as:
 
-- `agenda.json`
-- `agenda.md`
-- `work-package.json`
+- `agent-state.json`
+- `agent-steps.jsonl`
+- `events.jsonl`
+- `sources.json`
+- `review-protocol.json`
 - `paper.md`
 - `paper.json`
+- `references.json`
 - `manuscript-checks.json`
-- `quality-report.json`
 
 Project-level literature configuration is persisted in:
 
@@ -179,16 +180,10 @@ Project-level credentials are persisted locally in:
 .clawresearch/credentials.json
 ```
 
-The runtime keeps the canonical agent-accessible research work store in:
+The runtime keeps the canonical agent-accessible research workspace in:
 
 ```text
-.clawresearch/research-work-store.json
-```
-
-The current accepted research direction lives in:
-
-```text
-.clawresearch/research-direction.json
+.clawresearch/workspace.sqlite
 ```
 
 The console also keeps a raw debug transcript of the interaction in:
@@ -210,21 +205,20 @@ Each run keeps a small set of debuggable local artifacts, including:
 - `events.jsonl`
 - `stdout.log`
 - `stderr.log`
+- `agent-state.json`
+- `agent-steps.jsonl`
 - `brief.json`
 - `plan.json`
 - `sources.json`
-- `literature-review.json`
-- `paper-extractions.json`
-- `evidence-matrix.json`
-- `synthesis.md`
-- `claims.json`
-- `verification.json`
-- `next-questions.json`
-- `agenda.json`
+- `review-protocol.json`
+- `review-protocol.md`
+- `paper.md`
+- `paper.json`
+- `references.json`
+- `manuscript-checks.json`
 - `summary.md`
-- `research-journal.json` (now a run-local work-store checkpoint)
 
-`events.jsonl` is the structured event stream the console watches while a run is active. It currently emits small, readable steps such as `plan`, `source`, `claim`, `next`, `exec`, `summary`, and terminal `run` updates.
+`events.jsonl` is the structured event stream the console watches while a run is active. It currently emits small, readable steps such as model decisions, tool executions, checkpoints, and terminal `run` updates.
 
 The project-level work store is the durable research memory. It stores typed research objects such as:
 
@@ -238,33 +232,9 @@ The project-level work store is the durable research memory. It stores typed res
 
 Each object has a stable id and enough metadata for the agent to query, read, patch, and extend the research state without treating per-run artifacts as long-term memory.
 
-The planner and source gatherer receive compact contexts derived from this work store, so later `/go` segments build on prior sources, unresolved work items, evidence cells, claims, and manuscript state instead of starting cold each time.
+The detached worker runs a model-driven research session. Each step observes the workspace, asks the model for one explicit tool action, validates the action mechanically, executes exactly that action, persists the result, and observes again. Source search, extraction, evidence creation, claim work, section writing, critic review, checks, and release are model-selected tools, not hidden workflow phases.
 
-The detached worker now runs a minimal explicit research loop. It is still intentionally small, but it no longer just boots and exits. The current loop does this:
-
-- plan a bounded research mode
-- run a dedicated literature-review subsystem for review-style tasks, with task-aware paper ranking instead of generic web browsing
-- plan provider-aware retrieval queries from the brief, project memory, and literature memory
-- route scholarly discovery by domain instead of looping over a flat provider list
-- gather raw discovery hits from `openalex`, `crossref`, `arxiv`, `dblp`, `pubmed`, `europe-pmc`, `ieee-xplore`, `elsevier`, and `springer-nature`
-- use `core` and `unpaywall` as OA and retrieval helpers when configured
-- use publisher-specific access resolution to prefer readable OA routes and honestly mark entitlement-gated papers
-- keep general-web and local context separate from scholarly review
-- merge duplicate provider hits into canonical papers
-- resolve the best legal reading path per paper before synthesis
-- persist canonical paper access state, screening decisions, and provider auth status
-- use relevant project memory to shape planning and retrieval
-- synthesize themes
-- record claims with explicit evidence references
-- verify claim provenance, support status, and explicit unknown or unverified gaps
-- produce next-step research questions
-- write a small structured research journal batch into both the run directory and the project runtime journal store
-
-It is still not a full autonomous scientist yet. The current loop is best understood as a source-grounded first research pass with inspectable artifacts.
-
-When the run is clearly a literature-review task, ClawResearch now switches to a specialized literature subsystem. That subsystem builds a task-aware literature profile, ranks papers by domain and task fit rather than pure keyword overlap, merges provider duplicates into canonical papers, and uses a literature-specific synthesis prompt that emphasizes thematic comparison, citation grounding, and explicit gap identification.
-
-`sources.json` now keeps raw provider hits, routing notes, and merge diagnostics. `literature-review.json` keeps the canonical paper set, access state, screening state, and provider-auth status that mattered for the run.
+`sources.json` is an optional run checkpoint for source-tool observations. The durable source, evidence, claim, section, work-item, citation, and release state lives in `workspace.sqlite`.
 
 After dependencies are installed, the runtime can also be built and run as compiled JavaScript:
 
@@ -302,19 +272,16 @@ run        Run id: run-...
 run        Status: queued
 run        Trace: .clawresearch/runs/run-.../trace.log
 run        Events: .clawresearch/runs/run-.../events.jsonl
+run        Agent state: .clawresearch/runs/run-.../agent-state.json
+run        Agent steps: .clawresearch/runs/run-.../agent-steps.jsonl
 run        Plan: .clawresearch/runs/run-.../plan.json
 run        Sources: .clawresearch/runs/run-.../sources.json
-run        Literature review: .clawresearch/runs/run-.../literature-review.json
-run        Synthesis: .clawresearch/runs/run-.../synthesis.md
-run        Verification: .clawresearch/runs/run-.../verification.json
-run        Work-store checkpoint: .clawresearch/runs/run-.../research-journal.json
+run        Workspace db: .clawresearch/workspace.sqlite
 watch      Streaming live run activity from .clawresearch/runs/run-.../events.jsonl.
-plan       Plan the research mode and generate initial search queries.
-source     web-1: ...
-claim      ...
-verify     Verified 1 claims against 2 sources. 1 supported, 0 partially supported, 0 unverified, 0 explicit unknown.
-memory     Research work store updated: 15 sources, 4 open work items.
-next       ...
+agent      The researcher selected source.search.
+tool       source.search returned 6 source previews.
+agent      The researcher selected source.merge.
+tool       source.merge persisted 4 canonical sources.
 done       Run run-... completed.
 ```
 

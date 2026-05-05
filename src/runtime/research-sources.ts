@@ -4228,26 +4228,6 @@ export class SourceToolRuntime {
         }
       };
     }
-    const queryKey = providerQueryKey(providerId, querySet);
-    if (this.exhaustedProviderQueryKeys.has(queryKey)) {
-      this.lastObservation = `${getSourceProviderDefinition(providerId).label} search skipped because this provider/query set already produced no new screened sources twice.`;
-      this.recordSearchOutcome({
-        providerId,
-        querySet,
-        rawCandidates: 0,
-        newSources: 0,
-        error: this.lastObservation,
-        message: this.lastObservation
-      });
-      return {
-        action: "source.search",
-        message: this.lastObservation,
-        counts: {
-          newSources: 0,
-          scholarlySources: this.scholarlySources.length
-        }
-      };
-    }
     this.queries = uniqueStrings([...this.queries, ...querySet]);
     this.routing.plannedQueries = this.queries;
     this.attemptedProviderIds.add(providerId);

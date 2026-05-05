@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { OllamaProjectAssistantBackend } from "../src/runtime/project-assistant-backend.js";
 
-test("project assistant backend includes current run and agenda context in its prompt", async () => {
+test("project assistant backend includes current run context in its prompt", async () => {
   const originalFetch = globalThis.fetch;
   let capturedPrompt = "";
   let capturedUserMessage = "";
@@ -66,16 +66,7 @@ test("project assistant backend includes current run and agenda context in its p
           "summary: Literature review completed.",
           "run: Provider-aware literature run completed successfully."
         ],
-        summaryMarkdown: "# Research Summary\n\nThe agenda selected a next research focus."
-      },
-      latestAgenda: {
-        executiveSummary: "The best next direction is to optimize fast algorithms.",
-        gaps: [],
-        candidateDirections: [],
-        selectedDirectionId: "direction-1",
-        selectedWorkPackage: null,
-        holdReasons: [],
-        recommendedHumanDecision: "Resolve the missing local inputs before continuing."
+        summaryMarkdown: "# Research Summary\n\nThe worker selected a next research focus."
       }
     });
 
@@ -83,8 +74,7 @@ test("project assistant backend includes current run and agenda context in its p
     assert.match(capturedPrompt, /ongoing research assistant/i);
     assert.match(capturedPrompt, /Current run:/);
     assert.match(capturedPrompt, /run-1/);
-    assert.match(capturedPrompt, /direction-1/);
-    assert.match(capturedPrompt, /Resolve the missing local inputs before continuing/);
+    assert.doesNotMatch(capturedPrompt, /Latest agenda:/);
     assert.match(capturedUserMessage, /What was the result of the research\?/);
   } finally {
     globalThis.fetch = originalFetch;

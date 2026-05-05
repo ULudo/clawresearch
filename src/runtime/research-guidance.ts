@@ -123,7 +123,7 @@ const builtinGuidance: ResearchGuidanceObject[] = [
     body: [
       "Use section.create for a durable manuscript section with a clear title, role, markdown, and source/claim ids.",
       "Use section.patch to revise section text or metadata.",
-      "Use section.link_claim to connect an existing section to an existing claim.",
+      "Use section.link_claim to connect an existing section to an existing claim. Provide the manuscript section id or sectionId plus the claim id; if unsure, inspect workspace.list/read results first.",
       "Use section.check_claims to create visible work items when section claims lack support."
     ].join("\n"),
     tags: ["tool guide", "sections", "manuscript", "drafting", "revision"],
@@ -151,10 +151,10 @@ const builtinGuidance: ResearchGuidanceObject[] = [
     id: "tool-guide.checkpoints",
     kind: "ToolGuide",
     title: "Checkpoint and status tool",
-    summary: "Use workspace.status only for true checkpoints, external blockers, or real user decisions.",
+    summary: "Use workspace.status only for validated external blockers or real user decisions.",
     body: [
       "Do not use workspace.status simply because more machine-actionable work remains.",
-      "If checkpointing, include the concrete current state and any model-authored nextInternalActions.",
+      "Non-terminal status notes are returned as observations and the worker keeps going.",
       "Use externally_blocked only for real outside limitations such as credentials, provider outage, quota, access, or permissions.",
       "Use needs_user_decision only when you provide a concrete decision question and explicit options."
     ].join("\n"),

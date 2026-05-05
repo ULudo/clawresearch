@@ -32,9 +32,7 @@ import {
   type RunController
 } from "./run-controller.js";
 import {
-  researchDirectionPath,
   RunStore,
-  type ResearchDirectionState,
   type RunRecord
 } from "./run-store.js";
 import {
@@ -74,9 +72,6 @@ import {
   type RunEventKind,
   type RunEventRecord
 } from "./run-events.js";
-import type {
-  ResearchAgenda
-} from "./research-backend.js";
 import {
   createResearchWorkerState,
   loadResearchWorkerState,
@@ -213,15 +208,6 @@ function renderTaggedLines(writer: OutputWriter, tag: string, lines: string[]): 
   }
 }
 
-export type AgendaSnapshot = {
-  run: RunRecord | null;
-  agenda: ResearchAgenda;
-  source: "global" | "run";
-  sourceRunId: string | null;
-  sourceRunAgendaPath: string | null;
-  provenanceKnown: boolean;
-};
-
 type RuntimeArtifactStatus = {
   schemaVersion: number;
   runId: string;
@@ -270,65 +256,6 @@ async function readArtifactStatusOrNull(filePath: string): Promise<RuntimeArtifa
   }
 }
 
-async function loadAgendaSnapshotForRun(run: RunRecord): Promise<AgendaSnapshot | null> {
-  const agenda = await readJsonFileOrNull<ResearchAgenda>(run.artifacts.agendaPath);
-
-  if (agenda === null) {
-    return null;
-  }
-
-  return {
-    run,
-    agenda,
-    source: "run",
-    sourceRunId: run.id,
-    sourceRunAgendaPath: run.artifacts.agendaPath,
-    provenanceKnown: true
-  };
-}
-
-function directionSourceRunId(direction: ResearchDirectionState | ResearchAgenda): string | null {
-  const candidate = direction as Partial<ResearchDirectionState>;
-  return typeof candidate.sourceRunId === "string" && candidate.sourceRunId.trim().length > 0
-    ? candidate.sourceRunId
-    : null;
-}
-
-function directionSourceAgendaPath(direction: ResearchDirectionState | ResearchAgenda): string | null {
-  const candidate = direction as Partial<ResearchDirectionState>;
-  return typeof candidate.sourceRunAgendaPath === "string" && candidate.sourceRunAgendaPath.trim().length > 0
-    ? candidate.sourceRunAgendaPath
-    : null;
-}
-
-export async function latestAgendaSnapshot(runStore: RunStore): Promise<AgendaSnapshot | null> {
-  const runs = await runStore.list();
-  const currentAgenda = await readJsonFileOrNull<ResearchDirectionState | ResearchAgenda>(researchDirectionPath(runStore.projectRoot));
-
-  if (currentAgenda !== null) {
-    const sourceRunId = directionSourceRunId(currentAgenda);
-    const sourceRun = sourceRunId === null ? null : await loadRunIfPresent(runStore, sourceRunId);
-    return {
-      run: sourceRun,
-      agenda: currentAgenda,
-      source: "global",
-      sourceRunId,
-      sourceRunAgendaPath: directionSourceAgendaPath(currentAgenda),
-      provenanceKnown: sourceRun !== null
-    };
-  }
-
-  for (const run of runs) {
-    const snapshot = await loadAgendaSnapshotForRun(run);
-
-    if (snapshot !== null) {
-      return snapshot;
-    }
-  }
-
-  return null;
-}
-
 export function relativeProjectPath(projectRoot: string, targetPath: string): string {
   const relativePath = path.relative(projectRoot, targetPath);
   return relativePath.length === 0 ? "." : relativePath;
@@ -352,7 +279,7 @@ function renderWelcome(writer: OutputWriter, session: SessionState): void {
   }
 
   writeLine(writer, "The current directory is treated as the project root automatically.");
-  writeLine(writer, "Use `/help` for commands, `/status` for the current brief, agenda, and worker state, `/sources` to inspect literature providers, `/go` to start or continue the autonomous research worker, `/agenda` to inspect the latest research agenda, and `/quit` to leave.");
+  writeLine(writer, "Use `/help` for commands, `/status` for the current brief and worker state, `/sources` to inspect literature providers, `/go` to start or continue the autonomous research worker, and `/quit` to leave.");
   writeLine(writer);
 }
 
@@ -699,7 +626,6 @@ export function renderHelp(writer: OutputWriter, session: SessionState): void {
   writeLine(writer, "  /status Show the current research brief, run state, and backend");
   writeLine(writer, "  /sources Show the current literature providers for this project");
   writeLine(writer, "  /go     Start or continue the autonomous research worker");
-  writeLine(writer, "  /agenda Show the latest saved research agenda");
   writeLine(writer, "  /paper  Show the latest review-paper draft status");
   writeLine(writer, "  /pause  Pause the active detached run");
   writeLine(writer, "  /resume Resume the active detached run");
@@ -715,37 +641,6 @@ export function renderHelp(writer: OutputWriter, session: SessionState): void {
   writeLine(writer, `  Local intake backend: ${session.intake.backendLabel ?? "not configured"}`);
 }
 
-export function renderAgenda(
-  writer: OutputWriter,
-  snapshot: AgendaSnapshot | null,
-  projectRoot: string
-): void {
-  if (snapshot === null) {
-    writeLine(writer, "Agenda:");
-    writeLine(writer, "  none yet");
-    return;
-  }
-
-  writeLine(writer, "Agenda:");
-  writeLine(writer, `  source: ${snapshot.provenanceKnown && snapshot.sourceRunId !== null ? `run ${snapshot.sourceRunId}` : "global/unknown"}`);
-  writeLine(writer, `  current direction: ${relativeProjectPath(projectRoot, researchDirectionPath(projectRoot))}`);
-  if (snapshot.run !== null) {
-    writeLine(writer, `  run agenda: ${relativeProjectPath(projectRoot, snapshot.run.artifacts.agendaPath)}`);
-  }
-  writeLine(writer, `  summary: ${snapshot.agenda.executiveSummary}`);
-  writeLine(writer, `  candidate directions: ${snapshot.agenda.candidateDirections.length}`);
-  writeLine(writer, `  selected direction: ${snapshot.agenda.selectedDirectionId ?? "<none>"}`);
-  writeLine(writer, `  recommended decision: ${snapshot.agenda.recommendedHumanDecision}`);
-
-  if (snapshot.agenda.holdReasons.length > 0) {
-    writeLine(writer, "  hold reasons:");
-
-    for (const reason of snapshot.agenda.holdReasons) {
-      writeLine(writer, `    - ${reason}`);
-    }
-  }
-}
-
 export function renderStatus(
   writer: OutputWriter,
   session: SessionState,
@@ -753,7 +648,6 @@ export function renderStatus(
   transcriptPath: string,
   projectConfig: ProjectConfigState,
   credentials: CredentialStoreState,
-  agendaSnapshot: AgendaSnapshot | null = null,
   workerState: ResearchWorkerState | null = null,
   workStore: ResearchWorkStore | null = null
 ): void {
@@ -811,14 +705,9 @@ export function renderStatus(
     writeLine(writer, `  stderr: ${relativeProjectPath(session.projectRoot, run.artifacts.stderrPath)}`);
     writeLine(writer, `  plan: ${relativeProjectPath(session.projectRoot, run.artifacts.planPath)}`);
     writeLine(writer, `  sources: ${relativeProjectPath(session.projectRoot, run.artifacts.sourcesPath)}`);
-    writeLine(writer, `  literature: ${relativeProjectPath(session.projectRoot, run.artifacts.literaturePath)}`);
     writeLine(writer, `  review protocol: ${relativeProjectPath(session.projectRoot, run.artifacts.reviewProtocolPath)}`);
-    writeLine(writer, `  verification: ${relativeProjectPath(session.projectRoot, run.artifacts.verificationPath)}`);
     writeLine(writer, `  paper: ${relativeProjectPath(session.projectRoot, run.artifacts.paperPath)}`);
     writeLine(writer, `  paper checks: ${relativeProjectPath(session.projectRoot, run.artifacts.manuscriptChecksPath)}`);
-    writeLine(writer, `  next questions: ${relativeProjectPath(session.projectRoot, run.artifacts.nextQuestionsPath)}`);
-    writeLine(writer, `  agenda: ${relativeProjectPath(session.projectRoot, run.artifacts.agendaPath)}`);
-    writeLine(writer, `  agenda summary: ${relativeProjectPath(session.projectRoot, run.artifacts.agendaMarkdownPath)}`);
     writeLine(writer, `  workspace db: ${relativeProjectPath(session.projectRoot, researchWorkStoreFilePath(session.projectRoot))}`);
   }
 
@@ -830,13 +719,6 @@ export function renderStatus(
   const runtimeModel = resolveRuntimeModelConfig(projectConfig);
   writeLine(writer, `Model route: ${modelProviderLabel(runtimeModel.provider)} (${runtimeModel.model})`);
   writeLine(writer, `Debug log: ${relativeProjectPath(session.projectRoot, transcriptPath)}`);
-  if (agendaSnapshot === null) {
-    writeLine(writer, "Agenda available: no");
-  } else {
-    writeLine(writer, "Agenda available: yes");
-    writeLine(writer, `Agenda source: ${agendaSnapshot.provenanceKnown && agendaSnapshot.sourceRunId !== null ? `run ${agendaSnapshot.sourceRunId}` : "global/unknown"}`);
-    writeLine(writer, `Selected direction: ${agendaSnapshot.agenda.selectedDirectionId ?? "<none>"}`);
-  }
   writeLine(writer);
   writeLine(writer, "Autonomous worker:");
   if (workerState === null) {
@@ -2106,7 +1988,6 @@ async function readRecentRunEvents(run: RunRecord, limit = 8): Promise<string[]>
 type ProjectAssistantContextSnapshot = {
   run: RunRecord;
   currentRun: ProjectAssistantRunContext;
-  agenda: ResearchAgenda | null;
 };
 
 async function loadProjectAssistantContext(
@@ -2121,8 +2002,6 @@ async function loadProjectAssistantContext(
     return null;
   }
 
-  const agendaSnapshot = await loadAgendaSnapshotForRun(preferredRun)
-    ?? await latestAgendaSnapshot(runStore);
   const summaryMarkdown = await readTextFileOrNull(preferredRun.artifacts.summaryPath);
   const recentEvents = await readRecentRunEvents(preferredRun);
 
@@ -2136,8 +2015,7 @@ async function loadProjectAssistantContext(
       briefMatchesCurrent: briefsMatch(preferredRun.brief, session.brief),
       recentEvents,
       summaryMarkdown
-    },
-    agenda: agendaSnapshot?.agenda ?? null
+    }
   };
 }
 
@@ -2165,8 +2043,7 @@ async function requestProjectAssistantTurn(
         role: entry.role,
         content: entry.text
     })),
-    currentRun: context.currentRun,
-    latestAgenda: context.agenda
+    currentRun: context.currentRun
   });
 }
 
@@ -2346,25 +2223,11 @@ async function buildCompletedRunSummary(run: RunRecord): Promise<string> {
         return `Autonomous research worker paused. ${workerState.statusReason} ${workerState.userBlockers.join(" | ")}`;
       case "working":
         return `Autonomous research worker checkpointed this segment. ${workerState.statusReason}`;
-      case "checkpointed_budget_exhausted":
-        return `Autonomous research worker checkpointed after exhausting this segment budget. ${workerState.statusReason}`;
       case "paused":
         return `Autonomous research worker is paused. ${workerState.statusReason}`;
       case "not_started":
         break;
     }
-  }
-
-  const agendaSnapshot = await loadAgendaSnapshotForRun(run);
-
-  if (agendaSnapshot !== null) {
-    const summary = truncateSentence(agendaSnapshot.agenda.executiveSummary);
-
-    if (agendaSnapshot.agenda.holdReasons.length > 0) {
-      return `Literature review complete. ${summary} The agenda is on hold: ${agendaSnapshot.agenda.holdReasons.join(" | ")}`;
-    }
-
-    return `Research segment complete. ${summary}`;
   }
 
   const summaryMarkdown = await readTextFileOrNull(run.artifacts.summaryPath);
@@ -2377,7 +2240,7 @@ async function buildCompletedRunSummary(run: RunRecord): Promise<string> {
     const firstLine = lines[0];
 
     if (firstLine !== undefined) {
-      return `Literature review complete. ${truncateSentence(firstLine)}`;
+      return `Research segment complete. ${truncateSentence(firstLine)}`;
     }
   }
 
@@ -2604,7 +2467,7 @@ export async function emitAssistantTurn(
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown backend failure";
       session.intake.lastError = message;
-      const fallback = "The local research assistant is unavailable right now. You can inspect `/status`, `/agenda`, or ask again once Ollama is responding.";
+      const fallback = "The local research assistant is unavailable right now. You can inspect `/status` or ask again once Ollama is responding.";
       renderTaggedBlock(writer, "system", fallback);
       saveAssistantMessage(session, fallback, now(), "system");
     }
@@ -2917,9 +2780,7 @@ export async function handleGoCommand(
     `Stderr: ${relativeProjectPath(session.projectRoot, run.artifacts.stderrPath)}`,
     `Plan: ${relativeProjectPath(session.projectRoot, run.artifacts.planPath)}`,
     `Sources: ${relativeProjectPath(session.projectRoot, run.artifacts.sourcesPath)}`,
-    `Literature review: ${relativeProjectPath(session.projectRoot, run.artifacts.literaturePath)}`,
     `Review protocol: ${relativeProjectPath(session.projectRoot, run.artifacts.reviewProtocolPath)}`,
-    `Verification: ${relativeProjectPath(session.projectRoot, run.artifacts.verificationPath)}`,
     `Paper: ${relativeProjectPath(session.projectRoot, run.artifacts.paperPath)}`,
     `Paper checks: ${relativeProjectPath(session.projectRoot, run.artifacts.manuscriptChecksPath)}`,
     `Workspace db: ${relativeProjectPath(session.projectRoot, researchWorkStoreFilePath(session.projectRoot))}`,
@@ -3187,22 +3048,14 @@ async function handleCommand(
       applyCredentialsToEnvironment(currentCredentials);
       projectConfig.sources = currentProjectConfig.sources;
       credentials.providers = currentCredentials.providers;
-      const agendaSnapshot = await latestAgendaSnapshot(runStore);
       const workerState = await loadResearchWorkerState(session.projectRoot);
       const workStore = await loadResearchWorkStore({
         projectRoot: session.projectRoot,
         brief: session.brief,
         now: now()
       });
-      renderStatus(writer, session, run, transcriptPath, currentProjectConfig, currentCredentials, agendaSnapshot, workerState, workStore);
+      renderStatus(writer, session, run, transcriptPath, currentProjectConfig, currentCredentials, workerState, workStore);
       saveAssistantMessage(session, "Displayed the current research brief.", now(), "command");
-      await store.save(session);
-      return "continue";
-    }
-    case "/agenda": {
-      const snapshot = await latestAgendaSnapshot(runStore);
-      renderAgenda(writer, snapshot, session.projectRoot);
-      saveAssistantMessage(session, "Displayed the latest research agenda.", now(), "command");
       await store.save(session);
       return "continue";
     }

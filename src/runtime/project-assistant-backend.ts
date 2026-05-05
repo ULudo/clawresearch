@@ -9,7 +9,6 @@ import {
   resolveRuntimeModelConfig,
   type ProjectConfigState
 } from "./project-config-store.js";
-import type { ResearchAgenda } from "./research-backend.js";
 import type { RunStage, RunStatus } from "./run-store.js";
 import type { ResearchBrief } from "./session-store.js";
 
@@ -40,7 +39,6 @@ export type ProjectAssistantRequest = {
   openQuestions: string[];
   conversation: IntakeConversationMessage[];
   currentRun: ProjectAssistantRunContext | null;
-  latestAgenda: ResearchAgenda | null;
 };
 
 export type ProjectFileAction = {
@@ -169,10 +167,10 @@ function buildInstruction(request: ProjectAssistantRequest): string {
     "You are ClawResearch's ongoing research assistant.",
     "You are not the startup intake consultant anymore.",
     "You are helping inside an active local research project after or during runs.",
-    "Be aware of the current run, the latest agenda, and the persistent autonomous research-worker state.",
+    "Be aware of the current run and the persistent autonomous research-worker state.",
     "Answer the user's latest question directly using the supplied project context.",
     "If the user asks what happened, summarize what the latest run segment did, what the result was, and whether remaining work is internal, release-ready, or externally blocked.",
-    "Do not pretend an implementation or experiment succeeded if the run only produced a literature review, agenda, or status report.",
+    "Do not pretend an implementation or experiment succeeded if the run only produced source notes, checks, or status diagnostics.",
     "If the user asks to modify the topic, research question, research direction, success criterion, or otherwise change the project scope, update the structured brief accordingly.",
     "If the user changes the brief materially, mention that the current saved results may reflect the older brief and that running `/go` again is appropriate.",
     "If the user clearly asks you to create, write, append, or update a normal project Markdown/text file, include a fileActions entry. Do not merely give pasteable text.",
@@ -205,7 +203,6 @@ function buildInstruction(request: ProjectAssistantRequest): string {
     `Current brief: ${JSON.stringify(request.brief)}`,
     `Open questions: ${JSON.stringify(request.openQuestions)}`,
     `Current run: ${JSON.stringify(request.currentRun)}`,
-    `Latest agenda: ${JSON.stringify(request.latestAgenda)}`,
     "",
     "Conversation so far follows below in chat-message order."
   ].join("\n");

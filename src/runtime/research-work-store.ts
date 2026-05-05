@@ -73,7 +73,6 @@ export type WorkItemSeverity =
 export type ResearchWorkerStatus =
   | "not_started"
   | "working"
-  | "checkpointed_budget_exhausted"
   | "paused"
   | "release_ready"
   | "needs_user_decision"
@@ -221,7 +220,7 @@ export type WorkStoreWorkItem = WorkStoreBaseEntity & {
   severity: WorkItemSeverity;
   title: string;
   description: string;
-  targetKind: WorkStoreEntityKind | "protocol" | "brief" | "release" | "agenda" | "unknown";
+  targetKind: WorkStoreEntityKind | "protocol" | "brief" | "release" | "unknown";
   targetId: string | null;
   affectedSourceIds: string[];
   affectedClaimIds: string[];
@@ -650,7 +649,6 @@ function isResearchWorkerStatus(value: string | null): value is ResearchWorkerSt
   switch (value) {
     case "not_started":
     case "working":
-    case "checkpointed_budget_exhausted":
     case "paused":
     case "release_ready":
     case "needs_user_decision":

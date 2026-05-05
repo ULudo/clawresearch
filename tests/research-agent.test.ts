@@ -129,8 +129,7 @@ test("research action normalization accepts JSON escape hatches for dynamic work
       evidenceRows: 0,
       evidenceInsights: 0,
       manuscriptReadiness: null,
-      sessionStepsUsed: 0,
-      sessionStepsRemaining: 1
+      sessionStepsUsed: 0
     },
     criticReports: []
   });

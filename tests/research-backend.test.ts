@@ -319,8 +319,7 @@ test("research-agent backend uses native tool calls by default", async () => {
         evidenceRows: 4,
         evidenceInsights: 2,
         manuscriptReadiness: null,
-        sessionStepsUsed: 0,
-        sessionStepsRemaining: 3
+        sessionStepsUsed: 0
       },
       criticReports: []
     });
@@ -431,8 +430,7 @@ test("research-agent backend falls back to strict JSON when native tool calls ar
         evidenceRows: 4,
         evidenceInsights: 2,
         manuscriptReadiness: null,
-        sessionStepsUsed: 0,
-        sessionStepsRemaining: 3
+        sessionStepsUsed: 0
       },
       criticReports: []
     });
@@ -534,8 +532,7 @@ test("OpenAI Responses backend uses native function tools for research actions",
         evidenceRows: 4,
         evidenceInsights: 2,
         manuscriptReadiness: null,
-        sessionStepsUsed: 0,
-        sessionStepsRemaining: 3
+        sessionStepsUsed: 0
       },
       criticReports: []
     });
@@ -636,8 +633,7 @@ test("agent-step backend exposes first-class claim and manuscript-section tools"
         evidenceRows: 3,
         evidenceInsights: 2,
         manuscriptReadiness: "needs_human_review",
-        sessionStepsUsed: 0,
-        sessionStepsRemaining: 2
+        sessionStepsUsed: 0
       },
       workStore: {
         path: "/tmp/project/.clawresearch/workspace.sqlite",

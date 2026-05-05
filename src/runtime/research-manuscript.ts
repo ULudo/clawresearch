@@ -94,7 +94,6 @@ export type PaperOutline = {
   evidenceTablesToCite: string[];
   openQuestions: string[];
   limitations: string[];
-  agendaImplications: string[];
 };
 
 export type ReferenceRecord = {

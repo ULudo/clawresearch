@@ -62,16 +62,10 @@ export type RuntimeModelConfig = {
 
 export type RuntimeLlmConfig = {
   planningTimeoutMs: number;
-  extractionTimeoutMs: number;
-  agendaTimeoutMs: number;
   criticTimeoutMs: number;
   agentStepTimeoutMs: number;
-  extractionInitialBatchSize: number;
-  extractionMinBatchSize: number;
-  extractionRetryBudget: number;
   agentControlMode: ResearchAgentControlMode;
   agentInvalidActionBudget: number;
-  agentSegmentMaxSteps: number;
 };
 
 export type ProjectConfigState = {
@@ -159,16 +153,10 @@ function readStringArray(value: unknown): string[] {
 
 export const defaultRuntimeLlmConfig: RuntimeLlmConfig = {
   planningTimeoutMs: 300_000,
-  extractionTimeoutMs: 300_000,
-  agendaTimeoutMs: 300_000,
   criticTimeoutMs: 300_000,
   agentStepTimeoutMs: 300_000,
-  extractionInitialBatchSize: 6,
-  extractionMinBatchSize: 1,
-  extractionRetryBudget: 24,
   agentControlMode: "auto",
-  agentInvalidActionBudget: 2,
-  agentSegmentMaxSteps: 24
+  agentInvalidActionBudget: 2
 };
 
 export const defaultRuntimeModelConfig: RuntimeModelConfig = {
@@ -298,26 +286,13 @@ export function resolveRuntimeModelConfig(
 function normalizeRuntimeLlmConfig(raw: unknown): RuntimeLlmConfig {
   const record = asObject(raw);
   const base = defaultRuntimeLlmConfig;
-  const extractionMinBatchSize = readPositiveInteger(record.extractionMinBatchSize)
-    ?? base.extractionMinBatchSize;
-  const extractionInitialBatchSize = Math.max(
-    extractionMinBatchSize,
-    readPositiveInteger(record.extractionInitialBatchSize)
-      ?? base.extractionInitialBatchSize
-  );
 
   return {
     planningTimeoutMs: readPositiveInteger(record.planningTimeoutMs) ?? base.planningTimeoutMs,
-    extractionTimeoutMs: readPositiveInteger(record.extractionTimeoutMs) ?? base.extractionTimeoutMs,
-    agendaTimeoutMs: readPositiveInteger(record.agendaTimeoutMs) ?? base.agendaTimeoutMs,
     criticTimeoutMs: readPositiveInteger(record.criticTimeoutMs) ?? base.criticTimeoutMs,
     agentStepTimeoutMs: readPositiveInteger(record.agentStepTimeoutMs) ?? base.agentStepTimeoutMs,
-    extractionInitialBatchSize,
-    extractionMinBatchSize,
-    extractionRetryBudget: readPositiveInteger(record.extractionRetryBudget) ?? base.extractionRetryBudget,
     agentControlMode: readAgentControlMode(record.agentControlMode) ?? base.agentControlMode,
-    agentInvalidActionBudget: readPositiveInteger(record.agentInvalidActionBudget) ?? base.agentInvalidActionBudget,
-    agentSegmentMaxSteps: readPositiveInteger(record.agentSegmentMaxSteps) ?? base.agentSegmentMaxSteps
+    agentInvalidActionBudget: readPositiveInteger(record.agentInvalidActionBudget) ?? base.agentInvalidActionBudget
   };
 }
 
@@ -327,40 +302,21 @@ export function resolveRuntimeLlmConfig(
 ): RuntimeLlmConfig {
   const baseTimeout = readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_TIMEOUT_MS");
   const configured = normalizeRuntimeLlmConfig(config.runtime.llm);
-  const extractionMinBatchSize = readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_EXTRACTION_MIN_BATCH_SIZE")
-    ?? configured.extractionMinBatchSize;
-  const extractionInitialBatchSize = Math.max(
-    extractionMinBatchSize,
-    readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_EXTRACTION_BATCH_SIZE")
-      ?? configured.extractionInitialBatchSize
-  );
 
   return {
     planningTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_PLANNING_TIMEOUT_MS")
       ?? baseTimeout
       ?? configured.planningTimeoutMs,
-    extractionTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_EXTRACTION_TIMEOUT_MS")
-      ?? baseTimeout
-      ?? configured.extractionTimeoutMs,
-    agendaTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_AGENDA_TIMEOUT_MS")
-      ?? baseTimeout
-      ?? configured.agendaTimeoutMs,
     criticTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_CRITIC_TIMEOUT_MS")
       ?? baseTimeout
       ?? configured.criticTimeoutMs,
     agentStepTimeoutMs: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_AGENT_STEP_TIMEOUT_MS")
       ?? baseTimeout
       ?? configured.agentStepTimeoutMs,
-    extractionInitialBatchSize,
-    extractionMinBatchSize,
-    extractionRetryBudget: readEnvPositiveInteger(env, "CLAWRESEARCH_LLM_EXTRACTION_RETRY_BUDGET")
-      ?? configured.extractionRetryBudget,
     agentControlMode: readAgentControlMode(env.CLAWRESEARCH_AGENT_CONTROL_MODE)
       ?? configured.agentControlMode,
     agentInvalidActionBudget: readEnvPositiveInteger(env, "CLAWRESEARCH_AGENT_INVALID_ACTION_BUDGET")
-      ?? configured.agentInvalidActionBudget,
-    agentSegmentMaxSteps: readEnvPositiveInteger(env, "CLAWRESEARCH_AGENT_SEGMENT_MAX_STEPS")
-      ?? configured.agentSegmentMaxSteps
+      ?? configured.agentInvalidActionBudget
   };
 }
 

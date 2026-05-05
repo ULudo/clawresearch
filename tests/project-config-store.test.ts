@@ -69,7 +69,8 @@ test("project config store loads the current grouped source model and drops inva
     assert.deepEqual(config.sources.generalWeb.selectedProviderIds, ["wikipedia"]);
     assert.equal(config.sources.localContext.projectFilesEnabled, false);
     assert.equal(config.sources.explicitlyConfigured, true);
-    assert.equal(config.runtime.llm.extractionInitialBatchSize, 4);
+    assert.equal(config.runtime.llm.planningTimeoutMs, defaultRuntimeLlmConfig.planningTimeoutMs);
+    assert.equal("extractionInitialBatchSize" in config.runtime.llm, false);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -136,31 +137,20 @@ test("runtime llm config resolves env overrides over project defaults", async ()
     const store = new ProjectConfigStore(projectRoot, now);
     const config = await store.load();
     config.runtime.llm.planningTimeoutMs = 111_000;
-    config.runtime.llm.extractionInitialBatchSize = 6;
-    config.runtime.llm.extractionMinBatchSize = 2;
 
     const resolved = resolveRuntimeLlmConfig(config, {
       CLAWRESEARCH_LLM_TIMEOUT_MS: "222000",
       CLAWRESEARCH_LLM_CRITIC_TIMEOUT_MS: "444000",
-      CLAWRESEARCH_LLM_EXTRACTION_BATCH_SIZE: "5",
-      CLAWRESEARCH_LLM_EXTRACTION_MIN_BATCH_SIZE: "3",
-      CLAWRESEARCH_LLM_EXTRACTION_RETRY_BUDGET: "9",
       CLAWRESEARCH_LLM_AGENT_STEP_TIMEOUT_MS: "555000",
       CLAWRESEARCH_AGENT_CONTROL_MODE: "native_tool_calls",
-      CLAWRESEARCH_AGENT_INVALID_ACTION_BUDGET: "3",
-      CLAWRESEARCH_AGENT_SEGMENT_MAX_STEPS: "11"
+      CLAWRESEARCH_AGENT_INVALID_ACTION_BUDGET: "3"
     });
 
     assert.equal(resolved.planningTimeoutMs, 222_000);
-    assert.equal(resolved.extractionTimeoutMs, 222_000);
     assert.equal(resolved.criticTimeoutMs, 444_000);
-    assert.equal(resolved.extractionInitialBatchSize, 5);
-    assert.equal(resolved.extractionMinBatchSize, 3);
-    assert.equal(resolved.extractionRetryBudget, 9);
     assert.equal(resolved.agentStepTimeoutMs, 555_000);
     assert.equal(resolved.agentControlMode, "native_tool_calls");
     assert.equal(resolved.agentInvalidActionBudget, 3);
-    assert.equal(resolved.agentSegmentMaxSteps, 11);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

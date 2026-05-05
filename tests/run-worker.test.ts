@@ -25,7 +25,7 @@ import type {
   ResearchSourceToolAdapter
 } from "../src/runtime/research-sources.js";
 import { ProjectConfigStore } from "../src/runtime/project-config-store.js";
-import { researchDirectionPath, runDirectoryPath, runFilePath, RunStore } from "../src/runtime/run-store.js";
+import { runDirectoryPath, runFilePath, RunStore } from "../src/runtime/run-store.js";
 import { runDetachedJobWorker } from "../src/runtime/run-worker.js";
 import { loadResearchWorkerState, researchWorkerStatePath } from "../src/runtime/research-state.js";
 import {
@@ -44,6 +44,27 @@ function createNow(): () => string {
     step += 1;
     return timestamp;
   };
+}
+
+async function assertOldPhaseArtifactsAbsent(runDirectory: string): Promise<void> {
+  const oldPhaseArtifactNames = [
+    "literature-review.json",
+    "paper-extractions.json",
+    "evidence-matrix.json",
+    "synthesis.md",
+    "synthesis.json",
+    "claims.json",
+    "verification.json",
+    "paper-outline.json",
+    "quality-report.json",
+    "next-questions.json",
+    "agenda.json",
+    "agenda.md"
+  ];
+
+  for (const artifactName of oldPhaseArtifactNames) {
+    await assert.rejects(readFile(path.join(runDirectory, artifactName), "utf8"), /ENOENT/);
+  }
 }
 
 function canonicalPaper(overrides: Partial<CanonicalPaper> = {}): CanonicalPaper {
@@ -150,6 +171,26 @@ function reviewWorkflowFor(papers: CanonicalPaper[], reviewedPaperIds?: string[]
       deferred: 0
     },
     notes: []
+  };
+}
+
+function terminalUserDecisionWorkStore(statusReason: string): ResearchActionDecision["inputs"]["workStore"] {
+  return {
+    collection: "worker",
+    entityId: null,
+    filters: {},
+    semanticQuery: null,
+    limit: null,
+    cursor: null,
+    changes: {},
+    entity: {
+      status: "needs_user_decision",
+      statusReason: `Choose between scripted test options: ${statusReason}`,
+      nextInternalActions: [
+        "Keep the scripted test state.",
+        "Run another scripted test action."
+      ]
+    }
   };
 }
 
@@ -358,10 +399,27 @@ class StubResearchBackend implements ResearchBackend {
         evidenceTargets: [],
         paperIds: [],
         criticScope: null,
-        reason: "Test backend checkpoint."
+        reason: "Test backend terminal decision.",
+        workStore: {
+          collection: "worker",
+          entityId: null,
+          filters: {},
+          semanticQuery: null,
+          limit: null,
+          cursor: null,
+          changes: {},
+          entity: {
+            status: "needs_user_decision",
+            statusReason: "Choose whether the scripted test should keep or rerun its final state.",
+            nextInternalActions: [
+              "Keep the scripted test state.",
+              "Run another scripted test action."
+            ]
+          }
+        }
       },
-      expectedOutcome: "Checkpoint durable workspace state.",
-      stopCondition: "Stop this worker segment.",
+      expectedOutcome: "Stop only through a structured user-decision terminal state.",
+      stopCondition: "Structured test decision reached.",
       transport: "strict_json"
     };
   }
@@ -1178,10 +1236,11 @@ class SourceToolBackend extends StubResearchBackend {
           confidence: 0.86,
           inputs: {
             ...baseInputs,
-            reason: "Source tool smoke run complete."
+            reason: "Source tool smoke run complete.",
+            workStore: terminalUserDecisionWorkStore("Source tool smoke run complete.")
           },
-          expectedOutcome: "Checkpoint current model-driven research state.",
-          stopCondition: "Stop this worker segment.",
+          expectedOutcome: "Stop only through a structured user-decision terminal state.",
+          stopCondition: "Structured test decision reached.",
           transport: "strict_json"
         };
       }
@@ -1211,10 +1270,11 @@ class UnknownEvidenceSelectionBackend extends SourceToolBackend {
           evidenceTargets: [],
           paperIds: [],
           criticScope: null,
-          reason: "Unknown evidence selection test complete."
+          reason: "Unknown evidence selection test complete.",
+          workStore: terminalUserDecisionWorkStore("Unknown evidence selection test complete.")
         },
-        expectedOutcome: "Checkpoint without fallback evidence.",
-        stopCondition: "Stop this worker segment.",
+        expectedOutcome: "Stop only through a structured user-decision terminal state.",
+        stopCondition: "Structured test decision reached.",
         transport: "strict_json"
       };
       this.sourceActions.push(action);
@@ -1340,10 +1400,11 @@ class StubbornSourceSearchBackend extends StubResearchBackend {
         confidence: 0.84,
         inputs: {
           ...baseInputs,
-          reason: "Source dashboard test complete."
+          reason: "Source dashboard test complete.",
+          workStore: terminalUserDecisionWorkStore("Source dashboard test complete.")
         },
-        expectedOutcome: "Checkpoint current model-driven research state.",
-        stopCondition: "Stop this worker segment.",
+        expectedOutcome: "Stop only through a structured user-decision terminal state.",
+        stopCondition: "Structured test decision reached.",
         transport: "strict_json"
       };
     } else if (sourceState?.canonicalMergeCompleted === true) {
@@ -1398,6 +1459,7 @@ class StubbornSourceSearchBackend extends StubResearchBackend {
 
 class DashboardIgnoringSourceSearchBackend extends StubResearchBackend {
   readonly sourceActions: ResearchActionDecision[] = [];
+  readonly sourceActionRequests: ResearchActionRequest[] = [];
 
   async planResearch(): Promise<ResearchPlan> {
     return {
@@ -1418,6 +1480,30 @@ class DashboardIgnoringSourceSearchBackend extends StubResearchBackend {
   async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
     if (request.phase !== "research") {
       return super.chooseResearchAction(request);
+    }
+    this.sourceActionRequests.push(request);
+
+    if (this.sourceActions.length >= 3) {
+      const action: ResearchActionDecision = {
+        schemaVersion: 1,
+        action: "workspace.status",
+        rationale: "End the scripted test after repeated low-yield searches were still executed.",
+        confidence: 0.78,
+        inputs: {
+          providerIds: [],
+          searchQueries: [],
+          evidenceTargets: [],
+          paperIds: [],
+          criticScope: null,
+          reason: "Repeated low-yield search test complete.",
+          workStore: terminalUserDecisionWorkStore("Repeated low-yield search test complete.")
+        },
+        expectedOutcome: "Stop only through a structured user-decision terminal state.",
+        stopCondition: "Structured test decision reached.",
+        transport: "strict_json"
+      };
+      this.sourceActions.push(action);
+      return action;
     }
 
     const action: ResearchActionDecision = {
@@ -1477,10 +1563,11 @@ class ProviderlessSourceSearchBackend extends StubResearchBackend {
           evidenceTargets: [],
           paperIds: [],
           criticScope: null,
-          reason: "Providerless source search test complete."
+          reason: "Providerless source search test complete.",
+          workStore: terminalUserDecisionWorkStore("Providerless source search test complete.")
         },
-        expectedOutcome: "Checkpoint without fallback provider execution.",
-        stopCondition: "Stop this worker segment.",
+        expectedOutcome: "Stop only through a structured user-decision terminal state.",
+        stopCondition: "Structured test decision reached.",
         transport: "strict_json"
       };
       this.sourceActions.push(action);
@@ -1941,10 +2028,11 @@ class LiteratureAwareResearchBackend implements ResearchBackend {
           evidenceTargets: [],
           paperIds: [],
           criticScope: null,
-          reason: "Literature-aware model-driven session checkpoint."
+          reason: "Literature-aware model-driven session checkpoint.",
+          workStore: terminalUserDecisionWorkStore("Literature-aware model-driven session checkpoint.")
         },
-        expectedOutcome: "Checkpoint current workspace state.",
-        stopCondition: "Stop this worker segment.",
+        expectedOutcome: "Stop only through a structured user-decision terminal state.",
+        stopCondition: "Structured test decision reached.",
         transport: "strict_json"
       };
     }
@@ -2021,11 +2109,10 @@ class LiteratureAwareSourceToolAdapter implements ResearchSourceToolAdapter {
 
 class ArchitectureForbiddenWorkflowBackend extends StubResearchBackend {
   extractionCalls = 0;
-  agendaCalls = 0;
   readonly criticScopes: string[] = [];
 }
 
-class EndlessReadOnlySourceBackend extends StubResearchBackend {
+class InvalidStatusThenDecisionBackend extends StubResearchBackend {
   readonly sourceActions: ResearchActionDecision[] = [];
 
   override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
@@ -2033,10 +2120,10 @@ class EndlessReadOnlySourceBackend extends StubResearchBackend {
       return super.chooseResearchAction(request);
     }
 
-    const action: ResearchActionDecision = {
+    const action: ResearchActionDecision = this.sourceActions.length === 0 ? {
       schemaVersion: 1,
-      action: "workspace.search",
-      rationale: "Inspect workspace state without choosing a terminal source, extraction, evidence, or release action.",
+      action: "workspace.status",
+      rationale: "Try to mark the work externally blocked without a concrete external blocker record.",
       confidence: 0.8,
       inputs: {
         providerIds: [],
@@ -2046,18 +2133,54 @@ class EndlessReadOnlySourceBackend extends StubResearchBackend {
         criticScope: null,
         reason: null,
         workStore: {
-          collection: "workItems",
+          collection: "worker",
           entityId: null,
           filters: {},
-          semanticQuery: "open source work",
+          semanticQuery: null,
           limit: 5,
           cursor: null,
           changes: {},
-          entity: {}
+          entity: {
+            status: "externally_blocked",
+            statusReason: "The evidence is not good enough yet."
+          }
         }
       },
-      expectedOutcome: "Return visible workspace observations.",
-      stopCondition: "Checkpoint when the segment budget is exhausted.",
+      expectedOutcome: "Runtime should reject the terminal status and return an observation.",
+      stopCondition: "Continue because the status is not externally validated.",
+      transport: "strict_json"
+    } : {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "Ask for a real user decision with explicit options after the invalid status was rejected.",
+      confidence: 0.8,
+      inputs: {
+        providerIds: [],
+        searchQueries: [],
+        evidenceTargets: [],
+        paperIds: [],
+        criticScope: null,
+        reason: null,
+        workStore: {
+          collection: "worker",
+          entityId: null,
+          filters: {},
+          semanticQuery: null,
+          limit: 5,
+          cursor: null,
+          changes: {},
+          entity: {
+            status: "needs_user_decision",
+            statusReason: "Choose whether to broaden the objective beyond the confirmed scope.",
+            nextInternalActions: [
+              "Keep the confirmed scope and continue source work.",
+              "Broaden the objective to adjacent domains."
+            ]
+          }
+        }
+      },
+      expectedOutcome: "Stop only for the structured user decision.",
+      stopCondition: "Needs user decision with explicit options.",
       transport: "strict_json"
     };
     this.sourceActions.push(action);
@@ -2433,16 +2556,161 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
           evidenceTargets: [],
           paperIds: [],
           criticScope: null,
-          reason: "Explicit tool smoke run complete."
+          reason: "Explicit tool smoke run complete.",
+          workStore: terminalUserDecisionWorkStore("Explicit tool smoke run complete.")
         },
-        expectedOutcome: "Checkpoint current workspace state.",
-        stopCondition: "Stop after checkpoint.",
+        expectedOutcome: "Stop only through a structured user-decision terminal state.",
+        stopCondition: "Structured test decision reached.",
         transport: "strict_json"
       };
     }
 
     this.sourceActions.push(action);
     return action;
+  }
+}
+
+class SectionLinkClaimBackend extends StubResearchBackend {
+  readonly researchRequests: ResearchActionRequest[] = [];
+
+  constructor(private readonly mode: "payloadIds" | "swappedLinkIds") {
+    super();
+  }
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+
+    const claim = request.workStore?.recentClaims[0];
+    const section = request.workStore?.recentSections[0];
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [],
+      criticScope: null,
+      reason: null
+    };
+
+    if (claim === undefined) {
+      return {
+        schemaVersion: 1,
+        action: "claim.create",
+        rationale: "Create a claim before linking it to a section.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "claims",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              text: "Research lab tools should make provenance repair easy for the model.",
+              evidence: "This test claim is used to verify section-link tool ergonomics.",
+              confidence: "medium"
+            }
+          }
+        },
+        expectedOutcome: "Claim is persisted.",
+        stopCondition: "Continue to section creation.",
+        transport: "strict_json"
+      };
+    }
+
+    if (section === undefined) {
+      return {
+        schemaVersion: 1,
+        action: "section.create",
+        rationale: "Create an unlinked section before testing section.link_claim.",
+        confidence: 0.88,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              sectionId: "discussion",
+              role: "synthesis",
+              title: "Discussion",
+              paragraph: "This section should be linked to an existing claim by the explicit section.link_claim tool."
+            }
+          }
+        },
+        expectedOutcome: "Section is persisted without a claim link.",
+        stopCondition: "Continue to section.link_claim.",
+        transport: "strict_json"
+      };
+    }
+
+    if (!section.claimIds.includes(claim.id)) {
+      return {
+        schemaVersion: 1,
+        action: "section.link_claim",
+        rationale: "Link the existing section to the existing claim using the selected ID shape.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: this.mode === "payloadIds"
+              ? {
+                sectionId: section.sectionId,
+                claimId: claim.id
+              }
+              : {},
+            link: this.mode === "swappedLinkIds"
+              ? {
+                fromCollection: "claims",
+                fromId: claim.id,
+                toCollection: "manuscriptSections",
+                toId: section.id,
+                relation: "uses_claim",
+                snippet: null
+              }
+              : undefined
+          }
+        },
+        expectedOutcome: "Section and claim are durably linked.",
+        stopCondition: "Continue after the link exists.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "Checkpoint after section claim link was created.",
+      confidence: 0.8,
+      inputs: {
+        providerIds: [],
+        searchQueries: [],
+        evidenceTargets: [],
+        paperIds: [],
+        criticScope: null,
+        reason: "Section link test complete.",
+        workStore: terminalUserDecisionWorkStore("Section link test complete.")
+      },
+      expectedOutcome: "Stop only through a structured user-decision terminal state.",
+      stopCondition: "Structured test decision reached.",
+      transport: "strict_json"
+    };
   }
 }
 
@@ -2498,10 +2766,11 @@ class ExplicitManuscriptReleaseBlockedBackend extends StubResearchBackend {
         evidenceTargets: [],
         paperIds: [],
         criticScope: null,
-        reason: "Blocked release was reported."
+        reason: "Blocked release was reported.",
+        workStore: terminalUserDecisionWorkStore("Blocked release was reported.")
       },
-      expectedOutcome: "Checkpoint.",
-      stopCondition: "Stop.",
+      expectedOutcome: "Stop only through a structured user-decision terminal state.",
+      stopCondition: "Structured test decision reached.",
       transport: "strict_json"
     };
   }
@@ -2582,8 +2851,8 @@ test("architecture contract: evidence matrix is a model-selected view, not a hid
   }
 });
 
-test("architecture contract: agenda generation is not a mandatory post-manuscript step", async () => {
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-architecture-no-hidden-agenda-"));
+test("architecture contract: old phase artifacts are not written during a source checkpoint", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-architecture-no-old-phase-artifacts-"));
   const now = createNow();
 
   try {
@@ -2591,8 +2860,8 @@ test("architecture contract: agenda generation is not a mandatory post-manuscrip
     const run = await runStore.create({
       topic: "autonomous research agents",
       researchQuestion: "Can next work be represented by explicit work items?",
-      researchDirection: "The model should create agenda/work items when it wants them.",
-      successCriterion: "Agenda generation must not be hidden runtime synthesis."
+      researchDirection: "The model should create work items when it wants them.",
+      successCriterion: "Old phase artifacts must not be hidden runtime exports."
     }, ["clawresearch", "research-loop"]);
 
     const backend = new ArchitectureForbiddenWorkflowBackend();
@@ -2605,14 +2874,9 @@ test("architecture contract: agenda generation is not a mandatory post-manuscrip
       sourceToolAdapter: new MultiPaperSourceToolAdapter(3)
     });
 
-    const agendaArtifact = JSON.parse(await readFile((await runStore.load(run.id)).artifacts.agendaPath, "utf8")) as {
-      status?: string;
-      candidateDirections?: unknown[];
-    };
+    const runDirectory = (await runStore.load(run.id)).artifacts.runDirectory;
 
-    assert.equal(backend.agendaCalls, 0);
-    assert.equal(agendaArtifact.status, "pending");
-    assert.equal(agendaArtifact.candidateDirections, undefined);
+    await assertOldPhaseArtifactsAbsent(runDirectory);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -2647,25 +2911,26 @@ test("architecture contract: critic review scopes are explicit researcher tools,
   }
 });
 
-test("architecture contract: budget exhaustion checkpoints the worker instead of completing research", async () => {
-  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-architecture-budget-checkpoint-"));
+test("architecture contract: invalid terminal workspace.status becomes an observation and the worker continues", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-architecture-status-observation-"));
   const now = createNow();
 
   try {
     const runStore = new RunStore(projectRoot, "0.7.0", now);
     const run = await runStore.create({
       topic: "autonomous research agents",
-      researchQuestion: "Can segment budget exhaustion preserve ongoing work?",
-      researchDirection: "Repeated observation actions should end in a checkpoint, not completion.",
-      successCriterion: "The next /go can resume the same objective."
+      researchQuestion: "Can invalid terminal status attempts be rejected without stopping the worker?",
+      researchDirection: "The runtime should return failed status attempts as observations and let the researcher continue.",
+      successCriterion: "Only structured user decisions or concrete external blockers may stop the worker."
     }, ["clawresearch", "research-loop"]);
 
+    const backend = new InvalidStatusThenDecisionBackend();
     await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
       version: "0.7.0",
       now,
-      researchBackend: new EndlessReadOnlySourceBackend()
+      researchBackend: backend
     });
 
     const completedRun = await runStore.load(run.id);
@@ -2674,9 +2939,10 @@ test("architecture contract: budget exhaustion checkpoints the worker instead of
       now: now()
     });
 
-    assert.notEqual(completedRun.status, "completed");
-    assert.equal(workStore.worker.status, "checkpointed_budget_exhausted");
-    assert.match(workStore.worker.statusReason, /budget|checkpoint/i);
+    assert.equal(completedRun.status, "completed");
+    assert.equal(backend.sourceActions.length, 2);
+    assert.equal(workStore.worker.status, "needs_user_decision");
+    assert.match(workStore.worker.statusReason, /Choose whether to broaden/);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -2746,7 +3012,7 @@ test("architecture contract: externally_blocked requires a concrete external blo
     });
 
     assert.notEqual(workStore.worker.status, "externally_blocked");
-    assert.equal(workStore.worker.userBlockers.length, 0);
+    assert.doesNotMatch(workStore.worker.userBlockers.join("\n"), /credential|quota|provider outage|source access|permission/i);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -2999,10 +3265,11 @@ test("explicit evidence matrix view is read-only and does not create evidence ce
             evidenceTargets: [],
             paperIds: [],
             criticScope: null,
-            reason: "Matrix view read-only test complete."
+            reason: "Matrix view read-only test complete.",
+            workStore: terminalUserDecisionWorkStore("Matrix view read-only test complete.")
           },
-          expectedOutcome: "Checkpoint.",
-          stopCondition: "Stop.",
+          expectedOutcome: "Stop only through a structured user-decision terminal state.",
+          stopCondition: "Structured test decision reached.",
           transport: "strict_json"
         };
       }
@@ -3084,6 +3351,54 @@ test("explicit manuscript.release fails visibly when release invariants are miss
   }
 });
 
+test("section.link_claim resolves natural and swapped section/claim ids", async () => {
+  for (const mode of ["payloadIds", "swappedLinkIds"] as const) {
+    const projectRoot = await mkdtemp(path.join(os.tmpdir(), `clawresearch-section-link-${mode}-`));
+    const now = createNow();
+
+    try {
+      const runStore = new RunStore(projectRoot, "0.7.0", now);
+      const run = await runStore.create({
+        topic: "research lab tools",
+        researchQuestion: "Can section links be repaired from model-facing ids?",
+        researchDirection: "The model should be able to link an existing section to an existing claim.",
+        successCriterion: "section.link_claim creates durable section and claim linkage."
+      }, ["clawresearch", "research-loop"]);
+
+      const backend = new SectionLinkClaimBackend(mode);
+      const exitCode = await runDetachedJobWorker({
+        projectRoot,
+        runId: run.id,
+        version: "0.7.0",
+        now,
+        researchBackend: backend
+      });
+
+      const workStore = await loadResearchWorkStore({
+        projectRoot,
+        now: now()
+      });
+      const section = workStore.objects.manuscriptSections[0];
+      const claim = workStore.objects.claims[0];
+      const linkResult = backend.researchRequests
+        .flatMap((request) => request.toolResults ?? [])
+        .find((result) => result.action === "section.link_claim");
+
+      assert.equal(exitCode, 0);
+      assert.ok(section);
+      assert.ok(claim);
+      assert.deepEqual(section.claimIds, [claim.id]);
+      assert.deepEqual(claim.usedInSections, [section.id]);
+      assert.equal(linkResult?.status, "ok");
+      assert.equal(linkResult?.query?.sectionId, section.id);
+      assert.equal(linkResult?.query?.claimId, claim.id);
+      assert.ok(linkResult?.related?.some((item) => item.kind === "claim" && item.id === claim.id));
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  }
+});
+
 test("run store loads legacy run records with manuscript artifact defaults", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-store-legacy-manuscript-"));
   const runId = "run-legacy-manuscript";
@@ -3127,15 +3442,6 @@ test("run store loads legacy run records with manuscript artifact defaults", asy
         briefPath: path.join(runDirectoryPath(projectRoot, runId), "brief.json"),
         planPath: path.join(runDirectoryPath(projectRoot, runId), "plan.json"),
         sourcesPath: path.join(runDirectoryPath(projectRoot, runId), "sources.json"),
-        literaturePath: path.join(runDirectoryPath(projectRoot, runId), "literature-review.json"),
-        paperExtractionsPath: path.join(runDirectoryPath(projectRoot, runId), "paper-extractions.json"),
-        evidenceMatrixPath: path.join(runDirectoryPath(projectRoot, runId), "evidence-matrix.json"),
-        synthesisPath: path.join(runDirectoryPath(projectRoot, runId), "synthesis.md"),
-        claimsPath: path.join(runDirectoryPath(projectRoot, runId), "claims.json"),
-        verificationPath: path.join(runDirectoryPath(projectRoot, runId), "verification.json"),
-        nextQuestionsPath: path.join(runDirectoryPath(projectRoot, runId), "next-questions.json"),
-        agendaPath: path.join(runDirectoryPath(projectRoot, runId), "agenda.json"),
-        agendaMarkdownPath: path.join(runDirectoryPath(projectRoot, runId), "agenda.md"),
         summaryPath: path.join(runDirectoryPath(projectRoot, runId), "summary.md"),
         memoryPath: path.join(runDirectoryPath(projectRoot, runId), "research-journal.json")
       }
@@ -3144,7 +3450,6 @@ test("run store loads legacy run records with manuscript artifact defaults", asy
     const loaded = await new RunStore(projectRoot, "0.7.0", createNow()).load(runId);
 
     assert.match(loaded.artifacts.reviewProtocolPath, /review-protocol\.json$/);
-    assert.match(loaded.artifacts.paperOutlinePath, /paper-outline\.json$/);
     assert.match(loaded.artifacts.paperPath, /paper\.md$/);
     assert.match(loaded.artifacts.paperJsonPath, /paper\.json$/);
     assert.match(loaded.artifacts.referencesPath, /references\.json$/);
@@ -3248,7 +3553,6 @@ test("run worker lets the research agent choose source provider order and source
     assert.ok(backend.sourceActionRequests.every((request) => request.allowedActions.includes("section.create")));
     for (const [index, request] of backend.sourceActionRequests.entries()) {
       assert.equal(request.observations.sessionStepsUsed, index);
-      assert.equal(request.observations.sessionStepsRemaining, 24 - index);
     }
     const postSearchRequest = backend.sourceActionRequests.find((request) => (
       request.sourceState?.attemptedProviderIds.includes("arxiv") === true
@@ -3684,10 +3988,9 @@ test("source tool dashboard does not fabricate evidence when the model ignores e
     };
 
     assert.equal(exitCode, 0);
-    assert.equal(completedRun.status, "paused");
-    assert.ok(backend.sourceActions.every((action) => action.action === "source.search"));
-    assert.match(stdout, /Source dashboard:/);
-    assert.match(stdout, /without automatic merge or selection/i);
+    assert.equal(completedRun.status, "completed");
+    assert.ok(backend.sourceActions.filter((action) => action.action === "source.search").length >= 3);
+    assert.ok(backend.sourceActionRequests.some((request) => (request.sourceState?.repeatedSearchWarnings.length ?? 0) > 0));
     assert.doesNotMatch(stdout, /Source tool observation: Merged 1 screened scholarly sources into 1 canonical papers/i);
     assert.match(stdout, /Research work store checkpointed: 0 canonical sources, \d+ source candidates, 0 open work items/i);
     assert.equal(sourcesArtifact.sourceToolState?.canonicalMergeCompleted, false);

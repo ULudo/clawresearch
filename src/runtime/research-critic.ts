@@ -1,5 +1,5 @@
 import type { CanonicalPaper } from "./literature-store.js";
-import type { ResearchAgenda, ResearchPlan, ResearchSynthesis } from "./research-backend.js";
+import type { ResearchPlan, ResearchSynthesis } from "./research-backend.js";
 import type { EvidenceMatrix, PaperExtraction } from "./research-evidence.js";
 import type { ResearchSourceSnapshot, LiteratureRelevanceAssessment } from "./research-sources.js";
 import type {
@@ -86,7 +86,6 @@ export type CriticReviewRequest = {
   evidenceMatrix?: EvidenceMatrix | null;
   synthesis?: ResearchSynthesis | null;
   verification?: VerificationReport | null;
-  agenda?: ResearchAgenda | null;
   paper?: ReviewPaperArtifact | null;
   references?: ReferencesArtifact | null;
   manuscriptChecks?: ManuscriptChecksArtifact | null;

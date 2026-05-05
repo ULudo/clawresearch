@@ -71,7 +71,6 @@ function renderHelp(writer: OutputWriter): void {
   writeLine(writer, "Slash commands inside the console:");
   writeLine(writer, "  /help");
   writeLine(writer, "  /status");
-  writeLine(writer, "  /agenda");
   writeLine(writer, "  /sources");
   writeLine(writer, "  /paper");
   writeLine(writer, "  /paper open");

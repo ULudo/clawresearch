@@ -4,7 +4,6 @@ import {
   runtimeDirectoryPath,
   type ResearchBrief
 } from "./session-store.js";
-import type { ResearchAgenda } from "./research-backend.js";
 
 const runSchemaVersion = 1;
 
@@ -39,28 +38,16 @@ export type RunArtifactRecord = {
   briefPath: string;
   planPath: string;
   sourcesPath: string;
-  literaturePath: string;
   reviewProtocolPath: string;
   reviewProtocolMarkdownPath: string;
   criticProtocolReviewPath: string;
   criticSourceSelectionPath: string;
   criticEvidenceReviewPath: string;
   criticReleaseReviewPath: string;
-  paperExtractionsPath: string;
-  evidenceMatrixPath: string;
-  synthesisPath: string;
-  synthesisJsonPath: string;
-  claimsPath: string;
-  verificationPath: string;
-  paperOutlinePath: string;
   paperPath: string;
   paperJsonPath: string;
   referencesPath: string;
   manuscriptChecksPath: string;
-  qualityReportPath: string;
-  nextQuestionsPath: string;
-  agendaPath: string;
-  agendaMarkdownPath: string;
   summaryPath: string;
   memoryPath: string;
 };
@@ -83,14 +70,6 @@ export type RunRecord = {
   artifacts: RunArtifactRecord;
 };
 
-export type ResearchDirectionState = ResearchAgenda & {
-  schemaVersion: number;
-  sourceRunId: string | null;
-  sourceRunStage: RunStage | null;
-  sourceRunAgendaPath: string | null;
-  acceptedAt: string;
-};
-
 function asObject(value: unknown): Record<string, unknown> {
   if (typeof value === "object" && value !== null) {
     return value as Record<string, unknown>;
@@ -111,31 +90,6 @@ function readStringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.flatMap((entry) => typeof entry === "string" ? [entry] : [])
     : [];
-}
-
-function relativeProjectPath(projectRoot: string, targetPath: string): string {
-  const relativePath = path.relative(projectRoot, targetPath);
-  return relativePath.length === 0 ? "." : relativePath;
-}
-
-export function createResearchDirectionState(
-  agenda: ResearchAgenda,
-  run: RunRecord,
-  acceptedAt: string,
-  options: {
-    sourceRun?: RunRecord | null;
-  } = {}
-): ResearchDirectionState {
-  const sourceRun = options.sourceRun ?? run;
-
-  return {
-    ...agenda,
-    schemaVersion: 1,
-    sourceRunId: sourceRun.id,
-    sourceRunStage: sourceRun.stage,
-    sourceRunAgendaPath: relativeProjectPath(run.projectRoot, sourceRun.artifacts.agendaPath),
-    acceptedAt
-  };
 }
 
 function normalizeBrief(raw: unknown): ResearchBrief {
@@ -172,10 +126,6 @@ export function runFilePath(projectRoot: string, runId: string): string {
   return path.join(runDirectoryPath(projectRoot, runId), "run.json");
 }
 
-export function researchDirectionPath(projectRoot: string): string {
-  return path.join(runtimeDirectoryPath(projectRoot), "research-direction.json");
-}
-
 function createRunArtifacts(projectRoot: string, runId: string): RunArtifactRecord {
   const runDirectory = runDirectoryPath(projectRoot, runId);
 
@@ -190,28 +140,16 @@ function createRunArtifacts(projectRoot: string, runId: string): RunArtifactReco
     briefPath: path.join(runDirectory, "brief.json"),
     planPath: path.join(runDirectory, "plan.json"),
     sourcesPath: path.join(runDirectory, "sources.json"),
-    literaturePath: path.join(runDirectory, "literature-review.json"),
     reviewProtocolPath: path.join(runDirectory, "review-protocol.json"),
     reviewProtocolMarkdownPath: path.join(runDirectory, "review-protocol.md"),
     criticProtocolReviewPath: path.join(runDirectory, "critic-protocol-review.json"),
     criticSourceSelectionPath: path.join(runDirectory, "critic-source-selection.json"),
     criticEvidenceReviewPath: path.join(runDirectory, "critic-evidence-review.json"),
     criticReleaseReviewPath: path.join(runDirectory, "critic-release-review.json"),
-    paperExtractionsPath: path.join(runDirectory, "paper-extractions.json"),
-    evidenceMatrixPath: path.join(runDirectory, "evidence-matrix.json"),
-    synthesisPath: path.join(runDirectory, "synthesis.md"),
-    synthesisJsonPath: path.join(runDirectory, "synthesis.json"),
-    claimsPath: path.join(runDirectory, "claims.json"),
-    verificationPath: path.join(runDirectory, "verification.json"),
-    paperOutlinePath: path.join(runDirectory, "paper-outline.json"),
     paperPath: path.join(runDirectory, "paper.md"),
     paperJsonPath: path.join(runDirectory, "paper.json"),
     referencesPath: path.join(runDirectory, "references.json"),
     manuscriptChecksPath: path.join(runDirectory, "manuscript-checks.json"),
-    qualityReportPath: path.join(runDirectory, "quality-report.json"),
-    nextQuestionsPath: path.join(runDirectory, "next-questions.json"),
-    agendaPath: path.join(runDirectory, "agenda.json"),
-    agendaMarkdownPath: path.join(runDirectory, "agenda.md"),
     summaryPath: path.join(runDirectory, "summary.md"),
     memoryPath: path.join(runtimeDirectoryPath(projectRoot), "workspace.sqlite")
   };
@@ -232,28 +170,16 @@ function mergeRunArtifacts(raw: unknown, projectRoot: string, runId: string): Ru
     briefPath: readString(artifacts.briefPath) ?? defaults.briefPath,
     planPath: readString(artifacts.planPath) ?? defaults.planPath,
     sourcesPath: readString(artifacts.sourcesPath) ?? defaults.sourcesPath,
-    literaturePath: readString(artifacts.literaturePath) ?? defaults.literaturePath,
     reviewProtocolPath: readString(artifacts.reviewProtocolPath) ?? defaults.reviewProtocolPath,
     reviewProtocolMarkdownPath: readString(artifacts.reviewProtocolMarkdownPath) ?? defaults.reviewProtocolMarkdownPath,
     criticProtocolReviewPath: readString(artifacts.criticProtocolReviewPath) ?? defaults.criticProtocolReviewPath,
     criticSourceSelectionPath: readString(artifacts.criticSourceSelectionPath) ?? defaults.criticSourceSelectionPath,
     criticEvidenceReviewPath: readString(artifacts.criticEvidenceReviewPath) ?? defaults.criticEvidenceReviewPath,
     criticReleaseReviewPath: readString(artifacts.criticReleaseReviewPath) ?? defaults.criticReleaseReviewPath,
-    paperExtractionsPath: readString(artifacts.paperExtractionsPath) ?? defaults.paperExtractionsPath,
-    evidenceMatrixPath: readString(artifacts.evidenceMatrixPath) ?? defaults.evidenceMatrixPath,
-    synthesisPath: readString(artifacts.synthesisPath) ?? defaults.synthesisPath,
-    synthesisJsonPath: readString(artifacts.synthesisJsonPath) ?? defaults.synthesisJsonPath,
-    claimsPath: readString(artifacts.claimsPath) ?? defaults.claimsPath,
-    verificationPath: readString(artifacts.verificationPath) ?? defaults.verificationPath,
-    paperOutlinePath: readString(artifacts.paperOutlinePath) ?? defaults.paperOutlinePath,
     paperPath: readString(artifacts.paperPath) ?? defaults.paperPath,
     paperJsonPath: readString(artifacts.paperJsonPath) ?? defaults.paperJsonPath,
     referencesPath: readString(artifacts.referencesPath) ?? defaults.referencesPath,
     manuscriptChecksPath: readString(artifacts.manuscriptChecksPath) ?? defaults.manuscriptChecksPath,
-    qualityReportPath: readString(artifacts.qualityReportPath) ?? defaults.qualityReportPath,
-    nextQuestionsPath: readString(artifacts.nextQuestionsPath) ?? defaults.nextQuestionsPath,
-    agendaPath: readString(artifacts.agendaPath) ?? defaults.agendaPath,
-    agendaMarkdownPath: readString(artifacts.agendaMarkdownPath) ?? defaults.agendaMarkdownPath,
     summaryPath: readString(artifacts.summaryPath) ?? defaults.summaryPath,
     memoryPath: readString(artifacts.memoryPath) ?? defaults.memoryPath
   };

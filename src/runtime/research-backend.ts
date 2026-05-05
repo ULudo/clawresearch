@@ -61,59 +61,6 @@ export type ResearchClaim = {
   sourceIds: string[];
 };
 
-export type ResearchGapKind =
-  | "missing_baseline"
-  | "confounder"
-  | "coverage_gap"
-  | "method_gap"
-  | "evidence_conflict";
-
-export type ResearchGapSeverity =
-  | "low"
-  | "medium"
-  | "high";
-
-export type DirectionScores = {
-  evidenceBase: number;
-  novelty: number;
-  tractability: number;
-  expectedCost: number;
-  risk: number;
-  overall: number;
-};
-
-export type ResearchGap = {
-  id: string;
-  title: string;
-  summary: string;
-  sourceIds: string[];
-  claimIds: string[];
-  severity: ResearchGapSeverity;
-  gapKind: ResearchGapKind;
-};
-
-export type ResearchDirectionCandidate = {
-  id: string;
-  title: string;
-  summary: string;
-  mode: ResearchMode;
-  whyNow: string;
-  sourceIds: string[];
-  claimIds: string[];
-  gapIds: string[];
-  scores: DirectionScores;
-};
-
-export type ResearchAgenda = {
-  executiveSummary: string;
-  gaps: ResearchGap[];
-  candidateDirections: ResearchDirectionCandidate[];
-  selectedDirectionId: string | null;
-  selectedWorkPackage: null;
-  holdReasons: string[];
-  recommendedHumanDecision: string;
-};
-
 export type ResearchSynthesis = {
   executiveSummary: string;
   themes: ResearchTheme[];
@@ -414,7 +361,7 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     "Use release.verify for final computable release invariants; semantic concerns should become diagnostics or work items.",
     "Critic objections, failed release checks, and not-ready tool results are repair signals. Prefer concrete tool steps over stopping.",
     "Recent tool results are authoritative observations from executed tools. Use returned ids, snippets, and previews before repeating the same read action.",
-    "Use workspace.status only for a true checkpoint, segment-budget boundary, external blocker, or real user decision; do not checkpoint merely because machine-actionable work remains.",
+    "Use workspace.status only for a validated external blocker or real user decision; do not stop merely because machine-actionable work remains.",
     "",
     "Return JSON only with this exact shape:",
     "{",
@@ -758,7 +705,7 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
                   },
                   payloadJson: {
                     type: ["string", "null"],
-                    description: "Optional JSON object string for create/status payload fields. workspace.status may include {\"status\":\"working|externally_blocked|needs_user_decision\",\"statusReason\":\"...\",\"nextInternalActions\":[\"...\"]}."
+                    description: "Optional JSON object string for create/status payload fields. section.link_claim may include {\"sectionId\":\"...\",\"claimId\":\"...\"}. workspace.status may include {\"status\":\"externally_blocked|needs_user_decision\",\"statusReason\":\"...\",\"nextInternalActions\":[\"...\"]}; non-terminal status notes are returned as observations and do not stop the worker."
                   },
                   link: {
                     type: "object",
@@ -846,7 +793,7 @@ function nativeAgentStepInstruction(request: ResearchActionRequest): string {
     "Use release.verify for final computable release invariants; semantic concerns should become diagnostics or work items.",
     "Critic objections, failed release checks, and not-ready tool results are repair signals. Prefer concrete tool steps over stopping.",
     "Recent tool results are authoritative observations from executed tools. Use returned ids, snippets, and previews before repeating the same read action.",
-    "Use workspace.status only for a true checkpoint, segment-budget boundary, external blocker, or real user decision; do not checkpoint merely because machine-actionable work remains.",
+    "Use workspace.status only for a validated external blocker or real user decision; do not stop merely because machine-actionable work remains.",
     "",
     `Project root: ${request.projectRoot}`,
     `Run id: ${request.runId}`,

@@ -8,9 +8,7 @@ import {
   handlePauseCommand,
   handleResumeCommand,
   handleUserInput,
-  latestAgendaSnapshot,
   reconcileRelevantRun,
-  renderAgenda,
   renderHelp,
   renderStatus,
   summarizeCompletedRunIfNeeded,
@@ -151,7 +149,6 @@ type SlashCommandDefinition = {
 
 const slashCommands: SlashCommandDefinition[] = [
   { command: "/go", description: "Start or continue autonomous research" },
-  { command: "/agenda", description: "Show the latest research agenda" },
   { command: "/paper", description: "Show review-paper status" },
   { command: "/paper open", description: "Print the latest paper draft" },
   { command: "/paper checks", description: "Show manuscript readiness checks" },
@@ -311,7 +308,7 @@ function sourceCommandLike(input: string): boolean {
 }
 
 function footerHint(pendingLabel: string | null): string {
-  return pendingLabel ?? "/help  /sources  /status  /agenda  /go  /pause  /resume  /quit";
+  return pendingLabel ?? "/help  /sources  /status  /go  /pause  /resume  /quit";
 }
 
 function isSubmitKey(key: readline.Key): boolean {
@@ -1323,12 +1320,6 @@ export class ClawResearchTerminalUi {
       return;
     }
 
-    if (input === "/agenda") {
-      this.modal = await this.buildAgendaModal();
-      this.render();
-      return;
-    }
-
     if (input === "/go") {
       await this.runCommandAction("starting detached run", async (writer) => {
         await handleGoCommand(
@@ -1460,7 +1451,6 @@ export class ClawResearchTerminalUi {
       this.runController,
       this.now
     );
-    const agendaSnapshot = await latestAgendaSnapshot(this.runStore);
     const workerState = await loadResearchWorkerState(this.session.projectRoot);
     const workStore = await loadResearchWorkStore({
       projectRoot: this.session.projectRoot,
@@ -1476,25 +1466,12 @@ export class ClawResearchTerminalUi {
       this.transcript.filePath,
       currentProjectConfig,
       currentCredentials,
-      agendaSnapshot,
       workerState,
       workStore
     );
 
     return {
       title: "Status",
-      lines: capture.readText().trimEnd().split("\n")
-    };
-  }
-
-  private async buildAgendaModal(): Promise<ModalState> {
-    const snapshot = await latestAgendaSnapshot(this.runStore);
-    const capture = createBufferWriter();
-
-    renderAgenda(capture.writer, snapshot, this.session.projectRoot);
-
-    return {
-      title: "Agenda",
       lines: capture.readText().trimEnd().split("\n")
     };
   }

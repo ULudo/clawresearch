@@ -208,7 +208,6 @@ export type ResearchActionRequest = {
     evidenceInsights: number;
     manuscriptReadiness: string | null;
     sessionStepsUsed: number;
-    sessionStepsRemaining: number;
   };
   sourceState?: {
     availableProviderIds: string[];
@@ -330,6 +329,7 @@ export type ResearchActionRequest = {
     }>;
     recentSections: Array<{
       id: string;
+      sectionId: string;
       title: string;
       status: string;
       claimIds: string[];
