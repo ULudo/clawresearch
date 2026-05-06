@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import { normalizeResearchActionDecision, workspaceResearchActions } from "../src/runtime/research-agent.js";
 
 const expectedToolFamilies = [
+  "notebook.read",
+  "notebook.patch",
   "workspace.search",
   "workspace.read",
   "source.search",
@@ -19,7 +21,7 @@ const expectedToolFamilies = [
   "critic.review",
   "check.run",
   "release.verify",
-  "manuscript.release"
+  "manuscript.finalize"
 ];
 
 test("architecture contract: production action surface excludes legacy orchestration aliases", () => {

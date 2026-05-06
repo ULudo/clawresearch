@@ -302,7 +302,7 @@ function workspaceManuscriptDecisionForRequest(
 
   return {
     schemaVersion: 1,
-    action: "manuscript.release",
+    action: "manuscript.finalize",
     rationale,
     confidence: 0.84,
     inputs: {
@@ -615,7 +615,7 @@ class ToolResultAwareSynthesisBackend extends StubResearchBackend {
 
     return {
       schemaVersion: 1,
-      action: "manuscript.release",
+      action: "manuscript.finalize",
       rationale: "Release checks can evaluate the completed workspace manuscript.",
       confidence: 0.84,
       inputs: {
@@ -823,7 +823,7 @@ class SupportLinkSynthesisBackend extends StubResearchBackend {
 
     return {
       schemaVersion: 1,
-      action: "manuscript.release",
+      action: "manuscript.finalize",
       rationale: "Release checks can now render references from support links.",
       confidence: 0.85,
       inputs: {
@@ -1053,7 +1053,7 @@ class MismatchedSupportSynthesisBackend extends StubResearchBackend {
 
     return {
       schemaVersion: 1,
-      action: "manuscript.release",
+      action: "manuscript.finalize",
       rationale: "Let release checks report the support-readiness blocker.",
       confidence: 0.8,
       inputs: {
@@ -1363,7 +1363,7 @@ class StubbornSourceSearchBackend extends StubResearchBackend {
     return {
       researchMode: "literature_synthesis",
       objective: "Review autonomous research-agent harness architectures and evaluation practices.",
-      rationale: "The model starts with a repeated source-search strategy that the runtime should help it reconsider.",
+      rationale: "The model starts with a repeated source-search strategy and should receive factual search-result counts.",
       searchQueries: [
         "autonomous research agent harness architecture evaluation"
       ],
@@ -1421,11 +1421,11 @@ class StubbornSourceSearchBackend extends StubResearchBackend {
         stopCondition: "Stop after selection.",
         transport: "strict_json"
       };
-    } else if ((sourceState?.repeatedSearchWarnings.length ?? 0) > 0 || (sourceState?.consecutiveNoProgressSearches ?? 0) >= 2) {
+    } else if ((sourceState?.repeatedSearchFacts.length ?? 0) > 0 || (sourceState?.consecutiveNoProgressSearches ?? 0) >= 2) {
       action = {
         schemaVersion: 1,
         action: "source.merge",
-        rationale: "The source dashboard shows this repeated provider/query search is low-yield, so merge the screened sources.",
+        rationale: "The source dashboard shows repeated provider/query search counts, so merge the screened sources.",
         confidence: 0.84,
         inputs: baseInputs,
         expectedOutcome: "Canonical papers are available.",
@@ -1465,7 +1465,7 @@ class DashboardIgnoringSourceSearchBackend extends StubResearchBackend {
     return {
       researchMode: "literature_synthesis",
       objective: "Review autonomous research-agent harness architectures and evaluation practices.",
-      rationale: "The model ignores source-dashboard guidance, so the runtime fallback should still converge.",
+      rationale: "The model ignores source-dashboard facts, so the runtime must not fabricate later source steps.",
       searchQueries: [
         "autonomous research agent harness architecture evaluation"
       ],
@@ -1487,7 +1487,7 @@ class DashboardIgnoringSourceSearchBackend extends StubResearchBackend {
       const action: ResearchActionDecision = {
         schemaVersion: 1,
         action: "workspace.status",
-        rationale: "End the scripted test after repeated low-yield searches were still executed.",
+        rationale: "End the scripted test after repeated source searches were still executed.",
         confidence: 0.78,
         inputs: {
           providerIds: [],
@@ -1495,8 +1495,8 @@ class DashboardIgnoringSourceSearchBackend extends StubResearchBackend {
           evidenceTargets: [],
           paperIds: [],
           criticScope: null,
-          reason: "Repeated low-yield search test complete.",
-          workStore: terminalUserDecisionWorkStore("Repeated low-yield search test complete.")
+          reason: "Repeated search fact test complete.",
+          workStore: terminalUserDecisionWorkStore("Repeated search fact test complete.")
         },
         expectedOutcome: "Stop only through a structured user-decision terminal state.",
         stopCondition: "Structured test decision reached.",
@@ -2112,6 +2112,123 @@ class ArchitectureForbiddenWorkflowBackend extends StubResearchBackend {
   readonly criticScopes: string[] = [];
 }
 
+class PlanningProviderOverloadBackend extends StubResearchBackend {
+  override async planResearch(): Promise<ResearchPlan> {
+    throw new ResearchBackendError(
+      "http",
+      "planning",
+      "openai-codex planning provider unavailable: Our servers are currently overloaded. Please try again later.",
+      null
+    );
+  }
+}
+
+class NotebookToolBackend extends StubResearchBackend {
+  private patched = false;
+  private read = false;
+  readonly researchRequests: ResearchActionRequest[] = [];
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [],
+      criticScope: null,
+      reason: null
+    };
+
+    if (!this.patched) {
+      this.patched = true;
+      return {
+        schemaVersion: 1,
+        action: "notebook.patch",
+        rationale: "Keep the research objective and task list alive in the visible notebook.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: null,
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              objective: "Produce a professional review of model-driven research workspaces.",
+              definitionOfDone: [
+                "Representative sources are extracted.",
+                "Central claims are supported by citations.",
+                "The final manuscript is finalized only after checks pass."
+              ],
+              currentFocus: "Create the synthesis task list.",
+              readiness: "Not sufficient yet; only the task scaffold exists.",
+              tasks: [{
+                id: "task-build-synthesis",
+                title: "Build claim-led synthesis from selected evidence",
+                status: "todo",
+                notes: "Use workspace reads before writing claims.",
+                linkedEvidenceCellIds: ["evidence-cell-planned"],
+                linkedArtifactPaths: ["research-notes/synthesis-plan.md"]
+              }]
+            }
+          }
+        },
+        expectedOutcome: "Notebook stores objective, definition of done, and linked task metadata.",
+        stopCondition: "Continue after the notebook is updated.",
+        transport: "strict_json"
+      };
+    }
+
+    if (!this.read) {
+      this.read = true;
+      return {
+        schemaVersion: 1,
+        action: "notebook.read",
+        rationale: "Inspect the notebook summary before deciding the next action.",
+        confidence: 0.86,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: null,
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "Notebook read returns visible task state.",
+        stopCondition: "Continue after the notebook observation.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "End the scripted notebook smoke test with a structured user decision.",
+      confidence: 0.8,
+      inputs: {
+        ...baseInputs,
+        reason: "Notebook test complete.",
+        workStore: terminalUserDecisionWorkStore("Notebook smoke test complete.")
+      },
+      expectedOutcome: "Stop only through a structured test terminal state.",
+      stopCondition: "Structured test decision reached.",
+      transport: "strict_json"
+    };
+  }
+}
+
 class InvalidStatusThenDecisionBackend extends StubResearchBackend {
   readonly sourceActions: ResearchActionDecision[] = [];
 
@@ -2457,7 +2574,7 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
       action = {
         schemaVersion: 1,
         action: "critic.review",
-        rationale: "Ask the explicit critic tool to create visible research-debt work items.",
+        rationale: "Ask the explicit critic tool for visible reviewer feedback.",
         confidence: 0.84,
         inputs: {
           ...baseInputs,
@@ -2492,8 +2609,8 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
             }
           }
         },
-        expectedOutcome: "Critic output becomes work items only.",
-        stopCondition: "Visible critic work item exists.",
+        expectedOutcome: "Critic output is returned as feedback only.",
+        stopCondition: "Visible critic feedback exists.",
         transport: "strict_json"
       };
     } else if (!this.releaseVerified) {
@@ -2524,7 +2641,7 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
       this.manuscriptReleased = true;
       action = {
         schemaVersion: 1,
-        action: "manuscript.release",
+        action: "manuscript.finalize",
         rationale: "Export the manuscript from validated workspace state.",
         confidence: 0.88,
         inputs: {
@@ -2567,6 +2684,179 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
 
     this.sourceActions.push(action);
     return action;
+  }
+}
+
+class SupportRepairDiagnosticsBackend extends StubResearchBackend {
+  readonly researchRequests: ResearchActionRequest[] = [];
+  private readonly sourceId: string;
+  private stopped = false;
+
+  constructor(sourceId: string) {
+    super();
+    this.sourceId = sourceId;
+  }
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [this.sourceId],
+      criticScope: null,
+      reason: null
+    };
+    const lastBlockedSupport = request.toolResults?.find((result) => result.action === "claim.link_support" && result.status === "blocked");
+    if (lastBlockedSupport !== undefined || this.stopped) {
+      this.stopped = true;
+      return {
+        schemaVersion: 1,
+        action: "workspace.status",
+        rationale: "Stop the diagnostic smoke test after observing the blocked support-link repair packet.",
+        confidence: 0.8,
+        inputs: {
+          ...baseInputs,
+          reason: "Support-link diagnostic test complete.",
+          workStore: terminalUserDecisionWorkStore("Support-link diagnostic test complete.")
+        },
+        expectedOutcome: "Structured test terminal state.",
+        stopCondition: "Diagnostic observation captured.",
+        transport: "strict_json"
+      };
+    }
+
+    if ((request.workStore?.summary.extractions ?? 0) === 0) {
+      return {
+        schemaVersion: 1,
+        action: "extraction.create",
+        rationale: "Create a rich extraction before testing support-link diagnostics.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "extractions",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              sourceId: this.sourceId,
+              problemSetting: "Research tool runtimes need durable model-visible observations.",
+              systemType: "research workspace runtime",
+              architecture: "model-selected tools over a persistent workspace",
+              toolsAndMemory: "source tools, evidence cells, claims, and support links",
+              planningStyle: "state-driven observe-act-persist",
+              evaluationSetup: "architecture-contract tests and tool-result diagnostics",
+              successSignals: ["blocked tool calls return repair context"],
+              failureModes: ["missing ids can cause repeated no-op attempts"],
+              limitations: ["seeded smoke-test source"],
+              supportedClaims: [{ claim: "Repair context reduces support-link friction.", support: "explicit" }],
+              confidence: "high"
+            }
+          }
+        },
+        expectedOutcome: "Create extraction.",
+        stopCondition: "Extraction exists.",
+        transport: "strict_json"
+      };
+    }
+
+    if ((request.workStore?.summary.evidenceCells ?? 0) === 0) {
+      const extractionId = request.toolResults?.find((result) => result.action === "extraction.create")?.entity?.id
+        ?? null;
+      return {
+        schemaVersion: 1,
+        action: "evidence.create_cell",
+        rationale: "Create evidence before testing support-link diagnostics.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "evidenceCells",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              sourceId: this.sourceId,
+              extractionId,
+              field: "successSignals",
+              value: "Blocked support-link calls return valid claim and evidence-cell previews so the researcher can repair IDs without treating any preview as automatically correct support.",
+              confidence: "high"
+            }
+          }
+        },
+        expectedOutcome: "Create evidence cell.",
+        stopCondition: "Evidence cell exists.",
+        transport: "strict_json"
+      };
+    }
+
+    const claim = request.workStore?.recentClaims[0];
+    if (claim === undefined) {
+      return {
+        schemaVersion: 1,
+        action: "claim.create",
+        rationale: "Create a claim before testing support-link diagnostics.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "claims",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              text: "Support-link diagnostics should behave like IDE completion, not semantic auto-approval.",
+              evidence: "The evidence cell describes repair context for blocked support-link calls.",
+              sourceIds: [this.sourceId],
+              confidence: "medium"
+            }
+          }
+        },
+        expectedOutcome: "Create claim.",
+        stopCondition: "Claim exists.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "claim.link_support",
+      rationale: "Intentionally omit evidence/source ids to inspect repair diagnostics.",
+      confidence: 0.7,
+      inputs: {
+        ...baseInputs,
+        paperIds: [],
+        workStore: {
+          collection: "citations",
+          entityId: null,
+          filters: {},
+          semanticQuery: null,
+          limit: null,
+          cursor: null,
+          changes: {},
+          entity: {
+            claimId: claim.id
+          }
+        }
+      },
+      expectedOutcome: "Return a blocked repair packet with valid ids and cautions.",
+      stopCondition: "Support link remains uncreated.",
+      transport: "strict_json"
+    };
   }
 }
 
@@ -2714,7 +3004,7 @@ class SectionLinkClaimBackend extends StubResearchBackend {
   }
 }
 
-class ExplicitManuscriptReleaseBlockedBackend extends StubResearchBackend {
+class ExplicitManuscriptFinalizeBlockedBackend extends StubResearchBackend {
   private releaseRequested = false;
   readonly researchRequests: ResearchActionRequest[] = [];
 
@@ -2728,8 +3018,8 @@ class ExplicitManuscriptReleaseBlockedBackend extends StubResearchBackend {
       this.releaseRequested = true;
       return {
         schemaVersion: 1,
-        action: "manuscript.release",
-        rationale: "Try to release before claims, sections, support links, and references exist.",
+        action: "manuscript.finalize",
+        rationale: "Try to finalize before claims, sections, support links, and references exist.",
         confidence: 0.6,
         inputs: {
           providerIds: [],
@@ -2948,7 +3238,53 @@ test("architecture contract: invalid terminal workspace.status becomes an observ
   }
 });
 
-test("architecture contract: release_ready requires explicit release verification and manuscript release", async () => {
+test("notebook.read and notebook.patch are explicit model-facing tools with artifact/evidence links", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-notebook-tools-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "model-driven research workspaces",
+      researchQuestion: "Can the researcher maintain a simple living notebook?",
+      researchDirection: "The notebook should keep objective, definition of done, tasks, readiness, and links visible.",
+      successCriterion: "Notebook updates happen only through explicit notebook tools."
+    }, ["clawresearch", "research-loop"]);
+
+    const backend = new NotebookToolBackend();
+    await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const toolResults = backend.researchRequests.flatMap((request) => request.toolResults ?? []);
+    const readResult = toolResults.find((result) => result.action === "notebook.read");
+
+    assert.equal(workStore.notebook.objective, "Produce a professional review of model-driven research workspaces.");
+    assert.deepEqual(workStore.notebook.definitionOfDone, [
+      "Representative sources are extracted.",
+      "Central claims are supported by citations.",
+      "The final manuscript is finalized only after checks pass."
+    ]);
+    assert.equal(workStore.notebook.tasks[0]?.id, "task-build-synthesis");
+    assert.deepEqual(workStore.notebook.tasks[0]?.linkedEvidenceCellIds, ["evidence-cell-planned"]);
+    assert.deepEqual(workStore.notebook.tasks[0]?.linkedArtifactPaths, ["research-notes/synthesis-plan.md"]);
+    assert.equal(backend.researchRequests[1]?.workStore?.notebook.tasks[0]?.title, "Build claim-led synthesis from selected evidence");
+    assert.equal(readResult?.collection, "notebook");
+    assert.equal(readResult?.items?.[0]?.kind, "notebookTask");
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("architecture contract: manuscript completion requires explicit release verification and manuscript finalization", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-architecture-release-invariants-"));
   const now = createNow();
 
@@ -2958,7 +3294,7 @@ test("architecture contract: release_ready requires explicit release verificatio
       topic: "autonomous research agents",
       researchQuestion: "Can release state be validated explicitly?",
       researchDirection: "A draft or checked section must not imply released research.",
-      successCriterion: "release_ready requires explicit release.verify and manuscript.release."
+      successCriterion: "Manuscript completion requires explicit release.verify and manuscript.finalize."
     }, ["clawresearch", "research-loop"]);
 
     const backend = new ArchitectureForbiddenWorkflowBackend();
@@ -2977,8 +3313,8 @@ test("architecture contract: release_ready requires explicit release verificatio
     });
     const agentSteps = await readFile((await runStore.load(run.id)).artifacts.agentStepsPath, "utf8");
 
-    assert.doesNotMatch(agentSteps, /"action":"release\.verify"|"action":"manuscript\.release"/);
-    assert.notEqual(workStore.worker.status, "release_ready");
+    assert.doesNotMatch(agentSteps, /"action":"release\.verify"|"action":"manuscript\.finalize"/);
+    assert.equal(workStore.worker.completion, null);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -3018,6 +3354,48 @@ test("architecture contract: externally_blocked requires a concrete external blo
   }
 });
 
+test("provider overload during planning becomes an external blocker instead of a failed run", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-planning-provider-overload-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "research agents",
+      researchQuestion: "How should provider overload be represented?",
+      researchDirection: "Provider overload is an external blocker, not malformed research output.",
+      successCriterion: "The worker should persist an externally_blocked state and leave /go resumable."
+    }, ["clawresearch", "research-loop"]);
+
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: new PlanningProviderOverloadBackend()
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const paperMarkdown = await readFile(completedRun.artifacts.paperPath, "utf8");
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.equal(completedRun.job.exitCode, 0);
+    assert.match(completedRun.statusMessage ?? "", /external blocker/i);
+    assert.equal(workStore.worker.status, "externally_blocked");
+    assert.equal(workStore.worker.completion, null);
+    assert.ok(workStore.worker.userBlockers.some((blocker) => /overloaded/i.test(blocker)));
+    assert.match(paperMarkdown, /external blocker/i);
+    assert.match(paperMarkdown, /overloaded/i);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("architecture contract: critic or manuscript prose is not converted into hidden recovery queries", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-architecture-no-hidden-recovery-queries-"));
   const now = createNow();
@@ -3049,7 +3427,7 @@ test("architecture contract: critic or manuscript prose is not converted into hi
   }
 });
 
-test("explicit researcher tools create extraction, evidence, critic work items, release checks, and manuscript exports only when selected", async () => {
+test("explicit researcher tools create extraction, evidence, critic feedback, release checks, and finalized manuscript only when selected", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-explicit-researcher-tools-"));
   const now = createNow();
 
@@ -3107,7 +3485,7 @@ test("explicit researcher tools create extraction, evidence, critic work items, 
       "section.create",
       "critic.review",
       "release.verify",
-      "manuscript.release"
+      "manuscript.finalize"
     ]);
     const validActions = new Set(workspaceResearchActions());
     const emittedHints = backend.researchRequests
@@ -3140,7 +3518,7 @@ test("explicit researcher tools create extraction, evidence, critic work items, 
     assert.equal(workStore.objects.evidenceCells[0]?.sourceId, sourceId);
     assert.equal(workStore.objects.citations.length, 1);
     assert.equal(workStore.objects.citations[0]?.sourceId, sourceId);
-    assert.equal(workStore.objects.workItems.filter((item) => item.source === "critic").length, 1);
+    assert.equal(workStore.objects.workItems.filter((item) => item.source === "critic").length, 0);
     assert.ok(workStore.objects.releaseChecks.length > 0);
     assert.equal(references.referenceCount, 1);
     assert.equal(references.references[0]?.sourceId, sourceId);
@@ -3151,11 +3529,20 @@ test("explicit researcher tools create extraction, evidence, critic work items, 
     assert.match(paperMarkdown, /Agentic research tool runtimes for scientific synthesis/);
     assert.match(stdout, /Research tool observation: Extraction created/);
     assert.match(stdout, /Research tool observation: Evidence matrix view returned 1 row/);
-    assert.match(stdout, /Research tool observation: Manuscript released from workspace state/);
-    assert.match(agentSteps, /"action":"manuscript\.release_result"/);
-    assert.match(agentSteps, /"toolAction":"manuscript\.release"/);
-    assert.match(agentSteps, /"manuscriptExportsCreated":1/);
-    assert.equal(workStore.worker.status, "release_ready");
+    assert.match(stdout, /Research tool observation: Manuscript finalized from workspace state/);
+    assert.match(agentSteps, /"action":"manuscript\.finalize_result"/);
+    assert.match(agentSteps, /"toolAction":"manuscript\.finalize"/);
+    assert.match(agentSteps, /"manuscriptFinalized":1/);
+    assert.equal(workStore.worker.status, "working");
+    assert.equal(workStore.worker.completion?.kind, "manuscript_finalized");
+    assert.deepEqual(workStore.worker.completion?.artifactPaths, [
+      completedRun.artifacts.paperPath,
+      completedRun.artifacts.paperJsonPath,
+      completedRun.artifacts.referencesPath,
+      completedRun.artifacts.manuscriptChecksPath
+    ]);
+    assert.ok(workStore.notebook.artifactLinks.some((artifact) => artifact.kind === "paper" && artifact.path === completedRun.artifacts.paperPath));
+    assert.ok(workStore.notebook.artifactLinks.some((artifact) => artifact.kind === "references" && artifact.path === completedRun.artifacts.referencesPath));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -3298,7 +3685,56 @@ test("explicit evidence matrix view is read-only and does not create evidence ce
   }
 });
 
-test("explicit manuscript.release fails visibly when release invariants are missing", async () => {
+test("claim.link_support failures return repair context without auto-approving support", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-support-repair-diagnostics-"));
+  const now = createNow();
+
+  try {
+    const brief = {
+      topic: "support-link diagnostics",
+      researchQuestion: "Can support-link failures return useful repair context?",
+      researchDirection: "Test claim and evidence-cell previews after missing-id support-link failure.",
+      successCriterion: "The model receives valid IDs and a caution without creating a citation."
+    };
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create(brief, ["clawresearch", "research-loop"]);
+    const sourceId = await seedCanonicalWorkspaceSource({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now
+    });
+    const backend = new SupportRepairDiagnosticsBackend(sourceId);
+
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const toolResults = backend.researchRequests.flatMap((request) => request.toolResults ?? []);
+    const blockedSupport = toolResults.find((result) => result.action === "claim.link_support" && result.status === "blocked");
+
+    assert.equal(exitCode, 0);
+    assert.equal(workStore.objects.citations.length, 0);
+    assert.equal(blockedSupport?.collection, "citations");
+    assert.match(blockedSupport?.message ?? "", /Only link support when the evidence snippet actually supports the claim/i);
+    assert.ok(blockedSupport?.items?.some((item) => item.kind === "claim"));
+    assert.ok(blockedSupport?.related?.some((item) => item.kind === "evidenceCell"));
+    assert.ok(blockedSupport?.nextHints?.includes("evidence.create_cell"));
+    assert.ok(blockedSupport?.nextHints?.includes("claim.link_support"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("explicit manuscript.finalize fails visibly when release invariants are missing", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-explicit-release-blocked-"));
   const now = createNow();
 
@@ -3311,7 +3747,7 @@ test("explicit manuscript.release fails visibly when release invariants are miss
       successCriterion: "The explicit release tool reports invariant failures."
     }, ["clawresearch", "research-loop"]);
 
-    const backend = new ExplicitManuscriptReleaseBlockedBackend();
+    const backend = new ExplicitManuscriptFinalizeBlockedBackend();
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
@@ -3335,16 +3771,16 @@ test("explicit manuscript.release fails visibly when release invariants are miss
     assert.ok(checks.blockerCount > 0);
     assert.ok(checks.checks.some((check) => check.id === "workspace-claims" && check.status === "fail" && check.severity === "blocker"));
     assert.ok(checks.checks.some((check) => check.id === "workspace-sections" && check.status === "fail" && check.severity === "blocker"));
-    assert.match(paperMarkdown, /Manuscript release was explicitly requested/);
+    assert.match(paperMarkdown, /Manuscript finalization was explicitly requested/);
     assert.match(paperMarkdown, /No claims have been created/);
-    assert.notEqual(workStore.worker.status, "release_ready");
-    assert.ok(workStore.worker.nextInternalActions.some((action) => /not_ready tool result from manuscript\.release/i.test(action)));
+    assert.equal(workStore.worker.completion, null);
+    assert.ok(workStore.worker.nextInternalActions.some((action) => /not_ready tool result from manuscript\.finalize/i.test(action)));
     assert.ok(workStore.worker.nextInternalActions.some((action) => /release checks/i.test(action)));
     const releaseResult = backend.researchRequests
       .flatMap((request) => request.toolResults ?? [])
-      .find((result) => result.action === "manuscript.release");
+      .find((result) => result.action === "manuscript.finalize");
     assert.equal(releaseResult?.status, "not_ready");
-    assert.equal(releaseResult?.stateDelta?.manuscriptExportsCreated, 0);
+    assert.equal(releaseResult?.stateDelta?.manuscriptFinalized, 0);
     assert.ok(releaseResult?.related?.some((item) => item.kind === "releaseRepair" && item.fields?.suggestedActions !== undefined));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
@@ -3842,7 +4278,7 @@ test("source tool runtime does not choose a fallback provider for providerless s
   }
 });
 
-test("source tool dashboard asks the model to reconsider repeated low-yield searches", async () => {
+test("source tool dashboard exposes repeated search facts without interpreting them", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-source-dashboard-"));
   const now = createNow();
   const originalFetch = globalThis.fetch;
@@ -3900,7 +4336,12 @@ test("source tool dashboard asks the model to reconsider repeated low-yield sear
       sourceToolState?: {
         canonicalMergeCompleted?: boolean;
         consecutiveNoProgressSearches?: number;
-        repeatedSearchWarnings?: string[];
+        repeatedSearchFacts?: Array<{
+          providerId: string;
+          attempts: number;
+          lastRawCandidates: number;
+          lastNewSources: number;
+        }>;
         recentActions?: Array<{ action: string; newSources: number }>;
       } | null;
     };
@@ -3913,7 +4354,9 @@ test("source tool dashboard asks the model to reconsider repeated low-yield sear
       (request.sourceState?.candidatePaperIds.length ?? 0) > 0
       && request.allowedActions.includes("source.merge")
     )));
+    assert.ok(backend.sourceActionRequests.some((request) => (request.sourceState?.repeatedSearchFacts.length ?? 0) > 0));
     assert.equal(sourcesArtifact.sourceToolState?.canonicalMergeCompleted, true);
+    assert.ok((sourcesArtifact.sourceToolState?.repeatedSearchFacts?.[0]?.attempts ?? 0) >= 2);
     assert.ok(sourcesArtifact.sourceToolState?.recentActions?.some((action) => action.action === "source.select_evidence"));
   } finally {
     globalThis.fetch = originalFetch;
@@ -3921,7 +4364,7 @@ test("source tool dashboard asks the model to reconsider repeated low-yield sear
   }
 });
 
-test("source tool dashboard does not fabricate evidence when the model ignores exhausted-search guidance", async () => {
+test("source tool dashboard does not fabricate evidence when the model ignores repeated search facts", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-source-dashboard-ignore-"));
   const now = createNow();
   const originalFetch = globalThis.fetch;
@@ -3990,7 +4433,7 @@ test("source tool dashboard does not fabricate evidence when the model ignores e
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
     assert.ok(backend.sourceActions.filter((action) => action.action === "source.search").length >= 3);
-    assert.ok(backend.sourceActionRequests.some((request) => (request.sourceState?.repeatedSearchWarnings.length ?? 0) > 0));
+    assert.ok(backend.sourceActionRequests.some((request) => (request.sourceState?.repeatedSearchFacts.length ?? 0) > 0));
     assert.doesNotMatch(stdout, /Source tool observation: Merged 1 screened scholarly sources into 1 canonical papers/i);
     assert.match(stdout, /Research work store checkpointed: 0 canonical sources, \d+ source candidates, 0 open work items/i);
     assert.equal(sourcesArtifact.sourceToolState?.canonicalMergeCompleted, false);

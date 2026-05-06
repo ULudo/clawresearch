@@ -81,7 +81,7 @@ async function runSourceTools(request: ResearchSourceToolRequest): Promise<Resea
   const providerIds = session.state().availableProviderIds;
   const queries = request.plan.searchQueries.length > 0
     ? request.plan.searchQueries
-    : session.state().candidateQueries;
+    : session.state().modelPlannedQueries;
 
   for (const providerId of providerIds) {
     await session.queryProvider(providerId, queries);
@@ -342,7 +342,7 @@ test("source.resolve_access requires explicit ids and source.select_evidence hon
   }
 });
 
-test("dynamic query expansion preserves plan queries and adds brief entities for unfamiliar topics", async () => {
+test("source query diagnostics expose only model-planned queries, not brief-derived phrases", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-query-dynamic-"));
 
   try {
@@ -369,15 +369,14 @@ test("dynamic query expansion preserves plan queries and adds brief entities for
 
     assert.equal(queries[0]?.source, "plan");
     assert.equal(queries[0]?.query, "medieval Icelandic assemblies soundscape legal memory");
-    assert.ok(queries.some((query) => query.source === "brief_entity"));
-    assert.ok(queries.some((query) => query.source === "brief_task"));
+    assert.equal(queries.every((query) => query.source === "plan"), true);
     assert.ok(gathered.routing.plannedQueries[0]?.includes("medieval Icelandic assemblies"));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
 
-test("dynamic query expansion does not add hidden domain-vocabulary queries", async () => {
+test("source query diagnostics do not add hidden task or domain-vocabulary queries", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-query-no-domain-vocab-"));
 
   try {
@@ -403,7 +402,8 @@ test("dynamic query expansion does not add hidden domain-vocabulary queries", as
     const queries = gathered.retrievalDiagnostics?.queries ?? [];
 
     assert.ok(queries.some((query) => query.source === "plan"));
-    assert.ok(queries.some((query) => query.source === "brief_task"));
+    assert.equal(queries.some((query) => (query.source as string) === "brief_task"), false);
+    assert.equal(queries.some((query) => (query.source as string) === "brief_entity"), false);
     assert.equal(queries.some((query) => (query.source as string) === "domain_vocabulary"), false);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
@@ -1008,7 +1008,7 @@ test("direct arxiv full text beats metadata-only alternatives during access reso
   }
 });
 
-test("literature and memory hints influence the next retrieval pass", async () => {
+test("literature and memory hints are not injected as hidden retrieval queries", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-sources-memory-hints-"));
   const originalFetch = globalThis.fetch;
   const seenQueries: string[] = [];
@@ -1044,8 +1044,8 @@ test("literature and memory hints influence the next retrieval pass", async () =
       plan: {
         researchMode: "literature_synthesis",
         objective: "Follow the best prior lead.",
-        rationale: "Prior project and literature memory should shape retrieval.",
-        searchQueries: [],
+        rationale: "The model should author the retrieval query explicitly.",
+        searchQueries: ["explicit zeta follow-up query"],
         localFocus: []
       },
       memoryContext: emptyMemoryContext({
@@ -1094,14 +1094,10 @@ test("literature and memory hints influence the next retrieval pass", async () =
       scholarlyProviderIds: ["openalex"]
     });
 
-    assert.ok(
-      seenQueries.some((query) => /mollifier methods/i.test(query)),
-      `Expected a memory-derived query, saw: ${seenQueries.join(" | ")}`
-    );
-    assert.ok(
-      seenQueries.some((query) => /zero[- ]free region/i.test(query)),
-      `Expected a literature-memory-derived query, saw: ${seenQueries.join(" | ")}`
-    );
+    assert.ok(seenQueries.length > 0);
+    assert.equal(seenQueries.every((query) => /explicit zeta follow-up query/i.test(query)), true);
+    assert.equal(seenQueries.some((query) => /mollifier methods/i.test(query)), false);
+    assert.equal(seenQueries.some((query) => /zero[- ]free region/i.test(query)), false);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });

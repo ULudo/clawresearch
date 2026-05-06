@@ -1,7 +1,7 @@
 {
   "name": "clawresearch",
   "version": "0.6.0",
-  "description": "Console-first TypeScript scaffold for an autonomous research runtime",
+  "description": "Console-first research lab runtime for an LLM researcher",
   "type": "module",
   "bin": {
     "clawresearch": "dist/src/cli.js"

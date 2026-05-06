@@ -568,7 +568,7 @@ function criticOutcomeLabel(readinessStatus: ManuscriptReadinessState): string {
     return "Needs further evidence work";
   }
 
-  return "Not release-ready";
+  return "Not finalized";
 }
 
 function buildCriticGatedPaperArtifact(
@@ -588,13 +588,13 @@ function buildCriticGatedPaperArtifact(
         const suffix = sources.length > 0 ? ` Sources: ${sources.map((id) => `[${id}]`).join(", ")}.` : "";
         return `${claim.claim} ${claim.evidence}${suffix}`;
       })
-    : ["No release-ready structured claims were available from the work store."];
+    : ["No finalization-ready structured claims were available from the work store."];
   const blockerLines = blockers.length > 0
     ? blockers
     : ["The critic review did not pass, but no concrete objection text was available."];
   const nextStepLines = bundle.outline.openQuestions.length > 0
     ? bundle.outline.openQuestions
-    : ["Resolve the critic-generated work items in the research work store before releasing a manuscript."];
+    : ["Use the critic feedback to decide the next workspace, claim, source, or section action before finalizing a manuscript."];
   const existingStatusTitle = bundle.paper.scientificRoles.includes("status_report");
 
   return {
@@ -604,7 +604,7 @@ function buildCriticGatedPaperArtifact(
     title: existingStatusTitle ? bundle.paper.title : `${bundle.paper.title} - critic-gated research outcome`,
     abstract: `${outcomeLabel}: ${bundle.paper.abstract}`,
     reviewType: bundle.paper.reviewType,
-    structureRationale: "This artifact reports the current research state after critic review. It is not a released manuscript; manuscript release requires the work-store claims, evidence, citations, sections, deterministic checks, and critic checks to pass.",
+    structureRationale: "This artifact reports the current research state after critic review. It is not a released manuscript; manuscript finalization requires the work-store claims, evidence, citations, sections, deterministic checks, and critic checks to pass.",
     scientificRoles: ["status_report"],
     sections: [
       {

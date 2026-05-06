@@ -544,6 +544,14 @@ function normalizeBaseUrl(baseUrl: string | null, provider: RuntimeModelProvider
   return (baseUrl ?? fallback).replace(/\/responses\/?$/i, "").replace(/\/$/, "");
 }
 
+function compactRuntimeErrorText(text: string): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, 500);
+}
+
+function isProviderAvailabilityMessage(text: string): boolean {
+  return /\b(overloaded|temporarily unavailable|service unavailable|server unavailable|server busy|provider unavailable|provider outage|try again later|rate limit|quota)\b/i.test(text);
+}
+
 function modelResponseUrl(config: ResolvedRuntimeModelConfig): string {
   return `${normalizeBaseUrl(config.baseUrl, config.provider)}/responses`;
 }
@@ -756,6 +764,17 @@ async function postResponseJson(
       return JSON.parse(bodyText) as unknown;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      const failureText = compactRuntimeErrorText(`${message} ${bodyText}`);
+
+      if (isProviderAvailabilityMessage(failureText)) {
+        throw new ModelRuntimeError(
+          "http",
+          options.operation,
+          `${config.provider} ${options.operation} provider unavailable: ${compactRuntimeErrorText(message)}`,
+          options.timeoutMs
+        );
+      }
+
       throw new ModelRuntimeError(
         "malformed_json",
         options.operation,

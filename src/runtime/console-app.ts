@@ -704,8 +704,6 @@ export function renderStatus(
     writeLine(writer, `  stdout: ${relativeProjectPath(session.projectRoot, run.artifacts.stdoutPath)}`);
     writeLine(writer, `  stderr: ${relativeProjectPath(session.projectRoot, run.artifacts.stderrPath)}`);
     writeLine(writer, `  plan: ${relativeProjectPath(session.projectRoot, run.artifacts.planPath)}`);
-    writeLine(writer, `  sources: ${relativeProjectPath(session.projectRoot, run.artifacts.sourcesPath)}`);
-    writeLine(writer, `  review protocol: ${relativeProjectPath(session.projectRoot, run.artifacts.reviewProtocolPath)}`);
     writeLine(writer, `  paper: ${relativeProjectPath(session.projectRoot, run.artifacts.paperPath)}`);
     writeLine(writer, `  paper checks: ${relativeProjectPath(session.projectRoot, run.artifacts.manuscriptChecksPath)}`);
     writeLine(writer, `  workspace db: ${relativeProjectPath(session.projectRoot, researchWorkStoreFilePath(session.projectRoot))}`);
@@ -2215,9 +2213,11 @@ async function buildCompletedRunSummary(run: RunRecord): Promise<string> {
   const workerState = await loadResearchWorkerState(run.projectRoot);
 
   if (workerState !== null && workerState.lastRunId === run.id) {
+    if (workerState.completion?.kind === "manuscript_finalized") {
+      return `Autonomous research worker finalized the manuscript. ${workerState.statusReason}`;
+    }
+
     switch (workerState.status) {
-      case "release_ready":
-        return `Autonomous research worker reached release readiness. ${workerState.statusReason}`;
       case "externally_blocked":
       case "needs_user_decision":
         return `Autonomous research worker paused. ${workerState.statusReason} ${workerState.userBlockers.join(" | ")}`;
@@ -2711,12 +2711,12 @@ export async function handleGoCommand(
   const workerState = await loadResearchWorkerState(session.projectRoot);
   const workerObjectiveChanged = workerState === null ? false : !briefsMatch(workerState.brief, session.brief);
 
-  if (workerState?.status === "release_ready" && !workerObjectiveChanged) {
+  if (workerState?.completion?.kind === "manuscript_finalized" && !workerObjectiveChanged) {
     const lines = [
-      "The autonomous research worker is already release-ready for the current objective.",
+      "The autonomous research worker already finalized a manuscript for the current objective.",
       workerState.statusReason,
       `Latest run id: ${workerState.lastRunId ?? "<none>"}`,
-      `Paper readiness: ${workerState.paperReadiness ?? "<unknown>"}`
+      `Artifacts: ${workerState.completion.artifactPaths.join(", ")}`
     ];
     renderTaggedLines(writer, "run", lines);
     saveAssistantMessage(session, lines.join(" "), now(), "command");
@@ -2779,8 +2779,6 @@ export async function handleGoCommand(
     `Stdout: ${relativeProjectPath(session.projectRoot, run.artifacts.stdoutPath)}`,
     `Stderr: ${relativeProjectPath(session.projectRoot, run.artifacts.stderrPath)}`,
     `Plan: ${relativeProjectPath(session.projectRoot, run.artifacts.planPath)}`,
-    `Sources: ${relativeProjectPath(session.projectRoot, run.artifacts.sourcesPath)}`,
-    `Review protocol: ${relativeProjectPath(session.projectRoot, run.artifacts.reviewProtocolPath)}`,
     `Paper: ${relativeProjectPath(session.projectRoot, run.artifacts.paperPath)}`,
     `Paper checks: ${relativeProjectPath(session.projectRoot, run.artifacts.manuscriptChecksPath)}`,
     `Workspace db: ${relativeProjectPath(session.projectRoot, researchWorkStoreFilePath(session.projectRoot))}`,

@@ -350,6 +350,7 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     "The phase value is only a milestone/progress label. It must not limit your tool choice.",
     "The workspace dashboard is an index, not full memory; use workspace.list/search/read to inspect older or complete state.",
     "If a custom tool family is unclear, use guidance.search/read/recommend to inspect the ClawResearch lab manual.",
+    "Use notebook.read/patch to keep the objective, definition of done, task list, readiness note, and artifact links alive.",
     "Use workspace.search/read/list/create/patch/link/unlink to inspect or update the durable SQLite research workspace.",
     "Use source.search, source.merge, source.resolve_access, and source.select_evidence for source discovery and evidence-set construction.",
     "Use claim.create/patch/check_support/link_support for claim-led synthesis.",
@@ -359,6 +360,7 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     "Use protocol.create_or_revise when the research protocol itself needs visible revision by the researcher.",
     "Use critic.review for fresh stateless critique, and check.run for release/support checks.",
     "Use release.verify for final computable release invariants; semantic concerns should become diagnostics or work items.",
+    "Use manuscript.finalize only when you intentionally want the runtime to write paper.md from workspace sections after hard invariant checks pass.",
     "Critic objections, failed release checks, and not-ready tool results are repair signals. Prefer concrete tool steps over stopping.",
     "Recent tool results are authoritative observations from executed tools. Use returned ids, snippets, and previews before repeating the same read action.",
     "Use workspace.status only for a validated external blocker or real user decision; do not stop merely because machine-actionable work remains.",
@@ -705,7 +707,7 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
                   },
                   payloadJson: {
                     type: ["string", "null"],
-                    description: "Optional JSON object string for create/status payload fields. section.link_claim may include {\"sectionId\":\"...\",\"claimId\":\"...\"}. workspace.status may include {\"status\":\"externally_blocked|needs_user_decision\",\"statusReason\":\"...\",\"nextInternalActions\":[\"...\"]}; non-terminal status notes are returned as observations and do not stop the worker."
+                    description: "Optional JSON object string for create/status/notebook payload fields. notebook.patch may include {\"objective\":\"...\",\"definitionOfDone\":[\"...\"],\"tasks\":[{\"id\":\"task-1\",\"title\":\"...\",\"status\":\"todo\",\"linkedEvidenceCellIds\":[\"...\"]}]}. section.link_claim may include {\"sectionId\":\"...\",\"claimId\":\"...\"}. workspace.status may include {\"status\":\"externally_blocked|needs_user_decision\",\"statusReason\":\"...\",\"nextInternalActions\":[\"...\"]}; non-terminal status notes are returned as observations and do not stop the worker."
                   },
                   link: {
                     type: "object",
@@ -782,6 +784,7 @@ function nativeAgentStepInstruction(request: ResearchActionRequest): string {
     "The phase value is only a milestone/progress label. It must not limit your tool choice.",
     "The workspace dashboard is an index, not full memory; use workspace.list/search/read to inspect older or complete state.",
     "If a custom tool family is unclear, use guidance.search/read/recommend to inspect the ClawResearch lab manual.",
+    "Use notebook.read/patch to keep the objective, definition of done, task list, readiness note, and artifact links alive.",
     "Use workspace.search/read/list/create/patch/link/unlink to inspect or update the durable SQLite research workspace.",
     "Use source.search, source.merge, source.resolve_access, and source.select_evidence for source discovery and evidence-set construction.",
     "Use claim.create/patch/check_support/link_support for claim-led synthesis.",
@@ -791,6 +794,7 @@ function nativeAgentStepInstruction(request: ResearchActionRequest): string {
     "Use protocol.create_or_revise when the research protocol itself needs visible revision by the researcher.",
     "Use critic.review for fresh stateless critique, and check.run for release/support checks.",
     "Use release.verify for final computable release invariants; semantic concerns should become diagnostics or work items.",
+    "Use manuscript.finalize only when you intentionally want the runtime to write paper.md from workspace sections after hard invariant checks pass.",
     "Critic objections, failed release checks, and not-ready tool results are repair signals. Prefer concrete tool steps over stopping.",
     "Recent tool results are authoritative observations from executed tools. Use returned ids, snippets, and previews before repeating the same read action.",
     "Use workspace.status only for a validated external blocker or real user decision; do not stop merely because machine-actionable work remains.",

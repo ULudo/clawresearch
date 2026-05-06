@@ -43,7 +43,7 @@ async function runSourceTools(request: ResearchSourceToolRequest): Promise<Resea
   const session = await SourceToolRuntime.create(request);
   const queries = request.plan.searchQueries.length > 0
     ? request.plan.searchQueries
-    : session.state().candidateQueries;
+    : session.state().modelPlannedQueries;
 
   for (const providerId of session.state().availableProviderIds) {
     await session.queryProvider(providerId, queries);

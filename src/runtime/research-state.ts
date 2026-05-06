@@ -5,10 +5,11 @@ import {
   researchWorkStoreFilePath,
   updateResearchWorkStoreWorker,
   writeResearchWorkStore,
+  type ResearchWorkerCompletion,
   type ResearchWorkerStatus
 } from "./research-work-store.js";
 
-export type { ResearchWorkerStatus } from "./research-work-store.js";
+export type { ResearchWorkerCompletion, ResearchWorkerStatus } from "./research-work-store.js";
 
 export type ResearchWorkerEvidenceSnapshot = {
   canonicalPapers: number;
@@ -31,6 +32,7 @@ export type ResearchWorkerState = {
   projectRoot: string;
   brief: ResearchBrief;
   status: ResearchWorkerStatus;
+  completion: ResearchWorkerCompletion;
   activeRunId: string | null;
   lastRunId: string | null;
   segmentCount: number;
@@ -57,6 +59,7 @@ export function createResearchWorkerState(input: {
     projectRoot: input.projectRoot,
     brief: input.brief,
     status: "not_started",
+    completion: null,
     activeRunId: null,
     lastRunId: null,
     segmentCount: 0,
@@ -88,6 +91,7 @@ export async function loadResearchWorkerState(
     projectRoot,
     brief: store.brief,
     status: store.worker.status,
+    completion: store.worker.completion,
     activeRunId: store.worker.activeRunId,
     lastRunId: store.worker.lastRunId,
     segmentCount: store.worker.segmentCount,
@@ -156,6 +160,7 @@ export async function writeResearchWorkerState(state: ResearchWorkerState): Prom
     brief: state.brief
   }, {
     status: state.status,
+    completion: state.completion,
     activeRunId: state.activeRunId,
     lastRunId: state.lastRunId,
     segmentCount: state.segmentCount,

@@ -5,6 +5,8 @@ import type { ResearchGuidanceContext } from "./research-guidance.js";
 
 export type ResearchWorkspaceToolName =
   | "protocol.create_or_revise"
+  | "notebook.read"
+  | "notebook.patch"
   | "workspace.search"
   | "workspace.read"
   | "workspace.list"
@@ -37,7 +39,7 @@ export type ResearchWorkspaceToolName =
   | "guidance.recommend"
   | "check.run"
   | "release.verify"
-  | "manuscript.release";
+  | "manuscript.finalize";
 
 export type ResearchActionName = ResearchWorkspaceToolName;
 
@@ -46,6 +48,8 @@ export type ResearchActionName = ResearchWorkspaceToolName;
 // observations, but they must not narrow which action the researcher can choose.
 export const researchWorkspaceToolActions: ResearchWorkspaceToolName[] = [
   "protocol.create_or_revise",
+  "notebook.read",
+  "notebook.patch",
   "workspace.search",
   "workspace.read",
   "workspace.list",
@@ -77,7 +81,7 @@ export const researchWorkspaceToolActions: ResearchWorkspaceToolName[] = [
   "guidance.recommend",
   "check.run",
   "release.verify",
-  "manuscript.release",
+  "manuscript.finalize",
   "workspace.status"
 ];
 
@@ -212,7 +216,7 @@ export type ResearchActionRequest = {
   sourceState?: {
     availableProviderIds: string[];
     attemptedProviderIds: string[];
-    candidateQueries: string[];
+    modelPlannedQueries: string[];
     rawSources: number;
     screenedSources: number;
     backgroundSources: number;
@@ -232,8 +236,14 @@ export type ResearchActionRequest = {
       errors: number;
       lastError: string | null;
     }>;
-    exhaustedProviderIds: string[];
-    repeatedSearchWarnings: string[];
+    repeatedSearchFacts: Array<{
+      providerId: string;
+      queries: string[];
+      attempts: number;
+      lastRawCandidates: number;
+      lastNewSources: number;
+      lastError: string | null;
+    }>;
     mergeReadiness: {
       ready: boolean;
       reason: string;
@@ -286,10 +296,40 @@ export type ResearchActionRequest = {
     };
     worker: {
       status: string;
+      completion: {
+        kind: "manuscript_finalized";
+        artifactPaths: string[];
+        finalizedAt: string;
+      } | null;
       statusReason: string;
       paperReadiness: string | null;
       nextInternalActions: string[];
       userBlockers: string[];
+    };
+    notebook: {
+      objective: string;
+      definitionOfDone: string[];
+      currentFocus: string | null;
+      readiness: string;
+      tasks: Array<{
+        id: string;
+        title: string;
+        status: string;
+        notes: string | null;
+        linkedSourceIds: string[];
+        linkedExtractionIds: string[];
+        linkedEvidenceCellIds: string[];
+        linkedClaimIds: string[];
+        linkedSectionIds: string[];
+        linkedArtifactPaths: string[];
+      }>;
+      notes: string[];
+      artifactLinks: Array<{
+        label: string;
+        path: string;
+        kind: string;
+        createdAt: string;
+      }>;
     };
     recentProtocols: Array<{
       id: string;

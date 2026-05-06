@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   OllamaResearchBackend,
-  OpenAIResponsesResearchBackend
+  OpenAIResponsesResearchBackend,
+  ResearchBackendError
 } from "../src/runtime/research-backend.js";
 import { RuntimeModelClient, type ModelCredentialState } from "../src/runtime/model-runtime.js";
 import type { ProjectMemoryContext } from "../src/runtime/memory-store.js";
@@ -551,6 +552,70 @@ test("OpenAI Responses backend uses native function tools for research actions",
   }
 });
 
+test("OpenAI Responses backend classifies overloaded response failures as provider failures", async () => {
+  const originalFetch = globalThis.fetch;
+
+  try {
+    globalThis.fetch = async (): Promise<Response> => new Response([
+      "event: response.failed",
+      'data: {"type":"response.failed","response":{"error":{"message":"Our servers are currently overloaded. Please try again later."}}}',
+      "",
+      ""
+    ].join("\n"), {
+      status: 200,
+      headers: {
+        "content-type": "text/event-stream"
+      }
+    });
+
+    const backend = new OpenAIResponsesResearchBackend(new RuntimeModelClient({
+      provider: "openai-codex",
+      model: "gpt-test",
+      host: null,
+      baseUrl: "https://chatgpt.example.test/backend-api/codex",
+      configured: true,
+      label: "openai-codex:gpt-test"
+    }, {
+      ...modelCredentials(),
+      openai: {
+        apiKey: null
+      },
+      openaiCodex: {
+        access: "codex-access-token",
+        refresh: "codex-refresh-token",
+        expires: Date.UTC(2099, 0, 1),
+        email: null,
+        profileName: null
+      }
+    }));
+
+    await assert.rejects(
+      backend.planResearch({
+        projectRoot: "/tmp/project",
+        brief: {
+          topic: "research agents",
+          researchQuestion: "How should provider overload be handled?",
+          researchDirection: "Classify provider overload as an external provider problem.",
+          successCriterion: "Do not report provider overload as malformed JSON."
+        },
+        localFiles: [],
+        memoryContext: emptyMemoryContext(),
+        workerState: null
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof ResearchBackendError);
+        assert.equal(error.kind, "http");
+        assert.equal(error.operation, "planning");
+        assert.match(error.message, /provider unavailable/i);
+        assert.match(error.message, /overloaded/i);
+        return true;
+      }
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("agent-step backend exposes first-class claim and manuscript-section tools", async () => {
   const originalFetch = globalThis.fetch;
   let capturedPrompt = "";
@@ -650,10 +715,20 @@ test("agent-step backend exposes first-class claim and manuscript-section tools"
         },
         worker: {
           status: "working",
+          completion: null,
           statusReason: "Testing the agent tool loop.",
           paperReadiness: "needs_human_review",
           nextInternalActions: ["Create claim-led synthesis objects."],
           userBlockers: []
+        },
+        notebook: {
+          objective: "Test the model-driven research loop.",
+          definitionOfDone: ["Create supported claims."],
+          currentFocus: "Create claim-led synthesis objects.",
+          readiness: "Not sufficient yet.",
+          tasks: [],
+          notes: [],
+          artifactLinks: []
         },
         openWorkItems: [],
         recentProtocols: [],

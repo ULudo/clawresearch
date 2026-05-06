@@ -74,9 +74,53 @@ export type ResearchWorkerStatus =
   | "not_started"
   | "working"
   | "paused"
-  | "release_ready"
   | "needs_user_decision"
   | "externally_blocked";
+
+export type ResearchWorkerCompletion = null | {
+  kind: "manuscript_finalized";
+  artifactPaths: string[];
+  finalizedAt: string;
+};
+
+export type ResearchNotebookTaskStatus =
+  | "todo"
+  | "in_progress"
+  | "done"
+  | "blocked"
+  | "abandoned";
+
+export type ResearchNotebookTask = {
+  id: string;
+  title: string;
+  status: ResearchNotebookTaskStatus;
+  notes: string | null;
+  linkedSourceIds: string[];
+  linkedExtractionIds: string[];
+  linkedEvidenceCellIds: string[];
+  linkedClaimIds: string[];
+  linkedSectionIds: string[];
+  linkedArtifactPaths: string[];
+};
+
+export type ResearchNotebookArtifactLink = {
+  label: string;
+  path: string;
+  kind: "paper" | "references" | "checks" | "source_checkpoint" | "trace" | "other";
+  createdAt: string;
+};
+
+export type ResearchNotebook = {
+  schemaVersion: 1;
+  objective: string;
+  definitionOfDone: string[];
+  tasks: ResearchNotebookTask[];
+  currentFocus: string | null;
+  readiness: string;
+  notes: string[];
+  artifactLinks: ResearchNotebookArtifactLink[];
+  updatedAt: string;
+};
 
 export type WorkStoreBaseEntity = {
   id: string;
@@ -265,6 +309,7 @@ export type WorkStoreEntity =
 
 export type ResearchWorkStoreWorker = {
   status: ResearchWorkerStatus;
+  completion: ResearchWorkerCompletion;
   activeRunId: string | null;
   lastRunId: string | null;
   segmentCount: number;
@@ -308,6 +353,7 @@ export type ResearchWorkStore = {
   updatedAt: string;
   brief: ResearchBrief;
   worker: ResearchWorkStoreWorker;
+  notebook: ResearchNotebook;
   objects: ResearchWorkStoreObjects;
 };
 
@@ -402,6 +448,11 @@ CREATE TABLE IF NOT EXISTS meta (
   value TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS worker_state (
+  id TEXT PRIMARY KEY CHECK (id = 'current'),
+  json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS notebook_state (
   id TEXT PRIMARY KEY CHECK (id = 'current'),
   json TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -561,6 +612,7 @@ function createEmptyObjects(): ResearchWorkStoreObjects {
 function createEmptyWorker(now: string): ResearchWorkStoreWorker {
   return {
     status: "not_started",
+    completion: null,
     activeRunId: null,
     lastRunId: null,
     segmentCount: 0,
@@ -570,6 +622,27 @@ function createEmptyWorker(now: string): ResearchWorkStoreWorker {
     nextInternalActions: [],
     userBlockers: [],
     evidence: null
+  };
+}
+
+function createEmptyNotebook(now: string, brief: ResearchBrief = createEmptyBrief()): ResearchNotebook {
+  const objective = [
+    brief.topic,
+    brief.researchQuestion,
+    brief.researchDirection,
+    brief.successCriterion
+  ].flatMap((part) => readString(part) ?? []).join(" ");
+
+  return {
+    schemaVersion: 1,
+    objective: objective.length > 0 ? objective : "Unscoped research objective",
+    definitionOfDone: readString(brief.successCriterion) === null ? [] : [readString(brief.successCriterion) as string],
+    tasks: [],
+    currentFocus: null,
+    readiness: "No research readiness assessment has been written yet.",
+    notes: [],
+    artifactLinks: [],
+    updatedAt: now
   };
 }
 
@@ -615,6 +688,7 @@ function normalizeWorker(value: unknown, now: string): ResearchWorkStoreWorker {
   const status = readString(record.status);
   return {
     status: isResearchWorkerStatus(status) ? status : base.status,
+    completion: normalizeWorkerCompletion(record.completion),
     activeRunId: readString(record.activeRunId),
     lastRunId: readString(record.lastRunId),
     segmentCount: readNumber(record.segmentCount),
@@ -624,6 +698,24 @@ function normalizeWorker(value: unknown, now: string): ResearchWorkStoreWorker {
     nextInternalActions: readStringArray(record.nextInternalActions, 40),
     userBlockers: readStringArray(record.userBlockers, 40),
     evidence: normalizeWorkerEvidence(record.evidence)
+  };
+}
+
+function normalizeWorkerCompletion(value: unknown): ResearchWorkerCompletion {
+  const record = asObject(value);
+  if (record.kind !== "manuscript_finalized") {
+    return null;
+  }
+  const finalizedAt = readString(record.finalizedAt);
+  const artifactPaths = readStringArray(record.artifactPaths, 40);
+  if (finalizedAt === null || artifactPaths.length === 0) {
+    return null;
+  }
+
+  return {
+    kind: "manuscript_finalized",
+    artifactPaths,
+    finalizedAt
   };
 }
 
@@ -650,13 +742,88 @@ function isResearchWorkerStatus(value: string | null): value is ResearchWorkerSt
     case "not_started":
     case "working":
     case "paused":
-    case "release_ready":
     case "needs_user_decision":
     case "externally_blocked":
       return true;
     default:
       return false;
   }
+}
+
+function normalizeNotebookTaskStatus(value: unknown): ResearchNotebookTaskStatus {
+  switch (value) {
+    case "todo":
+    case "in_progress":
+    case "done":
+    case "blocked":
+    case "abandoned":
+      return value;
+    default:
+      return "todo";
+  }
+}
+
+function normalizeNotebookTask(value: unknown): ResearchNotebookTask | null {
+  const record = asObject(value);
+  const id = readString(record.id);
+  const title = readString(record.title);
+  if (id === null || title === null) {
+    return null;
+  }
+
+  return {
+    id,
+    title,
+    status: normalizeNotebookTaskStatus(record.status),
+    notes: readString(record.notes),
+    linkedSourceIds: readStringArray(record.linkedSourceIds, 80),
+    linkedExtractionIds: readStringArray(record.linkedExtractionIds, 80),
+    linkedEvidenceCellIds: readStringArray(record.linkedEvidenceCellIds, 80),
+    linkedClaimIds: readStringArray(record.linkedClaimIds, 80),
+    linkedSectionIds: readStringArray(record.linkedSectionIds, 80),
+    linkedArtifactPaths: readStringArray(record.linkedArtifactPaths, 80)
+  };
+}
+
+function normalizeNotebookArtifactLink(value: unknown): ResearchNotebookArtifactLink | null {
+  const record = asObject(value);
+  const label = readString(record.label);
+  const linkPath = readString(record.path);
+  const createdAt = readString(record.createdAt);
+  if (label === null || linkPath === null || createdAt === null) {
+    return null;
+  }
+  const kind = typeof record.kind === "string" && ["paper", "references", "checks", "source_checkpoint", "trace", "other"].includes(record.kind)
+    ? record.kind as ResearchNotebookArtifactLink["kind"]
+    : "other";
+
+  return {
+    label,
+    path: linkPath,
+    kind,
+    createdAt
+  };
+}
+
+function normalizeNotebook(value: unknown, now: string, brief: ResearchBrief): ResearchNotebook {
+  const base = createEmptyNotebook(now, brief);
+  const record = asObject(value);
+
+  return {
+    schemaVersion: 1,
+    objective: readString(record.objective) ?? base.objective,
+    definitionOfDone: readStringArray(record.definitionOfDone, 80),
+    tasks: Array.isArray(record.tasks)
+      ? record.tasks.flatMap((entry) => normalizeNotebookTask(entry) ?? [])
+      : [],
+    currentFocus: readString(record.currentFocus),
+    readiness: readString(record.readiness) ?? base.readiness,
+    notes: readStringArray(record.notes, 200),
+    artifactLinks: Array.isArray(record.artifactLinks)
+      ? record.artifactLinks.flatMap((entry) => normalizeNotebookArtifactLink(entry) ?? [])
+      : [],
+    updatedAt: normalizeTimestamp(record.updatedAt, now)
+  };
 }
 
 function normalizeEntityArray<T extends WorkStoreEntity>(
@@ -866,14 +1033,16 @@ export function createResearchWorkStore(input: {
   brief?: ResearchBrief | null;
   now: string;
 }): ResearchWorkStore {
+  const brief = input.brief ?? createEmptyBrief();
   return {
     schemaVersion: workStoreSchemaVersion,
     projectRoot: input.projectRoot,
     runtimeDirectory: runtimeDir(input.projectRoot),
     createdAt: input.now,
     updatedAt: input.now,
-    brief: input.brief ?? createEmptyBrief(),
+    brief,
     worker: createEmptyWorker(input.now),
+    notebook: createEmptyNotebook(input.now, brief),
     objects: createEmptyObjects()
   };
 }
@@ -939,6 +1108,8 @@ function loadWorkspaceDatabase(input: {
     const metaRows = statementRows<{ key: string; value: string }>(database, "SELECT key, value FROM meta");
     const meta = new Map(metaRows.map((row) => [row.key, row.value]));
     const workerRow = database.prepare("SELECT json FROM worker_state WHERE id = 'current'").get();
+    const notebookRow = database.prepare("SELECT json FROM notebook_state WHERE id = 'current'").get();
+    const brief = input.brief ?? normalizeBrief(parseJsonRecord(meta.get("brief")));
     const sources = statementRows<Record<string, unknown>>(database, "SELECT json FROM sources ORDER BY updated_at, id")
       .flatMap((row) => rowJsonEntity<WorkStoreCanonicalSource>(row, "canonicalSource") ?? []);
     const extractions = statementRows<Record<string, unknown>>(database, "SELECT json FROM extractions ORDER BY updated_at, id")
@@ -968,8 +1139,9 @@ function loadWorkspaceDatabase(input: {
       runtimeDirectory: runtimeDir(input.projectRoot),
       createdAt: normalizeTimestamp(meta.get("createdAt"), input.now),
       updatedAt: normalizeTimestamp(meta.get("updatedAt"), input.now),
-      brief: input.brief ?? normalizeBrief(parseJsonRecord(meta.get("brief"))),
+      brief,
       worker: normalizeWorker(workerRow?.json === undefined ? null : parseJsonValue(workerRow.json, null), input.now),
+      notebook: normalizeNotebook(notebookRow?.json === undefined ? null : parseJsonValue(notebookRow.json, null), input.now, brief),
       objects: {
         providerRuns,
         sources: rawSources,
@@ -1000,6 +1172,7 @@ function writeWorkspaceDatabase(store: ResearchWorkStore): void {
       database.exec(`
 DELETE FROM meta;
 DELETE FROM worker_state;
+DELETE FROM notebook_state;
 DELETE FROM sources;
 DELETE FROM extractions;
 DELETE FROM evidence_cells;
@@ -1019,6 +1192,8 @@ DELETE FROM events;
       insertMeta.run("brief", jsonText(store.brief));
       database.prepare("INSERT INTO worker_state (id, json, updated_at) VALUES ('current', ?, ?)")
         .run(jsonText(store.worker), store.worker.updatedAt);
+      database.prepare("INSERT INTO notebook_state (id, json, updated_at) VALUES ('current', ?, ?)")
+        .run(jsonText(store.notebook), store.notebook.updatedAt);
 
       const insertSource = database.prepare(`
 INSERT INTO sources (
@@ -1167,14 +1342,16 @@ export async function loadResearchWorkStore(input: {
   try {
     const raw = JSON.parse(await readFile(legacyResearchWorkStoreFilePath(input.projectRoot), "utf8")) as unknown;
     const record = asObject(raw);
+    const brief = input.brief ?? normalizeBrief(record.brief);
     const migrated: ResearchWorkStore = {
       schemaVersion: workStoreSchemaVersion,
       projectRoot: input.projectRoot,
       runtimeDirectory: runtimeDir(input.projectRoot),
       createdAt: normalizeTimestamp(record.createdAt, input.now),
       updatedAt: normalizeTimestamp(record.updatedAt, input.now),
-      brief: input.brief ?? normalizeBrief(record.brief),
+      brief,
       worker: normalizeWorker(record.worker, input.now),
+      notebook: normalizeNotebook(record.notebook, input.now, brief),
       objects: normalizeObjects(record.objects)
     };
     await writeResearchWorkStore(migrated);
@@ -1617,17 +1794,18 @@ export function buildLiteratureContextFromWorkStore(store: ResearchWorkStore): L
       summary: Array.isArray(cell.value) ? cell.value.join("; ") : cell.value,
       paperIds: [cell.sourceId]
     }));
-  const notebooks = store.worker.lastRunId === null
-    ? []
-    : [{
-      id: `worker-${store.worker.lastRunId}`,
-      title: `Worker state for ${store.worker.lastRunId}`,
-      summary: store.worker.statusReason,
-      nextQuestions: store.worker.nextInternalActions
-    }];
+  const notebooks = [{
+    id: "research-notebook",
+    title: store.notebook.objective,
+    summary: store.notebook.readiness,
+    nextQuestions: store.notebook.tasks
+      .filter((task) => task.status === "todo" || task.status === "in_progress" || task.status === "blocked")
+      .map((task) => task.title)
+      .slice(0, 8)
+  }];
 
   return {
-    available: papers.length > 0 || themes.length > 0,
+    available: papers.length > 0 || themes.length > 0 || notebooks.length > 0,
     paperCount: store.objects.canonicalSources.length,
     themeCount: themes.length,
     notebookCount: notebooks.length,

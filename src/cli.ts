@@ -41,19 +41,19 @@ async function findPackageRoot(startDirectory: string): Promise<string> {
   }
 }
 
-async function resolveDocs(packageRoot: string): Promise<{ resetDoc: string; literatureDoc: string }> {
+async function resolveDocs(packageRoot: string): Promise<{ readme: string; literatureDoc: string }> {
   return {
-    resetDoc: path.join(packageRoot, "docs", "reset-development-concept.md"),
+    readme: path.join(packageRoot, "README.md"),
     literatureDoc: path.join(packageRoot, "docs", "autonomous-research-agent-literature-synthesis.md")
   };
 }
 
-function renderDocs(writer: OutputWriter, packageRoot: string, resetDoc: string, literatureDoc: string): void {
-  writeLine(writer, "ClawResearch reset documents:");
-  writeLine(writer, `1. ${path.relative(packageRoot, resetDoc) || resetDoc}`);
+function renderDocs(writer: OutputWriter, packageRoot: string, readme: string, literatureDoc: string): void {
+  writeLine(writer, "ClawResearch documents:");
+  writeLine(writer, `1. ${path.relative(packageRoot, readme) || readme}`);
   writeLine(writer, `2. ${path.relative(packageRoot, literatureDoc) || literatureDoc}`);
   writeLine(writer);
-  writeLine(writer, "Read those first, then run `clawresearch` in the project directory you want to research.");
+  writeLine(writer, "Read the README for the current app architecture, then run `clawresearch` in the project directory you want to research.");
 }
 
 function renderHelp(writer: OutputWriter): void {
@@ -197,7 +197,7 @@ export async function main(argv: string[], options: MainOptions = {}): Promise<n
   }
 
   if (args.has("--docs")) {
-    renderDocs(writer, packageRoot, docs.resetDoc, docs.literatureDoc);
+    renderDocs(writer, packageRoot, docs.readme, docs.literatureDoc);
     return 0;
   }
 

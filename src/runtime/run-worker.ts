@@ -102,9 +102,12 @@ import {
   researchWorkStoreFilePath,
   summarizeResearchWorkStore,
   upsertResearchWorkStoreEntities,
-  workItemsFromCriticReports,
   writeResearchWorkStore,
   type ResearchWorkStore,
+  type ResearchWorkerCompletion,
+  type ResearchNotebook,
+  type ResearchNotebookArtifactLink,
+  type ResearchNotebookTask,
   type WorkStoreCollectionName,
   type WorkStoreCanonicalSource,
   type WorkStoreClaim,
@@ -112,6 +115,7 @@ import {
   type WorkStoreEvidenceCell,
   type WorkStoreEntity,
   type WorkStoreEntityKind,
+  type WorkStoreExtraction,
   type WorkStoreManuscriptSection,
   type WorkStoreProtocol,
   type WorkStoreReleaseCheck,
@@ -297,7 +301,7 @@ function sourceStateForAgent(session: SourceToolRuntime): ResearchActionRequest[
   return {
     availableProviderIds: state.availableProviderIds,
     attemptedProviderIds: state.attemptedProviderIds,
-    candidateQueries: state.candidateQueries,
+    modelPlannedQueries: state.modelPlannedQueries,
     rawSources: state.rawSources,
     screenedSources: state.screenedSources,
     backgroundSources: state.backgroundSources,
@@ -310,8 +314,7 @@ function sourceStateForAgent(session: SourceToolRuntime): ResearchActionRequest[
     newSourcesLastAction: state.newSourcesLastAction,
     consecutiveNoProgressSearches: state.consecutiveNoProgressSearches,
     providerYields: state.providerYields,
-    exhaustedProviderIds: state.exhaustedProviderIds,
-    repeatedSearchWarnings: state.repeatedSearchWarnings,
+    repeatedSearchFacts: state.repeatedSearchFacts,
     mergeReadiness: state.mergeReadiness,
     recentActions: state.recentActions,
     lastObservation: state.lastObservation
@@ -388,14 +391,40 @@ function workStoreContextForAgent(store: ResearchWorkStore): ResearchActionReque
       recentlyChangedIds: recentlyChangedWorkspaceIds(store),
       suggestedLookupTools: ["workspace.list", "workspace.search", "workspace.read"]
     },
-    worker: {
-      status: store.worker.status,
-      statusReason: store.worker.statusReason,
-      paperReadiness: store.worker.paperReadiness,
-      nextInternalActions: store.worker.nextInternalActions.slice(0, 8),
-      userBlockers: store.worker.userBlockers.slice(0, 8)
-    },
-    openWorkItems: store.objects.workItems
+	    worker: {
+	      status: store.worker.status,
+	      completion: store.worker.completion,
+	      statusReason: store.worker.statusReason,
+	      paperReadiness: store.worker.paperReadiness,
+	      nextInternalActions: store.worker.nextInternalActions.slice(0, 8),
+	      userBlockers: store.worker.userBlockers.slice(0, 8)
+	    },
+	    notebook: {
+	      objective: store.notebook.objective,
+	      definitionOfDone: store.notebook.definitionOfDone.slice(0, 12),
+	      currentFocus: store.notebook.currentFocus,
+	      readiness: store.notebook.readiness,
+	      tasks: store.notebook.tasks.slice(0, 30).map((task) => ({
+	        id: task.id,
+	        title: task.title,
+	        status: task.status,
+	        notes: task.notes,
+	        linkedSourceIds: task.linkedSourceIds.slice(0, 12),
+	        linkedExtractionIds: task.linkedExtractionIds.slice(0, 12),
+	        linkedEvidenceCellIds: task.linkedEvidenceCellIds.slice(0, 12),
+	        linkedClaimIds: task.linkedClaimIds.slice(0, 12),
+	        linkedSectionIds: task.linkedSectionIds.slice(0, 12),
+	        linkedArtifactPaths: task.linkedArtifactPaths.slice(0, 12)
+	      })),
+	      notes: store.notebook.notes.slice(-8),
+	      artifactLinks: store.notebook.artifactLinks.slice(-12).map((artifact) => ({
+	        label: artifact.label,
+	        path: artifact.path,
+	        kind: artifact.kind,
+	        createdAt: artifact.createdAt
+	      }))
+	    },
+	    openWorkItems: store.objects.workItems
       .filter((item) => item.status === "open")
       .slice(-12)
       .map((item) => ({
@@ -454,6 +483,194 @@ function workStoreContextForAgent(store: ResearchWorkStore): ResearchActionReque
   };
 }
 
+function notebookPreviewForAgent(notebook: ResearchNotebook): AgentVisibleEntityPreview {
+  const activeTasks = notebook.tasks.filter((task) => task.status === "todo" || task.status === "in_progress" || task.status === "blocked");
+  return {
+    id: "research-notebook",
+    kind: "researchNotebook",
+    title: notebook.objective,
+    snippet: compactPreviewText(notebook.readiness, 420),
+    fields: {
+      definitionOfDoneCount: notebook.definitionOfDone.length,
+      taskCount: notebook.tasks.length,
+      activeTaskCount: activeTasks.length,
+      currentFocus: notebook.currentFocus
+    }
+  };
+}
+
+function safeNotebookTaskStatus(value: unknown): ResearchNotebookTask["status"] {
+  return value === "todo"
+    || value === "in_progress"
+    || value === "done"
+    || value === "blocked"
+    || value === "abandoned"
+    ? value
+    : "todo";
+}
+
+function generatedNotebookTaskId(run: RunRecord, nowText: string, title: string): string {
+  return generatedToolEntityId("task", run, nowText, title);
+}
+
+function unsafeArtifactPath(value: string, run: RunRecord): string | null {
+  const trimmed = value.trim();
+
+  if (trimmed.length === 0) {
+    return "empty artifact path";
+  }
+
+  if (path.isAbsolute(trimmed)) {
+    const resolved = path.resolve(trimmed);
+    const projectRoot = path.resolve(run.projectRoot);
+    const runDirectory = path.resolve(run.artifacts.runDirectory);
+
+    return resolved === projectRoot
+      || resolved.startsWith(`${projectRoot}${path.sep}`)
+      || resolved === runDirectory
+      || resolved.startsWith(`${runDirectory}${path.sep}`)
+      ? null
+      : `artifact path is outside the project: ${trimmed}`;
+  }
+
+  const resolvedRelative = path.normalize(trimmed);
+
+  return resolvedRelative.startsWith("..") || path.isAbsolute(resolvedRelative)
+    ? `artifact path escapes the project: ${trimmed}`
+    : null;
+}
+
+function collectUnsafeNotebookArtifactPaths(input: {
+  run: RunRecord;
+  entity: Record<string, unknown>;
+}): string[] {
+  const paths = [
+    ...stringArrayInput(input.entity.linkedArtifactPaths, 40),
+    ...arrayInput(input.entity.tasks).flatMap((entry) => {
+      const task = objectInput(entry);
+      return task === null ? [] : stringArrayInput(task.linkedArtifactPaths, 40);
+    }),
+    ...arrayInput(input.entity.artifactLinks).flatMap((entry) => {
+      const artifact = objectInput(entry);
+      return artifact === null ? [] : [stringInput(artifact.path, "")];
+    })
+  ];
+
+  return paths
+    .map((artifactPath) => unsafeArtifactPath(artifactPath, input.run))
+    .filter((message): message is string => message !== null);
+}
+
+function taskFromNotebookPatch(input: {
+  run: RunRecord;
+  nowText: string;
+  entry: Record<string, unknown>;
+}): ResearchNotebookTask {
+  const title = stringInput(input.entry.title ?? input.entry.text, "Untitled research task");
+
+  return {
+    id: stringInput(input.entry.id, generatedNotebookTaskId(input.run, input.nowText, title)),
+    title,
+    status: safeNotebookTaskStatus(input.entry.status),
+    notes: nullableStringInput(input.entry.notes ?? input.entry.note),
+    linkedSourceIds: stringArrayInput(input.entry.linkedSourceIds ?? input.entry.sourceIds, 40),
+    linkedExtractionIds: stringArrayInput(input.entry.linkedExtractionIds ?? input.entry.extractionIds, 40),
+    linkedEvidenceCellIds: stringArrayInput(input.entry.linkedEvidenceCellIds ?? input.entry.evidenceCellIds, 40),
+    linkedClaimIds: stringArrayInput(input.entry.linkedClaimIds ?? input.entry.claimIds, 40),
+    linkedSectionIds: stringArrayInput(input.entry.linkedSectionIds ?? input.entry.sectionIds, 40),
+    linkedArtifactPaths: stringArrayInput(input.entry.linkedArtifactPaths ?? input.entry.artifactPaths, 40)
+  };
+}
+
+function artifactLinkFromNotebookPatch(input: {
+  nowText: string;
+  entry: Record<string, unknown>;
+}): ResearchNotebookArtifactLink {
+  const kind = input.entry.kind === "paper"
+    || input.entry.kind === "references"
+    || input.entry.kind === "checks"
+    || input.entry.kind === "source_checkpoint"
+    || input.entry.kind === "trace"
+    || input.entry.kind === "other"
+    ? input.entry.kind
+    : "other";
+
+  return {
+    label: stringInput(input.entry.label ?? input.entry.title, "Research artifact"),
+    path: stringInput(input.entry.path, ""),
+    kind,
+    createdAt: stringInput(input.entry.createdAt, input.nowText)
+  };
+}
+
+function patchNotebook(input: {
+  run: RunRecord;
+  store: ResearchWorkStore;
+  nowText: string;
+  entity: Record<string, unknown>;
+}): ResearchNotebook {
+  let tasks = [...input.store.notebook.tasks];
+  const upsertTask = (task: ResearchNotebookTask): void => {
+    const index = tasks.findIndex((existing) => existing.id === task.id);
+    tasks = index === -1
+      ? [...tasks, task]
+      : tasks.map((existing, existingIndex) => existingIndex === index ? { ...existing, ...task } : existing);
+  };
+
+  for (const entry of arrayInput(input.entity.tasks)) {
+    const task = objectInput(entry);
+    if (task !== null) {
+      upsertTask(taskFromNotebookPatch({ run: input.run, nowText: input.nowText, entry: task }));
+    }
+  }
+
+  const singleTask = objectInput(input.entity.task);
+  if (singleTask !== null) {
+    upsertTask(taskFromNotebookPatch({ run: input.run, nowText: input.nowText, entry: singleTask }));
+  }
+
+  const notes = uniqueStrings([
+    ...input.store.notebook.notes,
+    ...stringArrayInput(input.entity.notes, 40),
+    nullableStringInput(input.entity.note)
+  ]).slice(-80);
+  const artifactLinks = [...input.store.notebook.artifactLinks];
+  const upsertArtifactLink = (artifact: ResearchNotebookArtifactLink): void => {
+    const index = artifactLinks.findIndex((existing) => existing.path === artifact.path && existing.label === artifact.label);
+    if (index === -1) {
+      artifactLinks.push(artifact);
+    } else {
+      artifactLinks[index] = artifact;
+    }
+  };
+
+  for (const entry of arrayInput(input.entity.artifactLinks)) {
+    const artifact = objectInput(entry);
+    if (artifact !== null) {
+      upsertArtifactLink(artifactLinkFromNotebookPatch({ nowText: input.nowText, entry: artifact }));
+    }
+  }
+
+  const singleArtifact = objectInput(input.entity.artifactLink);
+  if (singleArtifact !== null) {
+    upsertArtifactLink(artifactLinkFromNotebookPatch({ nowText: input.nowText, entry: singleArtifact }));
+  }
+
+  return {
+    schemaVersion: 1,
+    objective: stringInput(input.entity.objective, input.store.notebook.objective),
+    definitionOfDone: stringArrayInput(input.entity.definitionOfDone, 40).length > 0
+      ? stringArrayInput(input.entity.definitionOfDone, 40)
+      : input.store.notebook.definitionOfDone,
+    tasks,
+    currentFocus: nullableStringInput(input.entity.currentFocus) ?? input.store.notebook.currentFocus,
+    readiness: stringInput(input.entity.readiness ?? input.entity.readinessSelfAssessment, input.store.notebook.readiness),
+    notes,
+    artifactLinks,
+    updatedAt: input.nowText
+  };
+}
+
 function isSourceSearchAction(action: ResearchActionDecision["action"]): boolean {
   return action === "source.search";
 }
@@ -509,11 +726,12 @@ function isResearchObjectToolAction(action: ResearchActionDecision["action"]): b
     || action === "work_item.patch"
     || action === "check.run"
     || action === "release.verify"
-    || action === "manuscript.release";
+    || action === "manuscript.finalize";
 }
 
 function isReadOnlyWorkspaceAction(action: ResearchActionDecision["action"]): boolean {
-  return action === "workspace.search"
+  return action === "notebook.read"
+    || action === "workspace.search"
     || action === "workspace.read"
     || action === "workspace.list"
     || action === "evidence.matrix_view"
@@ -543,6 +761,14 @@ function stringArrayInput(value: unknown, limit = 12): string[] {
   return Array.isArray(value)
     ? value.flatMap((entry) => typeof entry === "string" && entry.trim().length > 0 ? [entry.trim()] : []).slice(0, limit)
     : [];
+}
+
+function arrayInput(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function nullableStringInput(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
 function objectInput(value: unknown): Record<string, unknown> | null {
@@ -1108,6 +1334,118 @@ function supportLinkFromInput(input: {
   };
 }
 
+function supportLinkCaution(): string {
+  return "Only link support when the evidence snippet actually supports the claim; otherwise create better evidence, revise the claim, or search/read more sources.";
+}
+
+function recentClaimPreviews(store: ResearchWorkStore): AgentVisibleEntityPreview[] {
+  return store.objects.claims
+    .slice(-8)
+    .map((claim) => entityPreviewForAgent(claim, store));
+}
+
+function recentEvidenceCellPreviews(store: ResearchWorkStore, sourceId?: string | null): AgentVisibleEntityPreview[] {
+  const equivalentIds = sourceId === undefined || sourceId === null
+    ? null
+    : new Set(sourceEquivalentIds(store, sourceId));
+  return store.objects.evidenceCells
+    .filter((cell) => equivalentIds === null || equivalentIds.has(cell.sourceId))
+    .slice(-12)
+    .map((cell) => entityPreviewForAgent(cell, store));
+}
+
+function recentExtractionPreviews(store: ResearchWorkStore, sourceId?: string | null): AgentVisibleEntityPreview[] {
+  const equivalentIds = sourceId === undefined || sourceId === null
+    ? null
+    : new Set(sourceEquivalentIds(store, sourceId));
+  return store.objects.extractions
+    .filter((extraction) => equivalentIds === null || equivalentIds.has(extraction.sourceId))
+    .slice(-8)
+    .map((extraction) => entityPreviewForAgent(extraction, store));
+}
+
+function recentSourcePreviews(store: ResearchWorkStore): AgentVisibleEntityPreview[] {
+  return store.objects.canonicalSources
+    .slice(-8)
+    .map((source) => entityPreviewForAgent(source, store));
+}
+
+function claimLinkSupportBlockedResult(input: {
+  run: RunRecord;
+  timestamp: string;
+  message: string;
+  store: ResearchWorkStore;
+  query?: Record<string, unknown>;
+  sourceId?: string | null;
+  nextHints?: string[];
+}): AgentToolResult {
+  return makeAgentToolResult({
+    run: input.run,
+    action: "claim.link_support",
+    timestamp: input.timestamp,
+    status: "blocked",
+    readOnly: false,
+    message: `${input.message} ${supportLinkCaution()}`,
+    collection: "citations",
+    query: input.query,
+    items: recentClaimPreviews(input.store),
+    related: [
+      ...recentEvidenceCellPreviews(input.store, input.sourceId),
+      ...recentExtractionPreviews(input.store, input.sourceId),
+      ...(input.sourceId === undefined || input.sourceId === null ? recentSourcePreviews(input.store) : [])
+    ].slice(0, 24),
+    nextHints: input.nextHints ?? ["workspace.list", "workspace.read", "evidence.create_cell", "claim.link_support", "claim.patch"]
+  });
+}
+
+function extractionQualityWarnings(extraction: WorkStoreExtraction, existingForSource: WorkStoreExtraction[]): string[] {
+  const record = extraction.extraction;
+  const populatedStructuredFields = [
+    record.architecture,
+    record.toolsAndMemory,
+    record.planningStyle,
+    record.evaluationSetup,
+    ...record.successSignals,
+    ...record.failureModes,
+    ...record.limitations,
+    ...record.evidenceNotes
+  ].filter((value) => compactPreviewText(value).length > 0);
+  const warnings: string[] = [];
+
+  if (populatedStructuredFields.length <= 1) {
+    warnings.push("Most structured extraction fields are empty.");
+  }
+
+  const instructionLike = [
+    record.problemSetting,
+    ...record.supportedClaims.map((claim) => claim.claim)
+  ].some((text) => /\b(create|add|persist|fill|extract|structured extraction|comparison matrix|future claims|later claims)\b/i.test(text));
+  if (instructionLike) {
+    warnings.push("Some extraction text looks like an instruction or task description rather than source-derived content.");
+  }
+
+  if (existingForSource.length > 0) {
+    warnings.push(`${existingForSource.length} extraction record(s) already exist for this source.`);
+  }
+
+  return warnings;
+}
+
+function evidenceCellQualityWarnings(cell: WorkStoreEvidenceCell): string[] {
+  const valueText = compactPreviewText(cell.value, 700);
+  const warnings: string[] = [];
+
+  if (/\b(create|add|persist|fill|extract|comparison matrix|future claims|later claims)\b/i.test(valueText)) {
+    warnings.push("Evidence-cell value looks like an instruction or task description rather than source-derived evidence.");
+  }
+
+  if (valueText.length < 40) {
+    warnings.push("Evidence-cell value is very short.");
+  }
+
+  return warnings;
+}
+
 function repairWorkspaceCitationsFromClaimSources(input: {
   run: RunRecord;
   now: string;
@@ -1577,7 +1915,7 @@ function paperExtractionFromToolInput(input: {
   now: string;
   decision: ResearchActionDecision;
   store: ResearchWorkStore;
-}): { extraction: WorkStoreEntity; source: WorkStoreCanonicalSource } | null {
+}): { extraction: WorkStoreExtraction; source: WorkStoreCanonicalSource } | null {
   const entity = input.decision.inputs.workStore?.entity ?? {};
   const source = knownSourceFromToolInput({
     store: input.store,
@@ -1965,6 +2303,119 @@ async function executeGuidanceToolAction(input: {
       totalCount: result.count,
       items: result.items.map(guidancePreviewForAgent),
       nextHints: ["guidance.read", "workspace.search", "source.search", "claim.create"]
+    })
+  };
+}
+
+async function executeNotebookToolAction(input: {
+  run: RunRecord;
+  now: () => string;
+  decision: ResearchActionDecision;
+  store: ResearchWorkStore;
+}): Promise<WorkspaceToolExecutionResult> {
+  if (input.decision.action !== "notebook.read" && input.decision.action !== "notebook.patch") {
+    return {
+      handled: false,
+      store: input.store,
+      message: null
+    };
+  }
+
+  const timestamp = input.now();
+  const args = input.decision.inputs.workStore ?? defaultWorkStoreArgs();
+
+  if (input.decision.action === "notebook.read") {
+    const message = `Notebook read: ${input.store.notebook.tasks.length} task(s), ${input.store.notebook.definitionOfDone.length} definition-of-done item(s).`;
+    return {
+      handled: true,
+      store: input.store,
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp,
+        readOnly: true,
+        message,
+        collection: "notebook",
+        count: 1,
+        totalCount: 1,
+        entity: notebookPreviewForAgent(input.store.notebook),
+        items: input.store.notebook.tasks.slice(0, 30).map((task): AgentVisibleEntityPreview => ({
+          id: task.id,
+          kind: "notebookTask",
+          title: task.title,
+          status: task.status,
+          snippet: compactPreviewText(task.notes ?? "", 260),
+          sourceIds: task.linkedSourceIds.slice(0, 12),
+          claimIds: task.linkedClaimIds.slice(0, 12),
+          sectionIds: task.linkedSectionIds.slice(0, 12),
+          fields: {
+            linkedExtractionIds: task.linkedExtractionIds.slice(0, 12),
+            linkedEvidenceCellIds: task.linkedEvidenceCellIds.slice(0, 12),
+            linkedArtifactPaths: task.linkedArtifactPaths.slice(0, 12)
+          }
+        })),
+        nextHints: ["notebook.patch", "workspace.list", "workspace.read"]
+      })
+    };
+  }
+
+  const entity = {
+    ...args.changes,
+    ...args.entity
+  };
+  const unsafePaths = collectUnsafeNotebookArtifactPaths({ run: input.run, entity });
+  if (unsafePaths.length > 0) {
+    const message = `Notebook patch blocked because artifact link path validation failed: ${unsafePaths.slice(0, 3).join(" | ")}`;
+    return {
+      handled: true,
+      store: input.store,
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp,
+        status: "blocked",
+        readOnly: false,
+        message,
+        collection: "notebook",
+        entity: notebookPreviewForAgent(input.store.notebook),
+        nextHints: ["notebook.read", "notebook.patch"]
+      })
+    };
+  }
+
+  const notebook = patchNotebook({
+    run: input.run,
+    store: input.store,
+    nowText: timestamp,
+    entity
+  });
+  const nextStore = {
+    ...input.store,
+    notebook
+  };
+  await writeResearchWorkStore(nextStore);
+  const message = `Notebook patched: ${notebook.tasks.length} task(s), current focus ${notebook.currentFocus ?? "unset"}.`;
+  return {
+    handled: true,
+    store: nextStore,
+    message,
+    result: makeAgentToolResult({
+      run: input.run,
+      action: input.decision.action,
+      timestamp,
+      readOnly: false,
+      message,
+      collection: "notebook",
+      count: 1,
+      totalCount: 1,
+      entity: notebookPreviewForAgent(notebook),
+      stateDelta: {
+        notebooksPatched: 1,
+        notebookTasks: notebook.tasks.length
+      },
+      nextHints: ["notebook.read", "workspace.list", "source.search"]
     })
   };
 }
@@ -2377,10 +2828,10 @@ async function executeResearchObjectToolAction(input: {
           status: "noop",
           readOnly: false,
           message,
-          collection: "workItems",
+          collection: "criticReviews",
           count: 0,
-          totalCount: input.store.objects.workItems.length,
-          nextHints: ["work_item.create", "workspace.read", "check.run"]
+          totalCount: 0,
+          nextHints: ["workspace.read", "work_item.create", "check.run"]
         })
       };
     }
@@ -2417,14 +2868,12 @@ async function executeResearchObjectToolAction(input: {
       references,
       manuscriptChecks: checks
     });
-    const workItems = workItemsFromCriticReports(input.run, [review], nowText);
-    const nextStore = upsertResearchWorkStoreEntities(input.store, workItems, nowText);
-    await writeResearchWorkStore(nextStore);
     await writeJsonArtifact(criticReviewArtifactPath(input.run, stage), review);
-    const message = `Critic review ${stage} persisted ${workItems.length} work item(s); readiness ${review.readiness}.`;
+    const blockingObjections = review.objections.filter((objection) => objection.severity === "blocking").length;
+    const message = `Critic review ${stage} persisted as feedback only; readiness ${review.readiness}, ${blockingObjections} blocking objection(s).`;
     return {
       handled: true,
-      store: nextStore,
+      store: input.store,
       message,
       result: makeAgentToolResult({
         run: input.run,
@@ -2432,16 +2881,30 @@ async function executeResearchObjectToolAction(input: {
         timestamp: nowText,
         readOnly: false,
         message,
-        collection: "workItems",
-        count: workItems.length,
-        totalCount: nextStore.objects.workItems.length,
-        items: workItems.map((item) => entityPreviewForAgent(item, nextStore)),
+        collection: "criticReviews",
+        count: 1,
+        totalCount: 1,
+        items: review.objections.slice(0, 12).map((objection, index): AgentVisibleEntityPreview => ({
+          id: `${review.stage}-critic-objection-${index + 1}`,
+          kind: "criticObjection",
+          title: `${objection.severity} objection`,
+          text: objection.message,
+          snippet: compactPreviewText(objection.suggestedRevision ?? ""),
+          sourceIds: objection.affectedPaperIds.slice(0, 12),
+          claimIds: objection.affectedClaimIds.slice(0, 12),
+          fields: {
+            target: objection.target,
+            severity: objection.severity,
+            suggestedRevision: compactPreviewText(objection.suggestedRevision ?? "")
+          }
+        })),
         stateDelta: {
-          criticWorkItemsCreated: workItems.length
+          criticReviewsCreated: 1,
+          criticBlockingObjections: blockingObjections
         },
         nextHints: review.readiness === "pass"
           ? ["release.verify", "workspace.status"]
-          : ["workspace.read", "work_item.patch", "claim.patch", "source.search"]
+          : ["workspace.read", "work_item.create", "claim.patch", "source.search"]
       })
     };
   }
@@ -2675,52 +3138,83 @@ async function executeResearchObjectToolAction(input: {
   }
 
   if (input.decision.action === "claim.link_support") {
-    const claimId = args.entityId;
-    const evidenceCellId = stringInput(args.entity.evidenceCellId, stringArrayInput(args.entity.evidenceCellIds, 1)[0] ?? "");
+    const link = args.link ?? defaultWorkStoreArgs().link;
+    const claimCandidates = stringCandidates(
+      args.entityId,
+      args.entity.claimId,
+      args.entity.claim_id,
+      args.entity.claimIds,
+      link?.fromCollection === "claims" ? link.fromId : null,
+      link?.toCollection === "claims" ? link.toId : null
+    );
+    const resolvedClaim = resolveClaimReference(input.store, claimCandidates);
+    const claimId = resolvedClaim?.id ?? null;
+    const evidenceCellId = stringInput(
+      args.entity.evidenceCellId
+        ?? stringArrayInput(args.entity.evidenceCellIds, 1)[0]
+        ?? (link?.toCollection === "evidenceCells" ? link.toId : null)
+        ?? (link?.fromCollection === "evidenceCells" ? link.fromId : null),
+      ""
+    );
     const evidenceCell = evidenceCellId.length === 0
       ? null
       : readResearchWorkStoreEntity<WorkStoreEvidenceCell>(input.store, "evidenceCells", evidenceCellId);
     const sourceIds = uniqueStrings([
       ...input.decision.inputs.paperIds,
+      stringInput(args.entity.paperId, ""),
       ...stringArrayInput(args.entity.sourceIds, 20),
+      link?.toCollection === "canonicalSources" || link?.toCollection === "sources" ? link.toId : null,
+      link?.fromCollection === "canonicalSources" || link?.fromCollection === "sources" ? link.fromId : null,
       evidenceCell?.sourceId ?? null
     ]);
     const sourceId = stringInput(args.entity.sourceId, sourceIds[0] ?? "");
-    if (claimId === null || sourceId.length === 0) {
-      const message = "Claim support link skipped because claim id or source id was missing.";
+    const resolvedSourceId = sourceId.length > 0
+      ? sourceId
+      : evidenceCell?.sourceId ?? "";
+    if (claimId === null || resolvedSourceId.length === 0) {
+      const missing = [
+        claimId === null ? "claimId" : null,
+        resolvedSourceId.length === 0 ? "sourceId or evidenceCellId" : null
+      ].filter((item): item is string => item !== null);
+      const message = `claim.link_support blocked because ${missing.join(" and ")} ${missing.length === 1 ? "is" : "are"} missing or could not be resolved.`;
       return {
         handled: true,
         store: input.store,
         message,
-        result: makeAgentToolResult({
+        result: claimLinkSupportBlockedResult({
           run: input.run,
-          action: input.decision.action,
           timestamp: nowText,
-          status: "noop",
-          readOnly: false,
           message,
-          collection: "citations",
-          nextHints: ["workspace.list", "workspace.read", "claim.create"]
+          store: input.store,
+          query: {
+            missing,
+            claimCandidates,
+            sourceCandidates: sourceIds,
+            evidenceCellId: evidenceCellId || null
+          }
         })
       };
     }
-    const claim = readResearchWorkStoreEntity<WorkStoreClaim>(input.store, "claims", claimId);
+    const claim = resolvedClaim ?? readResearchWorkStoreEntity<WorkStoreClaim>(input.store, "claims", claimId);
     if (claim === null) {
-      const message = `Claim support link skipped because claim ${claimId} was not found.`;
+      const message = `claim.link_support blocked because claim ${claimId} was not found.`;
       return {
         handled: true,
         store: input.store,
         message,
-        result: makeAgentToolResult({
+        result: claimLinkSupportBlockedResult({
           run: input.run,
-          action: input.decision.action,
           timestamp: nowText,
-          status: "noop",
-          readOnly: false,
           message,
-          collection: "claims",
-          query: { entityId: claimId },
-          nextHints: ["workspace.search", "claim.create"]
+          store: input.store,
+          sourceId: resolvedSourceId,
+          query: {
+            claimId,
+            claimCandidates,
+            sourceId: resolvedSourceId,
+            evidenceCellId: evidenceCellId || null
+          },
+          nextHints: ["workspace.search", "claim.create", "claim.link_support"]
         })
       };
     }
@@ -2730,7 +3224,7 @@ async function executeResearchObjectToolAction(input: {
       now: nowText,
       store: input.store,
       claimId,
-      sourceId,
+      sourceId: resolvedSourceId,
       evidenceCellId: evidenceCell?.id ?? (evidenceCellId.length === 0 ? null : evidenceCellId),
       sectionIds,
       entity: args.entity,
@@ -2738,25 +3232,25 @@ async function executeResearchObjectToolAction(input: {
       relation: "supports"
     });
     if (citation === null) {
-      const message = `Claim support link skipped because claim ${claimId} or evidence cell ${evidenceCellId || "(auto)"} was not available.`;
+      const message = evidenceCellId.length > 0 && evidenceCell === null
+        ? `claim.link_support blocked because evidence cell ${evidenceCellId} was not found.`
+        : `claim.link_support blocked because source ${resolvedSourceId} has no existing evidence cell that can support claim ${claimId}.`;
       return {
         handled: true,
         store: input.store,
         message,
-        result: makeAgentToolResult({
+        result: claimLinkSupportBlockedResult({
           run: input.run,
-          action: input.decision.action,
           timestamp: nowText,
-          status: "noop",
-          readOnly: false,
           message,
-          collection: "citations",
+          store: input.store,
+          sourceId: resolvedSourceId,
           query: {
             claimId,
-            sourceId,
+            sourceId: resolvedSourceId,
             evidenceCellId: evidenceCellId || null
           },
-          nextHints: ["workspace.list", "evidence.create_cell", "claim.create"]
+          nextHints: ["workspace.list", "workspace.read", "evidence.create_cell", "claim.link_support"]
         })
       };
     }
@@ -2830,13 +3324,21 @@ async function executeResearchObjectToolAction(input: {
           collection: "extractions",
           count: 0,
           totalCount: input.store.objects.extractions.length,
+          items: recentSourcePreviews(input.store),
           nextHints: ["workspace.list", "source.search", "source.merge"]
         })
       };
     }
+    const existingExtractionsForSource = input.store.objects.extractions.filter((extraction) => (
+      sourceEquivalentIds(input.store, extractionResult.source.id).includes(extraction.sourceId)
+    ));
+    const warnings = extractionQualityWarnings(extractionResult.extraction, existingExtractionsForSource);
     const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, extractionResult.extraction, nowText);
     await writeResearchWorkStore(nextStore);
-    const message = `Extraction created for source ${extractionResult.source.title}.`;
+    const message = [
+      `Extraction created for source ${extractionResult.source.title}.`,
+      ...warnings.map((warning) => `Diagnostic: ${warning}`)
+    ].join(" ");
     return {
       handled: true,
       store: nextStore,
@@ -2851,10 +3353,17 @@ async function executeResearchObjectToolAction(input: {
         count: 1,
         totalCount: nextStore.objects.extractions.length,
         entity: entityPreviewForAgent(extractionResult.extraction, nextStore),
+        related: [
+          entityPreviewForAgent(extractionResult.source, nextStore),
+          ...existingExtractionsForSource.slice(-4).map((extraction) => entityPreviewForAgent(extraction, input.store))
+        ],
         stateDelta: {
-          extractionsCreated: 1
+          extractionsCreated: 1,
+          extractionDiagnostics: warnings.length
         },
-        nextHints: ["evidence.create_cell", "workspace.read", "claim.create"]
+        nextHints: warnings.length > 0
+          ? ["workspace.read", "extraction.create", "evidence.create_cell"]
+          : ["evidence.create_cell", "workspace.read", "claim.create"]
       })
     };
   }
@@ -2867,6 +3376,11 @@ async function executeResearchObjectToolAction(input: {
       store: input.store
     });
     if (cell === null) {
+      const requestedSource = knownSourceFromToolInput({
+        store: input.store,
+        decision: input.decision,
+        entity: args.entity
+      });
       const message = "Evidence cell create blocked because it requires a known source id and an existing extraction for that source.";
       return {
         handled: true,
@@ -2882,13 +3396,26 @@ async function executeResearchObjectToolAction(input: {
           collection: "evidenceCells",
           count: 0,
           totalCount: input.store.objects.evidenceCells.length,
+          items: requestedSource === null ? recentSourcePreviews(input.store) : [entityPreviewForAgent(requestedSource, input.store)],
+          related: recentExtractionPreviews(input.store, requestedSource?.id ?? null),
+          query: {
+            sourceId: requestedSource?.id ?? null,
+            extractionId: stringInput(args.entity.extractionId, "") || null,
+            required: ["known sourceId", "existing extraction for that source"]
+          },
           nextHints: ["extraction.create", "workspace.list", "workspace.read"]
         })
       };
     }
+    const warnings = evidenceCellQualityWarnings(cell);
+    const source = canonicalSourceForId(input.store, cell.sourceId);
+    const extraction = readResearchWorkStoreEntity<WorkStoreExtraction>(input.store, "extractions", cell.extractionId);
     const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, cell, nowText);
     await writeResearchWorkStore(nextStore);
-    const message = `Evidence cell created ${cell.id}.`;
+    const message = [
+      `Evidence cell created ${cell.id}.`,
+      ...warnings.map((warning) => `Diagnostic: ${warning}`)
+    ].join(" ");
     return {
       handled: true,
       store: nextStore,
@@ -2903,10 +3430,17 @@ async function executeResearchObjectToolAction(input: {
         count: 1,
         totalCount: nextStore.objects.evidenceCells.length,
         entity: entityPreviewForAgent(cell, nextStore),
+        related: [
+          ...(source === null ? [] : [entityPreviewForAgent(source, nextStore)]),
+          ...(extraction === null ? [] : [entityPreviewForAgent(extraction, nextStore)])
+        ],
         stateDelta: {
-          evidenceCellsCreated: 1
+          evidenceCellsCreated: 1,
+          evidenceCellDiagnostics: warnings.length
         },
-        nextHints: ["claim.create", "claim.link_support", "evidence.matrix_view"]
+        nextHints: warnings.length > 0
+          ? ["workspace.read", "evidence.create_cell", "claim.link_support"]
+          : ["claim.create", "claim.link_support", "evidence.matrix_view"]
       })
     };
   }
@@ -3147,12 +3681,12 @@ async function executeResearchObjectToolAction(input: {
         },
         nextHints: hardFailures.length > 0
           ? ["workspace.read", "claim.link_support", "section.link_claim"]
-          : ["manuscript.release", "critic.review"]
+          : ["manuscript.finalize", "critic.review"]
       })
     };
   }
 
-  if (input.decision.action === "manuscript.release") {
+  if (input.decision.action === "manuscript.finalize") {
     const references = referencesFromWorkStore(input.run, input.store);
     const checkBundle = workspaceManuscriptChecks({
       run: input.run,
@@ -3174,13 +3708,13 @@ async function executeResearchObjectToolAction(input: {
     await writeJsonArtifact(input.run.artifacts.paperJsonPath, paper);
 
     if (hardFailures.length > 0) {
-      const message = `Manuscript release is not ready: ${hardFailures.length} hard invariant repair item(s) remain.`;
+      const message = `Manuscript finalization is not ready: ${hardFailures.length} hard invariant repair item(s) remain.`;
       await writeFile(
         input.run.artifacts.paperPath,
         [
           "# Review Paper",
           "",
-          "Manuscript release was explicitly requested, but computable release invariants failed.",
+          "Manuscript finalization was explicitly requested, but computable release invariants failed.",
           "",
           "## Blocking Invariants",
           "",
@@ -3207,7 +3741,7 @@ async function executeResearchObjectToolAction(input: {
           stateDelta: {
             releaseChecksCreated: releaseChecks.length,
             hardInvariantBlockers: hardFailures.length,
-            manuscriptExportsCreated: 0
+            manuscriptFinalized: 0
           },
           nextHints: ["workspace.read", "claim.link_support", "section.link_claim", "release.verify"]
         })
@@ -3216,10 +3750,49 @@ async function executeResearchObjectToolAction(input: {
 
     const markdown = renderWorkspacePaperMarkdown(paper, references);
     await writeFile(input.run.artifacts.paperPath, `${markdown}\n`, "utf8");
-    const message = `Manuscript released from workspace state with ${paper.sections.length} section(s) and ${references.referenceCount} reference(s).`;
+    const completion: ResearchWorkerCompletion = {
+      kind: "manuscript_finalized",
+      artifactPaths: [
+        input.run.artifacts.paperPath,
+        input.run.artifacts.paperJsonPath,
+        input.run.artifacts.referencesPath,
+        input.run.artifacts.manuscriptChecksPath
+      ],
+      finalizedAt: nowText
+    };
+    const finalizedArtifactLinks: ResearchNotebookArtifactLink[] = [
+      { label: "Final paper", path: input.run.artifacts.paperPath, kind: "paper", createdAt: nowText },
+      { label: "Paper JSON", path: input.run.artifacts.paperJsonPath, kind: "paper", createdAt: nowText },
+      { label: "References", path: input.run.artifacts.referencesPath, kind: "references", createdAt: nowText },
+      { label: "Manuscript checks", path: input.run.artifacts.manuscriptChecksPath, kind: "checks", createdAt: nowText }
+    ];
+    const artifactLinks = [...nextStore.notebook.artifactLinks];
+    for (const artifact of finalizedArtifactLinks) {
+      const index = artifactLinks.findIndex((existing) => existing.path === artifact.path);
+      if (index === -1) {
+        artifactLinks.push(artifact);
+      } else {
+        artifactLinks[index] = artifact;
+      }
+    }
+    const completedStore = {
+      ...nextStore,
+      notebook: {
+        ...nextStore.notebook,
+        artifactLinks,
+        updatedAt: nowText
+      },
+      worker: {
+        ...nextStore.worker,
+        completion,
+        updatedAt: nowText
+      }
+    };
+    await writeResearchWorkStore(completedStore);
+    const message = `Manuscript finalized from workspace state with ${paper.sections.length} section(s) and ${references.referenceCount} reference(s).`;
     return {
       handled: true,
-      store: nextStore,
+      store: completedStore,
       message,
       result: makeAgentToolResult({
         run: input.run,
@@ -3242,7 +3815,7 @@ async function executeResearchObjectToolAction(input: {
         stateDelta: {
           releaseChecksCreated: releaseChecks.length,
           hardInvariantBlockers: 0,
-          manuscriptExportsCreated: 1
+          manuscriptFinalized: 1
         },
         nextHints: ["workspace.status"]
       })
@@ -3339,7 +3912,7 @@ async function executeResearchObjectToolAction(input: {
           sectionsChecked: 1,
           workItemsCreated: sectionReady ? 0 : 1
         },
-        nextHints: sectionReady ? ["release.verify", "manuscript.release"] : ["claim.link_support", "section.patch", "workspace.read"]
+        nextHints: sectionReady ? ["release.verify", "manuscript.finalize"] : ["claim.link_support", "section.patch", "workspace.read"]
       })
     };
   }
@@ -3367,6 +3940,11 @@ async function executeWorkspaceToolAction(input: {
   decision: ResearchActionDecision;
   store: ResearchWorkStore;
 }): Promise<WorkspaceToolExecutionResult> {
+  const notebookResult = await executeNotebookToolAction(input);
+  if (notebookResult.handled) {
+    return notebookResult;
+  }
+
   const guidanceResult = await executeGuidanceToolAction(input);
   if (guidanceResult.handled) {
     return guidanceResult;
@@ -3408,19 +3986,23 @@ function sourceSearchReconsiderationReason(input: {
   }
 
   const state = input.session.state();
-  const exhaustedChosenProviders = input.providerIds.filter((providerId) => input.session.isSearchExhausted(providerId, input.queries));
+  const chosenProviderQueryFacts = state.repeatedSearchFacts.filter((fact) => (
+    input.providerIds.includes(fact.providerId)
+    && input.queries.length > 0
+    && fact.queries.join("\u0000") === input.queries.join("\u0000")
+  ));
   const reasons = [
     state.canonicalMergeCompleted
-      ? "Canonical source records are already available; searching again will discard the current canonical source view unless a specific gap requires it."
+      ? "Canonical source records are already available; another source.search will refresh the source runtime view."
       : null,
     state.mergeReadiness.ready
       ? state.mergeReadiness.reason
       : null,
-    exhaustedChosenProviders.length > 0
-      ? `Chosen provider/query targets have already been low-yield: ${exhaustedChosenProviders.join(", ")}.`
+    chosenProviderQueryFacts.length > 0
+      ? `The same provider/query set has already been attempted: ${chosenProviderQueryFacts.map((fact) => `${fact.providerId} ${fact.attempts} attempt(s), last raw ${fact.lastRawCandidates}, last new ${fact.lastNewSources}${fact.lastError === null ? "" : `, last error ${fact.lastError}`}`).join("; ")}.`
       : null,
     state.consecutiveNoProgressSearches >= 2
-      ? `${state.consecutiveNoProgressSearches} consecutive source searches added no new screened sources.`
+      ? `${state.consecutiveNoProgressSearches} consecutive source.search actions added 0 new screened sources.`
       : null
   ].filter((reason): reason is string => reason !== null);
 
@@ -3428,7 +4010,7 @@ function sourceSearchReconsiderationReason(input: {
     return null;
   }
 
-  const recommended = "Use this as advisory context only: you may retry deliberately, change provider/query, or choose another source/workspace tool.";
+  const recommended = "These are execution facts only; decide the meaning yourself and choose the next tool action.";
 
   return `${reasons.join(" ")} ${recommended}`;
 }
@@ -3687,6 +4269,7 @@ type ModelDrivenSessionOutcome = {
   workStore: ResearchWorkStore;
   gathered: ResearchSourceSnapshot;
   workerStatus: ResearchWorkerStatus;
+  completion: ResearchWorkerCompletion;
   statusReason: string;
   paperReadiness: ManuscriptReadinessState | null;
   nextInternalActions: string[];
@@ -3787,8 +4370,8 @@ function statusDecisionOutcome(input: {
 
   const invalidTerminalRequest = requestedStatus === "externally_blocked"
     || requestedStatus === "needs_user_decision"
-    || requestedStatus === "release_ready"
-    || requestedStatus === "paused";
+    || requestedStatus === "paused"
+    || /\b(ready|complete|completed|done|finalized)\b/i.test(requestedStatus);
   const diagnosticActions = nextInternalActions.length > 0
     ? nextInternalActions
     : diagnosticNextActions;
@@ -3840,9 +4423,9 @@ function checkpointDiagnosticNextActions(input: {
     : ["Continue with the next machine-actionable research tool."];
 }
 
-function releaseSucceeded(result: AgentToolResult | null | undefined): boolean {
+function finalizationSucceeded(result: AgentToolResult | null | undefined): boolean {
   return result?.status !== "blocked"
-    && result?.stateDelta?.manuscriptExportsCreated === 1
+    && result?.stateDelta?.manuscriptFinalized === 1
     && result.stateDelta.hardInvariantBlockers === 0;
 }
 
@@ -3921,6 +4504,7 @@ async function runModelDrivenResearchSession(input: {
           workStore,
           gathered: await sourceSession.result(),
           workerStatus: outcome.workerStatus,
+          completion: workStore.worker.completion,
           statusReason: outcome.statusReason,
           paperReadiness: safeManuscriptReadiness(workStore.worker.paperReadiness),
           nextInternalActions: outcome.nextInternalActions,
@@ -3945,14 +4529,14 @@ async function runModelDrivenResearchSession(input: {
         await appendEvent(input.run, input.now, "memory", workspaceExecution.message);
         await appendStdout(input.run, `Research tool observation: ${workspaceExecution.message}`);
       }
-      if (decision.action === "manuscript.release" && releaseSucceeded(workspaceExecution.result)) {
+      if (decision.action === "manuscript.finalize" && finalizationSucceeded(workspaceExecution.result)) {
         const result = workspaceExecution.result;
         await input.agent.record({
           actor: "runtime",
-          phase: "release",
-          action: "manuscript.release_result",
+          phase: "finalization",
+          action: "manuscript.finalize_result",
           status: "completed",
-          summary: result?.message ?? "Manuscript release completed.",
+          summary: result?.message ?? "Manuscript finalization completed.",
           artifactPaths: [
             input.run.artifacts.paperPath,
             input.run.artifacts.paperJsonPath,
@@ -3962,7 +4546,7 @@ async function runModelDrivenResearchSession(input: {
           counts: {
             releaseChecksCreated: result?.stateDelta?.releaseChecksCreated ?? 0,
             hardInvariantBlockers: result?.stateDelta?.hardInvariantBlockers ?? 0,
-            manuscriptExportsCreated: result?.stateDelta?.manuscriptExportsCreated ?? 1
+            manuscriptFinalized: result?.stateDelta?.manuscriptFinalized ?? 1
           },
           metadata: {
             toolAction: result?.action ?? decision.action,
@@ -3976,8 +4560,9 @@ async function runModelDrivenResearchSession(input: {
         return {
           workStore,
           gathered: await sourceSession.result(),
-          workerStatus: "release_ready",
-          statusReason: "Manuscript release completed after explicit model-selected release action and hard invariant checks passed.",
+          workerStatus: "working",
+          completion: workStore.worker.completion,
+          statusReason: "Manuscript finalized after explicit model-selected manuscript.finalize action and hard invariant checks passed.",
           paperReadiness: "ready_for_revision",
           nextInternalActions: [],
           userBlockers: [],
@@ -4226,7 +4811,7 @@ async function chooseResearchActionStrict(input: {
 }
 
 function isExternalBlockerMessage(text: string): boolean {
-  return /\b(credential|api key|quota|rate limit|paywall|permission|access denied|forbidden|unauthori[sz]ed|license|tdm|missing required|provider outage|required external resource)\b/i.test(text);
+  return /\b(credential|api key|quota|rate limit|paywall|permission|access denied|forbidden|unauthori[sz]ed|license|tdm|missing required|provider outage|provider unavailable|service unavailable|server unavailable|server busy|overloaded|try again later|required external resource)\b/i.test(text);
 }
 
 function pendingArtifactStatus(run: RunRecord, artifactKind: string, timestamp: string): ArtifactStatus {
@@ -4385,7 +4970,7 @@ function workspacePaperArtifact(input: {
       ? "This manuscript export is rendered from durable workspace sections, claims, support links, and references."
       : "No manuscript sections are available for export yet.",
     reviewType: "narrative_review",
-    structureRationale: "This artifact is an explicit manuscript.release export from workspace state, not a hidden synthesis step.",
+    structureRationale: "This artifact is an explicit manuscript.finalize export from workspace state, not a hidden synthesis step.",
     scientificRoles: ["workspace_export"],
     sections,
     claims,
@@ -4545,7 +5130,7 @@ function workspaceManuscriptChecks(input: {
       message: unsupportedClaims.length === 0 && claims.length > 0
         ? "All manuscript claims have durable evidence-backed support links."
         : claims.length === 0
-          ? "No claims exist yet; the researcher should create and support claims before manuscript release."
+          ? "No claims exist yet; the researcher should create and support claims before manuscript finalization."
           : [
             `Unsupported claim count: ${unsupportedClaims.length}.`,
             ...supportIssueMessages.slice(0, 4)
@@ -4715,7 +5300,8 @@ function failedArtifactStatus(
 async function writeFailureDiagnostics(
   run: RunRecord,
   timestamp: string,
-  error: unknown
+  error: unknown,
+  input: { externalBlocker?: boolean } = {}
 ): Promise<void> {
   const paperStatus = failedArtifactStatus(run, "paper", timestamp, error);
   const checkStatus = failedArtifactStatus(run, "manuscript-checks", timestamp, error);
@@ -4727,10 +5313,12 @@ async function writeFailureDiagnostics(
     [
       "# Review Paper",
       "",
-      "No review-paper draft was produced.",
-      "",
-      `Run failed during ${run.stage}.`,
-      `Reason: ${errorMessage(error)}`
+	      "No review-paper draft was produced.",
+	      "",
+	      input.externalBlocker
+	        ? `Run paused on an external blocker during ${run.stage}.`
+	        : `Run failed during ${run.stage}.`,
+	      `Reason: ${errorMessage(error)}`
     ].join("\n"),
     "utf8"
   );
@@ -5054,9 +5642,10 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     await writeResearchWorkerState({
       ...previousWorkerState,
       projectRoot: run.projectRoot,
-      brief: run.brief,
-      status: sessionOutcome.workerStatus,
-      activeRunId: null,
+	      brief: run.brief,
+	      status: sessionOutcome.workerStatus,
+	      completion: sessionOutcome.completion,
+	      activeRunId: null,
       lastRunId: run.id,
       segmentCount: (previousWorkerState.segmentCount ?? 0) + 1,
       updatedAt: completedAt,
@@ -5096,9 +5685,9 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       run,
       `Research work store checkpointed: ${workStoreSummary.canonicalSources} canonical sources, ${workStoreSummary.sources} source candidates, ${workStoreSummary.openWorkItems} open work items.`
     );
-    await agent.record({
-      phase: "checkpoint",
-      action: sessionOutcome.workerStatus === "release_ready" ? "release_ready" : "checkpoint_workspace_state",
+	    await agent.record({
+	      phase: "checkpoint",
+	      action: sessionOutcome.completion?.kind === "manuscript_finalized" ? "manuscript_finalized" : "checkpoint_workspace_state",
       status: "completed",
       summary: sessionOutcome.statusReason,
       artifactPaths: [
@@ -5118,25 +5707,27 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     run.finishedAt = completedAt;
     run.job.exitCode = 0;
     run.job.signal = null;
-    run.workerPid = null;
-    run.status = "completed";
-    run.statusMessage = sessionOutcome.workerStatus === "release_ready"
-        ? "Research objective reached release-ready after explicit model-selected release."
-        : `Worker segment exited normally after model-selected action(s); research objective status is ${sessionOutcome.workerStatus}.`;
+	    run.workerPid = null;
+	    run.status = "completed";
+	    run.statusMessage = sessionOutcome.completion?.kind === "manuscript_finalized"
+	        ? "Research manuscript finalized after explicit model-selected manuscript.finalize."
+	        : `Worker segment exited normally after model-selected action(s); research objective status is ${sessionOutcome.workerStatus}.`;
     await store.save(run);
     await appendEvent(run, now, "run", run.statusMessage);
     return 0;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const externalBlocker = isExternalBlockerMessage(message);
-    const finishedAt = now();
-    run.job.finishedAt = now();
-    run.finishedAt = finishedAt;
-    run.job.exitCode = 1;
-    run.job.signal = null;
-    run.workerPid = null;
-    run.status = "failed";
-    run.statusMessage = `Run worker failed: ${message}`;
+	    const finishedAt = now();
+	    run.job.finishedAt = now();
+	    run.finishedAt = finishedAt;
+	    run.job.exitCode = externalBlocker ? 0 : 1;
+	    run.job.signal = null;
+	    run.workerPid = null;
+	    run.status = externalBlocker ? "completed" : "failed";
+	    run.statusMessage = externalBlocker
+	      ? `Autonomous research worker hit an external blocker: ${message}`
+	      : `Run worker failed: ${message}`;
     await store.save(run);
     await writeResearchWorkerState({
       ...previousWorkerState,
@@ -5155,12 +5746,18 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       userBlockers: externalBlocker ? [message] : [],
       evidence: previousWorkerState.evidence,
       critic: previousWorkerState.critic
-    });
-    await writeFailureDiagnostics(run, finishedAt, error);
-    await appendStderr(run, run.statusMessage);
-    await appendTrace(run, now, run.statusMessage);
-    await appendEvent(run, now, "stderr", run.statusMessage);
-    await appendEvent(run, now, "run", run.statusMessage);
-    return 1;
-  }
+	    });
+	    await writeFailureDiagnostics(run, finishedAt, error, { externalBlocker });
+	    if (externalBlocker) {
+	      await appendStdout(run, run.statusMessage);
+	    } else {
+	      await appendStderr(run, run.statusMessage);
+	    }
+	    await appendTrace(run, now, run.statusMessage);
+	    if (!externalBlocker) {
+	      await appendEvent(run, now, "stderr", run.statusMessage);
+	    }
+	    await appendEvent(run, now, "run", run.statusMessage);
+	    return externalBlocker ? 0 : 1;
+	  }
 }

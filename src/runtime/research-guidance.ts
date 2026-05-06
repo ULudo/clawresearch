@@ -76,7 +76,7 @@ const builtinGuidance: ResearchGuidanceObject[] = [
       "Use source.merge after useful candidates exist; merge deduplicates and creates canonical source records.",
       "Use source.resolve_access with known canonical source ids when access/full-text status matters.",
       "Use source.select_evidence with known source ids when you intentionally choose the current evidence set.",
-      "A failed or low-yield search is an observation; inspect sourceState and choose another explicit action if machine-actionable work remains."
+      "Search result counts and provider errors are observations; inspect sourceState and choose another explicit action if machine-actionable work remains."
     ].join("\n"),
     tags: ["tool guide", "sources", "search", "merge", "access", "evidence set"],
     advisory: true,
@@ -135,11 +135,11 @@ const builtinGuidance: ResearchGuidanceObject[] = [
     id: "tool-guide.release",
     kind: "ToolGuide",
     title: "Release verification and export tools",
-    summary: "Use release.verify and manuscript.release only when the workspace appears ready for mechanical release checks.",
+    summary: "Use release.verify and manuscript.finalize only when the workspace appears ready for mechanical release checks.",
     body: [
       "Use release.verify to run computable invariant checks: known ids, support links, citations, references, and sections.",
       "If release.verify reports failures, treat them as repair observations and continue with explicit workspace, claim, section, or source tools.",
-      "Use manuscript.release to export paper.md from workspace state only after hard invariants pass.",
+      "Use manuscript.finalize to export paper.md from workspace state only after hard invariants pass.",
       "Release failure means not ready; it is not a reason to stop unless the remaining issue is truly external or requires a user decision."
     ].join("\n"),
     tags: ["tool guide", "release", "verify", "paper", "references", "not ready"],

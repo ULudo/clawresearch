@@ -169,7 +169,7 @@ function buildInstruction(request: ProjectAssistantRequest): string {
     "You are helping inside an active local research project after or during runs.",
     "Be aware of the current run and the persistent autonomous research-worker state.",
     "Answer the user's latest question directly using the supplied project context.",
-    "If the user asks what happened, summarize what the latest run segment did, what the result was, and whether remaining work is internal, release-ready, or externally blocked.",
+    "If the user asks what happened, summarize what the latest run segment did, what the result was, and whether remaining work is internal, finalized, or externally blocked.",
     "Do not pretend an implementation or experiment succeeded if the run only produced source notes, checks, or status diagnostics.",
     "If the user asks to modify the topic, research question, research direction, success criterion, or otherwise change the project scope, update the structured brief accordingly.",
     "If the user changes the brief materially, mention that the current saved results may reflect the older brief and that running `/go` again is appropriate.",

@@ -111,6 +111,68 @@ test("research work store supports create, query, read, and patch operations", a
   }
 });
 
+test("research work store persists the living research notebook with task and artifact links", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-work-store-notebook-"));
+
+  try {
+    const now = "2026-01-01T00:00:00.000Z";
+    const store = createResearchWorkStore({
+      projectRoot,
+      now,
+      brief: {
+        topic: "Research workspaces",
+        researchQuestion: "How should the notebook keep the model oriented?",
+        researchDirection: "Persist objective, definition of done, readiness, and task links.",
+        successCriterion: "Notebook is canonical SQLite state, not a legacy artifact."
+      }
+    });
+    const nextStore = {
+      ...store,
+      notebook: {
+        ...store.notebook,
+        objective: "Produce a professional literature review from the workspace.",
+        definitionOfDone: ["Extract selected sources", "Support central claims", "Finalize paper.md"],
+        currentFocus: "Extract selected sources",
+        readiness: "Not sufficient because no claims are linked yet.",
+        tasks: [{
+          id: "task-extract",
+          title: "Extract selected sources",
+          status: "in_progress" as const,
+          notes: "Start with the strongest selected papers.",
+          linkedSourceIds: ["source-1"],
+          linkedExtractionIds: ["extraction-1"],
+          linkedEvidenceCellIds: ["evidence-1"],
+          linkedClaimIds: ["claim-1"],
+          linkedSectionIds: ["section-1"],
+          linkedArtifactPaths: ["research-notes/extraction-plan.md"]
+        }],
+        notes: ["Keep the model focused on research sufficiency, not exportability."],
+        artifactLinks: [{
+          label: "Final paper",
+          path: "paper.md",
+          kind: "paper" as const,
+          createdAt: now
+        }],
+        updatedAt: now
+      }
+    };
+
+    await writeResearchWorkStore(nextStore);
+    const loaded = await loadResearchWorkStore({
+      projectRoot,
+      now: "2026-01-01T00:00:01.000Z"
+    });
+
+    assert.equal(loaded.notebook.objective, "Produce a professional literature review from the workspace.");
+    assert.deepEqual(loaded.notebook.definitionOfDone, ["Extract selected sources", "Support central claims", "Finalize paper.md"]);
+    assert.equal(loaded.notebook.tasks[0]?.status, "in_progress");
+    assert.deepEqual(loaded.notebook.tasks[0]?.linkedEvidenceCellIds, ["evidence-1"]);
+    assert.equal(loaded.notebook.artifactLinks[0]?.path, "paper.md");
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("work store semantic search returns no items instead of unrelated fallback matches", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-work-store-no-semantic-fallback-"));
 
@@ -247,6 +309,7 @@ test("architecture contract: needs_user_decision requires explicit options and a
           successCriterion: "Do not mark needs_user_decision from a vague status string."
         },
         status: "needs_user_decision",
+        completion: null,
         activeRunId: null,
         lastRunId: "run-user-decision-contract",
         segmentCount: 1,

@@ -155,8 +155,9 @@ test("docs flag prints concept files", async () => {
   const code = await main(["--docs"], { writer: sink.writer });
 
   assert.equal(code, 0);
-  assert.match(sink.output, /docs\/reset-development-concept\.md/);
+  assert.match(sink.output, /README\.md/);
   assert.match(sink.output, /docs\/autonomous-research-agent-literature-synthesis\.md/);
+  assert.doesNotMatch(sink.output, /reset-development-concept/);
 });
 
 test("help flag prints interactive usage and slash commands", async () => {

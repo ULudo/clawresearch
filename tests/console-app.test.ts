@@ -484,7 +484,7 @@ test("handleGoCommand blocks unresolved user decisions but resumes after the bri
     session.brief.topic = "Autonomous research agents";
     session.brief.researchQuestion = "What makes autonomous research-agent literature reviews reliable?";
     session.brief.researchDirection = "Evaluate source selection, evidence synthesis, and critique loops.";
-    session.brief.successCriterion = "Produce a release-ready review paper or explain external blockers.";
+    session.brief.successCriterion = "Finalize a review paper or explain external blockers.";
     session.intake.readiness = "ready";
     await sessionStore.save(session);
 

@@ -1,126 +1,125 @@
 # ClawResearch
 
-ClawResearch is being restarted from a much smaller and cleaner foundation.
+ClawResearch is a local research lab for an LLM researcher.
 
-The repo now reflects a deliberate reset:
+The model is responsible for research judgment: planning, source selection, evidence interpretation, synthesis, writing, revision, and deciding what to do next. ClawResearch provides the lab infrastructure around that researcher: terminal UX, provider tools, persistent workspace memory, provenance, citation integrity, checkpoints, diagnostics, and final exports.
 
-> a console-first autonomous research runtime for empirical computational research
+The current product is console-first and project-local. Run it inside the directory you want to research. ClawResearch stores its workspace under `.clawresearch/` in that project.
 
-The first implementation taught us a lot, but it grew too quickly into a platform-heavy prototype. That prototype has been removed from the main code path so the next iteration can start from a clear, debuggable base.
+## Current Architecture
 
-## What This Repo Is Now
+ClawResearch is built around a model-driven research session:
 
-This repository is intentionally minimal.
+1. The runtime observes the current workspace state.
+2. The model chooses one explicit tool action.
+3. The runtime validates the action mechanically.
+4. The runtime executes exactly that action.
+5. The result is persisted and returned as an observation.
+6. The model observes again and chooses the next action.
 
-It currently contains:
+There is no hidden research pipeline. Source search, extraction, evidence creation, claim work, section writing, critic review, release checks, notebook updates, and manuscript finalization are model-selected tools.
 
-- the revised concept documents
-- a small TypeScript package scaffold
-- a single `clawresearch` entrypoint
-- a clean starting point for the rewrite on the workstation
+The runtime may block hard invariant violations such as broken IDs, malformed schemas, missing citation links, invalid references, provider access failures, or export failures. It should not secretly decide semantic research questions such as whether a source is relevant, whether a claim is useful, or whether a research direction is promising.
 
-It intentionally does **not** currently contain:
+## Core Concepts
 
-- the previous API layer
-- the previous daemon stack
-- the previous approval and policy machinery
-- the previous adapter and orchestration prototype
-
-## Start Here
-
-Read these documents in order:
-
-1. `docs/reset-development-concept.md`
-2. `docs/autonomous-research-agent-literature-synthesis.md`
-3. `docs/archive/product-design-v1.md` only if you want to inspect the discarded direction
-
-## Reset Direction
-
-The next implementation should be:
-
-- console-first
-- current-directory-as-project
-- persistent across restarts
-- capable of detached long-running jobs
-- findings-memory-driven
-- model- and backend-agnostic
-
-The next implementation should **not** begin as:
-
-- a web product
-- a research operations platform
-- a governance-first system
-- a large multi-component orchestration framework
-
-## Language Decision
-
-The new reset uses TypeScript rather than Python.
-
-That is a product decision, not a claim about what language the agent later researches in.
-
-The reasoning is simple:
-
-- ClawResearch is primarily a local agent product and runtime harness
-- terminal UX, streaming, process orchestration, and packaging are central
-- the actual research workloads can remain polyglot and run through external tools, shells, repos, Docker, or Python environments
-- the harness language should optimize for product flow and developer velocity, not for mirroring the language of downstream experiment code
+- **Researcher model**: the main LLM that owns planning, tool choice, synthesis, and writing.
+- **Research lab runtime**: the TypeScript/Node.js application that provides tools, storage, validation, logs, and exports.
+- **Workspace database**: the canonical project memory in `.clawresearch/workspace.sqlite`.
+- **Living notebook**: a compact model-owned project notebook stored in the workspace, containing the objective, definition of done, current tasks, readiness notes, and artifact links.
+- **Critic**: an optional reviewer call that can provide feedback when the researcher chooses `critic.review`; critic feedback is visible to the model and does not silently rewrite the workspace.
+- **Manuscript finalization**: the explicit `manuscript.finalize` tool writes `paper.md` only after mechanical export invariants pass.
 
 ## Quickstart
 
+Install dependencies:
+
 ```bash
 npm install
+```
+
+Start the terminal UI in the current project:
+
+```bash
 npm run dev
 ```
 
-That starts the TUI runtime in the current directory. The default experience is now a small terminal UI with:
-
-- a checklist-style provider selector for scholarly discovery, publisher/full-text, OA-helper, general-web, and local-context sources
-- a persistent chat transcript instead of a one-line prompt loop
-- a bottom chat field for talking to the intake consultant
-- a pinned brief/status view while the conversation evolves
-
-If you want the old line-oriented console for scripting, pipes, or debugging, use:
+Use the plain line-oriented console for scripts, pipes, or debugging:
 
 ```bash
 npm run dev -- --plain
 ```
 
-The startup chat still behaves like a real research intake conversation, backed by a local Ollama model by default.
+Use a different project root:
+
+```bash
+npm run dev -- --project-root /path/to/project
+```
+
+Build and run compiled JavaScript:
+
+```bash
+npm run build
+node dist/src/cli.js
+```
+
+Show CLI help:
+
+```bash
+npm run dev -- --help
+```
+
+## Model Setup
+
+The default local path uses Ollama.
 
 Current local-model assumption:
 
 - `ollama` is installed and running locally
-- `qwen3:14b` is available
+- a capable model is available, for example `qwen3:14b` or a stronger local model
 
-You can override the default model with:
+Override the Ollama model:
 
 ```bash
 CLAWRESEARCH_OLLAMA_MODEL=your-model-name npm run dev
 ```
 
-The intake chat gradually clarifies and captures:
+Hosted model and provider support is being developed through the same backend abstraction. The architecture expects stronger models to perform better because the runtime intentionally does not replace the researcher with hidden deterministic research logic.
+
+## Console Flow
+
+On startup, ClawResearch opens a research intake conversation. The intake chat helps clarify:
 
 - topic
 - research question
 - research direction
 - success criterion
 
-If the consultant proposes a concrete first-pass brief, `/go` can accept that draft directly, start or resume the autonomous research worker, stream live progress in the terminal, and persist checkpoints under the project runtime directory. A run is one execution segment of the persistent worker, not the whole research process.
+When the brief is good enough, run:
 
-After a run exists, the chat shifts from pure intake into a project-aware research assistant. It can summarize the latest run, explain the current blocker or next step, answer questions about the active project state, and react to requested changes in the research direction. When you materially change the brief after a saved run, ClawResearch will keep the updated brief and nudge you to run `/go` again so the artifacts catch up with the new direction.
+```text
+/go
+```
 
-Useful slash commands inside the console:
+`/go` starts or resumes the autonomous research worker for the current objective. The worker continues from the project workspace and streams readable progress events in the terminal.
+
+Useful slash commands:
 
 - `/help`
 - `/status`
 - `/sources`
+- `/paper`
+- `/paper open`
+- `/paper checks`
 - `/go`
 - `/pause`
 - `/resume`
 - `/quit`
 - `/exit`
 
-New projects now open a source-selection checklist at startup. The default selection is:
+## Source Providers
+
+New projects open a provider checklist at startup. The default selection is:
 
 - scholarly discovery: `openalex`, `crossref`, `dblp`, `pubmed`
 - publisher / full text: `arxiv`, `europe-pmc`
@@ -128,77 +127,45 @@ New projects now open a source-selection checklist at startup. The default selec
 - general web: none
 - local context: on
 
-Inside the TUI, use:
+Inside the TUI:
 
-- `Up` and `Down` to move through the provider list
-- `Space` or `Enter` to toggle a provider
-- `S` to save the current selection
-- `Esc` to leave the overlay
+- `Up` and `Down` move through providers
+- `Space` or `Enter` toggles a provider
+- `S` saves the current selection
+- `Esc` leaves the overlay
 
-`/sources` reopens the checklist later. The text commands `scholarly: ...`, `publishers: ...`, `helpers: ...`, `web: ...`, `local: off`, and `sources: ...` are accepted in plain mode, with `sources: ...` kept as a compatibility alias for scholarly discovery.
+`/sources` reopens the checklist later.
 
-The second wave of credentialed providers is selectable now too, but stays off by default:
+Credentialed providers are selectable but off by default, including:
 
 - scholarly discovery: `elsevier`
 - publisher / full text: `ieee-xplore`, `springer-nature`
 
-After provider selection, ClawResearch asks for the actual key, token, or email directly. It stores those credentials only in the local runtime folder and mirrors the expected environment-variable names in the background when the runtime starts. For example:
+When credentials are needed, ClawResearch asks for the key, token, or email directly and stores it only in the local runtime folder.
+
+## Workspace And Files
+
+Project runtime state lives in:
 
 ```text
-openalex api key [optional; Enter leaves it unset]:
-unpaywall email [required; Enter leaves it unavailable]:
-elsevier institution token [optional; Enter leaves it unset]:
+.clawresearch/
 ```
 
-Minimal runtime state is persisted locally in:
+Important project-level files:
 
-```text
-.clawresearch/session.json
-```
+- `.clawresearch/session.json`: console session state
+- `.clawresearch/project-config.json`: source and runtime configuration
+- `.clawresearch/credentials.json`: local credentials
+- `.clawresearch/workspace.sqlite`: canonical research workspace
+- `.clawresearch/console-transcript.log`: raw console transcript
 
-Run artifacts are intentionally small. The canonical workspace is the database; run files are logs, checkpoints, and explicit exports such as:
-
-- `agent-state.json`
-- `agent-steps.jsonl`
-- `events.jsonl`
-- `sources.json`
-- `review-protocol.json`
-- `paper.md`
-- `paper.json`
-- `references.json`
-- `manuscript-checks.json`
-
-Project-level literature configuration is persisted in:
-
-```text
-.clawresearch/project-config.json
-```
-
-Project-level credentials are persisted locally in:
-
-```text
-.clawresearch/credentials.json
-```
-
-The runtime keeps the canonical agent-accessible research workspace in:
-
-```text
-.clawresearch/workspace.sqlite
-```
-
-The console also keeps a raw debug transcript of the interaction in:
-
-```text
-.clawresearch/console-transcript.log
-```
-
-Detached runs are stored under:
+Detached run logs live under:
 
 ```text
 .clawresearch/runs/<run-id>/
 ```
 
-Each run keeps a small set of debuggable local artifacts, including:
+Run directories are for observability and exports. Typical files include:
 
 - `run.json`
 - `trace.log`
@@ -207,97 +174,96 @@ Each run keeps a small set of debuggable local artifacts, including:
 - `stderr.log`
 - `agent-state.json`
 - `agent-steps.jsonl`
-- `brief.json`
-- `plan.json`
-- `sources.json`
-- `review-protocol.json`
-- `review-protocol.md`
 - `paper.md`
 - `paper.json`
 - `references.json`
 - `manuscript-checks.json`
-- `summary.md`
 
-`events.jsonl` is the structured event stream the console watches while a run is active. It currently emits small, readable steps such as model decisions, tool executions, checkpoints, and terminal `run` updates.
+The canonical research state is the SQLite workspace, not the run artifacts.
 
-The project-level work store is the durable research memory. It stores typed research objects such as:
+The workspace stores durable research objects such as:
 
+- living research notebook
+- protocols
 - provider runs
 - sources and canonical sources
 - screening decisions and full-text/access records
 - extractions and evidence cells
-- claims, citations, and manuscript sections
-- critic/check work items
+- claims, support links, citations, and manuscript sections
+- researcher-authored work items
 - release checks and worker state
 
-Each object has a stable id and enough metadata for the agent to query, read, patch, and extend the research state without treating per-run artifacts as long-term memory.
+## Model-Facing Tools
 
-The detached worker runs a model-driven research session. Each step observes the workspace, asks the model for one explicit tool action, validates the action mechanically, executes exactly that action, persists the result, and observes again. Source search, extraction, evidence creation, claim work, section writing, critic review, checks, and release are model-selected tools, not hidden workflow phases.
+The production action surface is intentionally explicit. The model can inspect and mutate the workspace through tools such as:
 
-`sources.json` is an optional run checkpoint for source-tool observations. The durable source, evidence, claim, section, work-item, citation, and release state lives in `workspace.sqlite`.
+- `notebook.read`
+- `notebook.patch`
+- `workspace.list`
+- `workspace.search`
+- `workspace.read`
+- `workspace.create`
+- `workspace.patch`
+- `protocol.create_or_revise`
+- `source.search`
+- `source.merge`
+- `source.resolve_access`
+- `source.select_evidence`
+- `extraction.create`
+- `evidence.create_cell`
+- `evidence.matrix_view`
+- `claim.create`
+- `claim.patch`
+- `claim.link_support`
+- `claim.check_support`
+- `section.create`
+- `section.patch`
+- `section.link_claim`
+- `critic.review`
+- `release.verify`
+- `manuscript.finalize`
+- `workspace.status`
+- `guidance.search`
+- `guidance.read`
+- `guidance.recommend`
 
-After dependencies are installed, the runtime can also be built and run as compiled JavaScript:
+Tool failures are returned as observations with repair context. For example, if `claim.link_support` is missing a claim ID or evidence cell ID, the runtime returns nearby valid claims, evidence cells, sources, and cautious next hints instead of silently creating a bad citation.
 
-```bash
-npm run build
-node dist/src/cli.js
-```
+## Final Paper
 
-If you want a quick reminder of the reset contract from the terminal, run:
-
-```bash
-clawresearch --docs
-```
-
-Example startup flow:
+The main publishable export is:
 
 ```text
-$ clawresearch
-ClawResearch
-============
-Project root: /path/to/project
-Runtime state: .clawresearch/session.json
-
-Startup research chat is ready.
-This chat should feel like a stakeholder handing a research project to a capable research partner.
-
-What research problem should I investigate for this project, and what kind of outcome would make the work useful to you?
-clawresearch> We want to study sparse graph training for noisy datasets.
-clawresearch> The main question is whether a cheaper sampling strategy can preserve accuracy.
-clawresearch> Start from a reproducible baseline and compare a couple of bounded ablations.
-clawresearch> Success means staying within 1% of baseline accuracy while cutting runtime by 20%.
-clawresearch> /go
-run        Research run started.
-run        Run id: run-...
-run        Status: queued
-run        Trace: .clawresearch/runs/run-.../trace.log
-run        Events: .clawresearch/runs/run-.../events.jsonl
-run        Agent state: .clawresearch/runs/run-.../agent-state.json
-run        Agent steps: .clawresearch/runs/run-.../agent-steps.jsonl
-run        Plan: .clawresearch/runs/run-.../plan.json
-run        Sources: .clawresearch/runs/run-.../sources.json
-run        Workspace db: .clawresearch/workspace.sqlite
-watch      Streaming live run activity from .clawresearch/runs/run-.../events.jsonl.
-agent      The researcher selected source.search.
-tool       source.search returned 6 source previews.
-agent      The researcher selected source.merge.
-tool       source.merge persisted 4 canonical sources.
-done       Run run-... completed.
+paper.md
 ```
 
-## Repo Layout
+It is generated by `manuscript.finalize` from workspace sections, claims, support links, citations, and references. Mechanical checks must pass before the file is written. Research sufficiency remains a model judgment supported by the notebook, work items, critic feedback, and explicit release checks.
 
-- `docs/` contains the current source-of-truth concept
-- `src/` contains the reset TypeScript scaffold
-- `tests/` contains only minimal smoke coverage for the new baseline
+## Development
 
-## Development Intent
+Run type checks:
 
-The recommended workflow is:
+```bash
+npm run check
+```
 
-1. pull this repo on the stronger workstation
-2. install dependencies with Node.js 20+
-3. use the reset concept as the implementation contract
-4. rebuild the runtime incrementally from the console inward
+Run the full test suite:
 
-This keeps the repo honest: small concept, small scaffold, clean next steps.
+```bash
+npm test
+```
+
+The test suite includes architecture-contract tests that guard against reintroducing hidden research workflows, legacy action aliases, runtime-generated recovery queries, fallback evidence selection, and automatic source-to-manuscript phase behavior.
+
+## Design Direction
+
+ClawResearch should stay small and task-driven:
+
+- keep the workspace canonical
+- keep tools explicit and observable
+- keep semantic judgment with the model
+- keep runtime validation mechanical
+- keep guidance visible and overridable
+- delete obsolete pipeline-style code instead of preserving it for compatibility
+
+The goal is a research IDE for the model: simple enough to operate, durable enough to support long research projects, and strict enough to preserve provenance and export integrity.

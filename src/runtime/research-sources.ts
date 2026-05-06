@@ -179,8 +179,6 @@ export type ProviderAuthSnapshot = {
 
 export type QueryExpansionSource =
   | "plan"
-  | "brief_entity"
-  | "brief_task"
   | "memory"
   | "literature"
   | "rejected_candidate"
@@ -391,6 +389,7 @@ export type SourceActionHistoryEntry = {
   action: SourceToolObservation["action"];
   providerId: SourceProviderId | null;
   queryKey: string | null;
+  queries: string[];
   rawCandidates: number;
   newSources: number;
   error: string | null;
@@ -456,7 +455,7 @@ function paperToolPreview(paper: CanonicalPaper): NonNullable<SourceToolObservat
 export type SourceToolState = {
   availableProviderIds: SourceProviderId[];
   attemptedProviderIds: SourceProviderId[];
-  candidateQueries: string[];
+  modelPlannedQueries: string[];
   rawSources: number;
   screenedSources: number;
   backgroundSources: number;
@@ -469,8 +468,14 @@ export type SourceToolState = {
   newSourcesLastAction: number;
   consecutiveNoProgressSearches: number;
   providerYields: SourceProviderYield[];
-  exhaustedProviderIds: SourceProviderId[];
-  repeatedSearchWarnings: string[];
+  repeatedSearchFacts: Array<{
+    providerId: SourceProviderId;
+    queries: string[];
+    attempts: number;
+    lastRawCandidates: number;
+    lastNewSources: number;
+    lastError: string | null;
+  }>;
   mergeReadiness: SourceMergeReadiness;
   recentActions: SourceActionHistoryEntry[];
   lastObservation: string | null;
@@ -720,35 +725,6 @@ function queryCandidate(
   return normalized.length === 0
     ? []
     : [{ query: normalized, source, reason }];
-}
-
-function queryTokenSequence(text: string | null | undefined): string[] {
-  if (typeof text !== "string") {
-    return [];
-  }
-
-  return matchTokens(text)
-    .filter((token) => !stopTokens.has(token))
-    .filter((token) => token.length >= 3 || preservedShortTokens.has(token));
-}
-
-function keyPhrasesFromText(text: string | null | undefined, limit: number): string[] {
-  const tokens = queryTokenSequence(text);
-  const phrases: string[] = [];
-
-  if (tokens.length === 0) {
-    return [];
-  }
-
-  for (const size of [4, 3, 2]) {
-    for (let index = 0; index <= tokens.length - size; index += 1) {
-      phrases.push(tokens.slice(index, index + size).join(" "));
-    }
-  }
-
-  phrases.push(tokens.slice(0, Math.min(6, tokens.length)).join(" "));
-
-  return uniqueStrings(phrases).slice(0, limit);
 }
 
 function overlapScore(text: string, referenceTokens: Set<string>): number {
@@ -1173,165 +1149,20 @@ function buildRetrievalBudget(request: ResearchSourceToolRequest): RetrievalBudg
   };
 }
 
-function primaryQueryAnchor(request: ResearchSourceToolRequest): string {
-  const primaryTopic = request.brief.topic ?? request.plan.objective;
-  return compactQueryPhrase(primaryTopic, 8) ?? primaryTopic;
-}
-
-function combinedResearchText(request: ResearchSourceToolRequest): string {
-  return [
-    request.brief.topic,
-    request.brief.researchQuestion,
-    request.brief.researchDirection,
-    request.brief.successCriterion,
-    request.plan.objective,
-    request.plan.rationale,
-    ...request.plan.searchQueries,
-    ...request.plan.localFocus
-  ].filter((value): value is string => typeof value === "string").join(" ");
-}
-
-function buildBriefEntityQueryCandidates(request: ResearchSourceToolRequest): QueryExpansionCandidate[] {
-  const fields = [
-    request.brief.topic,
-    request.brief.researchQuestion,
-    request.brief.researchDirection,
-    request.brief.successCriterion,
-    request.plan.objective,
-    ...request.plan.localFocus
-  ];
-
-  return uniqueStrings(fields.flatMap((field) => keyPhrasesFromText(field, 4)))
-    .slice(0, 18)
-    .flatMap((phrase) => queryCandidate(phrase, "brief_entity", "Extracted from the research brief or local focus."));
-}
-
-function buildBriefTaskQueryCandidates(request: ResearchSourceToolRequest): QueryExpansionCandidate[] {
-  const text = combinedResearchText(request);
-  const anchor = primaryQueryAnchor(request);
-  const candidates: QueryExpansionCandidate[] = [];
-
-  if (/\b(literature|review|survey|synthesis|mapping|taxonomy|related work|prior work)\b/i.test(text)) {
-    candidates.push(...queryCandidate(`${anchor} literature review`, "brief_task", "The brief asks for literature synthesis or prior-work mapping."));
-    candidates.push(...queryCandidate(`${anchor} survey`, "brief_task", "The brief asks for a review-style evidence base."));
-  }
-
-  if (/\b(compare|comparison|taxonomy|trade-?off|versus|vs\b)\b/i.test(text)) {
-    candidates.push(...queryCandidate(`${anchor} comparison`, "brief_task", "The brief asks for comparison across approaches or evidence."));
-  }
-
-  if (/\b(evaluation|evaluate|benchmark|metric|baseline|evidence|success criteria?)\b/i.test(text)) {
-    candidates.push(...queryCandidate(`${anchor} evaluation`, "brief_task", "The brief asks for evaluation evidence or success criteria."));
-    candidates.push(...queryCandidate(`${anchor} benchmark`, "brief_task", "The brief asks for evaluable or benchmarkable evidence."));
-  }
-
-  if (/\b(implementation|architecture|system|workflow|tooling|runtime)\b/i.test(text)) {
-    candidates.push(...queryCandidate(`${anchor} architecture`, "brief_task", "The brief asks about systems, implementation, or architecture."));
-  }
-
-  if (/\b(workforce|staffing|employment|jobs?|labor|labour|displacement|worker|workers)\b/i.test(text)) {
-    candidates.push(...queryCandidate(`${anchor} workforce`, "brief_task", "The brief asks about workforce or labor effects."));
-    candidates.push(...queryCandidate(`${anchor} staffing`, "brief_task", "The brief asks about staffing patterns."));
-  }
-
-  return uniqueQueryCandidates(candidates);
-}
-
 function buildQueryExpansionCandidates(
-  request: ResearchSourceToolRequest,
-  domain: SourceProviderDomain | "mixed",
-  recoveryCandidates: QueryExpansionCandidate[] = []
+  request: ResearchSourceToolRequest
 ): QueryExpansionCandidate[] {
-  void domain;
   const explicitQueries = uniqueStrings(request.plan.searchQueries);
-  const topicPhrase = primaryQueryAnchor(request);
-  const focusQueries = uniqueStrings([
-    compactQueryPhrase(request.brief.researchQuestion, 7),
-    compactQueryPhrase(request.brief.researchDirection, 7),
-    compactQueryPhrase(request.brief.successCriterion, 7),
-    ...request.plan.localFocus.map((focus) => compactQueryPhrase(focus, 5)),
-    ...explicitQueries.map((query) => compactQueryPhrase(query, 8))
-  ]);
-  const literatureHints = request.literatureContext?.queryHints ?? [];
-  const memoryHints = request.memoryContext.queryHints ?? [];
   const planCandidates = explicitQueries.flatMap((query) => queryCandidate(query, "plan", "Model-planned retrieval query."));
-  const explicitRevisionQueries = uniqueStrings([
-    ...(request.revisionQueries ?? []),
-    ...(request.recoveryQueries ?? [])
-  ]);
-  const explicitRecoveryCandidates = explicitRevisionQueries
-    .flatMap((query) => queryCandidate(query, "revision", "Requested by the autonomous evidence-revision loop."));
-  const briefTaskCandidates = [
-    ...focusQueries.map((query) => `${topicPhrase} ${query}`),
-    topicPhrase
-  ].flatMap((query) => queryCandidate(query, "brief_task", "Derived from the scoped brief and research plan."));
-  const memoryCandidates = memoryHints.flatMap((hint) => queryCandidate(
-    `${topicPhrase} ${compactQueryPhrase(hint, 6) ?? hint}`,
-    "memory",
-    "Project research journal query hint."
-  ));
-  const literatureCandidates = literatureHints.flatMap((hint) => queryCandidate(
-    `${topicPhrase} ${compactQueryPhrase(hint, 6) ?? hint}`,
-    "literature",
-    "Canonical paper library query hint."
-  ));
-
-  return uniqueQueryCandidates([
-    ...planCandidates,
-    ...buildBriefEntityQueryCandidates(request),
-    ...briefTaskCandidates,
-    ...memoryCandidates,
-    ...literatureCandidates,
-    ...explicitRecoveryCandidates,
-    ...recoveryCandidates
-  ]);
-}
-
-function interleaveQueryCandidates(candidates: QueryExpansionCandidate[], limit: number): QueryExpansionCandidate[] {
-  const sourceOrder: QueryExpansionSource[] = [
-    "plan",
-    "brief_entity",
-    "brief_task",
-    "memory",
-    "literature",
-    "rejected_candidate",
-    "revision",
-    "recovery"
-  ];
-  const buckets = sourceOrder.map((source) => candidates.filter((candidate) => candidate.source === source));
-  const seen = new Set<string>();
-  const result: QueryExpansionCandidate[] = [];
-  const maxBucketLength = Math.max(0, ...buckets.map((bucket) => bucket.length));
-
-  for (let index = 0; index < maxBucketLength && result.length < limit; index += 1) {
-    for (const bucket of buckets) {
-      const candidate = bucket[index];
-      const key = candidate === undefined ? null : normalizeQueryKey(candidate.query);
-
-      if (candidate === undefined || key === null || seen.has(key)) {
-        continue;
-      }
-
-      seen.add(key);
-      result.push(candidate);
-
-      if (result.length >= limit) {
-        break;
-      }
-    }
-  }
-
-  return result;
+  return uniqueQueryCandidates(planCandidates);
 }
 
 function buildQueryPlan(
   request: ResearchSourceToolRequest,
-  domain: SourceProviderDomain | "mixed",
-  budget: RetrievalBudget,
-  recoveryCandidates: QueryExpansionCandidate[] = []
+  budget: RetrievalBudget
 ): { candidates: QueryExpansionCandidate[]; selected: QueryExpansionCandidate[]; queries: string[] } {
-  const candidates = buildQueryExpansionCandidates(request, domain, recoveryCandidates);
-  const selected = interleaveQueryCandidates(candidates, budget.maxQueries);
+  const candidates = buildQueryExpansionCandidates(request);
+  const selected = candidates.slice(0, budget.maxQueries);
 
   return {
     candidates,
@@ -3936,13 +3767,12 @@ export class SourceToolRuntime {
   private readonly seenScholarlySourceIds = new Set<string>();
   private readonly backgroundSources: ResearchSource[] = [];
   private readonly attemptedProviderIds = new Set<SourceProviderId>();
-  private readonly exhaustedProviderQueryKeys = new Set<string>();
   private readonly actionHistory: SourceActionHistoryEntry[] = [];
   private newSourcesLastAction = 0;
   private consecutiveNoProgressSearches = 0;
   private localSources: ResearchSource[] = [];
   private queryPlan: { queries: string[]; candidates: QueryExpansionCandidate[] };
-  private queries: string[];
+  private readonly modelPlannedQueries: string[];
   private canonicalReview: CanonicalReviewState | null = null;
   private readonly resolvedPaperIds = new Set<string>();
   private acceptedScreeningCount = 0;
@@ -3957,9 +3787,9 @@ export class SourceToolRuntime {
     this.domain = classifyDomain(request.brief, request.plan);
     this.routing = routeProviders(this.domain, this.scholarlyProviderIds);
     this.budget = buildRetrievalBudget(request);
-    this.queryPlan = buildQueryPlan(request, this.domain, this.budget);
-    this.queries = this.queryPlan.queries;
-    this.routing.plannedQueries = this.queries;
+    this.queryPlan = buildQueryPlan(request, this.budget);
+    this.modelPlannedQueries = this.queryPlan.queries;
+    this.routing.plannedQueries = this.modelPlannedQueries;
   }
 
   static async create(request: ResearchSourceToolRequest): Promise<SourceToolRuntime> {
@@ -3968,9 +3798,9 @@ export class SourceToolRuntime {
     await emitSourceProgress(request.progress, {
       phase: "setup",
       status: "completed",
-      message: `Prepared source tools with ${session.queries.length} candidate queries across ${session.availableProviderIds().length} available providers.`,
+      message: `Prepared source tools with ${session.modelPlannedQueries.length} model-planned quer${session.modelPlannedQueries.length === 1 ? "y" : "ies"} across ${session.availableProviderIds().length} available providers.`,
       counts: {
-        queries: session.queries.length,
+        queries: session.modelPlannedQueries.length,
         discoveryProviders: session.routing.discoveryProviderIds.length,
         maxAccessResolutions: session.budget.maxAccessResolutions
       }
@@ -3987,19 +3817,12 @@ export class SourceToolRuntime {
 
   state(): SourceToolState {
     const providerYields = this.providerYields();
-    const exhaustedProviderIds = providerYields
-      .filter((item) => (
-        item.calls >= 2
-        && item.newSources === 0
-        && (item.rawCandidates > 0 || item.errors > 0)
-      ) || item.errors >= 2)
-      .map((item) => item.providerId);
-    const repeatedSearchWarnings = this.repeatedSearchWarnings(providerYields, exhaustedProviderIds);
+    const repeatedSearchFacts = this.repeatedSearchFacts();
 
     return {
       availableProviderIds: this.availableProviderIds(),
       attemptedProviderIds: [...this.attemptedProviderIds],
-      candidateQueries: this.queries.slice(0, 16),
+      modelPlannedQueries: this.modelPlannedQueries.slice(0, 16),
       rawSources: this.localSources.length + this.scholarlySources.length + this.backgroundSources.length,
       screenedSources: this.scholarlySources.length,
       backgroundSources: this.backgroundSources.length,
@@ -4012,9 +3835,8 @@ export class SourceToolRuntime {
       newSourcesLastAction: this.newSourcesLastAction,
       consecutiveNoProgressSearches: this.consecutiveNoProgressSearches,
       providerYields,
-      exhaustedProviderIds,
-      repeatedSearchWarnings,
-      mergeReadiness: this.mergeReadiness(repeatedSearchWarnings),
+      repeatedSearchFacts,
+      mergeReadiness: this.mergeReadiness(),
       recentActions: this.actionHistory.slice(-8),
       lastObservation: this.lastObservation
     };
@@ -4046,29 +3868,31 @@ export class SourceToolRuntime {
     return [...byProvider.values()];
   }
 
-  private repeatedSearchWarnings(providerYields: SourceProviderYield[], exhaustedProviderIds: SourceProviderId[]): string[] {
-    const warnings: string[] = [];
+  private repeatedSearchFacts(): SourceToolState["repeatedSearchFacts"] {
+    const facts = new Map<string, SourceToolState["repeatedSearchFacts"][number]>();
 
-    if (this.consecutiveNoProgressSearches >= 2) {
-      warnings.push(`${this.consecutiveNoProgressSearches} consecutive source searches added no new screened scholarly sources.`);
+    for (const entry of this.actionHistory) {
+      if (entry.action !== "source.search" || entry.providerId === null || entry.queryKey === null) {
+        continue;
+      }
+
+      const previous = facts.get(entry.queryKey);
+      facts.set(entry.queryKey, {
+        providerId: entry.providerId,
+        queries: entry.queries,
+        attempts: (previous?.attempts ?? 0) + 1,
+        lastRawCandidates: entry.rawCandidates,
+        lastNewSources: entry.newSources,
+        lastError: entry.error
+      });
     }
 
-    if (exhaustedProviderIds.length > 0) {
-      warnings.push(`Low-yield or failing providers: ${exhaustedProviderIds.join(", ")}.`);
-    }
-
-    const productive = providerYields
-      .filter((item) => item.newSources > 0)
-      .sort((left, right) => right.newSources - left.newSources)
-      .slice(0, 3);
-    if (productive.length > 0) {
-      warnings.push(`Productive providers so far: ${productive.map((item) => `${item.providerId} (${item.newSources})`).join(", ")}.`);
-    }
-
-    return warnings;
+    return [...facts.values()]
+      .filter((entry) => entry.attempts >= 2)
+      .slice(-12);
   }
 
-  private mergeReadiness(warnings: string[]): SourceMergeReadiness {
+  private mergeReadiness(): SourceMergeReadiness {
     if (this.canonicalReview !== null) {
       return {
         ready: false,
@@ -4086,9 +3910,7 @@ export class SourceToolRuntime {
     if (this.scholarlySources.length >= 8 || this.consecutiveNoProgressSearches >= 2) {
       return {
         ready: true,
-        reason: warnings.length > 0
-          ? `${this.scholarlySources.length} screened scholarly sources are available. ${warnings.join(" ")}`
-          : `${this.scholarlySources.length} screened scholarly sources are available for explicit source.merge.`
+        reason: `${this.scholarlySources.length} screened scholarly sources are available for explicit source.merge.`
       };
     }
 
@@ -4129,11 +3951,6 @@ export class SourceToolRuntime {
     };
   }
 
-  isSearchExhausted(providerId: SourceProviderId, queries: string[]): boolean {
-    return this.exhaustedProviderQueryKeys.has(providerQueryKey(providerId, queries))
-      || this.state().exhaustedProviderIds.includes(providerId);
-  }
-
   private recordAction(entry: SourceActionHistoryEntry): void {
     this.actionHistory.push(entry);
     if (this.actionHistory.length > 20) {
@@ -4158,18 +3975,11 @@ export class SourceToolRuntime {
       this.consecutiveNoProgressSearches = 0;
     }
 
-    const matchingAttempts = this.actionHistory
-      .filter((entry) => entry.action === "source.search" && entry.queryKey === queryKey);
-    const previousNoProgressAttempts = matchingAttempts.filter((entry) => entry.newSources === 0 || entry.error !== null).length;
-
-    if ((input.newSources === 0 || input.error !== null) && previousNoProgressAttempts >= 1) {
-      this.exhaustedProviderQueryKeys.add(queryKey);
-    }
-
     this.recordAction({
       action: "source.search",
       providerId: input.providerId,
       queryKey,
+      queries: input.querySet,
       rawCandidates: input.rawCandidates,
       newSources: input.newSources,
       error: input.error,
@@ -4182,6 +3992,7 @@ export class SourceToolRuntime {
       action: observation.action,
       providerId: null,
       queryKey: null,
+      queries: [],
       rawCandidates: observation.counts.rawCandidates ?? 0,
       newSources: 0,
       error: null,
@@ -4228,8 +4039,6 @@ export class SourceToolRuntime {
         }
       };
     }
-    this.queries = uniqueStrings([...this.queries, ...querySet]);
-    this.routing.plannedQueries = this.queries;
     this.attemptedProviderIds.add(providerId);
     if (this.canonicalReview !== null) {
       this.canonicalReview = null;
