@@ -8,36 +8,6 @@ import {
   type ResearchSourceToolRequest,
   type ResearchSourceSnapshot
 } from "../src/runtime/research-sources.js";
-import type { ProjectMemoryContext } from "../src/runtime/memory-store.js";
-
-function emptyMemoryContext(): ProjectMemoryContext {
-  return {
-    available: false,
-    recordCount: 0,
-    countsByType: {
-      claim: 0,
-      finding: 0,
-      question: 0,
-      idea: 0,
-      summary: 0,
-      artifact: 0,
-      direction: 0,
-      hypothesis: 0,
-      method_plan: 0
-    },
-    claims: [],
-    findings: [],
-    questions: [],
-    ideas: [],
-    summaries: [],
-    artifacts: [],
-    directions: [],
-    hypotheses: [],
-    methodPlans: [],
-    queryHints: [],
-    localFileHints: []
-  };
-}
 
 async function runSourceTools(request: ResearchSourceToolRequest): Promise<ResearchSourceSnapshot> {
   const session = await SourceToolRuntime.create(request);
@@ -121,7 +91,6 @@ test("source gathering honors grouped provider selection when only background re
         ],
         localFocus: []
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: [],
       generalWebProviderIds: ["wikipedia"],
       projectFilesEnabled: false

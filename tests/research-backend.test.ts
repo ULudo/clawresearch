@@ -6,7 +6,7 @@ import {
   ResearchBackendError
 } from "../src/runtime/research-backend.js";
 import { RuntimeModelClient, type ModelCredentialState } from "../src/runtime/model-runtime.js";
-import type { ProjectMemoryContext } from "../src/runtime/memory-store.js";
+import type { WorkspacePromptContext } from "../src/runtime/research-work-store.js";
 import type { EvidenceMatrix, PaperExtraction } from "../src/runtime/research-evidence.js";
 
 function extractionForPaper(paperId: string): PaperExtraction {
@@ -65,62 +65,87 @@ function matrixForPaper(paperId: string): EvidenceMatrix {
   };
 }
 
-function emptyMemoryContext(): ProjectMemoryContext {
+function emptyWorkspaceContext(): WorkspacePromptContext {
   return {
     available: true,
-    recordCount: 3,
-    countsByType: {
-      claim: 0,
-      finding: 1,
-      question: 1,
-      idea: 1,
-      summary: 0,
-      artifact: 0,
-      direction: 0,
-      hypothesis: 0,
-      method_plan: 0
+    counts: {
+      providerRuns: 0,
+      sources: 0,
+      canonicalSources: 0,
+      screeningDecisions: 0,
+      fullTextRecords: 0,
+      extractions: 0,
+      evidenceCells: 1,
+      claims: 0,
+      citations: 0,
+      protocols: 0,
+      workItems: 1,
+      openWorkItems: 1,
+      manuscriptSections: 0,
+      releaseChecks: 0
     },
-    claims: [],
-    findings: [
-      {
-        id: "finding-1",
-        title: "Mollifier limitations remain central",
-        text: "Prior work suggests mollifier limitations are the clearest bounded follow-up.",
-        runId: "run-prior",
-        links: [],
-        data: {}
-      }
-    ],
-    questions: [
-      {
-        id: "question-1",
-        title: "Which obstacles limit mollifier methods for the Riemann Hypothesis?",
-        text: "Which obstacles limit mollifier methods for the Riemann Hypothesis?",
-        runId: "run-prior",
-        links: [],
-        data: {}
-      }
-    ],
-    ideas: [
-      {
-        id: "idea-1",
-        title: "Follow the mollifier thread",
-        text: "Use mollifier limitations as the next bounded literature pass.",
-        runId: "run-prior",
-        links: [],
-        data: {}
-      }
-    ],
-    summaries: [],
-    artifacts: [],
-    directions: [],
-    hypotheses: [],
-    methodPlans: [],
-    queryHints: [
-      "Which obstacles limit mollifier methods for the Riemann Hypothesis?",
-      "Follow the mollifier thread"
-    ],
-    localFileHints: []
+	    notebook: {
+	      objective: "Follow the mollifier thread.",
+	      definitionOfDone: ["Explain which obstacles limit mollifier methods."],
+	      currentFocus: "Mollifier limitations remain central.",
+	      readiness: "Not ready; prior workspace evidence says the mollifier limitations thread still needs synthesis.",
+      activeTasks: [{
+        id: "task-mollifier",
+        title: "Synthesize obstacles that limit mollifier methods",
+        status: "todo",
+        linkedSourceIds: [],
+        linkedEvidenceCellIds: ["evidence-mollifier"],
+        linkedClaimIds: [],
+        linkedSectionIds: [],
+        linkedArtifactPaths: []
+	      }],
+	      artifactLinks: [],
+	      diagnostics: {
+	        warningCount: 0,
+	        warnings: [],
+	        taskCount: 1,
+	        activeTaskCount: 1,
+	        readinessRecorded: true,
+	        currentFocusSet: true,
+	        definitionOfDoneAddressed: true,
+	        unlinkedSelectedSourceIds: [],
+	        unlinkedEvidenceCellIds: [],
+	        unlinkedClaimIds: [],
+	        unlinkedSectionIds: [],
+	        staleAfterWorkspaceChange: false,
+	        latestWorkspaceChangeAt: null
+	      }
+	    },
+    recentSources: [],
+    recentExtractions: [],
+    recentEvidenceCells: [{
+      id: "evidence-mollifier",
+      sourceId: "source-mollifier",
+      extractionId: "extraction-mollifier",
+      field: "limitations",
+      value: "Prior workspace evidence suggests mollifier limitations are the clearest bounded follow-up.",
+      confidence: "medium"
+    }],
+    recentClaims: [],
+    recentSections: [],
+    openWorkItems: [{
+      id: "workitem-mollifier",
+      type: "open_question",
+      title: "Which obstacles limit mollifier methods for the Riemann Hypothesis?",
+      severity: "major",
+      suggestedActions: [],
+      targetId: "evidence-mollifier",
+      affectedSourceIds: [],
+      affectedClaimIds: []
+    }],
+    recentReleaseChecks: [],
+    worker: {
+      status: "working",
+      statusReason: "Prior workspace context exists.",
+      nextInternalActions: [],
+      completion: null,
+      lastRunId: "run-prior"
+    }
   };
 }
 
@@ -138,7 +163,7 @@ function modelCredentials(apiKey = "test-openai-key"): ModelCredentialState {
   };
 }
 
-test("planning backend includes project memory context in the prompt it sends to Ollama", async () => {
+test("planning backend includes derived SQLite workspace context in the prompt it sends to Ollama", async () => {
   const originalFetch = globalThis.fetch;
   let capturedPrompt = "";
 
@@ -153,11 +178,24 @@ test("planning backend includes project memory context in the prompt it sends to
         message: {
           content: JSON.stringify({
             researchMode: "literature_synthesis",
-            objective: "Follow prior mollifier limitations work.",
-            rationale: "Project memory already identified the next bounded question.",
-            searchQueries: ["mollifier methods Riemann Hypothesis limitations"],
-            localFocus: ["mollifier methods"]
-          })
+	            objective: "Follow prior mollifier limitations work.",
+	            rationale: "The SQLite workspace already identified the next bounded question.",
+	            searchQueries: ["mollifier methods Riemann Hypothesis limitations"],
+	            localFocus: ["mollifier methods"],
+	            notebookPatch: {
+	              objective: "Follow prior mollifier limitations work.",
+	              definitionOfDone: ["Explain which obstacles limit mollifier methods."],
+	              currentFocus: "Synthesize mollifier limitations.",
+	              readiness: "Not sufficient yet; planning initialized the notebook.",
+	              tasks: [{
+	                id: "task-mollifier-limitations",
+	                title: "Synthesize mollifier limitations",
+	                status: "todo",
+	                notes: "Use prior workspace evidence before new claims.",
+	                linkedEvidenceCellIds: ["evidence-mollifier"]
+	              }]
+	            }
+	          })
         }
       }), {
         status: 200,
@@ -177,11 +215,16 @@ test("planning backend includes project memory context in the prompt it sends to
         successCriterion: "Produce a focused follow-up synthesis."
       },
       localFiles: [],
-      memoryContext: emptyMemoryContext()
+      workspaceContext: emptyWorkspaceContext()
     });
 
-    assert.equal(plan.researchMode, "literature_synthesis");
-    assert.match(capturedPrompt, /Project memory context:/);
+	    assert.equal(plan.researchMode, "literature_synthesis");
+	    assert.equal(plan.notebookPatch?.tasks?.[0]?.id, "task-mollifier-limitations");
+	    assert.equal(plan.notebookPatch?.currentFocus, "Synthesize mollifier limitations.");
+	    assert.match(capturedPrompt, /Workspace context:/);
+	    assert.match(capturedPrompt, /notebookPatch/);
+    assert.doesNotMatch(capturedPrompt, /Project memory context:/);
+    assert.doesNotMatch(capturedPrompt, /"queryHints"|"methodPlans"|"hypotheses"|"directions"|"findings"|"countsByType"/i);
     assert.match(capturedPrompt, /mollifier limitations/i);
     assert.match(capturedPrompt, /Follow the mollifier thread/i);
   } finally {
@@ -235,7 +278,7 @@ test("Ollama backend accumulates streamed JSON chunks instead of relying on one 
         successCriterion: "Return a valid plan."
       },
       localFiles: [],
-      memoryContext: emptyMemoryContext()
+      workspaceContext: emptyWorkspaceContext()
     });
 
     assert.equal(capturedStreamFlag, true);
@@ -599,7 +642,7 @@ test("OpenAI Responses backend classifies overloaded response failures as provid
           successCriterion: "Do not report provider overload as malformed JSON."
         },
         localFiles: [],
-        memoryContext: emptyMemoryContext(),
+        workspaceContext: emptyWorkspaceContext(),
         workerState: null
       }),
       (error: unknown) => {

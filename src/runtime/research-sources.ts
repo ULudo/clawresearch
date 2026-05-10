@@ -15,7 +15,6 @@ import type {
   LiteratureContext
 } from "./literature-store.js";
 import { createLiteratureEntityId } from "./literature-store.js";
-import type { ProjectMemoryContext } from "./memory-store.js";
 import {
   defaultBackgroundProviderIds,
   defaultScholarlyProviderIds,
@@ -178,12 +177,7 @@ export type ProviderAuthSnapshot = {
 };
 
 export type QueryExpansionSource =
-  | "plan"
-  | "memory"
-  | "literature"
-  | "rejected_candidate"
-  | "revision"
-  | "recovery";
+  | "plan";
 
 export type QueryExpansionCandidate = {
   query: string;
@@ -324,7 +318,6 @@ export type ResearchSourceToolRequest = {
   projectRoot: string;
   brief: ResearchBrief;
   plan: ResearchPlan;
-  memoryContext: ProjectMemoryContext;
   literatureContext?: LiteratureContext;
   revisionQueries?: string[];
   recoveryQueries?: string[];
@@ -1118,7 +1111,6 @@ function classifyDomain(brief: ResearchBrief, plan: ResearchPlan): SourceProvide
 
 function buildRetrievalBudget(request: ResearchSourceToolRequest): RetrievalBudget {
   const explicitQueries = uniqueStrings(request.plan.searchQueries);
-  const hintCount = (request.memoryContext.queryHints.length + (request.literatureContext?.queryHints.length ?? 0));
   const focusCount = [
     request.brief.researchQuestion,
     request.brief.researchDirection,
@@ -1132,7 +1124,7 @@ function buildRetrievalBudget(request: ResearchSourceToolRequest): RetrievalBudg
     24,
     Math.max(
       12,
-      explicitQueries.length + focusCount + Math.min(4, hintCount) + (broadTopic ? 4 : 2)
+      explicitQueries.length + focusCount + (broadTopic ? 4 : 2)
     )
   );
 

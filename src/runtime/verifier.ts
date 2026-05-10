@@ -1,4 +1,3 @@
-import { createMemoryRecordId } from "./memory-store.js";
 import type { ResearchClaim } from "./research-backend.js";
 import { createLiteratureEntityId } from "./literature-store.js";
 import type { CanonicalPaper, PaperAccessMode } from "./literature-store.js";
@@ -142,8 +141,19 @@ function sourceRecordId(source: CanonicalPaper): string {
   return createLiteratureEntityId("paper", source.key);
 }
 
+function hashString(text: string): string {
+  let hash = 2166136261;
+
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+
+  return (hash >>> 0).toString(36);
+}
+
 function claimRecordId(claim: ResearchClaim): string {
-  return createMemoryRecordId("claim", claim.claim);
+  return `claim-${hashString(`claim:${claim.claim.replace(/\s+/g, " ").trim()}`)}`;
 }
 
 function toProvenance(source: CanonicalPaper): SourceProvenance {

@@ -261,7 +261,6 @@ export type LiteratureContext = {
   papers: LiteratureContextPaperCard[];
   themes: LiteratureContextThemeCard[];
   notebooks: LiteratureContextNotebookCard[];
-  queryHints: string[];
 };
 
 function normalizeWhitespace(text: string): string {
@@ -958,12 +957,6 @@ export function buildLiteratureContext(
   const rankedNotebooks = [...state.notebooks]
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
     .slice(0, 4);
-  const queryHints = dedupeStrings([
-    ...rankedThemes.flatMap((theme) => [theme.title, ...theme.questionTexts]),
-    ...rankedNotebooks.flatMap((notebook) => notebook.nextQuestions),
-    ...rankedPapers.map((paper) => paper.title)
-  ]).slice(0, 12);
-
   return {
     available: state.paperCount > 0 || state.themeCount > 0 || state.notebookCount > 0,
     paperCount: state.paperCount,
@@ -991,8 +984,7 @@ export function buildLiteratureContext(
       title: notebook.title,
       summary: notebook.summary,
       nextQuestions: notebook.nextQuestions
-    })),
-    queryHints
+    }))
   };
 }
 

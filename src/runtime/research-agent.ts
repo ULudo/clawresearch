@@ -2,6 +2,7 @@ import type { ResearchBrief } from "./session-store.js";
 import type { ResearchPlan } from "./research-backend.js";
 import type { CriticReviewArtifact } from "./research-critic.js";
 import type { ResearchGuidanceContext } from "./research-guidance.js";
+import type { ResearchNotebookDiagnostics } from "./research-work-store.js";
 
 export type ResearchWorkspaceToolName =
   | "protocol.create_or_revise"
@@ -292,8 +293,9 @@ export type ResearchActionRequest = {
         id: string;
         updatedAt: string;
       }>;
-      suggestedLookupTools: string[];
-    };
+	      suggestedLookupTools: string[];
+	      notebookDiagnostics: ResearchNotebookDiagnostics;
+	    };
     worker: {
       status: string;
       completion: {

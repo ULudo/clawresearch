@@ -180,6 +180,7 @@ Run directories are for observability and exports. Typical files include:
 - `manuscript-checks.json`
 
 The canonical research state is the SQLite workspace, not the run artifacts.
+ClawResearch does not maintain a separate `research-journal.json`, `notes.json`, or `memory.json`; project memory is derived from `workspace.sqlite`.
 
 The workspace stores durable research objects such as:
 

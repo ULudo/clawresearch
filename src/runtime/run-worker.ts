@@ -1,19 +1,9 @@
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
-  buildLiteratureContext,
   createLiteratureEntityId,
-  LiteratureStore,
   type CanonicalPaper,
-  type CanonicalPaperInput,
-  type LiteratureNotebookInput,
-  type LiteratureThemeInput,
-  type LiteratureUpsertResult
 } from "./literature-store.js";
-import {
-  buildProjectMemoryContext,
-  MemoryStore
-} from "./memory-store.js";
 import { applyCredentialsToEnvironment, CredentialStore } from "./credential-store.js";
 import {
   authStatesForSelectedProviders,
@@ -91,10 +81,12 @@ import {
 } from "./research-state.js";
 import type { ResearchBrief } from "./session-store.js";
 import {
-  buildLiteratureContextFromWorkStore,
-  buildProjectMemoryContextFromWorkStore,
-  createResearchWorkStoreEntity,
-  loadResearchWorkStore,
+	  buildLiteratureContextFromWorkStore,
+	  buildNotebookDiagnostics,
+	  buildWorkspacePromptContextFromWorkStore,
+	  createResearchWorkStoreEntity,
+	  defaultNotebookReadiness,
+	  loadResearchWorkStore,
   mergeRunSegmentIntoResearchWorkStore,
   patchResearchWorkStoreEntity,
   queryResearchWorkStore,
@@ -107,7 +99,8 @@ import {
   type ResearchWorkerCompletion,
   type ResearchNotebook,
   type ResearchNotebookArtifactLink,
-  type ResearchNotebookTask,
+	  type ResearchNotebookTask,
+	  type ResearchNotebookDiagnostics,
   type WorkStoreCollectionName,
   type WorkStoreCanonicalSource,
   type WorkStoreClaim,
@@ -368,6 +361,7 @@ function workStoreContextForAgent(store: ResearchWorkStore): ResearchActionReque
   const supportReadiness = supportReadinessForWorkspace(store);
   const openWorkItems = store.objects.workItems.filter((item) => item.status === "open");
   const failedReleaseChecks = store.objects.releaseChecks.filter((check) => check.status === "fail");
+  const notebookDiagnostics = buildNotebookDiagnostics(store);
   const sourceAccess = {
     sourceCandidates: store.objects.sources.length,
     canonicalSources: store.objects.canonicalSources.length,
@@ -388,6 +382,7 @@ function workStoreContextForAgent(store: ResearchWorkStore): ResearchActionReque
       failedReleaseChecks: failedReleaseChecks.length,
       releaseCheckBlockers: failedReleaseChecks.filter((check) => check.severity === "blocker").length,
       sourceAccess,
+      notebookDiagnostics,
       recentlyChangedIds: recentlyChangedWorkspaceIds(store),
       suggestedLookupTools: ["workspace.list", "workspace.search", "workspace.read"]
     },
@@ -668,7 +663,53 @@ function patchNotebook(input: {
     notes,
     artifactLinks,
     updatedAt: input.nowText
+	  };
+	}
+
+function notebookPatchFromPlan(plan: ResearchPlan): Record<string, unknown> | null {
+  const patch = plan.notebookPatch;
+  if (patch === undefined || patch === null) {
+    return null;
+  }
+
+  return {
+    ...(patch.objective === undefined ? {} : { objective: patch.objective }),
+    ...(patch.definitionOfDone === undefined ? {} : { definitionOfDone: patch.definitionOfDone }),
+    ...(patch.tasks === undefined ? {} : { tasks: patch.tasks }),
+    ...(patch.currentFocus === undefined ? {} : { currentFocus: patch.currentFocus }),
+    ...(patch.readiness === undefined ? {} : { readiness: patch.readiness }),
+    ...(patch.notes === undefined ? {} : { notes: patch.notes })
   };
+}
+
+async function persistPlanningNotebookPatch(input: {
+  run: RunRecord;
+  store: ResearchWorkStore;
+  plan: ResearchPlan;
+  nowText: string;
+}): Promise<ResearchWorkStore> {
+  const entity = notebookPatchFromPlan(input.plan);
+  if (entity === null || Object.keys(entity).length === 0) {
+    return input.store;
+  }
+
+  const unsafePaths = collectUnsafeNotebookArtifactPaths({ run: input.run, entity });
+  if (unsafePaths.length > 0) {
+    return input.store;
+  }
+
+  const notebook = patchNotebook({
+    run: input.run,
+    store: input.store,
+    nowText: input.nowText,
+    entity
+  });
+  const nextStore = {
+    ...input.store,
+    notebook
+  };
+  await writeResearchWorkStore(nextStore);
+  return nextStore;
 }
 
 function isSourceSearchAction(action: ResearchActionDecision["action"]): boolean {
@@ -1219,6 +1260,37 @@ function releaseRepairPreviews(checks: Array<{ id: string; title: string; severi
       suggestedActions: releaseRepairHintsForCheck(check)
     }
   }));
+}
+
+function notebookDiagnosticPreviews(diagnostics: ResearchNotebookDiagnostics): AgentVisibleEntityPreview[] {
+  return diagnostics.warnings.slice(0, 8).map((warning) => ({
+    id: `notebook-diagnostic-${warning.code}`,
+    kind: "notebookDiagnostic",
+    title: warning.code,
+    status: "warning",
+    snippet: compactPreviewText(warning.message, 260),
+    fields: {
+      count: warning.count,
+      suggestedActions: warning.suggestedActions
+    }
+  }));
+}
+
+function notebookReadinessTextIsExplicitRelease(readiness: string): boolean {
+  return /\b(ready|finali[sz]e|release|submit|export)\b/i.test(readiness)
+    && /\b(caveat|limitation|bounded|despite|sufficient|complete|meets?|satisfies|acceptable)\b/i.test(readiness);
+}
+
+function notebookFinalizationReadinessIssue(notebook: ResearchNotebook): string | null {
+  const readiness = notebook.readiness.trim();
+  if (readiness.length === 0 || readiness === defaultNotebookReadiness) {
+    return "Research readiness has not been recorded in the notebook. Use notebook.patch to write the model-owned readiness assessment before manuscript.finalize.";
+  }
+  if (/\b(not sufficient|not ready|insufficient|needs more|not enough|unfinished|cannot finali[sz]e|blocked)\b/i.test(readiness)
+    && !notebookReadinessTextIsExplicitRelease(readiness)) {
+    return "Notebook readiness currently says the project is not sufficient or not ready. Patch notebook.readiness to an intentional release statement with caveats before manuscript.finalize.";
+  }
+  return null;
 }
 
 function numericTextIdPart(text: string): string {
@@ -3645,6 +3717,8 @@ async function executeResearchObjectToolAction(input: {
 
   if (input.decision.action === "release.verify" || (input.decision.action === "check.run" && args.entityId === null)) {
     const references = referencesFromWorkStore(input.run, input.store);
+    const notebookDiagnostics = buildNotebookDiagnostics(input.store);
+    const notebookReadinessIssue = notebookFinalizationReadinessIssue(input.store.notebook);
     const checkBundle = workspaceManuscriptChecks({
       run: input.run,
       store: input.store,
@@ -3656,9 +3730,12 @@ async function executeResearchObjectToolAction(input: {
     await writeJsonArtifact(input.run.artifacts.referencesPath, references);
     await writeJsonArtifact(input.run.artifacts.manuscriptChecksPath, checkBundle);
     const hardFailures = releaseChecks.filter((check) => check.status === "fail" && check.severity === "blocker");
+    const status = hardFailures.length > 0 || notebookReadinessIssue !== null ? "not_ready" : "ok";
     const message = hardFailures.length > 0
       ? `Release verification found ${hardFailures.length} hard invariant repair item(s); manuscript is not ready yet.`
-      : `Release verification wrote ${releaseChecks.length} check(s): ${hardFailures.length} hard invariant blocker(s).`;
+      : notebookReadinessIssue !== null
+        ? `Mechanical checks passed with 0 hard invariant blocker(s), but research readiness has not been intentionally recorded for finalization: ${notebookReadinessIssue}`
+        : `Mechanical checks passed. Release verification wrote ${releaseChecks.length} check(s): 0 hard invariant blocker(s), ${notebookDiagnostics.warningCount} notebook/project-management warning(s).`;
     return {
       handled: true,
       store: nextStore,
@@ -3667,27 +3744,36 @@ async function executeResearchObjectToolAction(input: {
         run: input.run,
         action: input.decision.action,
         timestamp: nowText,
-        status: hardFailures.length > 0 ? "not_ready" : "ok",
+        status,
         readOnly: false,
         message,
         collection: "releaseChecks",
         count: releaseChecks.length,
         totalCount: releaseChecks.length,
         items: releaseChecks.map((check) => entityPreviewForAgent(check, nextStore)),
-        related: hardFailures.length > 0 ? releaseRepairPreviews(hardFailures) : [],
+        related: [
+          ...releaseRepairPreviews(hardFailures),
+          ...notebookDiagnosticPreviews(notebookDiagnostics)
+        ],
         stateDelta: {
           releaseChecksCreated: releaseChecks.length,
-          hardInvariantBlockers: hardFailures.length
+          hardInvariantBlockers: hardFailures.length,
+          notebookDiagnosticWarnings: notebookDiagnostics.warningCount,
+          notebookReadinessRecorded: notebookReadinessIssue === null ? 1 : 0
         },
         nextHints: hardFailures.length > 0
           ? ["workspace.read", "claim.link_support", "section.link_claim"]
-          : ["manuscript.finalize", "critic.review"]
+          : notebookReadinessIssue !== null || notebookDiagnostics.warningCount > 0
+            ? ["notebook.read", "notebook.patch", "release.verify"]
+            : ["manuscript.finalize", "critic.review"]
       })
     };
   }
 
   if (input.decision.action === "manuscript.finalize") {
     const references = referencesFromWorkStore(input.run, input.store);
+    const notebookDiagnostics = buildNotebookDiagnostics(input.store);
+    const notebookReadinessIssue = notebookFinalizationReadinessIssue(input.store.notebook);
     const checkBundle = workspaceManuscriptChecks({
       run: input.run,
       store: input.store,
@@ -3707,18 +3793,26 @@ async function executeResearchObjectToolAction(input: {
     await writeJsonArtifact(input.run.artifacts.manuscriptChecksPath, checkBundle);
     await writeJsonArtifact(input.run.artifacts.paperJsonPath, paper);
 
-    if (hardFailures.length > 0) {
-      const message = `Manuscript finalization is not ready: ${hardFailures.length} hard invariant repair item(s) remain.`;
+    if (hardFailures.length > 0 || notebookReadinessIssue !== null) {
+      const message = notebookReadinessIssue !== null
+        ? `Manuscript finalization is not ready: ${notebookReadinessIssue}`
+        : `Manuscript finalization is not ready: ${hardFailures.length} hard invariant repair item(s) remain.`;
       await writeFile(
         input.run.artifacts.paperPath,
         [
           "# Review Paper",
           "",
-          "Manuscript finalization was explicitly requested, but computable release invariants failed.",
+          "Manuscript finalization was explicitly requested, but the workspace is not ready for final export.",
           "",
           "## Blocking Invariants",
           "",
-          ...hardFailures.map((check) => `- ${check.message}`)
+          ...(hardFailures.length === 0 ? ["- Mechanical release invariants passed."] : hardFailures.map((check) => `- ${check.message}`)),
+          "",
+          "## Notebook Readiness",
+          "",
+          notebookReadinessIssue === null
+            ? "- Notebook readiness is recorded."
+            : `- ${notebookReadinessIssue}`
         ].join("\n"),
         "utf8"
       );
@@ -3737,13 +3831,20 @@ async function executeResearchObjectToolAction(input: {
           count: releaseChecks.length,
           totalCount: releaseChecks.length,
           items: releaseChecks.map((check) => entityPreviewForAgent(check, nextStore)),
-          related: releaseRepairPreviews(releaseChecks.filter((check) => check.status === "fail" && check.severity === "blocker")),
+          related: [
+            ...releaseRepairPreviews(releaseChecks.filter((check) => check.status === "fail" && check.severity === "blocker")),
+            ...notebookDiagnosticPreviews(notebookDiagnostics)
+          ],
           stateDelta: {
             releaseChecksCreated: releaseChecks.length,
             hardInvariantBlockers: hardFailures.length,
+            notebookDiagnosticWarnings: notebookDiagnostics.warningCount,
+            notebookReadinessRecorded: notebookReadinessIssue === null ? 1 : 0,
             manuscriptFinalized: 0
           },
-          nextHints: ["workspace.read", "claim.link_support", "section.link_claim", "release.verify"]
+          nextHints: notebookReadinessIssue !== null
+            ? ["notebook.read", "notebook.patch", "release.verify"]
+            : ["workspace.read", "claim.link_support", "section.link_claim", "release.verify"]
         })
       };
     }
@@ -3815,6 +3916,8 @@ async function executeResearchObjectToolAction(input: {
         stateDelta: {
           releaseChecksCreated: releaseChecks.length,
           hardInvariantBlockers: 0,
+          notebookDiagnosticWarnings: notebookDiagnostics.warningCount,
+          notebookReadinessRecorded: 1,
           manuscriptFinalized: 1
         },
         nextHints: ["workspace.status"]
@@ -5069,8 +5172,10 @@ function workspaceManuscriptChecks(input: {
     .filter((item) => item.status === "open" && item.severity === "blocking");
   const openExternalBlockers = openBlockingWorkItems
     .filter((item) => item.type === "external_blocker" || item.type === "source_access");
-  const supportReadiness = supportReadinessForWorkspace(input.store);
-  const unsupportedClaims = claims.filter((claim) => supportReadiness.unsupportedClaimIds.has(claim.id));
+	  const supportReadiness = supportReadinessForWorkspace(input.store);
+	  const notebookDiagnostics = buildNotebookDiagnostics(input.store);
+	  const readinessIssue = notebookFinalizationReadinessIssue(input.store.notebook);
+	  const unsupportedClaims = claims.filter((claim) => supportReadiness.unsupportedClaimIds.has(claim.id));
   const supportIssueMessages = supportReadiness.issues.map((issue) => issue.message);
   const unsupportedSectionCount = sections.filter((section) => (
     section.claimIds.length === 0 || section.claimIds.some((claimId) => !supportReadiness.supportedClaimIds.has(claimId))
@@ -5095,17 +5200,35 @@ function workspaceManuscriptChecks(input: {
         ? `${input.store.objects.evidenceCells.length} evidence cell(s) are available.`
         : "No evidence cells are available for claim-led synthesis; the researcher can search, read, or extract more."
     },
-    {
-      id: "evidence-coverage",
+	    {
+	      id: "evidence-coverage",
       title: "Evidence coverage diagnostic",
       status: evidenceRows >= 3 ? "pass" : "warning",
       severity: "warning",
       message: evidenceRows >= 3
         ? "The workspace has multiple reviewed evidence rows."
-        : `Only ${evidenceRows} reviewed evidence row(s) are available. This is a diagnostic for the researcher, not a semantic release blocker.`
-    },
-    {
-      id: "workspace-claims",
+	        : `Only ${evidenceRows} reviewed evidence row(s) are available. This is a diagnostic for the researcher, not a semantic release blocker.`
+	    },
+	    {
+	      id: "notebook-readiness-recorded",
+	      title: "Notebook readiness is model-authored",
+	      status: readinessIssue === null ? "pass" : "warning",
+	      severity: "warning",
+	      message: readinessIssue === null
+	        ? "Notebook readiness contains an explicit model-authored assessment for finalization."
+	        : readinessIssue
+	    },
+	    {
+	      id: "notebook-project-management",
+	      title: "Notebook project-management diagnostics",
+	      status: notebookDiagnostics.warningCount === 0 ? "pass" : "warning",
+	      severity: "warning",
+	      message: notebookDiagnostics.warningCount === 0
+	        ? "Notebook task list, current focus, readiness, and task links are current."
+	        : `${notebookDiagnostics.warningCount} notebook warning(s): ${notebookDiagnostics.warnings.map((warning) => warning.message).slice(0, 4).join(" ")}`
+	    },
+	    {
+	      id: "workspace-claims",
       title: "Workspace has claims",
       status: claims.length > 0 ? "pass" : "fail",
       severity: "blocker",
@@ -5345,7 +5468,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     now: now()
   });
   const literatureContext = buildLiteratureContextFromWorkStore(workStore);
-  const memoryContext = buildProjectMemoryContextFromWorkStore(workStore);
+  const workspaceContext = buildWorkspacePromptContextFromWorkStore(workStore);
   const scholarlyDiscoveryProviders = selectedProviderIdsForCategory(projectConfig, "scholarlyDiscovery");
   const publisherFullTextProviders = selectedProviderIdsForCategory(projectConfig, "publisherFullText");
   const oaRetrievalHelperProviders = selectedProviderIdsForCategory(projectConfig, "oaRetrievalHelpers");
@@ -5392,14 +5515,14 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       phase: "startup",
       action: "observe_brief_and_project_state",
       status: "started",
-      summary: "Initialized run artifacts and loaded project memory, literature memory, providers, and credentials.",
+      summary: "Initialized run artifacts and loaded the SQLite workspace context, literature context, providers, and credentials.",
       artifactPaths: [
         run.artifacts.briefPath,
         run.artifacts.agentStatePath,
         run.artifacts.agentStepsPath
       ],
       counts: {
-        memoryRecords: memoryContext.recordCount,
+        workspaceObjects: Object.values(workspaceContext.counts).reduce((total, count) => total + count, 0),
         literaturePapers: literatureContext.paperCount,
         openWorkItems: workStore.objects.workItems.filter((item) => item.status === "open").length,
         selectedProviders: scholarlyProviders.length + generalWebProviders.length
@@ -5411,10 +5534,10 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     await appendEvent(
       run,
       now,
-      "memory",
-      memoryContext.available
-        ? `Loaded ${memoryContext.recordCount} prior memory records to inform planning and retrieval.`
-        : "No prior project memory was available to inform planning and retrieval."
+      "summary",
+      workspaceContext.available
+        ? `Loaded SQLite workspace context with ${workspaceContext.counts.canonicalSources} canonical sources, ${workspaceContext.counts.evidenceCells} evidence cells, ${workspaceContext.counts.claims} claims, and ${workspaceContext.counts.openWorkItems} open work items.`
+        : "No prior SQLite workspace objects were available to inform planning."
     );
     await appendEvent(
       run,
@@ -5422,7 +5545,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       "literature",
       literatureContext.available
         ? `Loaded ${literatureContext.paperCount} prior canonical papers, ${literatureContext.themeCount} theme boards, and ${literatureContext.notebookCount} review notebooks.`
-        : "No prior literature memory was available for this run."
+        : "No prior literature context was available for this run."
     );
     await appendStdout(run, `Research backend: ${researchBackend.label}`);
     await appendStdout(run, `Run loop command: ${run.job.command.join(" ")}`);
@@ -5457,7 +5580,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       projectRoot: run.projectRoot,
       brief: run.brief,
       localFiles,
-      memoryContext,
+      workspaceContext,
       literatureContext,
       workerState: previousWorkerState
     }, {
@@ -5479,8 +5602,23 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     const agentActionDiagnostics: ResearchActionDiagnostic[] = [];
     const agentActionTransports: AgentActionTransportRecord[] = [];
 
-    await writeJsonArtifact(run.artifacts.planPath, plan);
-    let currentProtocol = reviewProtocolFromWorkspace({
+	    await writeJsonArtifact(run.artifacts.planPath, plan);
+	    workStore = await persistPlanningNotebookPatch({
+	      run,
+	      store: workStore,
+	      plan,
+	      nowText: now()
+	    });
+	    const planningNotebookDiagnostics = buildNotebookDiagnostics(workStore);
+	    await appendEvent(
+	      run,
+	      now,
+	      "memory",
+	      plan.notebookPatch === undefined || plan.notebookPatch === null
+	        ? "Planning did not include a model-authored notebook patch; notebook diagnostics will keep this visible to the researcher model."
+	        : `Persisted model-authored notebook patch from planning: ${workStore.notebook.tasks.length} task(s), current focus ${workStore.notebook.currentFocus ?? "unset"}, ${planningNotebookDiagnostics.warningCount} notebook warning(s).`
+	    );
+	    let currentProtocol = reviewProtocolFromWorkspace({
       fallback: neutralReviewProtocolShell({
         run,
         plan,
@@ -5519,7 +5657,6 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       projectRoot: run.projectRoot,
       brief: run.brief,
       plan,
-      memoryContext,
       literatureContext,
       revisionQueries: [],
       criticExcludedPaperIds: [],

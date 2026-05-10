@@ -2,7 +2,6 @@ import { access, mkdir, readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 import type { CanonicalPaper, LiteratureContext } from "./literature-store.js";
-import type { ProjectMemoryContext, MemoryRecordType } from "./memory-store.js";
 import type { ReviewProtocol } from "./research-manuscript.js";
 import type { ResearchPlan } from "./research-backend.js";
 import type { CriticReviewArtifact, CriticReviewScope } from "./research-critic.js";
@@ -120,6 +119,31 @@ export type ResearchNotebook = {
   notes: string[];
   artifactLinks: ResearchNotebookArtifactLink[];
   updatedAt: string;
+};
+
+export const defaultNotebookReadiness = "No research readiness assessment has been written yet.";
+
+export type ResearchNotebookDiagnosticWarning = {
+  code: string;
+  message: string;
+  count: number;
+  suggestedActions: string[];
+};
+
+export type ResearchNotebookDiagnostics = {
+  warningCount: number;
+  warnings: ResearchNotebookDiagnosticWarning[];
+  taskCount: number;
+  activeTaskCount: number;
+  readinessRecorded: boolean;
+  currentFocusSet: boolean;
+  definitionOfDoneAddressed: boolean;
+  unlinkedSelectedSourceIds: string[];
+  unlinkedEvidenceCellIds: string[];
+  unlinkedClaimIds: string[];
+  unlinkedSectionIds: string[];
+  staleAfterWorkspaceChange: boolean;
+  latestWorkspaceChangeAt: string | null;
 };
 
 export type WorkStoreBaseEntity = {
@@ -639,7 +663,7 @@ function createEmptyNotebook(now: string, brief: ResearchBrief = createEmptyBrie
     definitionOfDone: readString(brief.successCriterion) === null ? [] : [readString(brief.successCriterion) as string],
     tasks: [],
     currentFocus: null,
-    readiness: "No research readiness assessment has been written yet.",
+    readiness: defaultNotebookReadiness,
     notes: [],
     artifactLinks: [],
     updatedAt: now
@@ -1679,97 +1703,356 @@ export function mergeRunSegmentIntoResearchWorkStore(
   };
 }
 
-function contextEntry(id: string, title: string, text: string, runId: string | null, data: Record<string, string | string[] | null> = {}) {
+export type WorkspacePromptContext = {
+  available: boolean;
+  counts: {
+    providerRuns: number;
+    sources: number;
+    canonicalSources: number;
+    screeningDecisions: number;
+    fullTextRecords: number;
+    extractions: number;
+    evidenceCells: number;
+    claims: number;
+    citations: number;
+    protocols: number;
+    workItems: number;
+    openWorkItems: number;
+    manuscriptSections: number;
+    releaseChecks: number;
+  };
+  notebook: {
+    objective: string;
+    definitionOfDone: string[];
+    currentFocus: string | null;
+    readiness: string;
+	    activeTasks: Array<{
+      id: string;
+      title: string;
+      status: ResearchNotebookTaskStatus;
+      linkedSourceIds: string[];
+      linkedEvidenceCellIds: string[];
+      linkedClaimIds: string[];
+      linkedSectionIds: string[];
+      linkedArtifactPaths: string[];
+	    }>;
+	    artifactLinks: ResearchNotebookArtifactLink[];
+	    diagnostics: ResearchNotebookDiagnostics;
+	  };
+  recentSources: Array<{
+    id: string;
+    title: string;
+    citation: string;
+    year: number | null;
+    venue: string | null;
+    providerIds: string[];
+    accessMode: string;
+    screeningDecision: string;
+  }>;
+  recentExtractions: Array<{
+    id: string;
+    sourceId: string;
+    problemSetting: string;
+    systemType: string;
+    confidence: string;
+  }>;
+  recentEvidenceCells: Array<{
+    id: string;
+    sourceId: string;
+    extractionId: string;
+    field: string;
+    value: string | string[];
+    confidence: string;
+  }>;
+  recentClaims: Array<{
+    id: string;
+    text: string;
+    supportStatus: string;
+    confidence: string;
+    sourceIds: string[];
+    citationIds: string[];
+  }>;
+  recentSections: Array<{
+    id: string;
+    title: string;
+    status: string;
+    claimIds: string[];
+    citationIds: string[];
+  }>;
+  openWorkItems: Array<{
+    id: string;
+    type: WorkItemType;
+    title: string;
+    severity: WorkItemSeverity;
+    suggestedActions: string[];
+    targetId: string | null;
+    affectedSourceIds: string[];
+    affectedClaimIds: string[];
+  }>;
+  recentReleaseChecks: Array<{
+    id: string;
+    title: string;
+    status: string;
+    message: string;
+    updatedAt: string;
+  }>;
+  worker: {
+    status: ResearchWorkerStatus;
+    statusReason: string;
+    nextInternalActions: string[];
+    completion: ResearchWorkerCompletion;
+    lastRunId: string | null;
+  };
+};
+
+function parseTimestampMs(value: string | null | undefined): number {
+  if (typeof value !== "string") {
+    return 0;
+  }
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function taskLinkedIds(store: ResearchWorkStore): {
+  sourceIds: Set<string>;
+  evidenceCellIds: Set<string>;
+  claimIds: Set<string>;
+  sectionIds: Set<string>;
+} {
   return {
-    id,
-    title,
-    text,
-    runId,
-    links: [],
-    data
+    sourceIds: new Set(store.notebook.tasks.flatMap((task) => task.linkedSourceIds)),
+    evidenceCellIds: new Set(store.notebook.tasks.flatMap((task) => task.linkedEvidenceCellIds)),
+    claimIds: new Set(store.notebook.tasks.flatMap((task) => task.linkedClaimIds)),
+    sectionIds: new Set(store.notebook.tasks.flatMap((task) => task.linkedSectionIds))
   };
 }
 
-function countsByMemoryType(store: ResearchWorkStore): Record<MemoryRecordType, number> {
+function notebookReadinessIsRecorded(readiness: string | null | undefined): boolean {
+  const trimmed = typeof readiness === "string" ? readiness.trim() : "";
+  return trimmed.length > 0 && trimmed !== defaultNotebookReadiness;
+}
+
+export function buildNotebookDiagnostics(store: ResearchWorkStore): ResearchNotebookDiagnostics {
+  const warnings: ResearchNotebookDiagnosticWarning[] = [];
+  const activeTaskCount = store.notebook.tasks
+    .filter((task) => task.status === "todo" || task.status === "in_progress" || task.status === "blocked")
+    .length;
+  const linkedIds = taskLinkedIds(store);
+  const selectedSourceIds = store.objects.canonicalSources
+    .filter((source) => source.screeningDecision === "include")
+    .map((source) => source.id);
+  const unlinkedSelectedSourceIds = selectedSourceIds
+    .filter((sourceId) => !linkedIds.sourceIds.has(sourceId))
+    .slice(0, 20);
+  const unlinkedEvidenceCellIds = store.objects.evidenceCells
+    .map((cell) => cell.id)
+    .filter((cellId) => !linkedIds.evidenceCellIds.has(cellId))
+    .slice(0, 20);
+  const unlinkedClaimIds = store.objects.claims
+    .map((claim) => claim.id)
+    .filter((claimId) => !linkedIds.claimIds.has(claimId))
+    .slice(0, 20);
+  const unlinkedSectionIds = store.objects.manuscriptSections
+    .map((section) => section.id)
+    .filter((sectionId) => !linkedIds.sectionIds.has(sectionId))
+    .slice(0, 20);
+  const taskText = store.notebook.tasks
+    .map((task) => `${task.title} ${task.notes ?? ""}`)
+    .join(" ")
+    .toLowerCase();
+  const readinessText = store.notebook.readiness.toLowerCase();
+  const definitionOfDoneAddressed = store.notebook.definitionOfDone.length > 0
+    && store.notebook.definitionOfDone.every((criterion) => {
+      const lower = criterion.toLowerCase();
+      return taskText.includes(lower.slice(0, Math.min(lower.length, 48))) || readinessText.includes(lower.slice(0, Math.min(lower.length, 48)));
+    });
+  const workspaceUpdatedAts = [
+    ...store.objects.canonicalSources.map((entity) => entity.updatedAt),
+    ...store.objects.extractions.map((entity) => entity.updatedAt),
+    ...store.objects.evidenceCells.map((entity) => entity.updatedAt),
+    ...store.objects.claims.map((entity) => entity.updatedAt),
+    ...store.objects.citations.map((entity) => entity.updatedAt),
+    ...store.objects.protocols.map((entity) => entity.updatedAt),
+    ...store.objects.workItems.map((entity) => entity.updatedAt),
+    ...store.objects.manuscriptSections.map((entity) => entity.updatedAt)
+  ];
+  const latestWorkspaceChangeAt = workspaceUpdatedAts
+    .slice()
+    .sort((left, right) => parseTimestampMs(right) - parseTimestampMs(left))[0] ?? null;
+  const staleAfterWorkspaceChange = latestWorkspaceChangeAt !== null
+    && parseTimestampMs(latestWorkspaceChangeAt) > parseTimestampMs(store.notebook.updatedAt);
+
+  const addWarning = (code: string, message: string, count: number, suggestedActions: string[]): void => {
+    warnings.push({ code, message, count, suggestedActions });
+  };
+
+  if (store.notebook.tasks.length === 0) {
+    addWarning("notebook-empty-task-list", "Notebook has no model-authored task list.", 1, ["notebook.patch"]);
+  }
+  if (store.notebook.currentFocus === null) {
+    addWarning("notebook-missing-current-focus", "Notebook currentFocus is not set.", 1, ["notebook.patch"]);
+  }
+  if (!notebookReadinessIsRecorded(store.notebook.readiness)) {
+    addWarning("notebook-readiness-unwritten", "Research readiness has not been recorded by the model.", 1, ["notebook.patch"]);
+  }
+  if (!definitionOfDoneAddressed) {
+    addWarning("notebook-definition-of-done-unaddressed", "Notebook readiness/tasks do not explicitly address the definition of done.", store.notebook.definitionOfDone.length, ["notebook.read", "notebook.patch"]);
+  }
+  if (unlinkedSelectedSourceIds.length > 0) {
+    addWarning("notebook-selected-sources-unlinked", `${unlinkedSelectedSourceIds.length} selected source(s) are not linked to notebook tasks.`, unlinkedSelectedSourceIds.length, ["notebook.patch", "workspace.list"]);
+  }
+  if (unlinkedEvidenceCellIds.length > 0) {
+    addWarning("notebook-evidence-unlinked", `${unlinkedEvidenceCellIds.length} evidence cell(s) are not linked to notebook tasks.`, unlinkedEvidenceCellIds.length, ["notebook.patch", "workspace.list"]);
+  }
+  if (unlinkedClaimIds.length > 0) {
+    addWarning("notebook-claims-unlinked", `${unlinkedClaimIds.length} claim(s) are not linked to notebook tasks.`, unlinkedClaimIds.length, ["notebook.patch", "workspace.list"]);
+  }
+  if (unlinkedSectionIds.length > 0) {
+    addWarning("notebook-sections-unlinked", `${unlinkedSectionIds.length} manuscript section(s) are not linked to notebook tasks.`, unlinkedSectionIds.length, ["notebook.patch", "workspace.list"]);
+  }
+  if (staleAfterWorkspaceChange) {
+    addWarning("notebook-stale-after-workspace-change", "Notebook was not updated after the latest state-changing workspace action.", 1, ["notebook.read", "notebook.patch"]);
+  }
+
   return {
-    claim: store.objects.claims.length,
-    finding: store.objects.evidenceCells.length,
-    question: store.objects.workItems.filter((item) => item.type === "open_question").length,
-    idea: store.objects.workItems.filter((item) => item.type === "agent_next_action").length,
-    summary: store.worker.lastRunId === null ? 0 : 1,
-    artifact: store.objects.releaseChecks.length + store.objects.manuscriptSections.length,
-    direction: store.objects.workItems.filter((item) => item.type === "agent_next_action").length,
-    hypothesis: 0,
-    method_plan: 0
+    warningCount: warnings.length,
+    warnings,
+    taskCount: store.notebook.tasks.length,
+    activeTaskCount,
+    readinessRecorded: notebookReadinessIsRecorded(store.notebook.readiness),
+    currentFocusSet: store.notebook.currentFocus !== null,
+    definitionOfDoneAddressed,
+    unlinkedSelectedSourceIds,
+    unlinkedEvidenceCellIds,
+    unlinkedClaimIds,
+    unlinkedSectionIds,
+    staleAfterWorkspaceChange,
+    latestWorkspaceChangeAt
   };
 }
 
-export function buildProjectMemoryContextFromWorkStore(store: ResearchWorkStore): ProjectMemoryContext {
-  const claims = store.objects.claims.slice(-12).map((claim) => contextEntry(
-    claim.id,
-    claim.text,
-    claim.evidence,
-    claim.runId,
-    {
-      sourceIds: claim.sourceIds,
-      supportStatus: claim.supportStatus,
-      confidence: claim.confidence
-    }
-  ));
-  const findings = store.objects.evidenceCells.slice(-20).map((cell) => contextEntry(
-    cell.id,
-    `${cell.field} for ${cell.sourceId}`,
-    Array.isArray(cell.value) ? cell.value.join("; ") : cell.value,
-    cell.runId,
-    {
-      sourceId: cell.sourceId,
-      confidence: cell.confidence
-    }
-  ));
-  const questions = store.objects.workItems
-    .filter((item) => item.status === "open" && (item.type === "open_question" || item.type === "evidence_gap"))
-    .slice(-12)
-    .map((item) => contextEntry(item.id, item.title, item.description, item.runId, {
-      type: item.type,
-      severity: item.severity,
-      suggestedActions: item.suggestedActions
-    }));
-  const summaries = store.worker.lastRunId === null
-    ? []
-    : [contextEntry(
-      `worker-${store.worker.lastRunId}`,
-      `Autonomous worker ${store.worker.status}`,
-      store.worker.statusReason,
-      store.worker.lastRunId,
-      {
-        paperReadiness: store.worker.paperReadiness,
-        nextInternalActions: store.worker.nextInternalActions
-      }
-    )];
+export function buildWorkspacePromptContextFromWorkStore(store: ResearchWorkStore): WorkspacePromptContext {
+  const openWorkItems = store.objects.workItems.filter((item) => item.status === "open");
+  const notebookDiagnostics = buildNotebookDiagnostics(store);
+  const activeTasks = store.notebook.tasks
+    .filter((task) => task.status === "todo" || task.status === "in_progress" || task.status === "blocked")
+    .slice(0, 20)
+    .map((task) => ({
+	      id: task.id,
+	      title: task.title,
+	      status: task.status,
+	      linkedSourceIds: task.linkedSourceIds.slice(),
+	      linkedEvidenceCellIds: task.linkedEvidenceCellIds.slice(),
+	      linkedClaimIds: task.linkedClaimIds.slice(),
+	      linkedSectionIds: task.linkedSectionIds.slice(),
+	      linkedArtifactPaths: task.linkedArtifactPaths.slice()
+	    }));
 
   return {
     available: store.objects.canonicalSources.length > 0
       || store.objects.claims.length > 0
-      || store.objects.workItems.length > 0,
-    recordCount: store.objects.claims.length + store.objects.evidenceCells.length + store.objects.workItems.length,
-    countsByType: countsByMemoryType(store),
-    claims,
-    findings,
-    questions,
-    ideas: [],
-    summaries,
-    artifacts: store.objects.releaseChecks.slice(-8).map((check) => contextEntry(check.id, check.title, check.message, check.runId)),
-    directions: store.objects.workItems
-      .filter((item) => item.type === "agent_next_action")
-      .slice(-8)
-      .map((item) => contextEntry(item.id, item.title, item.description, item.runId)),
-    hypotheses: [],
-    methodPlans: [],
-    queryHints: uniqueStrings([
-      ...store.objects.workItems.flatMap((item) => item.suggestedActions),
-      ...store.worker.nextInternalActions
-    ], 12),
-    localFileHints: []
+      || store.objects.evidenceCells.length > 0
+      || store.objects.workItems.length > 0
+      || store.notebook.tasks.length > 0,
+    counts: {
+      providerRuns: store.objects.providerRuns.length,
+      sources: store.objects.sources.length,
+      canonicalSources: store.objects.canonicalSources.length,
+      screeningDecisions: store.objects.screeningDecisions.length,
+      fullTextRecords: store.objects.fullTextRecords.length,
+      extractions: store.objects.extractions.length,
+      evidenceCells: store.objects.evidenceCells.length,
+      claims: store.objects.claims.length,
+      citations: store.objects.citations.length,
+      protocols: store.objects.protocols.length,
+      workItems: store.objects.workItems.length,
+      openWorkItems: openWorkItems.length,
+      manuscriptSections: store.objects.manuscriptSections.length,
+      releaseChecks: store.objects.releaseChecks.length
+    },
+	    notebook: {
+	      objective: store.notebook.objective,
+	      definitionOfDone: store.notebook.definitionOfDone.slice(0, 12),
+	      currentFocus: store.notebook.currentFocus,
+	      readiness: store.notebook.readiness,
+	      activeTasks,
+	      artifactLinks: store.notebook.artifactLinks.slice(-12).map((artifact) => ({ ...artifact })),
+	      diagnostics: notebookDiagnostics
+	    },
+    recentSources: store.objects.canonicalSources.slice(-12).map((source) => ({
+      id: source.id,
+      title: source.title,
+      citation: source.citation,
+      year: source.year,
+      venue: source.venue,
+      providerIds: source.providerIds,
+      accessMode: source.accessMode,
+      screeningDecision: source.screeningDecision
+    })),
+    recentExtractions: store.objects.extractions.slice(-12).map((extraction) => ({
+      id: extraction.id,
+      sourceId: extraction.sourceId,
+      problemSetting: extraction.extraction.problemSetting,
+      systemType: extraction.extraction.systemType,
+      confidence: extraction.extraction.confidence
+    })),
+    recentEvidenceCells: store.objects.evidenceCells.slice(-16).map((cell) => ({
+      id: cell.id,
+      sourceId: cell.sourceId,
+      extractionId: cell.extractionId,
+      field: cell.field,
+      value: cell.value,
+      confidence: cell.confidence
+    })),
+    recentClaims: store.objects.claims.slice(-16).map((claim) => {
+      const citationIds = store.objects.citations
+        .filter((citation) => citation.claimIds.includes(claim.id))
+        .map((citation) => citation.id);
+      return {
+        id: claim.id,
+        text: claim.text,
+        supportStatus: claim.supportStatus,
+        confidence: claim.confidence,
+        sourceIds: claim.sourceIds,
+        citationIds
+      };
+    }),
+    recentSections: store.objects.manuscriptSections.slice(-10).map((section) => {
+      const citationIds = store.objects.citations
+        .filter((citation) => citation.sectionIds.includes(section.id))
+        .map((citation) => citation.id);
+      return {
+        id: section.id,
+        title: section.title,
+        status: section.status,
+        claimIds: section.claimIds,
+        citationIds
+      };
+    }),
+    openWorkItems: openWorkItems.slice(-16).map((item) => ({
+      id: item.id,
+      type: item.type,
+      title: item.title,
+      severity: item.severity,
+      suggestedActions: item.suggestedActions,
+      targetId: item.targetId,
+      affectedSourceIds: item.affectedSourceIds,
+      affectedClaimIds: item.affectedClaimIds
+    })),
+    recentReleaseChecks: store.objects.releaseChecks.slice(-8).map((check) => ({
+      id: check.id,
+      title: check.title,
+      status: check.status,
+      message: check.message,
+      updatedAt: check.updatedAt
+    })),
+    worker: {
+      status: store.worker.status,
+      statusReason: store.worker.statusReason,
+      nextInternalActions: store.worker.nextInternalActions,
+      completion: store.worker.completion,
+      lastRunId: store.worker.lastRunId
+    }
   };
 }
 
@@ -1794,7 +2077,11 @@ export function buildLiteratureContextFromWorkStore(store: ResearchWorkStore): L
       summary: Array.isArray(cell.value) ? cell.value.join("; ") : cell.value,
       paperIds: [cell.sourceId]
     }));
-  const notebooks = [{
+  const notebookHasPriorContent = store.notebook.tasks.length > 0
+    || store.notebook.notes.length > 0
+    || store.notebook.artifactLinks.length > 0
+    || store.notebook.readiness !== defaultNotebookReadiness;
+  const notebooks = notebookHasPriorContent ? [{
     id: "research-notebook",
     title: store.notebook.objective,
     summary: store.notebook.readiness,
@@ -1802,7 +2089,7 @@ export function buildLiteratureContextFromWorkStore(store: ResearchWorkStore): L
       .filter((task) => task.status === "todo" || task.status === "in_progress" || task.status === "blocked")
       .map((task) => task.title)
       .slice(0, 8)
-  }];
+  }] : [];
 
   return {
     available: papers.length > 0 || themes.length > 0 || notebooks.length > 0,
@@ -1811,8 +2098,7 @@ export function buildLiteratureContextFromWorkStore(store: ResearchWorkStore): L
     notebookCount: notebooks.length,
     papers,
     themes,
-    notebooks,
-    queryHints: uniqueStrings(store.objects.workItems.flatMap((item) => item.suggestedActions), 12)
+    notebooks
   };
 }
 

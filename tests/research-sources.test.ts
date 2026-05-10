@@ -8,7 +8,6 @@ import {
   type ResearchSourceToolRequest,
   type ResearchSourceSnapshot
 } from "../src/runtime/research-sources.js";
-import type { ProjectMemoryContext } from "../src/runtime/memory-store.js";
 import type { LiteratureContext } from "../src/runtime/literature-store.js";
 
 function toAbstractIndex(text: string): Record<string, number[]> {
@@ -32,36 +31,6 @@ function toAbstractIndex(text: string): Record<string, number[]> {
   return index;
 }
 
-function emptyMemoryContext(overrides: Partial<ProjectMemoryContext> = {}): ProjectMemoryContext {
-  return {
-    available: false,
-    recordCount: 0,
-    countsByType: {
-      claim: 0,
-      finding: 0,
-      question: 0,
-      idea: 0,
-      summary: 0,
-      artifact: 0,
-      direction: 0,
-      hypothesis: 0,
-      method_plan: 0
-    },
-    claims: [],
-    findings: [],
-    questions: [],
-    ideas: [],
-    summaries: [],
-    artifacts: [],
-    directions: [],
-    hypotheses: [],
-    methodPlans: [],
-    queryHints: [],
-    localFileHints: [],
-    ...overrides
-  };
-}
-
 function emptyLiteratureContext(overrides: Partial<LiteratureContext> = {}): LiteratureContext {
   return {
     available: false,
@@ -71,7 +40,6 @@ function emptyLiteratureContext(overrides: Partial<LiteratureContext> = {}): Lit
     papers: [],
     themes: [],
     notebooks: [],
-    queryHints: [],
     ...overrides
   };
 }
@@ -113,7 +81,6 @@ function sourceToolRequest(projectRoot: string, overrides: Partial<ResearchSourc
       searchQueries: ["autonomous research agents source tools"],
       localFocus: ["source tools"]
     },
-    memoryContext: emptyMemoryContext(),
     scholarlyProviderIds: ["openalex"],
     generalWebProviderIds: [],
     projectFilesEnabled: false,
@@ -361,7 +328,6 @@ test("source query diagnostics expose only model-planned queries, not brief-deri
         searchQueries: ["medieval Icelandic assemblies soundscape legal memory"],
         localFocus: ["legal anthropology", "sound studies"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: []
     });
 
@@ -395,7 +361,6 @@ test("source query diagnostics do not add hidden task or domain-vocabulary queri
         searchQueries: ["autonomous research agents literature synthesis"],
         localFocus: ["evaluation", "memory", "provenance"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: []
     });
 
@@ -491,7 +456,6 @@ test("source diagnostics do not assign semantic source roles or primary-selectio
         searchQueries: ["autonomous research agents systems frameworks"],
         localFocus: ["planning", "tool use", "evaluation"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex"]
     });
 
@@ -549,7 +513,6 @@ test("provider routing biases openalex, arxiv, and dblp for CS/AI briefs", async
         searchQueries: ["autonomous research agents design patterns"],
         localFocus: ["agent workflows", "evaluation strategies"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex", "arxiv", "dblp"]
     });
 
@@ -601,7 +564,6 @@ test("provider routing biases pubmed and europe pmc for biomedical briefs", asyn
         searchQueries: ["clinical triage nursing homes patient care"],
         localFocus: ["patient care"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["pubmed", "europe_pmc", "openalex"]
     });
 
@@ -655,7 +617,6 @@ test("care-heavy AI briefs route biomedical providers before broad discovery", a
         searchQueries: ["AI nursing homes elderly care workforce displacement"],
         localFocus: ["nursing homes", "elderly care", "workforce displacement"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["pubmed", "europe_pmc", "openalex", "crossref", "arxiv", "dblp"]
     });
 
@@ -709,7 +670,6 @@ test("mathematical briefs route through mathematics-aware providers by default",
         searchQueries: ["Riemann Hypothesis prime number distribution"],
         localFocus: ["number theory", "prime numbers"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex", "crossref", "arxiv", "dblp", "pubmed", "europe_pmc", "elsevier", "ieee_xplore"]
     });
 
@@ -773,7 +733,6 @@ test("mathematical briefs are not pulled into cs-ai routing by generated computa
         ],
         localFocus: ["number theory", "zeta function"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex", "crossref", "arxiv", "dblp", "elsevier", "ieee_xplore"]
     });
 
@@ -827,7 +786,6 @@ test("social-science briefs prioritize broad scholarly and publisher sources ove
         searchQueries: ["AI adoption employment policy social services"],
         localFocus: ["employment", "policy", "workforce"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex", "crossref", "elsevier", "springer_nature", "dblp", "arxiv"]
     });
 
@@ -917,7 +875,6 @@ test("canonical merge combines duplicate provider hits and chooses the best read
         searchQueries: ["autonomous research agents best practices"],
         localFocus: ["design patterns", "evaluation practices"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex", "crossref"]
     });
 
@@ -994,7 +951,6 @@ test("direct arxiv full text beats metadata-only alternatives during access reso
         searchQueries: ["autonomous research agents reproducible evaluation"],
         localFocus: ["evaluation"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["arxiv", "crossref"]
     });
 
@@ -1048,37 +1004,6 @@ test("literature and memory hints are not injected as hidden retrieval queries",
         searchQueries: ["explicit zeta follow-up query"],
         localFocus: []
       },
-      memoryContext: emptyMemoryContext({
-        available: true,
-        recordCount: 1,
-        countsByType: {
-          claim: 0,
-          finding: 0,
-          question: 1,
-          idea: 0,
-          summary: 0,
-          artifact: 0,
-          direction: 0,
-          hypothesis: 0,
-          method_plan: 0
-        },
-        questions: [
-          {
-            id: "question-1",
-            title: "Which obstacles limit mollifier methods for the Riemann Hypothesis?",
-            text: "Which obstacles limit mollifier methods for the Riemann Hypothesis?",
-            runId: "run-prior",
-            links: [],
-            data: {}
-          }
-        ],
-        directions: [],
-        hypotheses: [],
-        methodPlans: [],
-        queryHints: [
-          "mollifier methods"
-        ]
-      }),
       literatureContext: emptyLiteratureContext({
         available: true,
         paperCount: 1,
@@ -1086,10 +1011,7 @@ test("literature and memory hints are not injected as hidden retrieval queries",
         notebookCount: 0,
         papers: [],
         themes: [],
-        notebooks: [],
-        queryHints: [
-          "zero-free region"
-        ]
+        notebooks: []
       }),
       scholarlyProviderIds: ["openalex"]
     });
@@ -1164,7 +1086,6 @@ test("provider retrieval pages beyond the old five-result ceiling", async () => 
         searchQueries: ["autonomous research agents design patterns"],
         localFocus: ["architectures", "evaluation strategies"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex"]
     });
 
@@ -1246,7 +1167,6 @@ test("source gathering emits progress and resolves access only for promising pap
         searchQueries: ["autonomous research agent harness architecture evaluation"],
         localFocus: ["planning", "tool use", "verification", "reproducibility"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex", "unpaywall"],
       credentials: {
         schemaVersion: 1,
@@ -1336,7 +1256,6 @@ test("provider fetch retries a transient rate limit before failing the run", asy
         searchQueries: ["autonomous research agents design patterns"],
         localFocus: ["architectures", "evaluation strategies"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex"]
     });
 
@@ -1379,7 +1298,6 @@ test("missing unpaywall email is reported as an access limitation", async () => 
         searchQueries: ["autonomous research agents design patterns"],
         localFocus: ["architectures", "evaluation strategies"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex", "unpaywall"]
     });
 
@@ -1461,7 +1379,6 @@ test("literature-review screening keeps query noise visible with advisory diagno
         searchQueries: ["Riemann Hypothesis proof techniques review"],
         localFocus: ["analytic number theory", "explicit criteria"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex"]
     });
 
@@ -1534,7 +1451,6 @@ test("source screening keeps strong task and focus matches visible without domai
         searchQueries: ["autonomous research agents literature synthesis"],
         localFocus: ["planning loops", "evaluation", "memory", "provenance"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex"]
     });
 
@@ -1641,7 +1557,6 @@ test("review workflow selects available high-quality papers without sparse-evide
         searchQueries: ["autonomous research agents literature synthesis"],
         localFocus: ["planning loops", "evaluation", "memory", "provenance"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex"]
     });
 
@@ -1748,7 +1663,6 @@ test("review workflow keeps researcher-visible papers without semantic off-topic
         searchQueries: ["autonomous research agents literature review summarization"],
         localFocus: ["information retrieval", "summarization", "information organization"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex"]
     });
 
@@ -1840,7 +1754,6 @@ test("source selection retains papers without deterministic success-criterion fa
         searchQueries: ["AI adoption nursing homes staffing care quality"],
         localFocus: ["staffing", "workforce displacement", "care quality"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex"]
     });
 
@@ -1912,7 +1825,6 @@ test("source selection does not turn semantic drift into deterministic missing f
         searchQueries: ["Riemann zeta zeros numerical verification error bounds"],
         localFocus: ["error bounds", "rigorous computation", "implementation constraints"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex"]
     });
 
@@ -2002,13 +1914,12 @@ test("thin evidence does not trigger runtime-generated revision queries", async 
         searchQueries: ["autonomous research agents evidence"],
         localFocus: ["planning", "evaluation"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex"]
     });
 
     assert.equal(gathered.retrievalDiagnostics?.revisionPasses, 0);
     assert.equal(gathered.retrievalDiagnostics?.providerAttempts.some((attempt) => attempt.phase === "revision"), false);
-    assert.equal(gathered.retrievalDiagnostics?.queries.some((query) => query.source === "revision" || query.source === "rejected_candidate"), false);
+    assert.equal(gathered.retrievalDiagnostics?.queries.every((query) => query.source === "plan"), true);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });
@@ -2114,7 +2025,6 @@ test("source quality warnings do not alter explicit evidence selection", async (
         searchQueries: ["Riemann Hypothesis proof techniques number theory"],
         localFocus: ["mollifier methods", "zero-density estimates"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["openalex"]
     });
 
@@ -2192,7 +2102,6 @@ test("canonical merge does not collapse revision-style series into hidden eviden
         searchQueries: ["Riemann Hypothesis mollifier methods", "Riemann Hypothesis zero density estimates"],
         localFocus: ["mollifier methods", "zero-density estimates"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["arxiv"]
     });
 
@@ -2263,7 +2172,6 @@ test("ieee xplore discovery yields canonical papers with honest access state", a
         searchQueries: ["autonomous research agents engineering benchmarks"],
         localFocus: ["benchmarks", "reproducibility"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["ieee_xplore"]
     });
 
@@ -2366,7 +2274,6 @@ test("elsevier discovery and acquisition upgrade a canonical paper to licensed f
         searchQueries: ["autonomous research agents scientific planning"],
         localFocus: ["planning", "evaluation"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["elsevier"]
     });
 
@@ -2453,7 +2360,6 @@ test("elsevier discovery keeps scopus results even when the science direct entit
         searchQueries: ["autonomous research agents scientific planning"],
         localFocus: ["planning", "evaluation"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["elsevier"]
     });
 
@@ -2557,7 +2463,6 @@ test("springer nature discovery and OA lookup resolve an open full-text route", 
         searchQueries: ["autonomous research agents reproducible literature synthesis"],
         localFocus: ["literature synthesis", "reproducibility"]
       },
-      memoryContext: emptyMemoryContext(),
       scholarlyProviderIds: ["springer_nature"]
     });
 

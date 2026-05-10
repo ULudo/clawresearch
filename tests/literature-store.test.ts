@@ -115,10 +115,7 @@ test("literature store persists canonical papers, access state, theme boards, an
     assert.equal(context.papers[0]?.accessMode, "fulltext_open");
     assert.match(context.themes[0]?.title ?? "", /Proof-technique families/);
     assert.match(context.notebooks[0]?.summary ?? "", /First-pass literature notebook/);
-    assert.ok(
-      context.queryHints.some((hint) => /proof-technique/i.test(hint)),
-      `Expected proof-technique query hint, saw: ${context.queryHints.join(" | ")}`
-    );
+    assert.equal("queryHints" in context, false);
     assert.match(serializedStore, /"paperCount": 1/);
     assert.match(serializedStore, /"fulltext_open"/);
   } finally {

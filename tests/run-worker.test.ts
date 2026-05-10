@@ -59,7 +59,8 @@ async function assertOldPhaseArtifactsAbsent(runDirectory: string): Promise<void
     "quality-report.json",
     "next-questions.json",
     "agenda.json",
-    "agenda.md"
+    "agenda.md",
+    "research-journal.json"
   ];
 
   for (const artifactName of oldPhaseArtifactNames) {
@@ -336,12 +337,33 @@ class StubResearchBackend implements ResearchBackend {
         "Riemann Hypothesis proof techniques",
         "Riemann zeta function proof strategy survey"
       ],
-      localFocus: [
-        "proof techniques",
-        "limitations"
-      ]
-    };
-  }
+	      localFocus: [
+	        "proof techniques",
+	        "limitations"
+	      ],
+	      notebookPatch: {
+	        objective: "Map the main proof-technique families and their limitations.",
+	        definitionOfDone: [
+	          "Research tasks are tracked in the notebook.",
+	          "Central claims are supported by evidence before finalization."
+	        ],
+	        currentFocus: "Establish the initial research workspace.",
+	        readiness: "Not sufficient yet; the notebook has only been initialized before research actions.",
+	        tasks: [{
+	          id: "task-initialize-research-workspace",
+	          title: "Initialize the research workspace and source protocol",
+	          status: "in_progress",
+	          notes: "This model-authored planning task keeps the run oriented before source, evidence, claim, and section work.",
+	          linkedSourceIds: [],
+	          linkedExtractionIds: [],
+	          linkedEvidenceCellIds: [],
+	          linkedClaimIds: [],
+	          linkedSectionIds: [],
+	          linkedArtifactPaths: []
+	        }]
+	      }
+	    };
+	  }
 
   async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
     this.actionRequests.push(request);
@@ -2003,7 +2025,7 @@ class LiteratureAwareResearchBackend implements ResearchBackend {
 
     return {
       researchMode: "literature_synthesis",
-      objective: "Use prior literature memory to continue the mollifier-focused review.",
+      objective: "Use prior literature context to continue the mollifier-focused review.",
       rationale: "The project already has canonical papers and theme boards that point to a bounded follow-up.",
       searchQueries: [
         "mollifier methods Riemann Hypothesis limitations"
@@ -2020,7 +2042,7 @@ class LiteratureAwareResearchBackend implements ResearchBackend {
       return {
         schemaVersion: 1,
         action: "workspace.status",
-        rationale: "Checkpoint after prior literature memory has been used to create durable claim and section state.",
+        rationale: "Checkpoint after prior literature context has been used to create durable claim and section state.",
         confidence: 0.86,
         inputs: {
           providerIds: [],
@@ -2069,7 +2091,7 @@ class LiteratureAwareResearchBackend implements ResearchBackend {
 class LiteratureAwareSourceToolAdapter implements ResearchSourceToolAdapter {
   async run(request: ResearchSourceToolRequest): Promise<ResearchSourceSnapshot> {
     assert.equal(request.literatureContext?.available, true);
-    assert.match(request.literatureContext?.queryHints.join(" | ") ?? "", /mollifier/i);
+    assert.match(request.literatureContext?.papers[0]?.title ?? "", /mollifier/i);
     const papers = [
       canonicalPaper({
         id: "paper-2",
@@ -2088,7 +2110,7 @@ class LiteratureAwareSourceToolAdapter implements ResearchSourceToolAdapter {
 
     return {
       notes: [
-        "Used prior literature memory to focus retrieval on mollifier methods."
+        "Used prior literature context to focus retrieval on mollifier methods."
       ],
       sources: [],
       canonicalPapers: papers,
@@ -2353,10 +2375,11 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
   readonly researchRequests: ResearchActionRequest[] = [];
   private extractionId: string | null = null;
   private evidenceCellId: string | null = null;
-  private matrixViewed = false;
-  private criticReviewed = false;
-  private releaseVerified = false;
-  private manuscriptReleased = false;
+	  private matrixViewed = false;
+	  private criticReviewed = false;
+	  private releaseVerified = false;
+	  private notebookReadinessPatched = false;
+	  private manuscriptReleased = false;
 
   override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
     if (request.phase !== "research") {
@@ -2637,7 +2660,45 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
         stopCondition: "Release checks exist.",
         transport: "strict_json"
       };
-    } else if (!this.manuscriptReleased) {
+	    } else if (!this.notebookReadinessPatched) {
+	      this.notebookReadinessPatched = true;
+	      action = {
+	        schemaVersion: 1,
+	        action: "notebook.patch",
+	        rationale: "Record the model-owned readiness assessment before finalization.",
+	        confidence: 0.9,
+	        inputs: {
+	          ...baseInputs,
+	          workStore: {
+	            collection: null,
+	            entityId: null,
+	            filters: {},
+	            semanticQuery: null,
+	            limit: null,
+	            cursor: null,
+	            changes: {},
+	            entity: {
+	              currentFocus: "Finalize the validated smoke manuscript export.",
+	              readiness: "Ready to finalize with caveats: this is a bounded single-source smoke manuscript whose mechanical provenance and citation invariants have been checked.",
+	              task: {
+	                id: "task-finalize-explicit-tool-smoke",
+	                title: "Finalize explicit tool smoke manuscript",
+	                status: "done",
+	                notes: "The manuscript is acceptable as a bounded smoke test, not as a professional literature review.",
+	                linkedSourceIds: [sourceId],
+	                linkedExtractionIds: this.extractionId === null ? [] : [this.extractionId],
+	                linkedEvidenceCellIds: this.evidenceCellId === null ? [] : [this.evidenceCellId],
+	                linkedClaimIds: claim === undefined ? [] : [claim.id],
+	                linkedSectionIds: section === undefined ? [] : [section.id]
+	              }
+	            }
+	          }
+	        },
+	        expectedOutcome: "Notebook readiness is explicit before finalization.",
+	        stopCondition: "Notebook readiness records the bounded release decision.",
+	        transport: "strict_json"
+	      };
+	    } else if (!this.manuscriptReleased) {
       this.manuscriptReleased = true;
       action = {
         schemaVersion: 1,
@@ -3167,6 +3228,7 @@ test("architecture contract: old phase artifacts are not written during a source
     const runDirectory = (await runStore.load(run.id)).artifacts.runDirectory;
 
     await assertOldPhaseArtifactsAbsent(runDirectory);
+    await assert.rejects(readFile(path.join(projectRoot, ".clawresearch", "research-journal.json"), "utf8"), /ENOENT/);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -3273,12 +3335,49 @@ test("notebook.read and notebook.patch are explicit model-facing tools with arti
       "Central claims are supported by citations.",
       "The final manuscript is finalized only after checks pass."
     ]);
-    assert.equal(workStore.notebook.tasks[0]?.id, "task-build-synthesis");
-    assert.deepEqual(workStore.notebook.tasks[0]?.linkedEvidenceCellIds, ["evidence-cell-planned"]);
-    assert.deepEqual(workStore.notebook.tasks[0]?.linkedArtifactPaths, ["research-notes/synthesis-plan.md"]);
-    assert.equal(backend.researchRequests[1]?.workStore?.notebook.tasks[0]?.title, "Build claim-led synthesis from selected evidence");
+	    const synthesisTask = workStore.notebook.tasks.find((task) => task.id === "task-build-synthesis");
+	    assert.ok(synthesisTask);
+	    assert.deepEqual(synthesisTask.linkedEvidenceCellIds, ["evidence-cell-planned"]);
+	    assert.deepEqual(synthesisTask.linkedArtifactPaths, ["research-notes/synthesis-plan.md"]);
+	    assert.ok(backend.researchRequests[1]?.workStore?.notebook.tasks.some((task) => task.title === "Build claim-led synthesis from selected evidence"));
     assert.equal(readResult?.collection, "notebook");
     assert.equal(readResult?.items?.[0]?.kind, "notebookTask");
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("planning persists the model-authored notebook patch before research actions", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-planning-notebook-patch-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "planning-owned notebook",
+      researchQuestion: "Does planning initialize notebook project state?",
+      researchDirection: "Persist model-authored task state before tool actions.",
+      successCriterion: "The notebook has tasks, focus, and readiness after planning."
+    }, ["clawresearch", "research-loop"]);
+
+    await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: new StubResearchBackend()
+    });
+
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const agentSteps = await readFile((await runStore.load(run.id)).artifacts.agentStepsPath, "utf8");
+
+    assert.ok(workStore.notebook.tasks.some((task) => task.id === "task-initialize-research-workspace"));
+    assert.equal(workStore.notebook.currentFocus, "Establish the initial research workspace.");
+    assert.match(workStore.notebook.readiness, /Not sufficient yet/);
+    assert.match(agentSteps, /protocol\.create_or_revise/);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -3482,11 +3581,12 @@ test("explicit researcher tools create extraction, evidence, critic feedback, re
       "evidence.matrix_view",
       "claim.create",
       "claim.link_support",
-      "section.create",
-      "critic.review",
-      "release.verify",
-      "manuscript.finalize"
-    ]);
+	      "section.create",
+	      "critic.review",
+	      "release.verify",
+	      "notebook.patch",
+	      "manuscript.finalize"
+	    ]);
     const validActions = new Set(workspaceResearchActions());
     const emittedHints = backend.researchRequests
       .flatMap((request) => request.toolResults ?? [])
@@ -3507,12 +3607,19 @@ test("explicit researcher tools create extraction, evidence, critic feedback, re
     assert.equal(supportLinkResult?.collection, "citations");
     assert.equal(supportLinkResult?.entity?.kind, "citation");
     assert.ok(supportLinkResult?.related?.some((item) => item.kind === "claim"));
-    const sectionCreateResult = backend.researchRequests
-      .flatMap((request) => request.toolResults ?? [])
-      .find((result) => result.action === "section.create");
-    assert.equal(sectionCreateResult?.collection, "manuscriptSections");
-    assert.equal(sectionCreateResult?.entity?.kind, "manuscriptSection");
-    assert.equal(workStore.objects.extractions.length, 1);
+	    const sectionCreateResult = backend.researchRequests
+	      .flatMap((request) => request.toolResults ?? [])
+	      .find((result) => result.action === "section.create");
+	    assert.equal(sectionCreateResult?.collection, "manuscriptSections");
+	    assert.equal(sectionCreateResult?.entity?.kind, "manuscriptSection");
+	    const releaseVerifyResult = backend.researchRequests
+	      .flatMap((request) => request.toolResults ?? [])
+	      .find((result) => result.action === "release.verify");
+	    assert.equal(releaseVerifyResult?.status, "not_ready");
+	    assert.match(releaseVerifyResult?.message ?? "", /Mechanical checks passed/);
+	    assert.match(releaseVerifyResult?.message ?? "", /research readiness/i);
+	    assert.ok(releaseVerifyResult?.related?.some((item) => item.kind === "notebookDiagnostic"));
+	    assert.equal(workStore.objects.extractions.length, 1);
     assert.equal(workStore.objects.extractions[0]?.sourceId, sourceId);
     assert.equal(workStore.objects.evidenceCells.length, 1);
     assert.equal(workStore.objects.evidenceCells[0]?.sourceId, sourceId);
@@ -3878,8 +3985,7 @@ test("run store loads legacy run records with manuscript artifact defaults", asy
         briefPath: path.join(runDirectoryPath(projectRoot, runId), "brief.json"),
         planPath: path.join(runDirectoryPath(projectRoot, runId), "plan.json"),
         sourcesPath: path.join(runDirectoryPath(projectRoot, runId), "sources.json"),
-        summaryPath: path.join(runDirectoryPath(projectRoot, runId), "summary.md"),
-        memoryPath: path.join(runDirectoryPath(projectRoot, runId), "research-journal.json")
+        summaryPath: path.join(runDirectoryPath(projectRoot, runId), "summary.md")
       }
     }, null, 2)}\n`, "utf8");
 
@@ -4497,7 +4603,7 @@ test("protocol.create_or_revise persists a researcher-owned protocol object", as
   }
 });
 
-test("run worker uses prior literature memory to inform planning and retrieval", async () => {
+test("run worker uses prior literature context to inform planning and retrieval", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-run-worker-literature-"));
   const now = createNow();
 

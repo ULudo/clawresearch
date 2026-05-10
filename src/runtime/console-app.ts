@@ -770,9 +770,8 @@ export function renderStatus(
   const literatureContext = workStore === null
     ? null
     : buildLiteratureContextFromWorkStore(workStore);
-
-  if (literatureContext !== null && literatureContext.available && literatureContext.queryHints.length > 0) {
-    writeLine(writer, `  current hints: ${literatureContext.queryHints.slice(0, 4).join(" | ")}`);
+  if (literatureContext !== null && literatureContext.available) {
+    writeLine(writer, `  workspace context: ${literatureContext.paperCount} canonical sources, ${literatureContext.themeCount} evidence themes, ${literatureContext.notebookCount} notebook summaries`);
   }
 }
 

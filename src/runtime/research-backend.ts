@@ -1,6 +1,9 @@
 import type { ResearchBrief } from "./session-store.js";
 import type { ResearchWorkerState } from "./research-state.js";
-import type { ProjectMemoryContext } from "./memory-store.js";
+import type {
+  ResearchNotebookTaskStatus,
+  WorkspacePromptContext
+} from "./research-work-store.js";
 import type {
   LiteratureContext
 } from "./literature-store.js";
@@ -47,6 +50,29 @@ export type ResearchPlan = {
   rationale: string;
   searchQueries: string[];
   localFocus: string[];
+  notebookPatch?: ResearchPlanNotebookPatch | null;
+};
+
+export type ResearchPlanNotebookTask = {
+  id?: string;
+  title: string;
+  status: ResearchNotebookTaskStatus;
+  notes: string | null;
+  linkedSourceIds: string[];
+  linkedExtractionIds: string[];
+  linkedEvidenceCellIds: string[];
+  linkedClaimIds: string[];
+  linkedSectionIds: string[];
+  linkedArtifactPaths: string[];
+};
+
+export type ResearchPlanNotebookPatch = {
+  objective?: string;
+  definitionOfDone?: string[];
+  tasks?: ResearchPlanNotebookTask[];
+  currentFocus?: string | null;
+  readiness?: string;
+  notes?: string[];
 };
 
 export type ResearchTheme = {
@@ -72,7 +98,7 @@ export type ResearchPlanningRequest = {
   projectRoot: string;
   brief: ResearchBrief;
   localFiles: string[];
-  memoryContext: ProjectMemoryContext;
+  workspaceContext: WorkspacePromptContext;
   literatureContext?: LiteratureContext;
   workerState?: ResearchWorkerState | null;
 };
@@ -200,6 +226,95 @@ function safeStringArray(value: unknown, limit = 8): string[] {
     .slice(0, limit);
 }
 
+function safeObject(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null ? value as Record<string, unknown> : null;
+}
+
+function safeNotebookTaskStatus(value: unknown): ResearchNotebookTaskStatus {
+  switch (value) {
+    case "todo":
+    case "in_progress":
+    case "done":
+    case "blocked":
+    case "abandoned":
+      return value;
+    default:
+      return "todo";
+  }
+}
+
+function normalizePlanNotebookTask(value: unknown): ResearchPlanNotebookTask | null {
+  const record = safeObject(value);
+  if (record === null) {
+    return null;
+  }
+  const title = safeString(record.title ?? record.text);
+  if (title === null) {
+    return null;
+  }
+
+  const id = safeString(record.id);
+  return {
+    ...(id === null ? {} : { id }),
+    title,
+    status: safeNotebookTaskStatus(record.status),
+    notes: safeString(record.notes ?? record.note),
+    linkedSourceIds: safeStringArray(record.linkedSourceIds ?? record.sourceIds, 40),
+    linkedExtractionIds: safeStringArray(record.linkedExtractionIds ?? record.extractionIds, 40),
+    linkedEvidenceCellIds: safeStringArray(record.linkedEvidenceCellIds ?? record.evidenceCellIds, 40),
+    linkedClaimIds: safeStringArray(record.linkedClaimIds ?? record.claimIds, 40),
+    linkedSectionIds: safeStringArray(record.linkedSectionIds ?? record.sectionIds, 40),
+    linkedArtifactPaths: safeStringArray(record.linkedArtifactPaths ?? record.artifactPaths, 40)
+  };
+}
+
+function normalizePlanNotebookPatch(raw: Record<string, unknown>): ResearchPlanNotebookPatch | null {
+  const notebookRecord = safeObject(raw.notebookPatch)
+    ?? safeObject(raw.notebook)
+    ?? (
+      raw.tasks !== undefined
+        || raw.currentFocus !== undefined
+        || raw.readiness !== undefined
+        || raw.definitionOfDone !== undefined
+        ? raw
+        : null
+    );
+  if (notebookRecord === null) {
+    return null;
+  }
+
+  const objective = safeString(notebookRecord.objective);
+  const currentFocus = safeString(notebookRecord.currentFocus);
+  const readiness = safeString(notebookRecord.readiness ?? notebookRecord.readinessSelfAssessment);
+  const definitionOfDone = safeStringArray(notebookRecord.definitionOfDone, 40);
+  const notes = safeStringArray(notebookRecord.notes, 40);
+  const tasks = Array.isArray(notebookRecord.tasks)
+    ? notebookRecord.tasks.flatMap((entry) => normalizePlanNotebookTask(entry) ?? [])
+    : [];
+
+  const patch: ResearchPlanNotebookPatch = {};
+  if (objective !== null) {
+    patch.objective = objective;
+  }
+  if (definitionOfDone.length > 0) {
+    patch.definitionOfDone = definitionOfDone;
+  }
+  if (tasks.length > 0) {
+    patch.tasks = tasks;
+  }
+  if (currentFocus !== null) {
+    patch.currentFocus = currentFocus;
+  }
+  if (readiness !== null) {
+    patch.readiness = readiness;
+  }
+  if (notes.length > 0) {
+    patch.notes = notes;
+  }
+
+  return Object.keys(patch).length > 0 ? patch : null;
+}
+
 function safeResearchMode(value: unknown): ResearchMode | null {
   switch (value) {
     case "literature_synthesis":
@@ -267,16 +382,17 @@ function normalizePlan(raw: unknown, brief: ResearchBrief): ResearchPlan {
   const fallbackTopic = brief.topic ?? "the requested project";
   const fallbackQuestion = brief.researchQuestion ?? `What is the most useful first-pass research framing for ${fallbackTopic}?`;
 
-  return {
-    researchMode: safeResearchMode(record.researchMode) ?? "literature_synthesis",
-    objective: safeString(record.objective) ?? fallbackQuestion,
-    rationale: safeString(record.rationale) ?? "Begin with a literature-grounded operating plan before making stronger claims.",
-    searchQueries: safeStringArray(record.searchQueries, 5).length > 0
-      ? safeStringArray(record.searchQueries, 5)
-      : [fallbackTopic, fallbackQuestion],
-    localFocus: safeStringArray(record.localFocus, 5)
-  };
-}
+	  return {
+	    researchMode: safeResearchMode(record.researchMode) ?? "literature_synthesis",
+	    objective: safeString(record.objective) ?? fallbackQuestion,
+	    rationale: safeString(record.rationale) ?? "Begin with a literature-grounded operating plan before making stronger claims.",
+	    searchQueries: safeStringArray(record.searchQueries, 5).length > 0
+	      ? safeStringArray(record.searchQueries, 5)
+	      : [fallbackTopic, fallbackQuestion],
+	    localFocus: safeStringArray(record.localFocus, 5),
+	    notebookPatch: normalizePlanNotebookPatch(record)
+	  };
+	}
 
 function planningInstruction(request: ResearchPlanningRequest): string {
   const literatureContext = request.literatureContext ?? {
@@ -286,20 +402,29 @@ function planningInstruction(request: ResearchPlanningRequest): string {
     notebookCount: 0,
     papers: [],
     themes: [],
-    notebooks: [],
-    queryHints: []
+    notebooks: []
+  };
+  const literaturePromptContext = {
+    available: literatureContext.available,
+    paperCount: literatureContext.paperCount,
+    themeCount: literatureContext.themeCount,
+    notebookCount: literatureContext.notebookCount,
+    papers: literatureContext.papers,
+    themes: literatureContext.themes,
+    notebooks: literatureContext.notebooks
   };
 
   return [
     "You are ClawResearch's planning module for a console-first autonomous research runtime.",
-    "Plan an initial research operating mode using the brief, current workspace memory, and local project context.",
-    "Use the project memory when it is relevant so the next pass builds on prior findings, open questions, useful ideas, and existing artifacts instead of starting from scratch.",
+    "Plan an initial research operating mode using the brief, current SQLite workspace context, and local project context.",
+    "Use the workspace context when it is relevant so the next pass builds on existing notebook tasks, sources, evidence, claims, sections, checks, and work items instead of starting from scratch.",
     "Ground the plan in the following design principles:",
     "- choose a research mode explicitly",
     "- prefer bounded literature-grounded work over overclaiming",
     "- keep the objective specific and debuggable",
-    "- produce search queries that are likely to retrieve useful sources",
-    "- use the project directory context when relevant",
+	    "- produce search queries that are likely to retrieve useful sources",
+	    "- initialize the living research notebook as a project-management contract owned by the researcher model",
+	    "- use the project directory context when relevant",
     "",
     "Allowed researchMode values:",
     "- literature_synthesis",
@@ -315,14 +440,22 @@ function planningInstruction(request: ResearchPlanningRequest): string {
     '  "objective": "string",',
     '  "rationale": "string",',
     '  "searchQueries": ["string"],',
-    '  "localFocus": ["string"]',
-    "}",
+	    '  "localFocus": ["string"],',
+	    '  "notebookPatch": {',
+	    '    "objective": "string",',
+	    '    "definitionOfDone": ["model-authored criteria for this project"],',
+	    '    "tasks": [{ "id": "optional stable task id", "title": "task title", "status": "todo|in_progress|done|blocked|abandoned", "notes": "string or null", "linkedSourceIds": [], "linkedExtractionIds": [], "linkedEvidenceCellIds": [], "linkedClaimIds": [], "linkedSectionIds": [], "linkedArtifactPaths": [] }],',
+	    '    "currentFocus": "string",',
+	    '    "readiness": "explicit current readiness assessment, usually not sufficient at startup",',
+	    '    "notes": ["optional notebook note"]',
+	    "  }",
+	    "}",
     "",
     `Project root: ${request.projectRoot}`,
     `Brief: ${JSON.stringify(request.brief)}`,
     `Local files: ${JSON.stringify(request.localFiles.slice(0, 20))}`,
-    `Project memory context: ${JSON.stringify(request.memoryContext)}`,
-    `Literature memory context: ${JSON.stringify(literatureContext)}`,
+    `Workspace context: ${JSON.stringify(request.workspaceContext)}`,
+    `Literature context: ${JSON.stringify(literaturePromptContext)}`,
     `Autonomous worker state: ${JSON.stringify(request.workerState ?? null)}`,
     "If autonomous worker state contains nextInternalActions, continue those machine-actionable research actions unless the brief has materially changed or an external blocker prevents progress."
   ].join("\n");
@@ -349,8 +482,9 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     "Do not invent tool names. Do not execute the action yourself. The runtime will validate and execute the chosen action.",
     "The phase value is only a milestone/progress label. It must not limit your tool choice.",
     "The workspace dashboard is an index, not full memory; use workspace.list/search/read to inspect older or complete state.",
-    "If a custom tool family is unclear, use guidance.search/read/recommend to inspect the ClawResearch lab manual.",
-    "Use notebook.read/patch to keep the objective, definition of done, task list, readiness note, and artifact links alive.",
+	    "If a custom tool family is unclear, use guidance.search/read/recommend to inspect the ClawResearch lab manual.",
+	    "The notebook is your living project-management contract: objective, definition of done, task list, current focus, readiness assessment, and artifact links.",
+	    "Use notebook.read/patch to keep that contract current as research state changes; the runtime will not infer research sufficiency for you.",
     "Use workspace.search/read/list/create/patch/link/unlink to inspect or update the durable SQLite research workspace.",
     "Use source.search, source.merge, source.resolve_access, and source.select_evidence for source discovery and evidence-set construction.",
     "Use claim.create/patch/check_support/link_support for claim-led synthesis.",
@@ -359,8 +493,8 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     "Use guidance.search/read/recommend to inspect advisory research-lab scaffolding. Guidance is not a gate and may be overridden.",
     "Use protocol.create_or_revise when the research protocol itself needs visible revision by the researcher.",
     "Use critic.review for fresh stateless critique, and check.run for release/support checks.",
-    "Use release.verify for final computable release invariants; semantic concerns should become diagnostics or work items.",
-    "Use manuscript.finalize only when you intentionally want the runtime to write paper.md from workspace sections after hard invariant checks pass.",
+	    "Use release.verify for final computable release invariants and notebook/project-management diagnostics; it does not decide research completeness.",
+	    "Use manuscript.finalize only when you intentionally want the runtime to write paper.md from workspace sections after hard invariant checks pass and you have explicitly recorded notebook.readiness.",
     "Critic objections, failed release checks, and not-ready tool results are repair signals. Prefer concrete tool steps over stopping.",
     "Recent tool results are authoritative observations from executed tools. Use returned ids, snippets, and previews before repeating the same read action.",
     "Use workspace.status only for a validated external blocker or real user decision; do not stop merely because machine-actionable work remains.",
@@ -783,8 +917,9 @@ function nativeAgentStepInstruction(request: ResearchActionRequest): string {
     "Do not answer in prose. Do not invent tools. The runtime validates and executes the chosen action.",
     "The phase value is only a milestone/progress label. It must not limit your tool choice.",
     "The workspace dashboard is an index, not full memory; use workspace.list/search/read to inspect older or complete state.",
-    "If a custom tool family is unclear, use guidance.search/read/recommend to inspect the ClawResearch lab manual.",
-    "Use notebook.read/patch to keep the objective, definition of done, task list, readiness note, and artifact links alive.",
+	    "If a custom tool family is unclear, use guidance.search/read/recommend to inspect the ClawResearch lab manual.",
+	    "The notebook is your living project-management contract: objective, definition of done, task list, current focus, readiness assessment, and artifact links.",
+	    "Use notebook.read/patch to keep that contract current as research state changes; the runtime will not infer research sufficiency for you.",
     "Use workspace.search/read/list/create/patch/link/unlink to inspect or update the durable SQLite research workspace.",
     "Use source.search, source.merge, source.resolve_access, and source.select_evidence for source discovery and evidence-set construction.",
     "Use claim.create/patch/check_support/link_support for claim-led synthesis.",
@@ -793,8 +928,8 @@ function nativeAgentStepInstruction(request: ResearchActionRequest): string {
     "Use guidance.search/read/recommend to inspect advisory research-lab scaffolding. Guidance is not a gate and may be overridden.",
     "Use protocol.create_or_revise when the research protocol itself needs visible revision by the researcher.",
     "Use critic.review for fresh stateless critique, and check.run for release/support checks.",
-    "Use release.verify for final computable release invariants; semantic concerns should become diagnostics or work items.",
-    "Use manuscript.finalize only when you intentionally want the runtime to write paper.md from workspace sections after hard invariant checks pass.",
+	    "Use release.verify for final computable release invariants and notebook/project-management diagnostics; it does not decide research completeness.",
+	    "Use manuscript.finalize only when you intentionally want the runtime to write paper.md from workspace sections after hard invariant checks pass and you have explicitly recorded notebook.readiness.",
     "Critic objections, failed release checks, and not-ready tool results are repair signals. Prefer concrete tool steps over stopping.",
     "Recent tool results are authoritative observations from executed tools. Use returned ids, snippets, and previews before repeating the same read action.",
     "Use workspace.status only for a validated external blocker or real user decision; do not stop merely because machine-actionable work remains.",
