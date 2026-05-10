@@ -86,8 +86,14 @@ export const researchWorkspaceToolActions: ResearchWorkspaceToolName[] = [
   "workspace.status"
 ];
 
-export function workspaceResearchActions(): ResearchActionName[] {
-  return [...researchWorkspaceToolActions];
+export type WorkspaceResearchActionOptions = {
+  criticAvailable?: boolean;
+};
+
+export function workspaceResearchActions(options: WorkspaceResearchActionOptions = {}): ResearchActionName[] {
+  const criticAvailable = options.criticAvailable ?? true;
+  return researchWorkspaceToolActions
+    .filter((action) => criticAvailable || action !== "critic.review");
 }
 
 export function isResearchWorkspaceToolName(value: ResearchActionName): value is ResearchWorkspaceToolName {
@@ -288,6 +294,7 @@ export type ResearchActionRequest = {
         fullTextAvailableSources: number;
         metadataOnlySources: number;
       };
+      recentCriticReviews?: Array<Record<string, string | number | null>>;
       recentlyChangedIds: Array<{
         collection: string;
         id: string;
@@ -332,6 +339,7 @@ export type ResearchActionRequest = {
         kind: string;
         createdAt: string;
       }>;
+      recentCriticReviews?: Array<Record<string, string | number | null>>;
     };
     recentProtocols: Array<{
       id: string;

@@ -51,7 +51,10 @@ import {
   type PaperExtractionConfidence
 } from "./research-evidence.js";
 import {
+  criticUnavailableReview,
   normalizeCriticReview,
+  type CriticReviewArtifact,
+  type CriticReviewRequest,
   type CriticReviewScope
 } from "./research-critic.js";
 import {
@@ -383,6 +386,7 @@ function workStoreContextForAgent(store: ResearchWorkStore): ResearchActionReque
       releaseCheckBlockers: failedReleaseChecks.filter((check) => check.severity === "blocker").length,
       sourceAccess,
       notebookDiagnostics,
+      recentCriticReviews: criticReviewSummariesFromNotebook(store),
       recentlyChangedIds: recentlyChangedWorkspaceIds(store),
       suggestedLookupTools: ["workspace.list", "workspace.search", "workspace.read"]
     },
@@ -417,7 +421,8 @@ function workStoreContextForAgent(store: ResearchWorkStore): ResearchActionReque
 	        path: artifact.path,
 	        kind: artifact.kind,
 	        createdAt: artifact.createdAt
-	      }))
+	      })),
+        recentCriticReviews: criticReviewSummariesFromNotebook(store)
 	    },
 	    openWorkItems: store.objects.workItems
       .filter((item) => item.status === "open")
@@ -780,6 +785,11 @@ function isReadOnlyWorkspaceAction(action: ResearchActionDecision["action"]): bo
     || action === "guidance.search"
     || action === "guidance.read"
     || action === "guidance.recommend";
+}
+
+function criticReviewAvailable(backend: ResearchBackend): boolean {
+  return backend.capabilities?.criticReview === true
+    && typeof backend.reviewResearchArtifact === "function";
 }
 
 function safeWorkStoreCollection(value: string | null | undefined): WorkStoreCollectionName | null {
@@ -2273,6 +2283,187 @@ function criticReviewArtifactPath(run: RunRecord, stage: CriticReviewScope): str
   }
 }
 
+function criticReviewArtifactLink(input: {
+  run: RunRecord;
+  stage: CriticReviewScope;
+  review: CriticReviewArtifact;
+  nowText: string;
+}): ResearchNotebookArtifactLink {
+  return {
+    label: `Critic review: ${input.stage} (${input.review.readiness})`,
+    path: criticReviewArtifactPath(input.run, input.stage),
+    kind: "other",
+    createdAt: input.nowText
+  };
+}
+
+function upsertNotebookArtifactLink(
+  store: ResearchWorkStore,
+  artifact: ResearchNotebookArtifactLink,
+  nowText: string
+): ResearchWorkStore {
+  const artifactLinks = store.notebook.artifactLinks
+    .filter((existing) => existing.path !== artifact.path);
+  artifactLinks.push(artifact);
+
+  return {
+    ...store,
+    updatedAt: nowText,
+    notebook: {
+      ...store.notebook,
+      artifactLinks,
+      updatedAt: nowText
+    }
+  };
+}
+
+function criticReviewSummaryFromArtifactLink(artifact: ResearchNotebookArtifactLink): Record<string, string | number | null> | null {
+  const match = /^Critic review: ([a-z_]+) \((pass|revise|block)\)$/i.exec(artifact.label);
+  if (match === null) {
+    return null;
+  }
+
+  return {
+    stage: match[1]?.toLowerCase() ?? "release",
+    readiness: match[2]?.toLowerCase() ?? "revise",
+    artifactPath: artifact.path,
+    createdAt: artifact.createdAt
+  };
+}
+
+function criticReviewSummariesFromNotebook(store: ResearchWorkStore): Array<Record<string, string | number | null>> {
+  return store.notebook.artifactLinks
+    .flatMap((artifact) => {
+      const summary = criticReviewSummaryFromArtifactLink(artifact);
+      return summary === null ? [] : [summary];
+    })
+    .slice(-8);
+}
+
+function criticSourcePacket(source: WorkStoreCanonicalSource): Record<string, unknown> {
+  return {
+    id: source.id,
+    title: source.title,
+    year: source.year,
+    venue: source.venue,
+    citation: source.citation,
+    abstract: compactPreviewText(source.abstract ?? "", 700),
+    screeningDecision: source.screeningDecision,
+    screeningRationale: compactPreviewText(source.screeningRationale ?? "", 300),
+    accessMode: source.accessMode,
+    providerIds: source.providerIds
+  };
+}
+
+function buildCriticReviewRequest(input: {
+  run: RunRecord;
+  store: ResearchWorkStore;
+  stage: CriticReviewScope;
+}): CriticReviewRequest {
+  const references = referencesFromWorkStore(input.run, input.store);
+  const checks = workspaceManuscriptChecks({
+    run: input.run,
+    store: input.store,
+    references
+  });
+  const paper = workspacePaperArtifact({
+    run: input.run,
+    store: input.store,
+    references,
+    readinessStatus: checks.readinessStatus
+  });
+  const citedSourceIds = new Set([
+    ...input.store.objects.citations.map((citation) => citation.sourceId),
+    ...paper.referencedPaperIds
+  ]);
+  const selectedSources = input.store.objects.canonicalSources
+    .filter((source) => source.screeningDecision === "include" || citedSourceIds.has(source.id))
+    .slice(0, 40)
+    .map(criticSourcePacket);
+  const citedSources = input.store.objects.canonicalSources
+    .filter((source) => citedSourceIds.has(source.id))
+    .slice(0, 40)
+    .map(criticSourcePacket);
+
+  return {
+    projectRoot: input.run.projectRoot,
+    runId: input.run.id,
+    stage: input.stage,
+    brief: input.run.brief,
+    paper,
+    references,
+    manuscriptChecks: checks,
+    workspace: {
+      notebook: input.store.notebook,
+      workspaceSummary: summarizeResearchWorkStore(input.store),
+      selectedSources,
+      citedSources,
+      protocols: input.store.objects.protocols.slice(-6).map((protocol) => ({
+        id: protocol.id,
+        title: protocol.title,
+        objective: protocol.objective,
+        researchQuestion: protocol.researchQuestion,
+        evidenceTargets: protocol.evidenceTargets,
+        manuscriptConstraints: protocol.manuscriptConstraints,
+        notes: protocol.notes,
+        author: protocol.author
+      })),
+      extractions: input.store.objects.extractions.slice(-30).map((extraction) => ({
+        id: extraction.id,
+        sourceId: extraction.sourceId,
+        extraction: extraction.extraction
+      })),
+      evidenceCells: input.store.objects.evidenceCells.slice(-60).map((cell) => ({
+        id: cell.id,
+        sourceId: cell.sourceId,
+        extractionId: cell.extractionId,
+        field: cell.field,
+        value: cell.value,
+        confidence: cell.confidence
+      })),
+      claims: input.store.objects.claims.slice(-50).map((claim) => ({
+        id: claim.id,
+        text: claim.text,
+        evidence: claim.evidence,
+        sourceIds: claim.sourceIds,
+        supportStatus: claim.supportStatus,
+        confidence: claim.confidence,
+        usedInSections: claim.usedInSections,
+        risk: claim.risk
+      })),
+      citations: input.store.objects.citations.slice(-80).map((citation) => ({
+        id: citation.id,
+        sourceId: citation.sourceId,
+        sourceTitle: citation.sourceTitle,
+        evidenceCellId: citation.evidenceCellId,
+        supportSnippet: citation.supportSnippet,
+        confidence: citation.confidence,
+        relevance: citation.relevance,
+        claimIds: citation.claimIds,
+        sectionIds: citation.sectionIds
+      })),
+      manuscriptSections: input.store.objects.manuscriptSections.map((section) => ({
+        id: section.id,
+        sectionId: section.sectionId,
+        role: section.role,
+        title: section.title,
+        markdown: section.markdown,
+        sourceIds: section.sourceIds,
+        claimIds: section.claimIds,
+        status: section.status
+      })),
+      releaseChecks: input.store.objects.releaseChecks.slice(-40).map((check) => ({
+        id: check.id,
+        checkId: check.checkId,
+        title: check.title,
+        status: check.status,
+        severity: check.severity,
+        message: check.message
+      }))
+    }
+  };
+}
+
 function guidancePreviewForAgent(item: {
   id: string;
   kind: string;
@@ -2835,6 +3026,8 @@ async function executeWorkStoreToolAction(input: {
 async function executeResearchObjectToolAction(input: {
   run: RunRecord;
   now: () => string;
+  researchBackend: ResearchBackend;
+  runtimeConfig: RuntimeLlmConfig;
   decision: ResearchActionDecision;
   store: ResearchWorkStore;
 }): Promise<WorkspaceToolExecutionResult> {
@@ -2880,15 +3073,8 @@ async function executeResearchObjectToolAction(input: {
 
   if (input.decision.action === "critic.review") {
     const stage = safeCriticReviewScope(args.entity.stage ?? input.decision.inputs.criticScope);
-    const rawReview = objectInput(args.entity.review)
-      ?? objectInput(args.entity.criticReview)
-      ?? (
-        "readiness" in args.entity || "objections" in args.entity || "recoveryAdvice" in args.entity || "revisionAdvice" in args.entity
-          ? args.entity
-          : null
-      );
-    if (rawReview === null) {
-      const message = "Critic review was not run because no critic review payload was provided and no critic backend transport is wired for this explicit tool yet.";
+    if (!criticReviewAvailable(input.researchBackend)) {
+      const message = "Critic review is not available in this project because no critic backend transport is configured.";
       return {
         handled: true,
         store: input.store,
@@ -2897,55 +3083,133 @@ async function executeResearchObjectToolAction(input: {
           run: input.run,
           action: input.decision.action,
           timestamp: nowText,
-          status: "noop",
+          status: "failed",
           readOnly: false,
           message,
           collection: "criticReviews",
           count: 0,
           totalCount: 0,
-          nextHints: ["workspace.read", "work_item.create", "check.run"]
+          error: message,
+          nextHints: ["workspace.read", "work_item.create", "check.run", "release.verify"]
         })
       };
     }
 
-    const references = referencesFromWorkStore(input.run, input.store);
-    const checks = workspaceManuscriptChecks({ run: input.run, store: input.store, references });
-    const paper = workspacePaperArtifact({
+    const request = buildCriticReviewRequest({
       run: input.run,
       store: input.store,
-      references,
-      readinessStatus: checks.readinessStatus
+      stage
     });
-    const review = normalizeCriticReview(rawReview, {
-      projectRoot: input.run.projectRoot,
-      runId: input.run.id,
-      stage,
-      brief: input.run.brief,
-      selectedPapers: [],
-      relevanceAssessments: input.store.objects.canonicalSources.map((source) => ({
-        paperId: source.id,
-        title: source.title,
-        status: "in_scope",
-        sourceRole: "background",
-        selectionDecision: "selected_supporting",
-        selectionReason: "Source is visible in the canonical workspace.",
-        criticConcerns: [],
-        requiredForManuscript: false,
-        reviewer: "advisory_protocol_review",
-        matchedCriteria: [],
-        missingCriteria: [],
-        reason: "Workspace source made visible to explicit critic.review."
-      })),
-      paper,
-      references,
-      manuscriptChecks: checks
-    });
+    let review: CriticReviewArtifact | undefined;
+    try {
+      review = await input.researchBackend.reviewResearchArtifact?.(request, {
+        operation: "critic",
+        timeoutMs: input.runtimeConfig.criticTimeoutMs
+      });
+    } catch (error) {
+      const message = `Critic review failed: ${errorMessage(error)}`;
+      const unavailableReview = criticUnavailableReview(request, errorMessage(error));
+      await writeJsonArtifact(criticReviewArtifactPath(input.run, stage), unavailableReview);
+      const nextStore = upsertNotebookArtifactLink(input.store, criticReviewArtifactLink({
+        run: input.run,
+        stage,
+        review: unavailableReview,
+        nowText
+      }), nowText);
+      await writeResearchWorkStore(nextStore);
+      return {
+        handled: true,
+        store: nextStore,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "failed",
+          readOnly: false,
+          message,
+          collection: "criticReviews",
+          count: 1,
+          totalCount: 1,
+          entity: {
+            id: `${unavailableReview.stage}-critic-review`,
+            kind: "criticReview",
+            title: `Critic review: ${stage}`,
+            status: unavailableReview.readiness,
+            snippet: compactPreviewText(unavailableReview.summary, 320),
+            fields: {
+              stage: unavailableReview.stage,
+              readiness: unavailableReview.readiness,
+              confidence: unavailableReview.confidence,
+              artifactPath: criticReviewArtifactPath(input.run, stage),
+              objections: unavailableReview.objections.length,
+              positiveFindings: unavailableReview.positiveFindings.length,
+              recommendedNextActions: unavailableReview.recommendedNextActions.slice(0, 6)
+            }
+          },
+          items: unavailableReview.objections.map((objection, index): AgentVisibleEntityPreview => ({
+            id: `${unavailableReview.stage}-critic-objection-${index + 1}`,
+            kind: "criticObjection",
+            title: `${objection.severity} objection`,
+            text: objection.message,
+            snippet: compactPreviewText(objection.suggestedRevision ?? ""),
+            sourceIds: objection.affectedPaperIds.slice(0, 12),
+            claimIds: objection.affectedClaimIds.slice(0, 12),
+            sectionIds: objection.affectedSectionIds.slice(0, 12),
+            fields: {
+              target: objection.target,
+              targetId: objection.targetId,
+              severity: objection.severity,
+              suggestedRevision: compactPreviewText(objection.suggestedRevision ?? "")
+            }
+          })),
+          error: message,
+          stateDelta: {
+            criticReviewsCreated: 1,
+            criticBlockingObjections: unavailableReview.objections.filter((objection) => objection.severity === "blocking").length,
+            notebookArtifactLinksCreated: 1
+          },
+          nextHints: ["workspace.read", "work_item.create", "check.run", "release.verify"]
+        })
+      };
+    }
+
+    if (review === undefined) {
+      const message = "Critic review failed: backend did not return a critic report.";
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "failed",
+          readOnly: false,
+          message,
+          collection: "criticReviews",
+          count: 0,
+          totalCount: 0,
+          error: message,
+          nextHints: ["workspace.read", "work_item.create", "check.run", "release.verify"]
+        })
+      };
+    }
+    review = normalizeCriticReview(review, request);
+
     await writeJsonArtifact(criticReviewArtifactPath(input.run, stage), review);
+    const nextStore = upsertNotebookArtifactLink(input.store, criticReviewArtifactLink({
+      run: input.run,
+      stage,
+      review,
+      nowText
+    }), nowText);
+    await writeResearchWorkStore(nextStore);
     const blockingObjections = review.objections.filter((objection) => objection.severity === "blocking").length;
-    const message = `Critic review ${stage} persisted as feedback only; readiness ${review.readiness}, ${blockingObjections} blocking objection(s).`;
+    const message = `Fresh critic review ${stage} persisted as feedback only; readiness ${review.readiness}, ${blockingObjections} blocking objection(s).`;
     return {
       handled: true,
-      store: input.store,
+      store: nextStore,
       message,
       result: makeAgentToolResult({
         run: input.run,
@@ -2956,6 +3220,22 @@ async function executeResearchObjectToolAction(input: {
         collection: "criticReviews",
         count: 1,
         totalCount: 1,
+        entity: {
+          id: `${review.stage}-critic-review`,
+          kind: "criticReview",
+          title: `Critic review: ${stage}`,
+          status: review.readiness,
+          snippet: compactPreviewText(review.summary, 320),
+          fields: {
+            stage: review.stage,
+            readiness: review.readiness,
+            confidence: review.confidence,
+            artifactPath: criticReviewArtifactPath(input.run, stage),
+            objections: review.objections.length,
+            positiveFindings: review.positiveFindings.length,
+            recommendedNextActions: review.recommendedNextActions.slice(0, 6)
+          }
+        },
         items: review.objections.slice(0, 12).map((objection, index): AgentVisibleEntityPreview => ({
           id: `${review.stage}-critic-objection-${index + 1}`,
           kind: "criticObjection",
@@ -2964,15 +3244,18 @@ async function executeResearchObjectToolAction(input: {
           snippet: compactPreviewText(objection.suggestedRevision ?? ""),
           sourceIds: objection.affectedPaperIds.slice(0, 12),
           claimIds: objection.affectedClaimIds.slice(0, 12),
+          sectionIds: objection.affectedSectionIds.slice(0, 12),
           fields: {
             target: objection.target,
+            targetId: objection.targetId,
             severity: objection.severity,
             suggestedRevision: compactPreviewText(objection.suggestedRevision ?? "")
           }
         })),
         stateDelta: {
           criticReviewsCreated: 1,
-          criticBlockingObjections: blockingObjections
+          criticBlockingObjections: blockingObjections,
+          notebookArtifactLinksCreated: 1
         },
         nextHints: review.readiness === "pass"
           ? ["release.verify", "workspace.status"]
@@ -3765,7 +4048,9 @@ async function executeResearchObjectToolAction(input: {
           ? ["workspace.read", "claim.link_support", "section.link_claim"]
           : notebookReadinessIssue !== null || notebookDiagnostics.warningCount > 0
             ? ["notebook.read", "notebook.patch", "release.verify"]
-            : ["manuscript.finalize", "critic.review"]
+            : criticReviewAvailable(input.researchBackend)
+              ? ["manuscript.finalize", "critic.review"]
+              : ["manuscript.finalize"]
       })
     };
   }
@@ -4040,6 +4325,8 @@ async function executeResearchObjectToolAction(input: {
 async function executeWorkspaceToolAction(input: {
   run: RunRecord;
   now: () => string;
+  researchBackend: ResearchBackend;
+  runtimeConfig: RuntimeLlmConfig;
   decision: ResearchActionDecision;
   store: ResearchWorkStore;
 }): Promise<WorkspaceToolExecutionResult> {
@@ -4551,7 +4838,13 @@ async function runModelDrivenResearchSession(input: {
   let toolResults: AgentToolResult[] = [];
   const sourceSession = await SourceToolRuntime.create(input.sourceRequest);
   const sessionSegment = 1;
+  const criticAvailable = criticReviewAvailable(input.researchBackend);
+  const allowedActions = workspaceResearchActions({ criticAvailable });
   await appendStdout(input.run, "Model-driven research session active; every step is selected by the researcher model from the full tool surface.");
+  if (!criticAvailable) {
+    await appendEvent(input.run, input.now, "summary", `Critic review unavailable: backend ${input.researchBackend.label} does not expose a critic review transport.`);
+    await appendStdout(input.run, `Critic review unavailable: backend ${input.researchBackend.label} does not expose a critic review transport.`);
+  }
 
   for (let step = 1; ; step += 1) {
     const sourceState = sourceSession.state();
@@ -4567,7 +4860,7 @@ async function runModelDrivenResearchSession(input: {
         projectRoot: input.run.projectRoot,
         runId: input.run.id,
         phase: "research",
-        allowedActions: workspaceResearchActions(),
+        allowedActions,
         brief: input.run.brief,
         plan: input.plan,
         observations: sessionObservations({ sourceState, workStore, step }),
@@ -4579,7 +4872,9 @@ async function runModelDrivenResearchSession(input: {
         retryInstruction: [
           "This is a state-driven research session, not a phase workflow.",
           "Inspect the current workspace/source/tool observations, choose exactly one next action, and let the runtime execute only that action.",
-          "All production tools are available regardless of milestone; do not stop for machine-actionable source, evidence, claim, critic, section, check, or release work.",
+          criticAvailable
+            ? "All available production tools are available regardless of milestone; do not stop for machine-actionable source, evidence, claim, critic, section, check, or release work."
+            : "All available production tools are available regardless of milestone; do not stop for machine-actionable source, evidence, claim, section, check, or release work.",
           "Use workspace.status only for a validated external blocker or real user decision that cannot be resolved with tools; otherwise continue working."
         ].join(" ")
       }
@@ -4622,6 +4917,8 @@ async function runModelDrivenResearchSession(input: {
     const workspaceExecution = await executeWorkspaceToolAction({
       run: input.run,
       now: input.now,
+      researchBackend: input.researchBackend,
+      runtimeConfig: input.runtimeConfig,
       decision,
       store: workStore
     });

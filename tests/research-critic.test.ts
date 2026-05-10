@@ -112,12 +112,44 @@ test("critic output normalization filters invented IDs and caps revision advice"
 
   assert.equal(normalized.readiness, "revise");
   assert.equal(normalized.confidence, 1);
+  assert.equal(normalized.objections[0].targetId, null);
   assert.deepEqual(normalized.objections[0].affectedPaperIds, ["paper-1"]);
   assert.deepEqual(normalized.objections[0].affectedClaimIds, ["claim-1"]);
   assert.equal(normalized.revisionAdvice.searchQueries.length, 12);
   assert.deepEqual(normalized.revisionAdvice.papersToExclude, ["paper-1"]);
   assert.deepEqual(normalized.revisionAdvice.papersToPromote, ["paper-1"]);
   assert.deepEqual(normalized.revisionAdvice.claimsToSoften, ["claim-1"]);
+});
+
+test("critic output normalization keeps global target ids nullable and bounds positive findings", () => {
+  const normalized = normalizeCriticReview({
+    readiness: "revise",
+    summary: "The manuscript is repairable but thin.",
+    objections: [{
+      severity: "major",
+      targetType: "manuscript",
+      targetId: "invented-global-id",
+      message: "The manuscript-level synthesis is too thin for release.",
+      affectedSourceIds: ["paper-1", "invented-paper"],
+      affectedClaimIds: ["claim-1"],
+      suggestedRevision: "Revise the manuscript around the supported claim ledger."
+    }],
+    positiveFindings: Array.from({ length: 8 }, (_, index) => ({
+      targetType: "manuscript",
+      targetId: index === 0 ? null : "invented-positive-id",
+      message: `Readiness-relevant strength ${index}`
+    })),
+    recommendedNextActions: ["Revise synthesis section."]
+  }, request());
+
+  assert.equal(normalized.summary, "The manuscript is repairable but thin.");
+  assert.equal(normalized.objections[0].target, "manuscript");
+  assert.equal(normalized.objections[0].targetId, null);
+  assert.deepEqual(normalized.objections[0].affectedPaperIds, ["paper-1"]);
+  assert.equal(normalized.positiveFindings.length, 5);
+  assert.equal(normalized.positiveFindings[0]?.targetId, null);
+  assert.equal(normalized.positiveFindings[1]?.targetId, null);
+  assert.deepEqual(normalized.recommendedNextActions, ["Revise synthesis section."]);
 });
 
 test("malformed critic output becomes a blocking diagnostic", () => {

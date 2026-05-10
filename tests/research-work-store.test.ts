@@ -357,10 +357,61 @@ test("workspace prompt context is a derived SQLite projection without pseudo-mem
     assert.equal(context.counts.openWorkItems, 1);
     assert.equal(context.notebook.objective, "Write a claim-led review from workspace evidence.");
     assert.equal(context.notebook.activeTasks[0]?.linkedEvidenceCellIds[0], "evidence-1");
+    assert.equal(context.notebook.recentCriticReviews?.length, 0);
     assert.equal(context.recentEvidenceCells[0]?.id, "evidence-1");
     assert.equal(context.recentClaims[0]?.id, "claim-1");
     assert.equal(context.openWorkItems[0]?.id, "workitem-1");
     assert.doesNotMatch(serialized, /queryHints|recordCount|countsByType|method_plan|hypotheses|directions|findings/i);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("workspace prompt context derives critic summaries from notebook artifact links", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-work-store-critic-context-"));
+
+  try {
+    const now = "2026-01-01T00:00:00.000Z";
+    const baseStore = createResearchWorkStore({
+      projectRoot,
+      now,
+      brief: {
+        topic: "agentic research",
+        researchQuestion: "How should critic reviews remain visible?",
+        researchDirection: "Keep critic feedback durable without a second memory store.",
+        successCriterion: "Expose critic artifact summaries from notebook state."
+      }
+    });
+    const store = {
+      ...baseStore,
+      notebook: {
+        ...baseStore.notebook,
+        objective: "Keep critic feedback visible.",
+        readiness: "Not ready until critic feedback has been considered.",
+        artifactLinks: [
+          {
+            label: "Critic review: release (revise)",
+            path: ".clawresearch/runs/run-test/critic-release-review.json",
+            kind: "other" as const,
+            createdAt: now
+          },
+          {
+            label: "Critic review: evidence (block)",
+            path: ".clawresearch/runs/run-test/critic-evidence-review.json",
+            kind: "other" as const,
+            createdAt: now
+          }
+        ]
+      }
+    };
+    const context = buildWorkspacePromptContextFromWorkStore(store);
+
+    assert.equal(context.notebook.recentCriticReviews?.length, 2);
+    assert.equal(context.notebook.recentCriticReviews?.[0]?.stage, "release");
+    assert.equal(context.notebook.recentCriticReviews?.[0]?.readiness, "revise");
+    assert.equal(context.notebook.recentCriticReviews?.[0]?.artifactPath, ".clawresearch/runs/run-test/critic-release-review.json");
+    assert.equal(context.notebook.recentCriticReviews?.[1]?.stage, "evidence");
+    assert.equal(context.notebook.recentCriticReviews?.[1]?.readiness, "block");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

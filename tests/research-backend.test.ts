@@ -100,6 +100,7 @@ function emptyWorkspaceContext(): WorkspacePromptContext {
         linkedArtifactPaths: []
 	      }],
 	      artifactLinks: [],
+	      recentCriticReviews: [],
 	      diagnostics: {
 	        warningCount: 0,
 	        warnings: [],
@@ -595,6 +596,132 @@ test("OpenAI Responses backend uses native function tools for research actions",
   }
 });
 
+test("OpenAI Codex backend uses the same OAuth transport for critic review", async () => {
+  const originalFetch = globalThis.fetch;
+  let capturedUrl = "";
+  let capturedAuth = "";
+  let capturedBody: {
+    model?: string;
+    stream?: boolean;
+    instructions?: string;
+  } = {};
+
+  try {
+    globalThis.fetch = async (input, init): Promise<Response> => {
+      capturedUrl = String(input);
+      capturedAuth = new Headers(init?.headers as Record<string, string>).get("authorization") ?? "";
+      capturedBody = JSON.parse(String(init?.body)) as typeof capturedBody;
+      return new Response(JSON.stringify({
+        output_text: JSON.stringify({
+          readiness: "revise",
+          confidence: 0.82,
+          summary: "The manuscript is repairable but needs a stronger synthesis section.",
+          objections: [{
+            code: "thin-synthesis",
+            severity: "major",
+            targetType: "manuscript",
+            targetId: null,
+            message: "The current manuscript does not yet synthesize the workspace claims.",
+            affectedSourceIds: [],
+            affectedEvidenceCellIds: [],
+            affectedClaimIds: ["claim-1"],
+            affectedSectionIds: ["section-1"],
+            suggestedRevision: "Revise the manuscript section around the supported claims."
+          }],
+          positiveFindings: [],
+          revisionAdvice: {
+            searchQueries: [],
+            evidenceTargets: [],
+            papersToExclude: [],
+            papersToPromote: [],
+            claimsToSoften: []
+          },
+          recommendedNextActions: ["Revise section-1."]
+        })
+      }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json"
+        }
+      });
+    };
+
+    const backend = new OpenAIResponsesResearchBackend(new RuntimeModelClient({
+      provider: "openai-codex",
+      model: "gpt-test",
+      host: null,
+      baseUrl: "https://chatgpt.example.test/backend-api/codex",
+      configured: true,
+      label: "openai-codex:gpt-test"
+    }, {
+      ...modelCredentials(),
+      openai: {
+        apiKey: null
+      },
+      openaiCodex: {
+        access: "codex-access-token",
+        refresh: "codex-refresh-token",
+        expires: Date.UTC(2099, 0, 1),
+        email: null,
+        profileName: null
+      }
+    }));
+    const review = await backend.reviewResearchArtifact?.({
+      projectRoot: "/tmp/project",
+      runId: "run-critic",
+      stage: "release",
+      brief: {
+        topic: "research agents",
+        researchQuestion: "Is the manuscript ready?",
+        researchDirection: "Review release readiness.",
+        successCriterion: "Return concrete critic objections."
+      },
+      workspace: {
+        notebook: {
+          objective: "Write a serious research note.",
+          definitionOfDone: ["Synthesize claims."],
+          readiness: "Ready with caveats."
+        },
+        workspaceSummary: {
+          claims: 1,
+          manuscriptSections: 1
+        },
+        selectedSources: [],
+        citedSources: [],
+        protocols: [],
+        extractions: [],
+        evidenceCells: [],
+        claims: [{
+          id: "claim-1",
+          text: "Supported claim."
+        }],
+        citations: [],
+        manuscriptSections: [{
+          id: "section-1",
+          title: "Synthesis",
+          markdown: "Draft."
+        }],
+        releaseChecks: []
+      }
+    }, {
+      operation: "critic",
+      timeoutMs: 300_000
+    });
+
+    assert.equal(review?.readiness, "revise");
+    assert.equal(review?.objections[0]?.targetId, null);
+    assert.deepEqual(review?.objections[0]?.affectedClaimIds, ["claim-1"]);
+    assert.equal(capturedUrl, "https://chatgpt.example.test/backend-api/codex/responses");
+    assert.equal(capturedAuth, "Bearer codex-access-token");
+    assert.equal(capturedBody.model, "gpt-test");
+    assert.equal(capturedBody.stream, true);
+    assert.match(capturedBody.instructions ?? "", /independent scientific reviewer/i);
+    assert.match(capturedBody.instructions ?? "", /Use IDs only if they appear in the packet/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("OpenAI Responses backend classifies overloaded response failures as provider failures", async () => {
   const originalFetch = globalThis.fetch;
 
@@ -794,6 +921,7 @@ test("agent-step backend exposes first-class claim and manuscript-section tools"
     assert.match(capturedPrompt, /claim\.create/i);
     assert.match(capturedPrompt, /section\.create/i);
     assert.match(capturedPrompt, /section\.check_claims/i);
+    assert.doesNotMatch(capturedPrompt, /critic\.review/i);
     assert.doesNotMatch(capturedPrompt, /synthesize_clustered|finalize_status_report|write_final_report/i);
   } finally {
     globalThis.fetch = originalFetch;

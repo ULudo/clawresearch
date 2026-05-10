@@ -146,6 +146,13 @@ export type ResearchNotebookDiagnostics = {
   latestWorkspaceChangeAt: string | null;
 };
 
+export type ResearchCriticReviewSummary = {
+  stage: string;
+  readiness: string;
+  artifactPath: string;
+  createdAt: string;
+};
+
 export type WorkStoreBaseEntity = {
   id: string;
   kind: WorkStoreEntityKind;
@@ -1621,21 +1628,27 @@ function extractionEntity(run: RunRecord, extraction: PaperExtraction, now: stri
 
 function targetKindFromCriticTarget(target: string): WorkStoreWorkItem["targetKind"] {
   switch (target) {
+    case "source":
     case "sources":
       return "canonicalSource";
     case "extraction":
       return "extraction";
     case "evidence":
       return "evidenceCell";
-    case "synthesis":
-    case "verification":
+    case "claim":
       return "claim";
+    case "section":
     case "manuscript":
       return "manuscriptSection";
+    case "citation":
+      return "citation";
     case "release":
+    case "release_check":
       return "release";
     case "protocol":
       return "protocol";
+    case "notebook":
+      return "unknown";
     default:
       return "unknown";
   }
@@ -1654,7 +1667,7 @@ export function workItemsFromCriticReports(run: RunRecord, reports: CriticReview
     title: `${criticScopeLabel(report.stage)} critic: ${objection.code}`,
     description: objection.message,
     targetKind: targetKindFromCriticTarget(objection.target),
-    targetId: objection.affectedPaperIds[0] ?? objection.affectedClaimIds[0] ?? null,
+    targetId: objection.targetId ?? objection.affectedPaperIds[0] ?? objection.affectedClaimIds[0] ?? null,
     affectedSourceIds: objection.affectedPaperIds,
     affectedClaimIds: objection.affectedClaimIds,
     suggestedActions: uniqueStrings([
@@ -1737,6 +1750,7 @@ export type WorkspacePromptContext = {
       linkedArtifactPaths: string[];
 	    }>;
 	    artifactLinks: ResearchNotebookArtifactLink[];
+	    recentCriticReviews: ResearchCriticReviewSummary[];
 	    diagnostics: ResearchNotebookDiagnostics;
 	  };
   recentSources: Array<{
@@ -1931,6 +1945,29 @@ export function buildNotebookDiagnostics(store: ResearchWorkStore): ResearchNote
   };
 }
 
+function criticReviewSummaryFromArtifactLink(artifact: ResearchNotebookArtifactLink): ResearchCriticReviewSummary | null {
+  const match = /^Critic review: ([a-z_]+) \((pass|revise|block)\)$/i.exec(artifact.label);
+  if (match === null) {
+    return null;
+  }
+
+  return {
+    stage: match[1]?.toLowerCase() ?? "release",
+    readiness: match[2]?.toLowerCase() ?? "revise",
+    artifactPath: artifact.path,
+    createdAt: artifact.createdAt
+  };
+}
+
+function criticReviewSummariesFromNotebook(store: ResearchWorkStore): ResearchCriticReviewSummary[] {
+  return store.notebook.artifactLinks
+    .flatMap((artifact) => {
+      const summary = criticReviewSummaryFromArtifactLink(artifact);
+      return summary === null ? [] : [summary];
+    })
+    .slice(-8);
+}
+
 export function buildWorkspacePromptContextFromWorkStore(store: ResearchWorkStore): WorkspacePromptContext {
   const openWorkItems = store.objects.workItems.filter((item) => item.status === "open");
   const notebookDiagnostics = buildNotebookDiagnostics(store);
@@ -1977,6 +2014,7 @@ export function buildWorkspacePromptContextFromWorkStore(store: ResearchWorkStor
 	      readiness: store.notebook.readiness,
 	      activeTasks,
 	      artifactLinks: store.notebook.artifactLinks.slice(-12).map((artifact) => ({ ...artifact })),
+	      recentCriticReviews: criticReviewSummariesFromNotebook(store),
 	      diagnostics: notebookDiagnostics
 	    },
     recentSources: store.objects.canonicalSources.slice(-12).map((source) => ({

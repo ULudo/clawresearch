@@ -23,6 +23,11 @@ import {
   resolveRuntimeModelConfig,
   type ProjectConfigState
 } from "./project-config-store.js";
+import {
+  normalizeCriticReview,
+  type CriticReviewArtifact,
+  type CriticReviewRequest
+} from "./research-critic.js";
 
 export type {
   EvidenceMatrix,
@@ -119,6 +124,7 @@ export type ResearchBackendCapabilities = {
     nativeToolCalls: boolean;
     strictJsonFallback: boolean;
   };
+  criticReview: boolean;
 };
 
 export type ResearchBackendFailureKind =
@@ -170,6 +176,7 @@ export interface ResearchBackend {
   readonly capabilities?: ResearchBackendCapabilities;
   planResearch(request: ResearchPlanningRequest, options?: ResearchBackendCallOptions): Promise<ResearchPlan>;
   chooseResearchAction(request: ResearchActionRequest, options?: ResearchBackendCallOptions): Promise<ResearchActionDecision>;
+  reviewResearchArtifact?(request: CriticReviewRequest, options?: ResearchBackendCallOptions): Promise<CriticReviewArtifact>;
 }
 
 type OllamaToolCall = {
@@ -461,7 +468,80 @@ function planningInstruction(request: ResearchPlanningRequest): string {
   ].join("\n");
 }
 
+function criticReviewInstruction(request: CriticReviewRequest): string {
+  const workspacePacket = request.workspace ?? null;
+  const criticPacket = {
+    stage: request.stage,
+    brief: request.brief,
+    notebook: workspacePacket?.notebook ?? null,
+    workspaceSummary: workspacePacket?.workspaceSummary ?? {},
+    selectedSources: workspacePacket?.selectedSources ?? [],
+    citedSources: workspacePacket?.citedSources ?? [],
+    protocols: workspacePacket?.protocols ?? [],
+    extractions: workspacePacket?.extractions ?? [],
+    evidenceCells: workspacePacket?.evidenceCells ?? [],
+    claims: workspacePacket?.claims ?? [],
+    citations: workspacePacket?.citations ?? [],
+    manuscriptSections: workspacePacket?.manuscriptSections ?? [],
+    releaseChecks: workspacePacket?.releaseChecks ?? [],
+    manuscriptChecks: request.manuscriptChecks ?? null,
+    references: request.references ?? null,
+    paper: request.paper ?? null
+  };
+
+  return [
+    "You are an independent scientific reviewer for ClawResearch.",
+    "You are a fresh stateless critic. Review only the provided research workspace packet.",
+    "Do not perform new research. Do not invent sources, claims, citations, IDs, or facts.",
+    "Do not rewrite the manuscript. Do not continue the research process. Do not assume access to anything not included in the packet.",
+    "Your job is to identify concrete weaknesses, unsupported claims, missing synthesis, overstatements, citation/provenance problems, and manuscript-readiness issues.",
+    "Distinguish mechanical/provenance issues from scientific/research-quality objections.",
+    "Be concrete. For every objection, name the affected claim, section, evidence cell, citation, release check, or source when possible.",
+    "Use IDs only if they appear in the packet. If the objection is global, use targetId null. Never invent source, claim, section, evidence, extraction, citation, protocol, or check IDs.",
+    "If the artifact is weak but repairable, use readiness \"revise\". Use readiness \"block\" only when the material is too incomplete, incoherent, or provenance-broken to responsibly revise without substantial new work. Use readiness \"pass\" only when no major or blocking objection remains.",
+    "Positive findings are optional. Include them only when they are directly relevant to readiness. Do not add generic praise.",
+    "",
+    "Return JSON only with this exact shape:",
+    "{",
+    '  "schemaVersion": 1,',
+    '  "stage": "protocol|sources|evidence|release",',
+    '  "readiness": "pass|revise|block",',
+    '  "confidence": 0.0,',
+    '  "summary": "short readiness-focused review summary",',
+    '  "objections": [{',
+    '    "code": "short-stable-code",',
+    '    "severity": "blocking|major|minor",',
+    '    "targetType": "notebook|protocol|source|extraction|evidence|claim|section|citation|manuscript|release_check",',
+    '    "targetId": "known id or null",',
+    '    "message": "concrete objection",',
+    '    "affectedSourceIds": ["known source ids only"],',
+    '    "affectedEvidenceCellIds": ["known evidence cell ids only"],',
+    '    "affectedClaimIds": ["known claim ids only"],',
+    '    "affectedSectionIds": ["known section ids only"],',
+    '    "suggestedRevision": "concrete suggested recovery or revision"',
+    "  }],",
+    '  "positiveFindings": [{ "targetType": "manuscript", "targetId": null, "message": "optional readiness-relevant strength" }],',
+    '  "revisionAdvice": {',
+    '    "searchQueries": [],',
+    '    "evidenceTargets": [],',
+    '    "papersToExclude": [],',
+    '    "papersToPromote": [],',
+    '    "claimsToSoften": []',
+    "  },",
+    '  "recommendedNextActions": ["concise model-facing next action suggestion"]',
+    "}",
+    "",
+    `Project root: ${request.projectRoot}`,
+    `Run id: ${request.runId}`,
+    `Review scope: ${request.stage}`,
+    `Critic packet: ${JSON.stringify(criticPacket)}`
+  ].join("\n");
+}
+
 function agentStepInstruction(request: ResearchActionRequest): string {
+  const criticInstruction = request.allowedActions.includes("critic.review")
+    ? "Use critic.review for fresh stateless critique, and check.run for release/support checks."
+    : "Use check.run for release/support checks.";
   const criticSummaries = request.criticReports.map((report) => ({
     stage: report.stage,
     readiness: report.readiness,
@@ -492,7 +572,7 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     "Use work_item.create/patch when critic or check feedback becomes actionable research debt.",
     "Use guidance.search/read/recommend to inspect advisory research-lab scaffolding. Guidance is not a gate and may be overridden.",
     "Use protocol.create_or_revise when the research protocol itself needs visible revision by the researcher.",
-    "Use critic.review for fresh stateless critique, and check.run for release/support checks.",
+    criticInstruction,
 	    "Use release.verify for final computable release invariants and notebook/project-management diagnostics; it does not decide research completeness.",
 	    "Use manuscript.finalize only when you intentionally want the runtime to write paper.md from workspace sections after hard invariant checks pass and you have explicitly recorded notebook.readiness.",
     "Critic objections, failed release checks, and not-ready tool results are repair signals. Prefer concrete tool steps over stopping.",
@@ -911,6 +991,9 @@ function responseResearchActionToolDefinition(request: ResearchActionRequest): {
 }
 
 function nativeAgentStepInstruction(request: ResearchActionRequest): string {
+  const criticInstruction = request.allowedActions.includes("critic.review")
+    ? "Use critic.review for fresh stateless critique, and check.run for release/support checks."
+    : "Use check.run for release/support checks.";
   return [
     "You are the researcher. ClawResearch is the lab runtime.",
     `Call ${researchActionToolName} exactly once.`,
@@ -927,7 +1010,7 @@ function nativeAgentStepInstruction(request: ResearchActionRequest): string {
     "Use work_item.create/patch when critic or check feedback becomes actionable research debt.",
     "Use guidance.search/read/recommend to inspect advisory research-lab scaffolding. Guidance is not a gate and may be overridden.",
     "Use protocol.create_or_revise when the research protocol itself needs visible revision by the researcher.",
-    "Use critic.review for fresh stateless critique, and check.run for release/support checks.",
+    criticInstruction,
 	    "Use release.verify for final computable release invariants and notebook/project-management diagnostics; it does not decide research completeness.",
 	    "Use manuscript.finalize only when you intentionally want the runtime to write paper.md from workspace sections after hard invariant checks pass and you have explicitly recorded notebook.readiness.",
     "Critic objections, failed release checks, and not-ready tool results are repair signals. Prefer concrete tool steps over stopping.",
@@ -1055,7 +1138,8 @@ export class OllamaResearchBackend implements ResearchBackend {
     actionControl: {
       nativeToolCalls: true,
       strictJsonFallback: true
-    }
+    },
+    criticReview: true
   };
 
   constructor(
@@ -1077,6 +1161,20 @@ export class OllamaResearchBackend implements ResearchBackend {
     );
 
     return normalizePlan(raw, request.brief);
+  }
+
+  async reviewResearchArtifact(request: CriticReviewRequest, options: ResearchBackendCallOptions = {
+    operation: "critic",
+    timeoutMs: 300_000
+  }): Promise<CriticReviewArtifact> {
+    const raw = await ollamaJsonCall<unknown>(
+      this.host,
+      this.model,
+      criticReviewInstruction(request),
+      options
+    );
+
+    return normalizeCriticReview(raw, request);
   }
 
   async chooseResearchAction(request: ResearchActionRequest, options: ResearchBackendCallOptions = {
@@ -1143,7 +1241,8 @@ export class OpenAIResponsesResearchBackend implements ResearchBackend {
     actionControl: {
       nativeToolCalls: true,
       strictJsonFallback: true
-    }
+    },
+    criticReview: true
   };
 
   constructor(private readonly client: RuntimeModelClient) {
@@ -1161,6 +1260,19 @@ export class OpenAIResponsesResearchBackend implements ResearchBackend {
     );
 
     return normalizePlan(raw, request.brief);
+  }
+
+  async reviewResearchArtifact(request: CriticReviewRequest, options: ResearchBackendCallOptions = {
+    operation: "critic",
+    timeoutMs: 300_000
+  }): Promise<CriticReviewArtifact> {
+    const raw = await modelJsonCall<unknown>(
+      this.client,
+      criticReviewInstruction(request),
+      options
+    );
+
+    return normalizeCriticReview(raw, request);
   }
 
   private async chooseResearchActionNative(

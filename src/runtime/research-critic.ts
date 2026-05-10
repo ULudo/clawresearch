@@ -28,23 +28,36 @@ export type CriticObjectionSeverity =
   | "minor";
 
 export type CriticObjectionTarget =
+  | "notebook"
   | "protocol"
+  | "source"
   | "sources"
   | "extraction"
   | "evidence"
-  | "synthesis"
-  | "verification"
+  | "claim"
+  | "section"
+  | "citation"
   | "manuscript"
+  | "release_check"
   | "release";
 
 export type CriticObjection = {
   code: string;
   severity: CriticObjectionSeverity;
   target: CriticObjectionTarget;
+  targetId: string | null;
   message: string;
   affectedPaperIds: string[];
+  affectedEvidenceCellIds: string[];
   affectedClaimIds: string[];
+  affectedSectionIds: string[];
   suggestedRevision: string | null;
+};
+
+export type CriticPositiveFinding = {
+  target: CriticObjectionTarget;
+  targetId: string | null;
+  message: string;
 };
 
 export type CriticRevisionAdvice = {
@@ -62,8 +75,25 @@ export type CriticReviewArtifact = {
   reviewer: "ephemeral_critic";
   readiness: CriticReadiness;
   confidence: number;
+  summary: string;
   objections: CriticObjection[];
+  positiveFindings: CriticPositiveFinding[];
   revisionAdvice: CriticRevisionAdvice;
+  recommendedNextActions: string[];
+};
+
+export type CriticWorkspacePacket = {
+  notebook: unknown;
+  workspaceSummary: Record<string, unknown>;
+  selectedSources: Array<Record<string, unknown>>;
+  citedSources: Array<Record<string, unknown>>;
+  protocols: Array<Record<string, unknown>>;
+  extractions: Array<Record<string, unknown>>;
+  evidenceCells: Array<Record<string, unknown>>;
+  claims: Array<Record<string, unknown>>;
+  citations: Array<Record<string, unknown>>;
+  manuscriptSections: Array<Record<string, unknown>>;
+  releaseChecks: Array<Record<string, unknown>>;
 };
 
 export type CriticReviewRequest = {
@@ -89,6 +119,7 @@ export type CriticReviewRequest = {
   paper?: ReviewPaperArtifact | null;
   references?: ReferencesArtifact | null;
   manuscriptChecks?: ManuscriptChecksArtifact | null;
+  workspace?: CriticWorkspacePacket | null;
 };
 
 const maxObjections = 12;
@@ -157,20 +188,30 @@ function normalizeSeverity(value: unknown, readiness: CriticReadiness): CriticOb
 
 function normalizeTarget(value: unknown, stage: CriticReviewScope): CriticObjectionTarget {
   switch (readString(value)?.toLowerCase()) {
+    case "notebook":
+      return "notebook";
     case "protocol":
       return "protocol";
+    case "source":
+      return "source";
     case "sources":
       return "sources";
     case "extraction":
       return "extraction";
     case "evidence":
       return "evidence";
-    case "synthesis":
-      return "synthesis";
-    case "verification":
-      return "verification";
+    case "claim":
+      return "claim";
+    case "section":
+      return "section";
+    case "citation":
+      return "citation";
     case "manuscript":
       return "manuscript";
+    case "release_check":
+    case "release check":
+    case "release-check":
+      return "release_check";
     case "release":
       return "release";
     default:
@@ -190,15 +231,89 @@ function normalizeConfidence(value: unknown, readiness: CriticReadiness): number
 function allowedPaperIdsFor(request: CriticReviewRequest): Set<string> {
   return new Set([
     ...(request.selectedPapers ?? []).map((paper) => paper.id),
-    ...(request.relevanceAssessments ?? []).map((assessment) => assessment.paperId)
+    ...(request.relevanceAssessments ?? []).map((assessment) => assessment.paperId),
+    ...(request.workspace?.selectedSources ?? []).flatMap((source) => readString(source.id) ?? []),
+    ...(request.workspace?.citedSources ?? []).flatMap((source) => readString(source.id) ?? []),
+    ...(request.workspace?.claims ?? []).flatMap((claim) => readStringArray(claim.sourceIds)),
+    ...(request.workspace?.citations ?? []).flatMap((citation) => readString(citation.sourceId) ?? [])
   ]);
 }
 
 function allowedClaimIdsFor(request: CriticReviewRequest): Set<string> {
   return new Set([
     ...(request.paper?.claims.map((claim) => claim.claimId) ?? []),
-    ...(request.verification?.verifiedClaims.map((claim) => claim.claimId) ?? [])
+    ...(request.verification?.verifiedClaims.map((claim) => claim.claimId) ?? []),
+    ...(request.workspace?.claims ?? []).flatMap((claim) => readString(claim.id) ?? []),
+    ...(request.workspace?.citations ?? []).flatMap((citation) => readStringArray(citation.claimIds))
   ]);
+}
+
+function allowedEvidenceCellIdsFor(request: CriticReviewRequest): Set<string> {
+  return new Set([
+    ...(request.workspace?.evidenceCells ?? []).flatMap((cell) => readString(cell.id) ?? []),
+    ...(request.workspace?.citations ?? []).flatMap((citation) => readString(citation.evidenceCellId) ?? [])
+  ]);
+}
+
+function allowedExtractionIdsFor(request: CriticReviewRequest): Set<string> {
+  return new Set((request.workspace?.extractions ?? [])
+    .flatMap((extraction) => readString(extraction.id) ?? []));
+}
+
+function allowedSectionIdsFor(request: CriticReviewRequest): Set<string> {
+  return new Set([
+    ...(request.workspace?.manuscriptSections ?? []).flatMap((section) => readString(section.id) ?? []),
+    ...(request.workspace?.citations ?? []).flatMap((citation) => readStringArray(citation.sectionIds))
+  ]);
+}
+
+function allowedReleaseCheckIdsFor(request: CriticReviewRequest): Set<string> {
+  return new Set((request.workspace?.releaseChecks ?? [])
+    .flatMap((check) => readString(check.id) ?? []));
+}
+
+function allowedCitationIdsFor(request: CriticReviewRequest): Set<string> {
+  return new Set((request.workspace?.citations ?? [])
+    .flatMap((citation) => readString(citation.id) ?? []));
+}
+
+function allowedProtocolIdsFor(request: CriticReviewRequest): Set<string> {
+  return new Set((request.workspace?.protocols ?? [])
+    .flatMap((protocol) => readString(protocol.id) ?? []));
+}
+
+function allowedIdsForTarget(request: CriticReviewRequest, target: CriticObjectionTarget): Set<string> {
+  switch (target) {
+    case "source":
+    case "sources":
+      return allowedPaperIdsFor(request);
+    case "evidence":
+      return allowedEvidenceCellIdsFor(request);
+    case "extraction":
+      return allowedExtractionIdsFor(request);
+    case "claim":
+      return allowedClaimIdsFor(request);
+    case "section":
+      return allowedSectionIdsFor(request);
+    case "citation":
+      return allowedCitationIdsFor(request);
+    case "protocol":
+      return allowedProtocolIdsFor(request);
+    case "release_check":
+      return allowedReleaseCheckIdsFor(request);
+    default:
+      return new Set();
+  }
+}
+
+function normalizeTargetId(value: unknown, request: CriticReviewRequest, target: CriticObjectionTarget): string | null {
+  const id = readString(value);
+  if (id === null) {
+    return null;
+  }
+
+  const allowedIds = allowedIdsForTarget(request, target);
+  return allowedIds.has(id) ? id : null;
 }
 
 function filterKnownIds(values: unknown, allowedIds: Set<string>): string[] {
@@ -218,6 +333,8 @@ function normalizeObjections(
 ): CriticObjection[] {
   const allowedPaperIds = allowedPaperIdsFor(request);
   const allowedClaimIds = allowedClaimIdsFor(request);
+  const allowedEvidenceCellIds = allowedEvidenceCellIdsFor(request);
+  const allowedSectionIds = allowedSectionIdsFor(request);
   const rawObjections = Array.isArray(raw) ? raw.slice(0, maxObjections) : [];
   const objections = rawObjections.flatMap((entry, index) => {
     const record = asObject(entry);
@@ -225,14 +342,18 @@ function normalizeObjections(
     if (message === null) {
       return [];
     }
+    const target = normalizeTarget(record.targetType ?? record.target, request.stage);
 
     return [{
       code: readString(record.code) ?? `critic-${request.stage}-${index + 1}`,
       severity: normalizeSeverity(record.severity, readiness),
-      target: normalizeTarget(record.target, request.stage),
+      target,
+      targetId: normalizeTargetId(record.targetId, request, target),
       message: compactText(message),
-      affectedPaperIds: filterKnownIds(record.affectedPaperIds ?? record.paperIds, allowedPaperIds),
+      affectedPaperIds: filterKnownIds(record.affectedPaperIds ?? record.affectedSourceIds ?? record.sourceIds ?? record.paperIds, allowedPaperIds),
+      affectedEvidenceCellIds: filterKnownIds(record.affectedEvidenceCellIds ?? record.evidenceCellIds, allowedEvidenceCellIds),
       affectedClaimIds: filterKnownIds(record.affectedClaimIds ?? record.claimIds, allowedClaimIds),
+      affectedSectionIds: filterKnownIds(record.affectedSectionIds ?? record.sectionIds, allowedSectionIds),
       suggestedRevision: readString(record.suggestedRevision ?? record.suggestedRecovery) === null
         ? null
         : compactText(readString(record.suggestedRevision ?? record.suggestedRecovery) ?? "", 260)
@@ -244,14 +365,34 @@ function normalizeObjections(
       code: `critic-${request.stage}-nonpass`,
       severity: "blocking",
       target: normalizeTarget(null, request.stage),
+      targetId: null,
       message: `The ${request.stage.replace(/_/g, " ")} critic did not pass this artifact but did not provide a structured objection.`,
       affectedPaperIds: [],
+      affectedEvidenceCellIds: [],
       affectedClaimIds: [],
+      affectedSectionIds: [],
       suggestedRevision: "Revise the prior research stage with more focused evidence before release."
     }];
   }
 
   return objections;
+}
+
+function normalizePositiveFindings(raw: unknown, request: CriticReviewRequest): CriticPositiveFinding[] {
+  const rawFindings = Array.isArray(raw) ? raw.slice(0, 5) : [];
+  return rawFindings.flatMap((entry) => {
+    const record = asObject(entry);
+    const message = readString(record.message);
+    if (message === null) {
+      return [];
+    }
+    const target = normalizeTarget(record.targetType ?? record.target, request.stage);
+    return [{
+      target,
+      targetId: normalizeTargetId(record.targetId, request, target),
+      message: compactText(message, 260)
+    }];
+  });
 }
 
 function normalizeRevisionAdvice(raw: unknown, request: CriticReviewRequest): CriticRevisionAdvice {
@@ -285,6 +426,8 @@ export function normalizeCriticReview(raw: unknown, request: CriticReviewRequest
   let readiness = normalizeReadiness(record.readiness) ?? "block";
   const revisionAdvice = normalizeRevisionAdvice(record.revisionAdvice ?? record.recoveryAdvice, request);
   let objections = normalizeObjections(record.objections, request, readiness);
+  const positiveFindings = normalizePositiveFindings(record.positiveFindings, request);
+  const recommendedNextActions = uniqueStrings(readStringArray(record.recommendedNextActions), 8);
 
   if (request.stage === "protocol") {
     const stageCompatibleObjections = objections.filter((objection) => (
@@ -308,8 +451,11 @@ export function normalizeCriticReview(raw: unknown, request: CriticReviewRequest
     reviewer: "ephemeral_critic",
     readiness,
     confidence: normalizeConfidence(record.confidence, readiness),
+    summary: compactText(readString(record.summary) ?? `Critic returned ${readiness} for ${request.stage}.`, 500),
     objections,
-    revisionAdvice
+    positiveFindings,
+    revisionAdvice,
+    recommendedNextActions
   };
 }
 
@@ -324,22 +470,28 @@ export function criticUnavailableReview(
     reviewer: "ephemeral_critic",
     readiness: "block",
     confidence: 1,
+    summary: compactText(`Critic review was unavailable: ${message}`, 500),
     objections: [{
       code: "critic-unavailable",
       severity: "blocking",
       target: normalizeTarget(null, request.stage),
+      targetId: null,
       message: compactText(`Critic review was unavailable: ${message}`),
       affectedPaperIds: [],
+      affectedEvidenceCellIds: [],
       affectedClaimIds: [],
+      affectedSectionIds: [],
       suggestedRevision: "Retry with a working critic backend before releasing a full manuscript."
     }],
+    positiveFindings: [],
     revisionAdvice: {
       searchQueries: [],
       evidenceTargets: [],
       papersToExclude: [],
       papersToPromote: [],
       claimsToSoften: []
-    }
+    },
+    recommendedNextActions: []
   };
 }
 

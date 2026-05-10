@@ -20,6 +20,10 @@ import type {
   ResearchActionRequest
 } from "../src/runtime/research-agent.js";
 import type {
+  CriticReviewArtifact,
+  CriticReviewRequest
+} from "../src/runtime/research-critic.js";
+import type {
   ResearchSourceToolRequest,
   ResearchSourceSnapshot,
   ResearchSourceToolAdapter
@@ -2145,6 +2149,190 @@ class PlanningProviderOverloadBackend extends StubResearchBackend {
   }
 }
 
+class FailingCriticBackend extends StubResearchBackend {
+  readonly capabilities = {
+    actionControl: {
+      nativeToolCalls: false,
+      strictJsonFallback: true
+    },
+    criticReview: true
+  };
+  readonly researchRequests: ResearchActionRequest[] = [];
+  private reviewed = false;
+  private stopped = false;
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+    if (!this.reviewed) {
+      this.reviewed = true;
+      return {
+        schemaVersion: 1,
+        action: "critic.review",
+        rationale: "Call critic explicitly to test durable critic failure visibility.",
+        confidence: 0.9,
+        inputs: {
+          providerIds: [],
+          searchQueries: [],
+          evidenceTargets: [],
+          paperIds: [],
+          criticScope: "release",
+          reason: null,
+          workStore: {
+            collection: null,
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "Critic failure is persisted visibly.",
+        stopCondition: "Continue after observing failed critic transport.",
+        transport: "strict_json"
+      };
+    }
+    if (!this.stopped) {
+      this.stopped = true;
+      return {
+        schemaVersion: 1,
+        action: "workspace.status",
+        rationale: "Stop after critic failure visibility is observed.",
+        confidence: 0.8,
+        inputs: {
+          providerIds: [],
+          searchQueries: [],
+          evidenceTargets: [],
+          paperIds: [],
+          criticScope: null,
+          reason: "Critic failure visibility test complete.",
+          workStore: terminalUserDecisionWorkStore("Critic failure visibility test complete.")
+        },
+        expectedOutcome: "Stop through structured test decision.",
+        stopCondition: "Structured test decision reached.",
+        transport: "strict_json"
+      };
+    }
+    return super.chooseResearchAction(request);
+  }
+
+  async reviewResearchArtifact(): Promise<CriticReviewArtifact> {
+    throw new ResearchBackendError("http", "critic", "critic provider unavailable in test", null);
+  }
+}
+
+class RepeatedCriticBackend extends StubResearchBackend {
+  readonly capabilities = {
+    actionControl: {
+      nativeToolCalls: false,
+      strictJsonFallback: true
+    },
+    criticReview: true
+  };
+  readonly researchRequests: ResearchActionRequest[] = [];
+  private reviewCount = 0;
+  private stopped = false;
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+    if (this.reviewCount < 2) {
+      return {
+        schemaVersion: 1,
+        action: "critic.review",
+        rationale: "Call the same critic stage again so the latest review replaces stale readiness.",
+        confidence: 0.9,
+        inputs: {
+          providerIds: [],
+          searchQueries: [],
+          evidenceTargets: [],
+          paperIds: [],
+          criticScope: "release",
+          reason: null,
+          workStore: {
+            collection: null,
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "The repeated critic artifact link reflects the newest readiness.",
+        stopCondition: "Continue after observing the repeated critic review.",
+        transport: "strict_json"
+      };
+    }
+    if (!this.stopped) {
+      this.stopped = true;
+      return {
+        schemaVersion: 1,
+        action: "workspace.status",
+        rationale: "Stop after repeated critic review visibility is observed.",
+        confidence: 0.8,
+        inputs: {
+          providerIds: [],
+          searchQueries: [],
+          evidenceTargets: [],
+          paperIds: [],
+          criticScope: null,
+          reason: "Repeated critic review visibility test complete.",
+          workStore: terminalUserDecisionWorkStore("Repeated critic review visibility test complete.")
+        },
+        expectedOutcome: "Stop through structured test decision.",
+        stopCondition: "Structured test decision reached.",
+        transport: "strict_json"
+      };
+    }
+    return super.chooseResearchAction(request);
+  }
+
+  async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    this.reviewCount += 1;
+    const readiness = this.reviewCount === 1 ? "revise" : "pass";
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness,
+      confidence: 0.82,
+      summary: `Repeated critic review ${this.reviewCount} returns ${readiness}.`,
+      objections: readiness === "revise"
+        ? [{
+          code: "repeat-review-revise",
+          severity: "major",
+          target: "manuscript",
+          targetId: null,
+          message: "The first review asks for revision.",
+          affectedPaperIds: [],
+          affectedEvidenceCellIds: [],
+          affectedClaimIds: [],
+          affectedSectionIds: [],
+          suggestedRevision: "Run the critic again after revision."
+        }]
+        : [],
+      positiveFindings: [],
+      revisionAdvice: {
+        searchQueries: [],
+        evidenceTargets: [],
+        papersToExclude: [],
+        papersToPromote: [],
+        claimsToSoften: []
+      },
+      recommendedNextActions: readiness === "revise" ? ["Revise before release."] : []
+    };
+  }
+}
+
 class NotebookToolBackend extends StubResearchBackend {
   private patched = false;
   private read = false;
@@ -2371,8 +2559,16 @@ async function seedCanonicalWorkspaceSource(input: {
 }
 
 class ExplicitResearchToolBackend extends StubResearchBackend {
+  readonly capabilities = {
+    actionControl: {
+      nativeToolCalls: false,
+      strictJsonFallback: true
+    },
+    criticReview: true
+  };
   readonly sourceActions: ResearchActionDecision[] = [];
   readonly researchRequests: ResearchActionRequest[] = [];
+  readonly criticRequests: CriticReviewRequest[] = [];
   private extractionId: string | null = null;
   private evidenceCellId: string | null = null;
 	  private matrixViewed = false;
@@ -2610,26 +2806,7 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
             limit: null,
             cursor: null,
             changes: {},
-            entity: {
-              stage: "release",
-              readiness: "revise",
-              confidence: 0.76,
-              objections: [{
-                code: "critic-tighten-limitations",
-                severity: "minor",
-                target: "manuscript",
-                message: "The limitations paragraph should clearly state that this is a single-source smoke scenario.",
-                affectedClaimIds: [claim.id],
-                suggestedRevision: "Keep the limitation visible in the final export."
-              }],
-              revisionAdvice: {
-                searchQueries: [],
-                evidenceTargets: [],
-                papersToExclude: [],
-                papersToPromote: [],
-                claimsToSoften: []
-              }
-            }
+            entity: {}
           }
         },
         expectedOutcome: "Critic output is returned as feedback only.",
@@ -2745,6 +2922,50 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
 
     this.sourceActions.push(action);
     return action;
+  }
+
+  async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    this.criticRequests.push(request);
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "revise",
+      confidence: 0.76,
+      summary: "The critic sees a bounded single-source smoke manuscript and requests a clearer limitation.",
+      objections: [{
+        code: "critic-tighten-limitations",
+        severity: "minor",
+        target: "manuscript",
+        targetId: "invented-manuscript-target",
+        message: "The limitations paragraph should clearly state that this is a single-source smoke scenario.",
+        affectedPaperIds: ["invented-source"],
+        affectedEvidenceCellIds: [],
+        affectedClaimIds: [
+          ...(request.workspace?.claims[0]?.id === undefined ? [] : [String(request.workspace.claims[0].id)]),
+          "invented-claim"
+        ],
+        affectedSectionIds: [
+          ...(request.workspace?.manuscriptSections[0]?.id === undefined ? [] : [String(request.workspace.manuscriptSections[0].id)]),
+          "invented-section"
+        ],
+        suggestedRevision: "Keep the limitation visible in the final export."
+      }],
+      positiveFindings: Array.from({ length: 8 }, (_, index) => ({
+        target: "manuscript",
+        targetId: `invented-positive-${index}`,
+        message: `Readiness-relevant smoke-test strength ${index}`
+      })),
+      revisionAdvice: {
+        searchQueries: [],
+        evidenceTargets: [],
+        papersToExclude: [],
+        papersToPromote: [],
+        claimsToSoften: []
+      },
+      recommendedNextActions: ["Revise or explicitly retain the limitation before finalization."]
+    };
   }
 }
 
@@ -3257,7 +3478,103 @@ test("architecture contract: critic review scopes are explicit researcher tools,
       sourceToolAdapter: new MultiPaperSourceToolAdapter(2)
     });
 
+    const completedRun = await runStore.load(run.id);
+    const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
     assert.deepEqual(backend.criticScopes, []);
+    assert.ok(backend.actionRequests.every((request) => !request.allowedActions.includes("critic.review")));
+    assert.match(stdout, /Critic review unavailable: backend stub:research does not expose a critic review transport/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("critic backend failures are linked into notebook context", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-critic-failure-visible-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "critic failure visibility",
+      researchQuestion: "Does a failed configured critic remain visible?",
+      researchDirection: "The runtime should persist the failed critic artifact link.",
+      successCriterion: "The researcher can see the critic failure after the tool result window."
+    }, ["clawresearch", "research-loop"]);
+
+    const backend = new FailingCriticBackend();
+    await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const criticReview = JSON.parse(await readFile(completedRun.artifacts.criticReleaseReviewPath, "utf8")) as {
+      readiness: string;
+      objections: Array<{ code: string }>;
+    };
+    const laterRequest = backend.researchRequests.find((request) => (
+      request.workStore?.dashboard?.recentCriticReviews?.some((review) => review.artifactPath === completedRun.artifacts.criticReleaseReviewPath)
+    ));
+
+    assert.equal(criticReview.readiness, "block");
+    assert.equal(criticReview.objections[0]?.code, "critic-unavailable");
+    assert.ok(workStore.notebook.artifactLinks.some((artifact) => artifact.label === "Critic review: release (block)" && artifact.path === completedRun.artifacts.criticReleaseReviewPath));
+    assert.ok(laterRequest, "failed critic review should remain visible through recentCriticReviews");
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("repeated critic reviews replace stale notebook artifact links", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-critic-review-replace-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "critic review replacement",
+      researchQuestion: "Does the newest critic review replace stale notebook readiness?",
+      researchDirection: "The runtime should keep the latest same-stage critic artifact link.",
+      successCriterion: "Only the latest readiness is visible for the critic artifact path."
+    }, ["clawresearch", "research-loop"]);
+
+    const backend = new RepeatedCriticBackend();
+    await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const criticReview = JSON.parse(await readFile(completedRun.artifacts.criticReleaseReviewPath, "utf8")) as {
+      readiness: string;
+    };
+    const matchingLinks = workStore.notebook.artifactLinks
+      .filter((artifact) => artifact.path === completedRun.artifacts.criticReleaseReviewPath);
+    const laterRequest = backend.researchRequests.find((request) => (
+      request.workStore?.dashboard?.recentCriticReviews?.some((review) => (
+        review.artifactPath === completedRun.artifacts.criticReleaseReviewPath
+          && review.readiness === "pass"
+      ))
+    ));
+
+    assert.equal(criticReview.readiness, "pass");
+    assert.equal(matchingLinks.length, 1);
+    assert.equal(matchingLinks[0]?.label, "Critic review: release (pass)");
+    assert.ok(laterRequest, "latest same-stage critic review should be visible without stale readiness");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -3570,6 +3887,13 @@ test("explicit researcher tools create extraction, evidence, critic feedback, re
     };
     const criticReview = JSON.parse(await readFile(completedRun.artifacts.criticReleaseReviewPath, "utf8")) as {
       readiness: string;
+      objections: Array<{
+        targetId: string | null;
+        affectedPaperIds: string[];
+        affectedClaimIds: string[];
+        affectedSectionIds: string[];
+      }>;
+      positiveFindings: unknown[];
     };
     const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
     const agentSteps = await readFile(completedRun.artifacts.agentStepsPath, "utf8");
@@ -3626,12 +3950,26 @@ test("explicit researcher tools create extraction, evidence, critic feedback, re
     assert.equal(workStore.objects.citations.length, 1);
     assert.equal(workStore.objects.citations[0]?.sourceId, sourceId);
     assert.equal(workStore.objects.workItems.filter((item) => item.source === "critic").length, 0);
+    assert.equal(backend.criticRequests.length, 1);
+    assert.equal(backend.criticRequests[0]?.stage, "release");
+    assert.equal(backend.criticRequests[0]?.workspace?.claims[0]?.id, workStore.objects.claims[0]?.id);
+    assert.equal(backend.criticRequests[0]?.workspace?.manuscriptSections[0]?.id, workStore.objects.manuscriptSections[0]?.id);
+    assert.ok(workStore.notebook.artifactLinks.some((artifact) => artifact.label === "Critic review: release (revise)" && artifact.path === completedRun.artifacts.criticReleaseReviewPath));
     assert.ok(workStore.objects.releaseChecks.length > 0);
     assert.equal(references.referenceCount, 1);
     assert.equal(references.references[0]?.sourceId, sourceId);
     assert.equal(paper.readinessStatus, "ready_for_revision");
     assert.deepEqual(paper.referencedPaperIds, [sourceId]);
     assert.equal(criticReview.readiness, "revise");
+    assert.equal(criticReview.objections[0]?.targetId, null);
+    assert.deepEqual(criticReview.objections[0]?.affectedPaperIds, []);
+    assert.deepEqual(criticReview.objections[0]?.affectedClaimIds, [workStore.objects.claims[0]?.id]);
+    assert.deepEqual(criticReview.objections[0]?.affectedSectionIds, [workStore.objects.manuscriptSections[0]?.id]);
+    assert.equal(criticReview.positiveFindings.length, 5);
+    const postCriticRequest = backend.researchRequests.find((request) => (
+      request.workStore?.dashboard?.recentCriticReviews?.some((review) => review.artifactPath === completedRun.artifacts.criticReleaseReviewPath)
+    ));
+    assert.ok(postCriticRequest, "critic review summary should remain visible in later workspace dashboard context");
     assert.match(paperMarkdown, /Tool-Loop Architecture/);
     assert.match(paperMarkdown, /Agentic research tool runtimes for scientific synthesis/);
     assert.match(stdout, /Research tool observation: Extraction created/);
