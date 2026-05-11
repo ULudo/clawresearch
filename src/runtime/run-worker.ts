@@ -65,7 +65,8 @@ import {
   type SourceToolProgressEvent,
   type ResearchSourceToolAdapter,
   type ResearchSourceSnapshot,
-  type SourceToolObservation
+  type SourceToolObservation,
+  type SourceEvidenceSelectionMode
 } from "./research-sources.js";
 import {
   type RunController
@@ -733,6 +734,10 @@ function isSourceSelectEvidenceAction(action: ResearchActionDecision["action"]):
   return action === "source.select_evidence";
 }
 
+function safeSourceEvidenceSelectionMode(value: unknown): SourceEvidenceSelectionMode | null {
+  return value === "append" || value === "replace" || value === "remove" ? value : null;
+}
+
 function isStatusAction(action: ResearchActionDecision["action"]): boolean {
   return action === "workspace.status";
 }
@@ -1140,6 +1145,10 @@ function rememberAgentToolResult(results: AgentToolResult[], result: AgentToolRe
 }
 
 function sourceToolStatus(observation: SourceToolObservation): AgentToolResult["status"] {
+  if (/\bblocked\b/i.test(observation.message)) {
+    return "blocked";
+  }
+
   if (/\b(failed|not available)\b/i.test(observation.message)) {
     return "failed";
   }
@@ -1225,7 +1234,10 @@ function sourceToolResultFromObservation(input: {
     query: {
       providerIds,
       searchQueries: input.decision.inputs.searchQueries,
-      paperIds: input.decision.inputs.paperIds
+      paperIds: input.decision.inputs.paperIds,
+      mode: input.decision.action === "source.select_evidence"
+        ? safeSourceEvidenceSelectionMode(input.decision.inputs.workStore?.entity.mode)
+        : null
     },
     count: sourceToolCount(input.observation),
     totalCount: sourceToolTotalCount(input.observation),
@@ -1961,16 +1973,9 @@ function knownSourceFromToolInput(input: {
   return null;
 }
 
-function supportedClaimsFromToolInput(value: unknown, decision: ResearchActionDecision): PaperExtraction["supportedClaims"] {
+function supportedClaimsFromToolInput(value: unknown): PaperExtraction["supportedClaims"] {
   if (!Array.isArray(value)) {
-    const targets = decision.inputs.evidenceTargets.length > 0
-      ? decision.inputs.evidenceTargets
-      : [decision.expectedOutcome];
-    return targets
-      .map((claim) => compactPreviewText(claim, 260))
-      .filter((claim) => claim.length > 0)
-      .slice(0, 12)
-      .map((claim) => ({ claim, support: "partial" }));
+    return [];
   }
 
   return value.flatMap((entry) => {
@@ -2008,7 +2013,29 @@ function paperExtractionFromToolInput(input: {
     return null;
   }
 
-  const problemSetting = stringInput(entity.problemSetting ?? entity.problem, input.decision.expectedOutcome);
+  const problemSetting = stringInput(entity.problemSetting ?? entity.problem, "");
+  const successSignals = stringArrayInput(entity.successSignals ?? entity.findings, 40);
+  const failureModes = stringArrayInput(entity.failureModes, 40);
+  const limitations = stringArrayInput(entity.limitations, 40);
+  const supportedClaims = supportedClaimsFromToolInput(entity.supportedClaims ?? entity.claims);
+  const evidenceNotes = stringArrayInput(entity.evidenceNotes ?? entity.notes, 40);
+  const extractionContentPresent = [
+    problemSetting,
+    stringInput(entity.systemType, ""),
+    stringInput(entity.architecture, ""),
+    stringInput(entity.toolsAndMemory, ""),
+    stringInput(entity.planningStyle, ""),
+    stringInput(entity.evaluationSetup, ""),
+    ...successSignals,
+    ...failureModes,
+    ...limitations,
+    ...supportedClaims.map((claim) => claim.claim),
+    ...evidenceNotes
+  ].some((value) => value.trim().length > 0);
+  if (!extractionContentPresent) {
+    return null;
+  }
+
   const paperExtraction: PaperExtraction = {
     id: stringInput(entity.id ?? entity.extractionId, generatedToolEntityId("extraction", input.run, input.now, source.id)),
     paperId: source.id,
@@ -2019,12 +2046,12 @@ function paperExtractionFromToolInput(input: {
     toolsAndMemory: stringInput(entity.toolsAndMemory, ""),
     planningStyle: stringInput(entity.planningStyle, ""),
     evaluationSetup: stringInput(entity.evaluationSetup, ""),
-    successSignals: stringArrayInput(entity.successSignals ?? entity.findings, 40),
-    failureModes: stringArrayInput(entity.failureModes, 40),
-    limitations: stringArrayInput(entity.limitations, 40),
-    supportedClaims: supportedClaimsFromToolInput(entity.supportedClaims ?? entity.claims, input.decision),
+    successSignals,
+    failureModes,
+    limitations,
+    supportedClaims,
     confidence: safePaperExtractionConfidence(entity.confidence),
-    evidenceNotes: stringArrayInput(entity.evidenceNotes ?? entity.notes, 40)
+    evidenceNotes
   };
 
   return {
@@ -2045,9 +2072,12 @@ function claimFromToolInput(input: {
   run: RunRecord;
   now: string;
   decision: ResearchActionDecision;
-}): WorkStoreClaim {
+}): WorkStoreClaim | null {
   const entity = input.decision.inputs.workStore?.entity ?? {};
-  const text = stringInput(entity.text, input.decision.inputs.reason ?? input.decision.rationale);
+  const text = stringInput(entity.text ?? entity.claim, "");
+  if (text.length === 0) {
+    return null;
+  }
   const sourceIds = uniqueStrings([
     ...input.decision.inputs.paperIds,
     ...stringArrayInput(entity.sourceIds, 20)
@@ -2094,7 +2124,11 @@ function evidenceCellFromToolInput(input: {
   const field = safeEvidenceCellField(entity.field);
   const value = Array.isArray(entity.value)
     ? stringArrayInput(entity.value, 40)
-    : stringInput(entity.value, input.decision.inputs.evidenceTargets.join("; ") || input.decision.expectedOutcome);
+    : stringInput(entity.value ?? entity.evidenceText ?? entity.text, "");
+  const hasEvidenceValue = Array.isArray(value) ? value.length > 0 : value.trim().length > 0;
+  if (!hasEvidenceValue) {
+    return null;
+  }
 
   return {
     id: stringInput(entity.id, generatedToolEntityId("evidence-cell", input.run, input.now, `${source.id}-${field}`)),
@@ -2115,18 +2149,21 @@ function manuscriptSectionFromToolInput(input: {
   now: string;
   decision: ResearchActionDecision;
   existing?: WorkStoreManuscriptSection | null;
-}): WorkStoreManuscriptSection {
+}): WorkStoreManuscriptSection | null {
   const entity = input.decision.inputs.workStore?.entity ?? {};
   const changes = input.decision.inputs.workStore?.changes ?? {};
   const sectionId = stringInput(
     entity.sectionId ?? changes.sectionId,
     input.existing?.sectionId ?? stringInput(input.decision.inputs.workStore?.entityId, "discussion")
   );
-  const paragraph = stringInput(
-    entity.paragraph ?? entity.markdown ?? changes.paragraph ?? changes.markdown,
-    input.decision.inputs.reason ?? input.decision.expectedOutcome
+  const paragraphs = stringArrayInput(entity.paragraphs ?? changes.paragraphs, 80);
+  const markdown = stringInput(
+    entity.markdown ?? entity.content ?? entity.paragraph ?? changes.markdown ?? changes.content ?? changes.paragraph,
+    paragraphs.join("\n\n")
   );
-  const markdown = paragraph;
+  if (markdown.length === 0) {
+    return null;
+  }
 
   return {
     id: input.existing?.id ?? stringInput(entity.id, generatedToolEntityId("section", input.run, input.now, sectionId)),
@@ -3351,6 +3388,26 @@ async function executeResearchObjectToolAction(input: {
       now: nowText,
       decision: input.decision
     });
+    if (claim === null) {
+      const message = "Claim create blocked because explicit claim text is required in workStore.entity.text or workStore.entity.claim; process rationale/expectedOutcome is never persisted as claim content.";
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "blocked",
+          readOnly: false,
+          message,
+          collection: "claims",
+          count: 0,
+          totalCount: input.store.objects.claims.length,
+          nextHints: ["workspace.read", "claim.create", "notebook.patch"]
+        })
+      };
+    }
     const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, claim, nowText);
     await writeResearchWorkStore(nextStore);
     const message = `Claim created ${claim.id}.`;
@@ -3664,7 +3721,7 @@ async function executeResearchObjectToolAction(input: {
       store: input.store
     });
     if (extractionResult === null) {
-      const message = "Extraction create blocked because no known canonical source id was provided.";
+      const message = "Extraction create blocked because it requires a known canonical source id plus explicit source-derived extraction content; process rationale/expectedOutcome is never persisted as extraction content.";
       return {
         handled: true,
         store: input.store,
@@ -3680,7 +3737,7 @@ async function executeResearchObjectToolAction(input: {
           count: 0,
           totalCount: input.store.objects.extractions.length,
           items: recentSourcePreviews(input.store),
-          nextHints: ["workspace.list", "source.search", "source.merge"]
+          nextHints: ["workspace.read", "workspace.list", "extraction.create"]
         })
       };
     }
@@ -3736,7 +3793,7 @@ async function executeResearchObjectToolAction(input: {
         decision: input.decision,
         entity: args.entity
       });
-      const message = "Evidence cell create blocked because it requires a known source id and an existing extraction for that source.";
+      const message = "Evidence cell create blocked because it requires a known source id, an existing extraction for that source, and explicit evidence value/text; process rationale/expectedOutcome is never persisted as evidence content.";
       return {
         handled: true,
         store: input.store,
@@ -3756,7 +3813,7 @@ async function executeResearchObjectToolAction(input: {
           query: {
             sourceId: requestedSource?.id ?? null,
             extractionId: stringInput(args.entity.extractionId, "") || null,
-            required: ["known sourceId", "existing extraction for that source"]
+            required: ["known sourceId", "existing extraction for that source", "explicit evidence value/text"]
           },
           nextHints: ["extraction.create", "workspace.list", "workspace.read"]
         })
@@ -3896,6 +3953,27 @@ async function executeResearchObjectToolAction(input: {
       decision: input.decision,
       existing
     });
+    if (section === null) {
+      const message = "Section create/patch blocked because explicit manuscript content is required in workStore.entity.markdown, content, paragraph, or paragraphs; process rationale/expectedOutcome is never persisted as section prose.";
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "blocked",
+          readOnly: false,
+          message,
+          collection: "manuscriptSections",
+          count: 0,
+          totalCount: input.store.objects.manuscriptSections.length,
+          items: input.store.objects.manuscriptSections.slice(-8).map((entry) => entityPreviewForAgent(entry, input.store)),
+          nextHints: ["workspace.read", "section.create", "section.patch", "notebook.patch"]
+        })
+      };
+    }
     const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, section, nowText);
     await writeResearchWorkStore(nextStore);
     const message = `Section updated ${section.id}.`;
@@ -4015,10 +4093,10 @@ async function executeResearchObjectToolAction(input: {
     const hardFailures = releaseChecks.filter((check) => check.status === "fail" && check.severity === "blocker");
     const status = hardFailures.length > 0 || notebookReadinessIssue !== null ? "not_ready" : "ok";
     const message = hardFailures.length > 0
-      ? `Release verification found ${hardFailures.length} hard invariant repair item(s); manuscript is not ready yet.`
+      ? `Mechanical release verification only: found ${hardFailures.length} hard invariant repair item(s); manuscript is not ready yet. This does not assess research quality.`
       : notebookReadinessIssue !== null
-        ? `Mechanical checks passed with 0 hard invariant blocker(s), but research readiness has not been intentionally recorded for finalization: ${notebookReadinessIssue}`
-        : `Mechanical checks passed. Release verification wrote ${releaseChecks.length} check(s): 0 hard invariant blocker(s), ${notebookDiagnostics.warningCount} notebook/project-management warning(s).`;
+        ? `Mechanical release verification only: checks passed with 0 hard invariant blocker(s), but research readiness has not been intentionally recorded for finalization: ${notebookReadinessIssue} This does not assess research quality.`
+        : `Mechanical release verification only: checks passed. Wrote ${releaseChecks.length} check(s): 0 hard invariant blocker(s), ${notebookDiagnostics.warningCount} notebook/project-management warning(s). Passing this does not assess research quality or scientific sufficiency.`;
     return {
       handled: true,
       store: nextStore,
@@ -4543,7 +4621,8 @@ async function executeSourceToolAction(input: {
   }
 
   if (isSourceSelectEvidenceAction(input.decision.action)) {
-    const observation = await input.session.selectEvidenceSet(input.decision.inputs.paperIds);
+    const selectionMode = safeSourceEvidenceSelectionMode(input.decision.inputs.workStore?.entity.mode);
+    const observation = await input.session.selectEvidenceSet(input.decision.inputs.paperIds, selectionMode);
     await persistSourceWorkspace();
     await appendEvent(input.run, input.now, "source", observation.message);
     await appendStdout(input.run, `Source tool observation: ${observation.message}`);
@@ -5385,34 +5464,11 @@ function workspacePaperArtifact(input: {
 function renderWorkspacePaperMarkdown(paper: ReviewPaperArtifact, references: ReferencesArtifact): string {
   const lines = [
     `# ${paper.title}`,
-    "",
-    "## Abstract",
-    "",
-    paper.abstract,
-    "",
-    "## Manuscript Structure",
-    "",
-    paper.structureRationale,
     ""
   ];
 
   for (const section of paper.sections) {
     lines.push(`## ${section.title}`, "", section.markdown, "");
-  }
-
-  if (paper.claims.length > 0) {
-    lines.push("## Claim Ledger", "");
-    for (const claim of paper.claims) {
-      const sources = claim.sourceIds.length > 0
-        ? ` Sources: ${claim.sourceIds.map((sourceId) => `[${sourceId}]`).join(", ")}.`
-        : "";
-      lines.push(`- ${claim.claim} ${claim.evidence}${sources}`);
-    }
-    lines.push("");
-  }
-
-  if (paper.limitations.length > 0) {
-    lines.push("## Limitations", "", ...paper.limitations.map((limitation) => `- ${limitation}`), "");
   }
 
   lines.push("## References", "");
@@ -5477,6 +5533,7 @@ function workspaceManuscriptChecks(input: {
   const unsupportedSectionCount = sections.filter((section) => (
     section.claimIds.length === 0 || section.claimIds.some((claimId) => !supportReadiness.supportedClaimIds.has(claimId))
   )).length;
+  const emptySectionCount = sections.filter((section) => section.markdown.trim().length === 0).length;
   const evidenceRows = input.store.objects.extractions.length;
   const checks: ManuscriptCheck[] = [
     {
@@ -5541,6 +5598,17 @@ function workspaceManuscriptChecks(input: {
       message: sections.length > 0
         ? `${sections.length} manuscript section(s) are available.`
         : "No manuscript sections have been created through section tools; a manuscript export needs section objects before release."
+    },
+    {
+      id: "section-content",
+      title: "Manuscript sections contain explicit content",
+      status: sections.length > 0 && emptySectionCount === 0 ? "pass" : "fail",
+      severity: "blocker",
+      message: sections.length === 0
+        ? "No manuscript sections exist yet."
+        : emptySectionCount === 0
+          ? "All manuscript sections contain explicit markdown content."
+          : `${emptySectionCount} manuscript section(s) have empty markdown content.`
     },
     {
       id: "claim-citation-support",

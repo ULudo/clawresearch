@@ -199,6 +199,19 @@ function terminalUserDecisionWorkStore(statusReason: string): ResearchActionDeci
   };
 }
 
+function sourceSelectionWorkStore(mode: "append" | "replace" | "remove"): ResearchActionDecision["inputs"]["workStore"] {
+  return {
+    collection: "canonicalSources",
+    entityId: null,
+    filters: {},
+    semanticQuery: null,
+    limit: null,
+    cursor: null,
+    changes: {},
+    entity: { mode }
+  };
+}
+
 function workspaceManuscriptDecisionForRequest(
   request: ResearchActionRequest,
   rationale = "Proceed with the next claim/evidence/section workspace action."
@@ -1248,7 +1261,8 @@ class SourceToolBackend extends StubResearchBackend {
           confidence: 0.86,
           inputs: {
             ...baseInputs,
-            paperIds: sourceState.candidatePaperIds
+            paperIds: sourceState.resolvedPaperIds.length > 0 ? sourceState.resolvedPaperIds : sourceState.candidatePaperIds,
+            workStore: sourceSelectionWorkStore("replace")
           },
           expectedOutcome: "Select the current evidence set.",
           stopCondition: "Stop after the evidence set has been checkpointed.",
@@ -1321,7 +1335,8 @@ class UnknownEvidenceSelectionBackend extends SourceToolBackend {
           evidenceTargets: [],
           paperIds: ["paper-does-not-exist"],
           criticScope: null,
-          reason: null
+          reason: null,
+          workStore: sourceSelectionWorkStore("append")
         },
         expectedOutcome: "Unknown ids are rejected visibly.",
         stopCondition: "Stop after the selection attempt.",
@@ -1441,7 +1456,8 @@ class StubbornSourceSearchBackend extends StubResearchBackend {
         confidence: 0.82,
         inputs: {
           ...baseInputs,
-          paperIds: sourceState.candidatePaperIds
+          paperIds: sourceState.resolvedPaperIds.length > 0 ? sourceState.resolvedPaperIds : sourceState.candidatePaperIds,
+          workStore: sourceSelectionWorkStore("replace")
         },
         expectedOutcome: "Selected evidence set.",
         stopCondition: "Stop after selection.",
@@ -3905,12 +3921,12 @@ test("explicit researcher tools create extraction, evidence, critic feedback, re
       "evidence.matrix_view",
       "claim.create",
       "claim.link_support",
-	      "section.create",
-	      "critic.review",
-	      "release.verify",
-	      "notebook.patch",
-	      "manuscript.finalize"
-	    ]);
+      "section.create",
+      "critic.review",
+      "release.verify",
+      "notebook.patch",
+      "manuscript.finalize"
+    ]);
     const validActions = new Set(workspaceResearchActions());
     const emittedHints = backend.researchRequests
       .flatMap((request) => request.toolResults ?? [])
@@ -3931,19 +3947,19 @@ test("explicit researcher tools create extraction, evidence, critic feedback, re
     assert.equal(supportLinkResult?.collection, "citations");
     assert.equal(supportLinkResult?.entity?.kind, "citation");
     assert.ok(supportLinkResult?.related?.some((item) => item.kind === "claim"));
-	    const sectionCreateResult = backend.researchRequests
-	      .flatMap((request) => request.toolResults ?? [])
-	      .find((result) => result.action === "section.create");
-	    assert.equal(sectionCreateResult?.collection, "manuscriptSections");
-	    assert.equal(sectionCreateResult?.entity?.kind, "manuscriptSection");
-	    const releaseVerifyResult = backend.researchRequests
-	      .flatMap((request) => request.toolResults ?? [])
-	      .find((result) => result.action === "release.verify");
-	    assert.equal(releaseVerifyResult?.status, "not_ready");
-	    assert.match(releaseVerifyResult?.message ?? "", /Mechanical checks passed/);
-	    assert.match(releaseVerifyResult?.message ?? "", /research readiness/i);
-	    assert.ok(releaseVerifyResult?.related?.some((item) => item.kind === "notebookDiagnostic"));
-	    assert.equal(workStore.objects.extractions.length, 1);
+    const sectionCreateResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "section.create");
+    assert.equal(sectionCreateResult?.collection, "manuscriptSections");
+    assert.equal(sectionCreateResult?.entity?.kind, "manuscriptSection");
+    const releaseVerifyResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "release.verify");
+    assert.equal(releaseVerifyResult?.status, "not_ready");
+    assert.match(releaseVerifyResult?.message ?? "", /Mechanical release verification only/i);
+    assert.match(releaseVerifyResult?.message ?? "", /research readiness/i);
+    assert.ok(releaseVerifyResult?.related?.some((item) => item.kind === "notebookDiagnostic"));
+    assert.equal(workStore.objects.extractions.length, 1);
     assert.equal(workStore.objects.extractions[0]?.sourceId, sourceId);
     assert.equal(workStore.objects.evidenceCells.length, 1);
     assert.equal(workStore.objects.evidenceCells[0]?.sourceId, sourceId);
@@ -3972,6 +3988,10 @@ test("explicit researcher tools create extraction, evidence, critic feedback, re
     assert.ok(postCriticRequest, "critic review summary should remain visible in later workspace dashboard context");
     assert.match(paperMarkdown, /Tool-Loop Architecture/);
     assert.match(paperMarkdown, /Agentic research tool runtimes for scientific synthesis/);
+    assert.doesNotMatch(paperMarkdown, /## Abstract/);
+    assert.doesNotMatch(paperMarkdown, /## Manuscript Structure/);
+    assert.doesNotMatch(paperMarkdown, /## Claim Ledger/);
+    assert.match(paperMarkdown, /## References/);
     assert.match(stdout, /Research tool observation: Extraction created/);
     assert.match(stdout, /Research tool observation: Evidence matrix view returned 1 row/);
     assert.match(stdout, /Research tool observation: Manuscript finalized from workspace state/);
@@ -4174,6 +4194,319 @@ test("claim.link_support failures return repair context without auto-approving s
     assert.ok(blockedSupport?.related?.some((item) => item.kind === "evidenceCell"));
     assert.ok(blockedSupport?.nextHints?.includes("evidence.create_cell"));
     assert.ok(blockedSupport?.nextHints?.includes("claim.link_support"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("durable research content never falls back to process metadata", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-content-boundaries-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "content-boundary contracts",
+      researchQuestion: "Can process metadata be kept out of durable research content?",
+      researchDirection: "Exercise blocked and successful create tools.",
+      successCriterion: "Only explicit content fields persist."
+    }, ["clawresearch", "research-loop"]);
+    const sourceId = await seedCanonicalWorkspaceSource({
+      projectRoot,
+      runId: run.id,
+      brief: run.brief,
+      now
+    });
+
+    class ContentBoundaryBackend extends StubResearchBackend {
+      private step = 0;
+      readonly researchRequests: ResearchActionRequest[] = [];
+
+      override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+        if (request.phase !== "research") {
+          return super.chooseResearchAction(request);
+        }
+        this.researchRequests.push(request);
+        this.step += 1;
+        const baseInputs = {
+          providerIds: [],
+          searchQueries: [],
+          evidenceTargets: [],
+          paperIds: [sourceId],
+          criticScope: null,
+          reason: "PROCESS REASON MUST NOT PERSIST"
+        };
+        const extractionId = request.toolResults?.find((result) => result.action === "extraction.create" && result.status === "ok")?.entity?.id ?? null;
+
+        if (this.step === 1) {
+          return {
+            schemaVersion: 1,
+            action: "extraction.create",
+            rationale: "PROCESS RATIONALE MUST NOT PERSIST",
+            confidence: 0.8,
+            inputs: {
+              ...baseInputs,
+              workStore: {
+                collection: "extractions",
+                entityId: null,
+                filters: {},
+                semanticQuery: null,
+                limit: null,
+                cursor: null,
+                changes: {},
+                entity: { sourceId }
+              }
+            },
+            expectedOutcome: "PROCESS EXPECTED EXTRACTION MUST NOT PERSIST",
+            stopCondition: "Process stop metadata.",
+            transport: "strict_json"
+          };
+        }
+        if (this.step === 2) {
+          return {
+            schemaVersion: 1,
+            action: "extraction.create",
+            rationale: "Create explicit extraction content.",
+            confidence: 0.9,
+            inputs: {
+              ...baseInputs,
+              reason: null,
+              workStore: {
+                collection: "extractions",
+                entityId: null,
+                filters: {},
+                semanticQuery: null,
+                limit: null,
+                cursor: null,
+                changes: {},
+                entity: {
+                  sourceId,
+                  problemSetting: "Explicit extraction content is source-derived.",
+                  successSignals: ["Explicit extraction fields persist."]
+                }
+              }
+            },
+            expectedOutcome: "Create extraction.",
+            stopCondition: "Extraction exists.",
+            transport: "strict_json"
+          };
+        }
+        if (this.step === 3) {
+          return {
+            schemaVersion: 1,
+            action: "evidence.create_cell",
+            rationale: "PROCESS RATIONALE MUST NOT PERSIST",
+            confidence: 0.8,
+            inputs: {
+              ...baseInputs,
+              workStore: {
+                collection: "evidenceCells",
+                entityId: null,
+                filters: {},
+                semanticQuery: null,
+                limit: null,
+                cursor: null,
+                changes: {},
+                entity: { sourceId, extractionId, field: "successSignals" }
+              }
+            },
+            expectedOutcome: "PROCESS EXPECTED EVIDENCE MUST NOT PERSIST",
+            stopCondition: "Process stop metadata.",
+            transport: "strict_json"
+          };
+        }
+        if (this.step === 4) {
+          return {
+            schemaVersion: 1,
+            action: "evidence.create_cell",
+            rationale: "Create explicit evidence content.",
+            confidence: 0.9,
+            inputs: {
+              ...baseInputs,
+              reason: null,
+              workStore: {
+                collection: "evidenceCells",
+                entityId: null,
+                filters: {},
+                semanticQuery: null,
+                limit: null,
+                cursor: null,
+                changes: {},
+                entity: {
+                  sourceId,
+                  extractionId,
+                  field: "successSignals",
+                  value: "Explicit evidence value persists.",
+                  confidence: "medium"
+                }
+              }
+            },
+            expectedOutcome: "Create evidence cell.",
+            stopCondition: "Evidence exists.",
+            transport: "strict_json"
+          };
+        }
+        if (this.step === 5) {
+          return {
+            schemaVersion: 1,
+            action: "claim.create",
+            rationale: "PROCESS RATIONALE MUST NOT PERSIST",
+            confidence: 0.8,
+            inputs: {
+              ...baseInputs,
+              workStore: {
+                collection: "claims",
+                entityId: null,
+                filters: {},
+                semanticQuery: null,
+                limit: null,
+                cursor: null,
+                changes: {},
+                entity: {}
+              }
+            },
+            expectedOutcome: "PROCESS EXPECTED CLAIM MUST NOT PERSIST",
+            stopCondition: "Process stop metadata.",
+            transport: "strict_json"
+          };
+        }
+        if (this.step === 6) {
+          return {
+            schemaVersion: 1,
+            action: "claim.create",
+            rationale: "Create explicit claim content.",
+            confidence: 0.9,
+            inputs: {
+              ...baseInputs,
+              reason: null,
+              workStore: {
+                collection: "claims",
+                entityId: null,
+                filters: {},
+                semanticQuery: null,
+                limit: null,
+                cursor: null,
+                changes: {},
+                entity: {
+                  text: "Explicit claim text persists.",
+                  evidence: "Explicit evidence statement persists.",
+                  confidence: "medium"
+                }
+              }
+            },
+            expectedOutcome: "Create claim.",
+            stopCondition: "Claim exists.",
+            transport: "strict_json"
+          };
+        }
+        if (this.step === 7) {
+          return {
+            schemaVersion: 1,
+            action: "section.create",
+            rationale: "PROCESS RATIONALE MUST NOT PERSIST",
+            confidence: 0.8,
+            inputs: {
+              ...baseInputs,
+              workStore: {
+                collection: "manuscriptSections",
+                entityId: null,
+                filters: {},
+                semanticQuery: null,
+                limit: null,
+                cursor: null,
+                changes: {},
+                entity: { sectionId: "boundary", title: "Boundary" }
+              }
+            },
+            expectedOutcome: "PROCESS EXPECTED SECTION MUST NOT PERSIST",
+            stopCondition: "Process stop metadata.",
+            transport: "strict_json"
+          };
+        }
+        if (this.step === 8) {
+          return {
+            schemaVersion: 1,
+            action: "section.create",
+            rationale: "Create explicit section content.",
+            confidence: 0.9,
+            inputs: {
+              ...baseInputs,
+              reason: null,
+              workStore: {
+                collection: "manuscriptSections",
+                entityId: null,
+                filters: {},
+                semanticQuery: null,
+                limit: null,
+                cursor: null,
+                changes: {},
+                entity: {
+                  sectionId: "boundary",
+                  title: "Boundary",
+                  markdown: "Explicit manuscript markdown persists."
+                }
+              }
+            },
+            expectedOutcome: "Create section.",
+            stopCondition: "Section exists.",
+            transport: "strict_json"
+          };
+        }
+
+        return {
+          schemaVersion: 1,
+          action: "workspace.status",
+          rationale: "Stop after content-boundary checks.",
+          confidence: 0.8,
+          inputs: {
+            providerIds: [],
+            searchQueries: [],
+            evidenceTargets: [],
+            paperIds: [],
+            criticScope: null,
+            reason: "Content boundary test complete.",
+            workStore: terminalUserDecisionWorkStore("Content boundary test complete.")
+          },
+          expectedOutcome: "Structured test terminal state.",
+          stopCondition: "Stop after blocked and successful content tools.",
+          transport: "strict_json"
+        };
+      }
+    }
+
+    const backend = new ContentBoundaryBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const toolResults = backend.researchRequests.flatMap((request) => request.toolResults ?? []);
+    const uniqueToolResults = [...new Map(toolResults.map((result) => [`${result.status}:${result.action}:${result.message}`, result])).values()];
+    const persistedText = JSON.stringify(workStore.objects);
+
+    assert.equal(exitCode, 0);
+    assert.deepEqual(
+      uniqueToolResults
+        .filter((result) => result.status === "blocked")
+        .map((result) => result.action),
+      ["extraction.create", "evidence.create_cell", "claim.create", "section.create"]
+    );
+    assert.equal(workStore.objects.extractions.length, 1);
+    assert.equal(workStore.objects.evidenceCells.length, 1);
+    assert.equal(workStore.objects.claims.length, 1);
+    assert.equal(workStore.objects.manuscriptSections.length, 1);
+    assert.equal(workStore.objects.claims[0]?.text, "Explicit claim text persists.");
+    assert.equal(workStore.objects.evidenceCells[0]?.value, "Explicit evidence value persists.");
+    assert.equal(workStore.objects.manuscriptSections[0]?.markdown, "Explicit manuscript markdown persists.");
+    assert.doesNotMatch(persistedText, /PROCESS RATIONALE MUST NOT PERSIST/);
+    assert.doesNotMatch(persistedText, /PROCESS EXPECTED/);
+    assert.doesNotMatch(persistedText, /PROCESS REASON MUST NOT PERSIST/);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -4553,14 +4886,13 @@ test("source tool runtime does not substitute fallback evidence for unknown rese
     assert.equal(sourcesArtifact.sourceToolState?.selectedPapers, 0);
     assert.equal(workStore.objects.extractions.length, 0);
     assert.equal(workStore.objects.evidenceCells.length, 0);
-    assert.match((sourcesArtifact.reviewWorkflow?.notes ?? []).join(" "), /no fallback semantic selection/i);
-    assert.match((sourcesArtifact.reviewWorkflow?.notes ?? []).join(" "), /paper-does-not-exist/i);
-    assert.match(stdout, /no fallback evidence selection was substituted/i);
+    assert.match(stdout, /unknown requested paper id/i);
+    assert.match(stdout, /No evidence selection state was changed/i);
     const selectionResult = backend.sourceActionRequests
       .flatMap((request) => request.toolResults ?? [])
       .find((result) => result.action === "source.select_evidence");
-    assert.equal(selectionResult?.status, "noop");
-    assert.match(selectionResult?.message ?? "", /unknown id/i);
+    assert.equal(selectionResult?.status, "blocked");
+    assert.match(selectionResult?.message ?? "", /unknown requested paper id/i);
   } finally {
     globalThis.fetch = originalFetch;
     await rm(projectRoot, { recursive: true, force: true });

@@ -59,7 +59,7 @@ async function runSourceTools(request: ResearchSourceToolRequest): Promise<Resea
   const candidatePaperIds = session.state().candidatePaperIds;
   if (candidatePaperIds.length > 0) {
     await session.resolveAccess(candidatePaperIds);
-    await session.selectEvidenceSet(candidatePaperIds);
+    await session.selectEvidenceSet(candidatePaperIds, "replace");
   }
 
   return session.result();
@@ -283,6 +283,14 @@ test("source.resolve_access requires explicit ids and source.select_evidence hon
             primary_location: { source: { display_name: "Research Tooling" }, landing_page_url: "https://example.org/select" },
             doi: "https://doi.org/10.1000/source-select",
             abstract_inverted_index: toAbstractIndex("Explicit source selection for autonomous research agents.")
+          }, {
+            id: "https://openalex.org/W-select-2",
+            display_name: "Append and remove evidence selections for research agents",
+            publication_year: 2026,
+            authorships: [{ author: { display_name: "Second Select Author" } }],
+            primary_location: { source: { display_name: "Research Tooling" }, landing_page_url: "https://example.org/select-two" },
+            doi: "https://doi.org/10.1000/source-select-two",
+            abstract_inverted_index: toAbstractIndex("Append replace remove evidence selection modes for autonomous research agents.")
           }]
         }), { status: 200, headers: { "content-type": "application/json" } });
       }
@@ -293,15 +301,31 @@ test("source.resolve_access requires explicit ids and source.select_evidence hon
     const session = await SourceToolRuntime.create(sourceToolRequest(projectRoot));
     await session.queryProvider("openalex", ["explicit source selection"]);
     await session.mergeSources();
-    const knownPaperId = session.state().candidatePaperIds[0]!;
+    const [knownPaperId, secondKnownPaperId] = session.state().candidatePaperIds;
     const noIdResolution = await session.resolveAccess([]);
-    const selection = await session.selectEvidenceSet([knownPaperId, "paper-missing"]);
+    const missingModeSelection = await session.selectEvidenceSet([knownPaperId]);
+    const unknownSelection = await session.selectEvidenceSet([knownPaperId, "paper-missing"], "append");
+    const firstAppend = await session.selectEvidenceSet([knownPaperId], "append");
+    const secondAppend = await session.selectEvidenceSet([secondKnownPaperId!], "append");
+    const removal = await session.selectEvidenceSet([knownPaperId], "remove");
+    const replacement = await session.selectEvidenceSet([knownPaperId], "replace");
     const result = await session.result();
 
     assert.equal(noIdResolution.counts.resolvedPapers, 0);
     assert.match(noIdResolution.message, /requires explicit known paper ids/i);
-    assert.equal(selection.counts.selectedPapers, 1);
-    assert.match(result.reviewWorkflow.notes.join("\n"), /Unknown requested paper id/i);
+    assert.match(missingModeSelection.message, /selection mode is required/i);
+    assert.equal(missingModeSelection.counts.selectedPapers, 0);
+    assert.match(unknownSelection.message, /unknown requested paper id/i);
+    assert.equal(unknownSelection.counts.selectedPapers, 0);
+    assert.equal(firstAppend.counts.selectedPapers, 1);
+    assert.equal(firstAppend.counts.addedPapers, 1);
+    assert.equal(secondAppend.counts.selectedPapers, 2);
+    assert.equal(secondAppend.counts.previousSelectedPapers, 1);
+    assert.equal(removal.counts.selectedPapers, 1);
+    assert.equal(removal.counts.removedPapers, 1);
+    assert.equal(replacement.counts.selectedPapers, 1);
+    assert.equal(replacement.counts.addedPapers, 1);
+    assert.equal(replacement.counts.removedPapers, 1);
     assert.deepEqual(result.reviewedPapers.map((paper) => paper.id), [knownPaperId]);
   } finally {
     globalThis.fetch = originalFetch;

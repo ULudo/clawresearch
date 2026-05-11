@@ -347,6 +347,10 @@ export type SourceToolObservation = {
     candidatePapers?: number;
     resolvedPapers?: number;
     selectedPapers?: number;
+    previousSelectedPapers?: number;
+    addedPapers?: number;
+    removedPapers?: number;
+    unknownPapers?: number;
   };
   items?: Array<{
     id: string;
@@ -363,6 +367,8 @@ export type SourceToolObservation = {
     fields?: Record<string, string | number | boolean | null | string[]>;
   }>;
 };
+
+export type SourceEvidenceSelectionMode = "append" | "replace" | "remove";
 
 export type SourceProviderYield = {
   providerId: SourceProviderId;
@@ -4260,7 +4266,7 @@ export class SourceToolRuntime {
     return observation;
   }
 
-  async selectEvidenceSet(paperIds: string[] = []): Promise<SourceToolObservation> {
+  async selectEvidenceSet(paperIds: string[] = [], mode: SourceEvidenceSelectionMode | null = null): Promise<SourceToolObservation> {
     if (this.canonicalReview === null) {
       this.lastObservation = "source.select_evidence requires canonical papers from an explicit source.merge action; no automatic merge or evidence selection was performed.";
       const observation: SourceToolObservation = {
@@ -4278,10 +4284,65 @@ export class SourceToolRuntime {
     }
 
     let canonicalReview = this.canonicalReview!;
+    const currentPaperIds = canonicalReview.reviewedPapers.map((paper) => paper.id);
+    if (mode === null) {
+      this.lastObservation = "source.select_evidence blocked because selection mode is required. Set mode to append, replace, or remove so evidence state changes are explicit.";
+      const observation: SourceToolObservation = {
+        action: "source.select_evidence",
+        message: this.lastObservation,
+        counts: {
+          canonicalPapers: canonicalReview.canonicalPapers.length,
+          selectedPapers: canonicalReview.reviewedPapers.length,
+          previousSelectedPapers: currentPaperIds.length
+        },
+        items: canonicalReview.reviewedPapers.slice(0, 12).map(paperToolPreview)
+      };
+      this.recordNonSearchAction(observation);
+      return observation;
+    }
+
     const requestedPaperIds = uniqueStrings(paperIds);
     const knownPaperIds = new Set(canonicalReview.canonicalPapers.map((paper) => paper.id));
-    const selectedPaperIds = requestedPaperIds.filter((paperId) => knownPaperIds.has(paperId));
+    const requestedKnownPaperIds = requestedPaperIds.filter((paperId) => knownPaperIds.has(paperId));
     const unknownPaperIds = requestedPaperIds.filter((paperId) => !knownPaperIds.has(paperId));
+    if (unknownPaperIds.length > 0) {
+      this.lastObservation = `source.select_evidence blocked because unknown requested paper id(s) are not selectable: ${unknownPaperIds.slice(0, 12).join(", ")}. No evidence selection state was changed.`;
+      const observation: SourceToolObservation = {
+        action: "source.select_evidence",
+        message: this.lastObservation,
+        counts: {
+          canonicalPapers: canonicalReview.canonicalPapers.length,
+          selectedPapers: currentPaperIds.length,
+          previousSelectedPapers: currentPaperIds.length,
+          unknownPapers: unknownPaperIds.length
+        },
+        items: canonicalReview.reviewedPapers.slice(0, 12).map(paperToolPreview)
+      };
+      this.recordNonSearchAction(observation);
+      return observation;
+    }
+
+    const currentPaperIdSet = new Set(currentPaperIds);
+    const nextPaperIdSet = new Set(currentPaperIds);
+    if (mode === "replace") {
+      nextPaperIdSet.clear();
+      for (const paperId of requestedKnownPaperIds) {
+        nextPaperIdSet.add(paperId);
+      }
+    } else if (mode === "append") {
+      for (const paperId of requestedKnownPaperIds) {
+        nextPaperIdSet.add(paperId);
+      }
+    } else {
+      for (const paperId of requestedKnownPaperIds) {
+        nextPaperIdSet.delete(paperId);
+      }
+    }
+    const selectedPaperIds = canonicalReview.canonicalPapers
+      .map((paper) => paper.id)
+      .filter((paperId) => nextPaperIdSet.has(paperId));
+    const addedPaperIds = selectedPaperIds.filter((paperId) => !currentPaperIdSet.has(paperId));
+    const removedPaperIds = currentPaperIds.filter((paperId) => !nextPaperIdSet.has(paperId));
     const selectedPaperIdSet = new Set(selectedPaperIds);
     const reviewedPapers = canonicalReview.canonicalPapers.filter((paper) => selectedPaperIdSet.has(paper.id));
     const deferredPaperIds = canonicalReview.reviewWorkflow.includedPaperIds.filter((paperId) => !selectedPaperIdSet.has(paperId));
@@ -4306,23 +4367,14 @@ export class SourceToolRuntime {
         notes: [
           ...diagnostics.reviewWorkflow.notes,
           selectedPaperIds.length > 0
-            ? `Researcher-selected evidence set honored ${selectedPaperIds.length} known paper id(s).`
-            : "Researcher-selected evidence set contained no known paper ids; no fallback semantic selection was substituted.",
-          unknownPaperIds.length > 0
-            ? `Unknown requested paper id(s) were ignored visibly: ${unknownPaperIds.slice(0, 12).join(", ")}.`
-            : null
+            ? `Researcher-selected evidence set ${mode} honored ${requestedKnownPaperIds.length} known paper id(s); current selection has ${selectedPaperIds.length} paper(s).`
+            : `Researcher-selected evidence set ${mode} left no selected paper ids; no fallback semantic selection was substituted.`
         ].filter((note): note is string => note !== null)
       }
     };
     this.canonicalReview = canonicalReview;
 
-    this.lastObservation = selectedPaperIds.length === 0 && unknownPaperIds.length > 0
-      ? `source.select_evidence contained no known paper ids; no fallback evidence selection was substituted. Unknown id(s): ${unknownPaperIds.slice(0, 12).join(", ")}.`
-      : unknownPaperIds.length > 0
-        ? `Selected ${canonicalReview.reviewedPapers.length} known researcher-requested papers for the evidence set from ${canonicalReview.canonicalPapers.length} canonical papers; ignored unknown id(s): ${unknownPaperIds.slice(0, 12).join(", ")}.`
-        : requestedPaperIds.length > 0
-          ? `Selected ${canonicalReview.reviewedPapers.length} researcher-requested papers for the evidence set from ${canonicalReview.canonicalPapers.length} canonical papers.`
-          : `Selected ${canonicalReview.reviewedPapers.length} papers for the evidence set from ${canonicalReview.canonicalPapers.length} canonical papers.`;
+    this.lastObservation = `source.select_evidence ${mode} completed: ${currentPaperIds.length} previously selected, ${addedPaperIds.length} added, ${removedPaperIds.length} removed, ${canonicalReview.reviewedPapers.length} now selected from ${canonicalReview.canonicalPapers.length} canonical papers.`;
     await emitSourceProgress(this.request.progress, {
       phase: "review_selection",
       status: "completed",
@@ -4338,7 +4390,10 @@ export class SourceToolRuntime {
       message: this.lastObservation,
       counts: {
         canonicalPapers: canonicalReview.canonicalPapers.length,
-        selectedPapers: canonicalReview.reviewedPapers.length
+        selectedPapers: canonicalReview.reviewedPapers.length,
+        previousSelectedPapers: currentPaperIds.length,
+        addedPapers: addedPaperIds.length,
+        removedPapers: removedPaperIds.length
       },
       items: canonicalReview.reviewedPapers.slice(0, 12).map(paperToolPreview)
     };
