@@ -37,7 +37,9 @@ import {
   loadResearchWorkStore,
   researchWorkStoreFilePath,
   upsertResearchWorkStoreEntities,
-  writeResearchWorkStore
+  writeResearchWorkStore,
+  type ResearchMissionTarget,
+  type WorkStoreEntity
 } from "../src/runtime/research-work-store.js";
 
 function createNow(): () => string {
@@ -2574,6 +2576,326 @@ async function seedCanonicalWorkspaceSource(input: {
   return sourceId;
 }
 
+async function seedThinReviewWorkspace(input: {
+  projectRoot: string;
+  runId: string;
+  brief: Parameters<typeof createResearchWorkStore>[0]["brief"];
+  now: () => string;
+  missionTarget: ResearchMissionTarget;
+  sourceCount?: number;
+  extractedCount?: number;
+  evidenceCount?: number;
+  citedCount?: number;
+}): Promise<void> {
+  const timestamp = input.now();
+  const sourceCount = input.sourceCount ?? 22;
+  const extractedCount = Math.min(input.extractedCount ?? 19, sourceCount);
+  const evidenceCount = Math.min(input.evidenceCount ?? 8, extractedCount);
+  const citedCount = Math.min(input.citedCount ?? 3, evidenceCount);
+  const sourceIds = Array.from({ length: sourceCount }, (_, index) => `source-review-${index + 1}`);
+  const extractedSourceIds = sourceIds.slice(0, extractedCount);
+  const evidenceSourceIds = sourceIds.slice(0, evidenceCount);
+  const citedSourceIds = sourceIds.slice(0, citedCount);
+  const canonicalSources: WorkStoreEntity[] = sourceIds.map((sourceId, index) => ({
+    id: sourceId,
+    kind: "canonicalSource" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    key: `doi:10.5555/thin-review-${index + 1}`,
+    title: `Representative research workspace paper ${index + 1}`,
+    citation: `Author ${index + 1} (2026). Representative research workspace paper ${index + 1}.`,
+    abstract: "A representative source used to test artifact-contract finalization.",
+    year: 2026,
+    authors: [`Author ${index + 1}`],
+    venue: "Workspace Review Journal",
+    providerIds: ["test"],
+    identifiers: {
+      doi: `10.5555/thin-review-${index + 1}`,
+      pmid: null,
+      pmcid: null,
+      arxivId: null
+    },
+    accessMode: "fulltext_open",
+    bestAccessUrl: `https://example.org/thin-review-${index + 1}.pdf`,
+    screeningDecision: "include",
+    screeningRationale: "Selected by the fake researcher for review.",
+    tags: ["review-source"]
+  }));
+  const extractions: WorkStoreEntity[] = extractedSourceIds.map((sourceId, index) => ({
+    id: `extraction-review-${index + 1}`,
+    kind: "extraction" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    sourceId,
+    extraction: {
+      id: `extraction-review-${index + 1}`,
+      paperId: sourceId,
+      runId: input.runId,
+      problemSetting: "Model-driven research workspaces need explicit synthesis affordances.",
+      systemType: "research workspace",
+      architecture: "SQLite workspace plus explicit model-selected tools.",
+      toolsAndMemory: "source, extraction, evidence, claim, section, critic, and finalization tools",
+      planningStyle: "model-owned planning with runtime provenance",
+      evaluationSetup: "architecture and behavior smoke tests",
+      successSignals: ["state is inspectable", "citations are traceable"],
+      failureModes: ["thin synthesis can look mechanically valid"],
+      limitations: ["test fixture"],
+      supportedClaims: [{
+        claim: "Research workspaces need artifact-aware finalization.",
+        support: "explicit" as const
+      }],
+      confidence: "high" as const,
+      evidenceNotes: ["Synthetic test extraction."]
+    }
+  }));
+  const evidenceCells: WorkStoreEntity[] = evidenceSourceIds.map((sourceId, index) => ({
+    id: `evidence-review-${index + 1}`,
+    kind: "evidenceCell" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    sourceId,
+    extractionId: `extraction-review-${index + 1}`,
+    field: "successSignals" as const,
+    value: "Artifact-aware finalization keeps checkpoint briefs distinct from professional papers.",
+    confidence: "high"
+  }));
+  const claims: WorkStoreEntity[] = citedSourceIds.map((sourceId, index) => ({
+    id: `claim-review-${index + 1}`,
+    kind: "claim" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    text: `Artifact-aware finalization claim ${index + 1}`,
+    evidence: "Supported by synthetic evidence cells in this test fixture.",
+    sourceIds: [sourceId],
+    supportStatus: "supported",
+    confidence: "high",
+    usedInSections: ["section-thin-synthesis"],
+    risk: null
+  }));
+  const citations: WorkStoreEntity[] = citedSourceIds.map((sourceId, index) => ({
+    id: `citation-review-${index + 1}`,
+    kind: "citation" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    sourceId,
+    sourceTitle: `Representative research workspace paper ${index + 1}`,
+    evidenceCellId: `evidence-review-${index + 1}`,
+    supportSnippet: "Artifact-aware finalization keeps checkpoint briefs distinct from professional papers.",
+    confidence: "high",
+    relevance: "direct support",
+    claimIds: [`claim-review-${index + 1}`],
+    sectionIds: ["section-thin-synthesis"]
+  }));
+  const section: WorkStoreEntity = {
+    id: "section-thin-synthesis",
+    kind: "manuscriptSection" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    sectionId: "thin-synthesis",
+    role: "synthesis",
+    title: "Thin Synthesis",
+    markdown: "This deliberately thin section cites only a few sources despite a larger selected and extracted source set.",
+    sourceIds: citedSourceIds,
+    claimIds: claims.map((claim) => claim.id),
+    status: "checked"
+  };
+  const store = upsertResearchWorkStoreEntities({
+    ...createResearchWorkStore({
+      projectRoot: input.projectRoot,
+      brief: input.brief,
+      now: timestamp
+    }),
+    notebook: {
+      schemaVersion: 1,
+      missionTarget: input.missionTarget,
+      paperMode: "literature_review",
+      objective: "Produce an artifact-contract regression review.",
+      definitionOfDone: ["Do not confuse a checkpoint brief with a professional paper."],
+      tasks: [{
+        id: "task-thin-synthesis",
+        title: "Show thin synthesis cannot pass professional finalization",
+        status: "in_progress",
+        notes: "The workspace is mechanically linked but intentionally too thin for professional_paper.",
+        linkedSourceIds: citedSourceIds,
+        linkedExtractionIds: ["extraction-review-1"],
+        linkedEvidenceCellIds: ["evidence-review-1"],
+        linkedClaimIds: ["claim-review-1"],
+        linkedSectionIds: ["section-thin-synthesis"],
+        linkedArtifactPaths: []
+      }],
+      currentFocus: "Validate artifact-aware finalization.",
+      readiness: input.missionTarget === "professional_paper"
+        ? "Ready to finalize professional_paper literature_review with caveats according to the fake researcher."
+        : "Ready to finalize research_brief literature_review with caveats according to the fake researcher.",
+      notes: [],
+      artifactLinks: [],
+      updatedAt: timestamp
+    },
+    worker: {
+      ...createResearchWorkStore({
+        projectRoot: input.projectRoot,
+        brief: input.brief,
+        now: timestamp
+      }).worker,
+      evidence: {
+        canonicalPapers: sourceIds.length,
+        includedPapers: sourceIds.length,
+        selectedSourceIds: sourceIds,
+        explicitlySelectedEvidencePapers: sourceIds.length,
+        selectedPapers: sourceIds.length,
+        extractedPapers: extractedSourceIds.length,
+        evidenceRows: evidenceCells.length,
+        referencedPapers: citedSourceIds.length
+      }
+    }
+  }, [
+    ...canonicalSources,
+    ...extractions,
+    ...evidenceCells,
+    ...claims,
+    ...citations,
+    section
+  ], timestamp);
+  await writeResearchWorkStore(store);
+}
+
+async function seedSharedClaimSupportWorkspace(input: {
+  projectRoot: string;
+  runId: string;
+  brief: Parameters<typeof createResearchWorkStore>[0]["brief"];
+  now: () => string;
+}): Promise<{
+  claimId: string;
+  sourceIds: string[];
+  evidenceCellIds: string[];
+}> {
+  const timestamp = input.now();
+  const claimId = "claim-support-link-regression-with-a-deliberately-long-identifier-that-used-to-truncate-source-identity";
+  const sourceIds = ["source-support-1", "source-support-2", "source-support-3"];
+  const evidenceCellIds = sourceIds.map((_, index) => `evidence-support-${index + 1}`);
+  const canonicalSources: WorkStoreEntity[] = sourceIds.map((sourceId, index) => ({
+    id: sourceId,
+    kind: "canonicalSource" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    key: `doi:10.5555/support-link-${index + 1}`,
+    title: `Support link regression source ${index + 1}`,
+    citation: `Support Author ${index + 1} (2026). Support link regression source ${index + 1}.`,
+    abstract: "A seeded source used to test durable support-link identity across sources.",
+    year: 2026,
+    authors: [`Support Author ${index + 1}`],
+    venue: "Support Link Test Journal",
+    providerIds: ["test"],
+    identifiers: {
+      doi: `10.5555/support-link-${index + 1}`,
+      pmid: null,
+      pmcid: null,
+      arxivId: null
+    },
+    accessMode: "fulltext_open",
+    bestAccessUrl: `https://example.org/support-link-${index + 1}.pdf`,
+    screeningDecision: "include",
+    screeningRationale: "Selected by the fake researcher for support-link identity testing.",
+    tags: ["support-link-regression"]
+  }));
+  const extractions: WorkStoreEntity[] = sourceIds.map((sourceId, index) => ({
+    id: `extraction-support-${index + 1}`,
+    kind: "extraction" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    sourceId,
+    extraction: {
+      id: `extraction-support-${index + 1}`,
+      paperId: sourceId,
+      runId: input.runId,
+      problemSetting: "Durable support links can be attached from multiple sources to one claim.",
+      systemType: "support-link regression fixture",
+      architecture: "one claim, multiple selected sources, and distinct evidence cells",
+      toolsAndMemory: "claim.link_support writes citation-renderable support links",
+      planningStyle: "scripted regression test",
+      evaluationSetup: "attach support links for three source/evidence identities",
+      successSignals: ["all support links remain durable"],
+      failureModes: ["generated ids can collide when long claim ids are truncated"],
+      limitations: ["synthetic fixture"],
+      supportedClaims: [{
+        claim: "Support-link identity must include source and evidence identity.",
+        support: "explicit" as const
+      }],
+      confidence: "high" as const,
+      evidenceNotes: ["Synthetic extraction for support-link regression."]
+    }
+  }));
+  const evidenceCells: WorkStoreEntity[] = sourceIds.map((sourceId, index) => ({
+    id: evidenceCellIds[index] ?? `evidence-support-${index + 1}`,
+    kind: "evidenceCell" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    sourceId,
+    extractionId: `extraction-support-${index + 1}`,
+    field: "successSignals" as const,
+    value: `Source ${index + 1} provides independent evidence that durable support links must preserve source identity.`,
+    confidence: "high"
+  }));
+  const claim: WorkStoreEntity = {
+    id: claimId,
+    kind: "claim" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    text: "Durable support links must preserve distinct source identities for the same claim.",
+    evidence: "Multiple seeded sources each provide independent support for this single claim.",
+    sourceIds: [],
+    supportStatus: "weak",
+    confidence: "medium",
+    usedInSections: [],
+    risk: "No support links have been attached yet."
+  };
+  const store = upsertResearchWorkStoreEntities({
+    ...createResearchWorkStore({
+      projectRoot: input.projectRoot,
+      brief: input.brief,
+      now: timestamp
+    }),
+    worker: {
+      ...createResearchWorkStore({
+        projectRoot: input.projectRoot,
+        brief: input.brief,
+        now: timestamp
+      }).worker,
+      evidence: {
+        canonicalPapers: sourceIds.length,
+        includedPapers: sourceIds.length,
+        selectedSourceIds: sourceIds,
+        explicitlySelectedEvidencePapers: sourceIds.length,
+        selectedPapers: sourceIds.length,
+        extractedPapers: 0,
+        evidenceRows: evidenceCells.length,
+        referencedPapers: 0
+      }
+    }
+  }, [
+    ...canonicalSources,
+    ...extractions,
+    ...evidenceCells,
+    claim
+  ], timestamp);
+  await writeResearchWorkStore(store);
+  return {
+    claimId,
+    sourceIds,
+    evidenceCellIds
+  };
+}
+
 class ExplicitResearchToolBackend extends StubResearchBackend {
   readonly capabilities = {
     actionControl: {
@@ -2871,6 +3193,8 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
 	            cursor: null,
 	            changes: {},
 	            entity: {
+	              missionTarget: "research_brief",
+	              paperMode: "technical_survey",
 	              currentFocus: "Finalize the validated smoke manuscript export.",
 	              readiness: "Ready to finalize with caveats: this is a bounded single-source smoke manuscript whose mechanical provenance and citation invariants have been checked.",
 	              task: {
@@ -2947,9 +3271,9 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
       runId: request.runId,
       stage: request.stage,
       reviewer: "ephemeral_critic",
-      readiness: "revise",
+      readiness: "pass",
       confidence: 0.76,
-      summary: "The critic sees a bounded single-source smoke manuscript and requests a clearer limitation.",
+      summary: "The critic sees a bounded single-source smoke manuscript and approves release with the limitation visible.",
       objections: [{
         code: "critic-tighten-limitations",
         severity: "minor",
@@ -2980,7 +3304,7 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
         papersToPromote: [],
         claimsToSoften: []
       },
-      recommendedNextActions: ["Revise or explicitly retain the limitation before finalization."]
+      recommendedNextActions: []
     };
   }
 }
@@ -3153,6 +3477,86 @@ class SupportRepairDiagnosticsBackend extends StubResearchBackend {
       },
       expectedOutcome: "Return a blocked repair packet with valid ids and cautions.",
       stopCondition: "Support link remains uncreated.",
+      transport: "strict_json"
+    };
+  }
+}
+
+class MultiSourceSupportLinkBackend extends StubResearchBackend {
+  readonly researchRequests: ResearchActionRequest[] = [];
+  private nextSourceIndex = 0;
+
+  constructor(
+    private readonly claimId: string,
+    private readonly sourceIds: string[],
+    private readonly evidenceCellIds: string[]
+  ) {
+    super();
+  }
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [],
+      criticScope: null,
+      reason: null
+    };
+
+    if (this.nextSourceIndex < this.sourceIds.length) {
+      const sourceId = this.sourceIds[this.nextSourceIndex] ?? "";
+      const evidenceCellId = this.evidenceCellIds[this.nextSourceIndex] ?? "";
+      this.nextSourceIndex += 1;
+      return {
+        schemaVersion: 1,
+        action: "claim.link_support",
+        rationale: "Attach another source-backed support link to the same long claim id.",
+        confidence: 0.92,
+        inputs: {
+          ...baseInputs,
+          paperIds: [sourceId],
+          workStore: {
+            collection: "citations",
+            entityId: this.claimId,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              claimId: this.claimId,
+              sourceId,
+              evidenceCellId,
+              supportSnippet: `Source ${this.nextSourceIndex} provides independent evidence that durable support links must preserve source identity.`,
+              confidence: "high",
+              relevance: "direct support"
+            }
+          }
+        },
+        expectedOutcome: "Attach one durable support link without overwriting links from other sources.",
+        stopCondition: "The support link count increases or updates only the same claim/source/evidence identity.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "Stop after all same-claim support links have been attempted.",
+      confidence: 0.84,
+      inputs: {
+        ...baseInputs,
+        reason: "Multi-source support-link regression complete.",
+        workStore: terminalUserDecisionWorkStore("Multi-source support-link regression complete.")
+      },
+      expectedOutcome: "Structured terminal state for the regression test.",
+      stopCondition: "The regression workspace can be inspected.",
       transport: "strict_json"
     };
   }
@@ -3361,6 +3765,244 @@ class ExplicitManuscriptFinalizeBlockedBackend extends StubResearchBackend {
       stopCondition: "Structured test decision reached.",
       transport: "strict_json"
     };
+  }
+}
+
+class FinalizeSeededWorkspaceBackend extends StubResearchBackend {
+  readonly researchRequests: ResearchActionRequest[] = [];
+  private finalized = false;
+
+  constructor(
+    private readonly requestedMissionTarget: ResearchMissionTarget | null = null,
+    private readonly missionTarget: ResearchMissionTarget = "professional_paper"
+  ) {
+    super();
+  }
+
+  override async planResearch(): Promise<ResearchPlan> {
+    return {
+      researchMode: "literature_synthesis",
+      objective: "Finalize the seeded workspace according to the notebook artifact contract.",
+      rationale: "The regression test preloads the workspace; planning only preserves artifact intent.",
+      searchQueries: [],
+      localFocus: [],
+      notebookPatch: {
+        missionTarget: this.missionTarget,
+        paperMode: "literature_review",
+        currentFocus: "Validate seeded artifact finalization.",
+        readiness: `Ready to finalize ${this.missionTarget} literature_review with caveats according to the fake researcher.`
+      }
+    };
+  }
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [],
+      criticScope: null,
+      reason: null
+    };
+
+    if (!this.finalized) {
+      this.finalized = true;
+      return {
+        schemaVersion: 1,
+        action: "manuscript.finalize",
+        rationale: "Attempt to finalize the seeded workspace exactly as it stands.",
+        confidence: 0.8,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: this.requestedMissionTarget === null ? {} : {
+              missionTarget: this.requestedMissionTarget
+            }
+          }
+        },
+        expectedOutcome: "Finalization either writes paper.md or returns artifact-contract repair diagnostics.",
+        stopCondition: "The explicit finalization result is visible.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "Stop the seeded finalization regression test after observing the result.",
+      confidence: 0.8,
+      inputs: {
+        ...baseInputs,
+        reason: "Seeded finalization test complete.",
+        workStore: terminalUserDecisionWorkStore("Seeded finalization test complete.")
+      },
+      expectedOutcome: "Structured terminal state.",
+      stopCondition: "Structured test terminal state reached.",
+      transport: "strict_json"
+    };
+  }
+}
+
+class CriticAvailableFinalizeSeededWorkspaceBackend extends FinalizeSeededWorkspaceBackend {
+  readonly capabilities = {
+    actionControl: {
+      nativeToolCalls: false,
+      strictJsonFallback: true
+    },
+    criticReview: true
+  };
+  readonly criticRequests: CriticReviewRequest[] = [];
+
+  async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    this.criticRequests.push(request);
+    throw new Error("critic.review should not be auto-run by manuscript.finalize");
+  }
+}
+
+class CriticThenFinalizeSeededWorkspaceBackend extends FinalizeSeededWorkspaceBackend {
+  readonly capabilities = {
+    actionControl: {
+      nativeToolCalls: false,
+      strictJsonFallback: true
+    },
+    criticReview: true
+  };
+  readonly criticRequests: CriticReviewRequest[] = [];
+  private reviewed = false;
+
+  constructor(missionTarget: ResearchMissionTarget = "research_brief") {
+    super(null, missionTarget);
+  }
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    if (!this.reviewed) {
+      this.reviewed = true;
+      this.researchRequests.push(request);
+      return {
+        schemaVersion: 1,
+        action: "critic.review",
+        rationale: "Create the runtime-owned release critic pass before finalization.",
+        confidence: 0.9,
+        inputs: {
+          providerIds: [],
+          searchQueries: [],
+          evidenceTargets: [],
+          paperIds: [],
+          criticScope: "release",
+          reason: null,
+          workStore: {
+            collection: "workItems",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "A release critic pass is persisted by the critic.review handler.",
+        stopCondition: "Continue to manuscript.finalize after the pass is visible.",
+        transport: "strict_json"
+      };
+    }
+
+    return super.chooseResearchAction(request);
+  }
+
+  async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    this.criticRequests.push(request);
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "pass",
+      confidence: 0.9,
+      summary: "The release critic approves this bounded seeded workspace for export.",
+      objections: [],
+      positiveFindings: [{
+        target: "release",
+        targetId: null,
+        message: "Mechanical support links and references are sufficient for this bounded fixture."
+      }],
+      revisionAdvice: {
+        searchQueries: [],
+        evidenceTargets: [],
+        papersToExclude: [],
+        papersToPromote: [],
+        claimsToSoften: []
+      },
+      recommendedNextActions: []
+    };
+  }
+}
+
+class FakeCriticNotebookLinkFinalizeBackend extends CriticAvailableFinalizeSeededWorkspaceBackend {
+  private patched = false;
+
+  constructor(private readonly fakeCriticPath: string) {
+    super(null, "research_brief");
+  }
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    if (!this.patched) {
+      this.patched = true;
+      this.researchRequests.push(request);
+      return {
+        schemaVersion: 1,
+        action: "notebook.patch",
+        rationale: "Try to fake critic authority through a notebook artifact link.",
+        confidence: 0.88,
+        inputs: {
+          providerIds: [],
+          searchQueries: [],
+          evidenceTargets: [],
+          paperIds: [],
+          criticScope: null,
+          reason: null,
+          workStore: {
+            collection: null,
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              artifactLink: {
+                label: "Critic review: release (pass)",
+                path: this.fakeCriticPath,
+                kind: "other"
+              }
+            }
+          }
+        },
+        expectedOutcome: "The fake critic link is visible but not trusted for finalization.",
+        stopCondition: "Continue to manuscript.finalize.",
+        transport: "strict_json"
+      };
+    }
+
+    return super.chooseResearchAction(request);
   }
 }
 
@@ -3970,13 +4612,13 @@ test("explicit researcher tools create extraction, evidence, critic feedback, re
     assert.equal(backend.criticRequests[0]?.stage, "release");
     assert.equal(backend.criticRequests[0]?.workspace?.claims[0]?.id, workStore.objects.claims[0]?.id);
     assert.equal(backend.criticRequests[0]?.workspace?.manuscriptSections[0]?.id, workStore.objects.manuscriptSections[0]?.id);
-    assert.ok(workStore.notebook.artifactLinks.some((artifact) => artifact.label === "Critic review: release (revise)" && artifact.path === completedRun.artifacts.criticReleaseReviewPath));
+    assert.ok(workStore.notebook.artifactLinks.some((artifact) => artifact.label === "Critic review: release (pass)" && artifact.path === completedRun.artifacts.criticReleaseReviewPath && artifact.createdBy === "runtime"));
     assert.ok(workStore.objects.releaseChecks.length > 0);
     assert.equal(references.referenceCount, 1);
     assert.equal(references.references[0]?.sourceId, sourceId);
     assert.equal(paper.readinessStatus, "ready_for_revision");
     assert.deepEqual(paper.referencedPaperIds, [sourceId]);
-    assert.equal(criticReview.readiness, "revise");
+    assert.equal(criticReview.readiness, "pass");
     assert.equal(criticReview.objections[0]?.targetId, null);
     assert.deepEqual(criticReview.objections[0]?.affectedPaperIds, []);
     assert.deepEqual(criticReview.objections[0]?.affectedClaimIds, [workStore.objects.claims[0]?.id]);
@@ -4194,6 +4836,56 @@ test("claim.link_support failures return repair context without auto-approving s
     assert.ok(blockedSupport?.related?.some((item) => item.kind === "evidenceCell"));
     assert.ok(blockedSupport?.nextHints?.includes("evidence.create_cell"));
     assert.ok(blockedSupport?.nextHints?.includes("claim.link_support"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("claim.link_support preserves distinct support links for the same long claim id", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-support-link-id-regression-"));
+  const now = createNow();
+
+  try {
+    const brief = {
+      topic: "support-link identity regression",
+      researchQuestion: "Can one claim accumulate support links from multiple selected sources?",
+      researchDirection: "Attach multiple evidence-backed citations to the same long claim id.",
+      successCriterion: "Different source/evidence identities must not overwrite each other."
+    };
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create(brief, ["clawresearch", "research-loop"]);
+    const seeded = await seedSharedClaimSupportWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now
+    });
+
+    const backend = new MultiSourceSupportLinkBackend(seeded.claimId, seeded.sourceIds, seeded.evidenceCellIds);
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const linkedSourceIds = workStore.objects.citations.map((citation) => citation.sourceId).sort();
+    const supportLinkIds = workStore.objects.citations.map((citation) => citation.id);
+    const supportResults = backend.researchRequests.flatMap((request) => request.toolResults ?? [])
+      .filter((result) => result.action === "claim.link_support");
+
+    assert.equal(exitCode, 0);
+    assert.equal(workStore.objects.citations.length, seeded.sourceIds.length);
+    assert.equal(new Set(supportLinkIds).size, seeded.sourceIds.length);
+    assert.deepEqual(linkedSourceIds, [...seeded.sourceIds].sort());
+    assert.equal(workStore.objects.claims[0]?.sourceIds.length, seeded.sourceIds.length);
+    assert.equal(workStore.objects.claims[0]?.supportStatus, "supported");
+    assert.ok(supportResults.every((result) => result.stateDelta?.supportLinksCreated === 1));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -4535,7 +5227,6 @@ test("explicit manuscript.finalize fails visibly when release invariants are mis
     });
 
     const completedRun = await runStore.load(run.id);
-    const paperMarkdown = await readFile(completedRun.artifacts.paperPath, "utf8");
     const checks = JSON.parse(await readFile(completedRun.artifacts.manuscriptChecksPath, "utf8")) as {
       blockerCount: number;
       checks: Array<{ id: string; status: string; severity: string }>;
@@ -4549,8 +5240,7 @@ test("explicit manuscript.finalize fails visibly when release invariants are mis
     assert.ok(checks.blockerCount > 0);
     assert.ok(checks.checks.some((check) => check.id === "workspace-claims" && check.status === "fail" && check.severity === "blocker"));
     assert.ok(checks.checks.some((check) => check.id === "workspace-sections" && check.status === "fail" && check.severity === "blocker"));
-    assert.match(paperMarkdown, /Manuscript finalization was explicitly requested/);
-    assert.match(paperMarkdown, /No claims have been created/);
+    await assert.rejects(readFile(completedRun.artifacts.paperPath, "utf8"), /ENOENT/);
     assert.equal(workStore.worker.completion, null);
     assert.ok(workStore.worker.nextInternalActions.some((action) => /not_ready tool result from manuscript\.finalize/i.test(action)));
     assert.ok(workStore.worker.nextInternalActions.some((action) => /release checks/i.test(action)));
@@ -4560,6 +5250,359 @@ test("explicit manuscript.finalize fails visibly when release invariants are mis
     assert.equal(releaseResult?.status, "not_ready");
     assert.equal(releaseResult?.stateDelta?.manuscriptFinalized, 0);
     assert.ok(releaseResult?.related?.some((item) => item.kind === "releaseRepair" && item.fields?.suggestedActions !== undefined));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("test-08-shaped source collapse blocks finalization and keeps working", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-professional-contract-blocked-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "model-driven research workspaces",
+      researchQuestion: "Can artifact contracts stop thin professional review exports?",
+      researchDirection: "Use a seeded weak workspace to test finalization.",
+      successCriterion: "Produce a professional literature review paper."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "artifact-contract"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "professional_paper"
+    });
+
+    const backend = new FinalizeSeededWorkspaceBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const checks = JSON.parse(await readFile(completedRun.artifacts.manuscriptChecksPath, "utf8")) as {
+      blockerCount: number;
+    };
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const finalizeResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "manuscript.finalize");
+
+    assert.equal(exitCode, 0);
+    assert.equal(checks.blockerCount, 0);
+    await assert.rejects(readFile(completedRun.artifacts.paperPath, "utf8"), /ENOENT/);
+    await assert.rejects(readFile(completedRun.artifacts.paperJsonPath, "utf8"), /ENOENT/);
+    assert.equal(workStore.worker.completion, null);
+    assert.equal(finalizeResult?.status, "not_ready");
+    assert.equal(finalizeResult?.stateDelta?.hardInvariantBlockers, 0);
+    assert.ok((finalizeResult?.stateDelta?.artifactContractFailures ?? 0) > 0);
+    assert.match(finalizeResult?.message ?? "", /not ready for professional_paper\/literature_review/i);
+    assert.match(finalizeResult?.message ?? "", /continue/i);
+    assert.ok(finalizeResult?.related?.some((item) => item.kind === "artifactContractDiagnostic" && /runtime-owned release-scope critic\.review pass/i.test(item.snippet ?? "")));
+    assert.ok(finalizeResult?.related?.some((item) => item.kind === "artifactContractDiagnostic" && /Selected-to-rendered source disposition collapsed/i.test(item.snippet ?? "")));
+    assert.ok(finalizeResult?.related?.some((item) => item.kind === "artifactContractDiagnostic" && /checkpoint brief/i.test(item.snippet ?? "")));
+    const collapseDiagnostic = finalizeResult?.related?.find((item) => item.kind === "artifactContractDiagnostic" && /Selected-to-rendered source disposition collapsed/i.test(item.snippet ?? ""));
+    assert.deepEqual(finalizeResult?.nextHints?.slice(0, 3), ["workspace.list", "claim.link_support", "section.patch"]);
+    assert.ok(Array.isArray(collapseDiagnostic?.fields?.selectedToRenderedCollapseSourceIds));
+    assert.ok((collapseDiagnostic?.fields?.selectedToRenderedCollapseSourceIds as string[]).length > 0);
+    assert.ok((collapseDiagnostic?.fields?.suggestedActions as string[]).includes("claim.link_support"));
+    assert.ok(workStore.worker.nextInternalActions.some((action) => /not_ready tool result from manuscript\.finalize/i.test(action)));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("professional_paper mission cannot be finalized as a research_brief downgrade", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-professional-no-brief-downgrade-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "model-driven research workspaces",
+      researchQuestion: "Can the model downgrade the mission at finalization time?",
+      researchDirection: "Use a seeded weak workspace to test requested artifact mismatch.",
+      successCriterion: "Produce a professional literature review paper."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "artifact-contract"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "professional_paper"
+    });
+
+    const backend = new FinalizeSeededWorkspaceBackend("research_brief");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const finalizeResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "manuscript.finalize");
+
+    assert.equal(exitCode, 0);
+    await assert.rejects(readFile(completedRun.artifacts.paperPath, "utf8"), /ENOENT/);
+    assert.equal(workStore.worker.completion, null);
+    assert.equal(finalizeResult?.status, "not_ready");
+    assert.ok(finalizeResult?.related?.some((item) => item.kind === "artifactContractDiagnostic" && /downgrade/i.test(item.snippet ?? "")));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("research_brief without a runtime release critic pass is not ready", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-brief-needs-release-critic-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "model-driven research workspaces",
+      researchQuestion: "Does a brief need release critic authority?",
+      researchDirection: "Use a mechanically linked seeded workspace.",
+      successCriterion: "Return not_ready until critic.review release passes."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "artifact-contract"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    const backend = new CriticAvailableFinalizeSeededWorkspaceBackend(null, "research_brief");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const finalizeResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "manuscript.finalize");
+
+    assert.equal(exitCode, 0);
+    await assert.rejects(readFile(completedRun.artifacts.paperPath, "utf8"), /ENOENT/);
+    assert.equal(workStore.worker.completion, null);
+    assert.equal(backend.criticRequests.length, 0);
+    assert.equal(finalizeResult?.status, "not_ready");
+    assert.ok(finalizeResult?.nextHints?.includes("critic.review"));
+    assert.ok(finalizeResult?.related?.some((item) => item.kind === "artifactContractDiagnostic" && /No runtime-owned release-scope critic\.review pass/i.test(item.snippet ?? "")));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("fake critic notebook link does not satisfy finalization authority", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-fake-critic-link-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "model-driven research workspaces",
+      researchQuestion: "Can notebook.patch fake critic authority?",
+      researchDirection: "Patch a critic-looking artifact link without invoking critic.review.",
+      successCriterion: "Finalization remains blocked."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "artifact-contract"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    const backend = new FakeCriticNotebookLinkFinalizeBackend(run.artifacts.criticReleaseReviewPath);
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const fakeLink = workStore.notebook.artifactLinks.find((artifact) => (
+      artifact.label === "Critic review: release (pass)"
+      && artifact.path === completedRun.artifacts.criticReleaseReviewPath
+    ));
+    const finalizeResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "manuscript.finalize");
+
+    assert.equal(exitCode, 0);
+    assert.ok(fakeLink, "the model-authored fake critic link should be present as notebook context");
+    assert.equal(fakeLink?.createdBy, undefined);
+    assert.equal(backend.criticRequests.length, 0);
+    await assert.rejects(readFile(completedRun.artifacts.paperPath, "utf8"), /ENOENT/);
+    assert.equal(workStore.worker.completion, null);
+    assert.equal(finalizeResult?.status, "not_ready");
+    assert.ok(finalizeResult?.nextHints?.includes("critic.review"));
+    assert.ok(finalizeResult?.related?.some((item) => item.kind === "artifactContractDiagnostic" && /Model-authored notebook artifact links/i.test(item.snippet ?? "")));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("research_brief mission can finalize after a runtime release critic pass", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-brief-contract-finalizes-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "model-driven research workspaces",
+      researchQuestion: "Can a lightweight linked workspace finalize as a brief?",
+      researchDirection: "Use a seeded workspace to test research_brief finalization.",
+      successCriterion: "Produce a research brief."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "artifact-contract"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_brief");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const paperMarkdown = await readFile(completedRun.artifacts.paperPath, "utf8");
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+
+    assert.equal(exitCode, 0);
+    assert.equal(backend.criticRequests.length, 1);
+    assert.match(paperMarkdown, /Thin Synthesis/);
+    assert.match(paperMarkdown, /## References/);
+    assert.equal(workStore.worker.completion?.kind, "manuscript_finalized");
+    assert.ok(workStore.notebook.artifactLinks.some((artifact) => artifact.path === completedRun.artifacts.criticReleaseReviewPath && artifact.createdBy === "runtime"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("critic review packet uses exact selected and cited sources, not every screened include", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-critic-exact-selection-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "critic source packets",
+      researchQuestion: "Does critic review receive the model-selected evidence set?",
+      researchDirection: "Only exact selected and cited sources should be sent as selected sources.",
+      successCriterion: "Broad screened includes are not mislabeled as selected."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "critic-source-packet"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 5,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+    const seededStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    await writeResearchWorkStore({
+      ...seededStore,
+      worker: {
+        ...seededStore.worker,
+        evidence: {
+          ...(seededStore.worker.evidence ?? {
+            canonicalPapers: 5,
+            includedPapers: 5,
+            extractedPapers: 1,
+            evidenceRows: 1,
+            referencedPapers: 1
+          }),
+          selectedSourceIds: ["source-review-2"],
+          explicitlySelectedEvidencePapers: 1,
+          selectedPapers: 1
+        }
+      }
+    });
+
+    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_brief");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+    const criticSelectedIds = backend.criticRequests[0]?.workspace?.selectedSources
+      .map((source) => String(source.id))
+      .sort();
+
+    assert.equal(exitCode, 0);
+    assert.equal(backend.criticRequests.length, 1);
+    assert.deepEqual(criticSelectedIds, ["source-review-1", "source-review-2"]);
+    assert.equal(criticSelectedIds?.includes("source-review-3"), false);
+    assert.equal(criticSelectedIds?.includes("source-review-4"), false);
+    assert.equal(criticSelectedIds?.includes("source-review-5"), false);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

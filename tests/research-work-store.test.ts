@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import {
 	  buildWorkspacePromptContextFromWorkStore,
+	  buildWorkspaceDispositionDiagnostics,
 	  buildNotebookDiagnostics,
 	  createResearchWorkStore,
   createResearchWorkStoreEntity,
@@ -14,11 +15,13 @@ import {
   queryResearchWorkStore,
   readResearchWorkStoreEntity,
   researchWorkStoreFilePath,
+  upsertResearchWorkStoreEntities,
   writeResearchWorkStore,
 	  type WorkStoreCitation,
 	  type WorkStoreCanonicalSource,
   type WorkStoreClaim,
   type WorkStoreEvidenceCell,
+  type WorkStoreEntity,
   type WorkStoreManuscriptSection,
   type WorkStoreCreateInput,
   type WorkStoreWorkItem
@@ -134,6 +137,8 @@ test("research work store persists the living research notebook with task and ar
       ...store,
       notebook: {
         ...store.notebook,
+        missionTarget: "professional_paper" as const,
+        paperMode: "literature_review" as const,
         objective: "Produce a professional literature review from the workspace.",
         definitionOfDone: ["Extract selected sources", "Support central claims", "Finalize paper.md"],
         currentFocus: "Extract selected sources",
@@ -168,6 +173,8 @@ test("research work store persists the living research notebook with task and ar
     });
 
     assert.equal(loaded.notebook.objective, "Produce a professional literature review from the workspace.");
+    assert.equal(loaded.notebook.missionTarget, "professional_paper");
+    assert.equal(loaded.notebook.paperMode, "literature_review");
     assert.deepEqual(loaded.notebook.definitionOfDone, ["Extract selected sources", "Support central claims", "Finalize paper.md"]);
     assert.equal(loaded.notebook.tasks[0]?.status, "in_progress");
     assert.deepEqual(loaded.notebook.tasks[0]?.linkedEvidenceCellIds, ["evidence-1"]);
@@ -192,6 +199,22 @@ test("notebook diagnostics expose empty, unwritten, unlinked, and stale project-
         successCriterion: "Notebook warnings remain observations."
       }
     });
+    store = {
+      ...store,
+      worker: {
+        ...store.worker,
+        evidence: {
+          canonicalPapers: 1,
+          includedPapers: 1,
+          selectedSourceIds: ["source-1"],
+          explicitlySelectedEvidencePapers: 1,
+          selectedPapers: 1,
+          extractedPapers: 0,
+          evidenceRows: 0,
+          referencedPapers: 0
+        }
+      }
+    };
 
     store = createResearchWorkStoreEntity<WorkStoreCanonicalSource>(store, {
       id: "source-1",
@@ -264,6 +287,319 @@ test("notebook diagnostics expose empty, unwritten, unlinked, and stale project-
     assert.ok(warningCodes.includes("notebook-claims-unlinked"));
     assert.ok(warningCodes.includes("notebook-sections-unlinked"));
     assert.ok(warningCodes.includes("notebook-stale-after-workspace-change"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("workspace disposition diagnostics expose structural source attrition", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-work-store-disposition-"));
+
+  try {
+    const now = "2026-01-01T00:00:00.000Z";
+    const sourceIds = ["source-1", "source-2", "source-3", "source-4"];
+    let store = createResearchWorkStore({
+      projectRoot,
+      now,
+      brief: {
+        topic: "Disposition diagnostics",
+        researchQuestion: "Can structural source attrition be surfaced?",
+        researchDirection: "Compare selected, extracted, evidenced, cited, and rendered sources.",
+        successCriterion: "Diagnostics expose IDs without judging semantics."
+      }
+    });
+    store = {
+      ...store,
+      worker: {
+        ...store.worker,
+        evidence: {
+          canonicalPapers: sourceIds.length,
+          includedPapers: sourceIds.length,
+          selectedSourceIds: sourceIds,
+          explicitlySelectedEvidencePapers: sourceIds.length,
+          selectedPapers: sourceIds.length,
+          extractedPapers: 0,
+          evidenceRows: 0,
+          referencedPapers: 0
+        }
+      }
+    };
+
+    const sources: WorkStoreEntity[] = sourceIds.map((sourceId, index) => ({
+      id: sourceId,
+      kind: "canonicalSource" as const,
+      runId: "run-1",
+      createdAt: now,
+      updatedAt: now,
+      key: `doi:10.1/disposition-${index + 1}`,
+      title: `Disposition source ${index + 1}`,
+      citation: `Example (${2026 + index}). Disposition source ${index + 1}.`,
+      abstract: "A selected source for disposition diagnostics.",
+      year: 2026,
+      authors: ["Example"],
+      venue: "Workspace Systems",
+      providerIds: ["test"],
+      identifiers: {
+        doi: `10.1/disposition-${index + 1}`,
+        pmid: null,
+        pmcid: null,
+        arxivId: null
+      },
+      accessMode: "metadata_only",
+      bestAccessUrl: null,
+      screeningDecision: "include",
+      screeningRationale: "Selected for the diagnostic fixture.",
+      tags: []
+    }));
+    const extractionTemplate = {
+      runId: "run-1",
+      problemSetting: "Runtime diagnostics should expose structural disposition.",
+      systemType: "workspace",
+      architecture: "source, extraction, evidence, claim, citation, reference ledgers",
+      toolsAndMemory: "workspace store",
+      planningStyle: "structural",
+      evaluationSetup: "unit tests",
+      successSignals: ["source ids remain visible"],
+      failureModes: ["collapsed references"],
+      limitations: ["fixture"],
+      supportedClaims: [],
+      confidence: "medium" as const,
+      evidenceNotes: []
+    };
+    const entities: WorkStoreEntity[] = [
+      ...sources,
+      {
+        id: "extraction-source-1-a",
+        kind: "extraction" as const,
+        runId: "run-1",
+        createdAt: now,
+        updatedAt: now,
+        sourceId: "source-1",
+        extraction: { ...extractionTemplate, id: "extraction-source-1-a", paperId: "source-1" }
+      },
+      {
+        id: "extraction-source-1-b",
+        kind: "extraction" as const,
+        runId: "run-1",
+        createdAt: now,
+        updatedAt: now,
+        sourceId: "source-1",
+        extraction: { ...extractionTemplate, id: "extraction-source-1-b", paperId: "source-1" }
+      },
+      {
+        id: "extraction-source-2",
+        kind: "extraction" as const,
+        runId: "run-1",
+        createdAt: now,
+        updatedAt: now,
+        sourceId: "source-2",
+        extraction: { ...extractionTemplate, id: "extraction-source-2", paperId: "source-2" }
+      },
+      {
+        id: "evidence-source-1",
+        kind: "evidenceCell" as const,
+        runId: "run-1",
+        createdAt: now,
+        updatedAt: now,
+        sourceId: "source-1",
+        extractionId: "extraction-source-1-a",
+        field: "successSignals" as const,
+        value: "Source disposition remains visible.",
+        confidence: "medium"
+      },
+      {
+        id: "claim-source-1",
+        kind: "claim" as const,
+        runId: "run-1",
+        createdAt: now,
+        updatedAt: now,
+        text: "Disposition diagnostics expose source attrition.",
+        evidence: "The fixture links one claim to one source.",
+        sourceIds: ["source-1"],
+        supportStatus: "supported",
+        confidence: "medium",
+        usedInSections: [],
+        risk: null
+      },
+      {
+        id: "citation-source-1",
+        kind: "citation" as const,
+        runId: "run-1",
+        createdAt: now,
+        updatedAt: now,
+        sourceId: "source-1",
+        sourceTitle: "Disposition source 1",
+        evidenceCellId: "evidence-source-1",
+        supportSnippet: "Source disposition remains visible.",
+        confidence: "medium",
+        relevance: "direct",
+        claimIds: ["claim-source-1"],
+        sectionIds: []
+      }
+    ];
+    store = upsertResearchWorkStoreEntities(store, entities, now);
+
+    const disposition = buildWorkspaceDispositionDiagnostics(store, {
+      renderedReferenceSourceIds: ["source-1"]
+    });
+    const diagnostics = buildNotebookDiagnostics(store);
+    const warningCodes = diagnostics.warnings.map((warning) => warning.code);
+
+    assert.deepEqual(disposition.selectedSourceIds, sourceIds);
+    assert.deepEqual(disposition.extractedSourceIds, ["source-1", "source-2"]);
+    assert.deepEqual(disposition.evidenceCellSourceIds, ["source-1"]);
+    assert.deepEqual(disposition.claimSourceIds, ["source-1"]);
+    assert.deepEqual(disposition.citationSourceIds, ["source-1"]);
+    assert.deepEqual(disposition.renderedReferenceSourceIds, ["source-1"]);
+    assert.deepEqual(disposition.missingSelectedExtractionSourceIds, ["source-3", "source-4"]);
+    assert.deepEqual(disposition.duplicateExtractionSourceIds, ["source-1"]);
+    assert.deepEqual(disposition.extractedNotEvidenceSourceIds, ["source-2"]);
+    assert.deepEqual(disposition.evidenceNotCitedSourceIds, []);
+    assert.deepEqual(disposition.selectedToRenderedCollapseSourceIds, ["source-2", "source-3", "source-4"]);
+    assert.equal(disposition.selectedToRenderedCollapse, true);
+    assert.ok(warningCodes.includes("workspace-selected-to-rendered-collapse"));
+    assert.deepEqual(diagnostics.disposition.selectedToRenderedCollapseSourceIds, ["source-2", "source-3", "source-4"]);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("workspace disposition diagnostics prefer explicit selected evidence ids over screened includes", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-work-store-explicit-selection-"));
+
+  try {
+    const now = "2026-01-01T00:00:00.000Z";
+    const sourceIds = ["source-1", "source-2", "source-3", "source-4", "source-5"];
+    let store = createResearchWorkStore({
+      projectRoot,
+      now,
+      brief: {
+        topic: "Explicit source selection",
+        researchQuestion: "Can diagnostics distinguish broad screening includes from the exact evidence set?",
+        researchDirection: "Use the model-selected source IDs as canonical disposition inputs.",
+        successCriterion: "Diagnostics do not tell the model that every include is selected."
+      }
+    });
+    store = {
+      ...store,
+      worker: {
+        ...store.worker,
+        evidence: {
+          canonicalPapers: sourceIds.length,
+          includedPapers: sourceIds.length,
+          selectedSourceIds: ["source-2", "source-4"],
+          explicitlySelectedEvidencePapers: 2,
+          selectedPapers: 2,
+          extractedPapers: 1,
+          evidenceRows: 0,
+          referencedPapers: 0
+        }
+      }
+    };
+    store = upsertResearchWorkStoreEntities(store, sourceIds.map((sourceId, index) => ({
+      id: sourceId,
+      kind: "canonicalSource" as const,
+      runId: "run-1",
+      createdAt: now,
+      updatedAt: now,
+      key: `doi:10.2/selection-${index + 1}`,
+      title: `Screened include ${index + 1}`,
+      citation: `Example (${2026 + index}). Screened include ${index + 1}.`,
+      abstract: "A broad screened include, not necessarily part of the selected evidence set.",
+      year: 2026,
+      authors: ["Example"],
+      venue: "Workspace Systems",
+      providerIds: ["test"],
+      identifiers: {
+        doi: `10.2/selection-${index + 1}`,
+        pmid: null,
+        pmcid: null,
+        arxivId: null
+      },
+      accessMode: "metadata_only",
+      bestAccessUrl: null,
+      screeningDecision: "include",
+      screeningRationale: "Broadly included by source screening.",
+      tags: []
+    })), now);
+
+    const disposition = buildWorkspaceDispositionDiagnostics(store);
+    const diagnostics = buildNotebookDiagnostics(store);
+
+    assert.deepEqual(disposition.selectedSourceIds, ["source-2", "source-4"]);
+    assert.deepEqual(disposition.missingSelectedExtractionSourceIds, ["source-2", "source-4"]);
+    assert.deepEqual(diagnostics.unlinkedSelectedSourceIds, ["source-2", "source-4"]);
+    assert.equal(diagnostics.disposition.selectedSourceIds.length, 2);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("workspace disposition diagnostics do not fall back to screened includes after an explicit empty selection", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-work-store-empty-selection-"));
+
+  try {
+    const now = "2026-01-01T00:00:00.000Z";
+    let store = createResearchWorkStore({
+      projectRoot,
+      now,
+      brief: {
+        topic: "Empty evidence selection",
+        researchQuestion: "Does an empty selected evidence set stay empty?",
+        researchDirection: "Do not reinterpret broad screened includes as selected evidence.",
+        successCriterion: "Diagnostics should report zero selected sources."
+      }
+    });
+    store = {
+      ...store,
+      worker: {
+        ...store.worker,
+        evidence: {
+          canonicalPapers: 3,
+          includedPapers: 3,
+          selectedSourceIds: [],
+          explicitlySelectedEvidencePapers: 0,
+          selectedPapers: 0,
+          extractedPapers: 0,
+          evidenceRows: 0,
+          referencedPapers: 0
+        }
+      }
+    };
+    store = upsertResearchWorkStoreEntities(store, [1, 2, 3].map((index) => ({
+      id: `source-${index}`,
+      kind: "canonicalSource" as const,
+      runId: "run-1",
+      createdAt: now,
+      updatedAt: now,
+      key: `doi:10.3/empty-selection-${index}`,
+      title: `Screened include ${index}`,
+      citation: `Example (2026). Screened include ${index}.`,
+      abstract: "A broad screened include.",
+      year: 2026,
+      authors: ["Example"],
+      venue: "Workspace Systems",
+      providerIds: ["test"],
+      identifiers: {
+        doi: `10.3/empty-selection-${index}`,
+        pmid: null,
+        pmcid: null,
+        arxivId: null
+      },
+      accessMode: "metadata_only",
+      bestAccessUrl: null,
+      screeningDecision: "include",
+      screeningRationale: "Broad include, not selected evidence.",
+      tags: []
+    })), now);
+
+    const disposition = buildWorkspaceDispositionDiagnostics(store);
+    const diagnostics = buildNotebookDiagnostics(store);
+
+    assert.deepEqual(disposition.selectedSourceIds, []);
+    assert.deepEqual(disposition.missingSelectedExtractionSourceIds, []);
+    assert.deepEqual(diagnostics.unlinkedSelectedSourceIds, []);
+    assert.equal(diagnostics.disposition.selectedToRenderedCollapse, false);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -355,6 +691,8 @@ test("workspace prompt context is a derived SQLite projection without pseudo-mem
     assert.equal(context.counts.evidenceCells, 1);
     assert.equal(context.counts.claims, 1);
     assert.equal(context.counts.openWorkItems, 1);
+    assert.equal(context.notebook.missionTarget, "professional_paper");
+    assert.equal(context.notebook.paperMode, "literature_review");
     assert.equal(context.notebook.objective, "Write a claim-led review from workspace evidence.");
     assert.equal(context.notebook.activeTasks[0]?.linkedEvidenceCellIds[0], "evidence-1");
     assert.equal(context.notebook.recentCriticReviews?.length, 0);

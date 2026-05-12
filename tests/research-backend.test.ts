@@ -9,6 +9,15 @@ import { RuntimeModelClient, type ModelCredentialState } from "../src/runtime/mo
 import type { WorkspacePromptContext } from "../src/runtime/research-work-store.js";
 import type { EvidenceMatrix, PaperExtraction } from "../src/runtime/research-evidence.js";
 
+type CapturedJsonSchema = {
+  type?: unknown;
+  enum?: string[];
+  description?: string;
+  properties?: Record<string, CapturedJsonSchema>;
+  required?: string[];
+  items?: CapturedJsonSchema;
+};
+
 function extractionForPaper(paperId: string): PaperExtraction {
   return {
     id: `extraction-${paperId}`,
@@ -85,6 +94,8 @@ function emptyWorkspaceContext(): WorkspacePromptContext {
       releaseChecks: 0
     },
 	    notebook: {
+	      missionTarget: "professional_paper",
+	      paperMode: "literature_review",
 	      objective: "Follow the mollifier thread.",
 	      definitionOfDone: ["Explain which obstacles limit mollifier methods."],
 	      currentFocus: "Mollifier limitations remain central.",
@@ -114,7 +125,21 @@ function emptyWorkspaceContext(): WorkspacePromptContext {
 	        unlinkedClaimIds: [],
 	        unlinkedSectionIds: [],
 	        staleAfterWorkspaceChange: false,
-	        latestWorkspaceChangeAt: null
+	        latestWorkspaceChangeAt: null,
+	        disposition: {
+	          selectedSourceIds: [],
+	          extractedSourceIds: [],
+	          evidenceCellSourceIds: [],
+	          claimSourceIds: [],
+	          citationSourceIds: [],
+	          renderedReferenceSourceIds: [],
+	          missingSelectedExtractionSourceIds: [],
+	          duplicateExtractionSourceIds: [],
+	          extractedNotEvidenceSourceIds: [],
+	          evidenceNotCitedSourceIds: [],
+	          selectedToRenderedCollapseSourceIds: [],
+	          selectedToRenderedCollapse: false
+	        }
 	      }
 	    },
     recentSources: [],
@@ -184,6 +209,8 @@ test("planning backend includes derived SQLite workspace context in the prompt i
 	            searchQueries: ["mollifier methods Riemann Hypothesis limitations"],
 	            localFocus: ["mollifier methods"],
 	            notebookPatch: {
+	              missionTarget: "professional_paper",
+	              paperMode: "literature_review",
 	              objective: "Follow prior mollifier limitations work.",
 	              definitionOfDone: ["Explain which obstacles limit mollifier methods."],
 	              currentFocus: "Synthesize mollifier limitations.",
@@ -220,6 +247,8 @@ test("planning backend includes derived SQLite workspace context in the prompt i
     });
 
 	    assert.equal(plan.researchMode, "literature_synthesis");
+	    assert.equal(plan.notebookPatch?.missionTarget, "professional_paper");
+	    assert.equal(plan.notebookPatch?.paperMode, "literature_review");
 	    assert.equal(plan.notebookPatch?.tasks?.[0]?.id, "task-mollifier-limitations");
 	    assert.equal(plan.notebookPatch?.currentFocus, "Synthesize mollifier limitations.");
 	    assert.match(capturedPrompt, /Workspace context:/);
@@ -293,7 +322,7 @@ test("Ollama backend accumulates streamed JSON chunks instead of relying on one 
 test("research-agent backend uses native tool calls by default", async () => {
   const originalFetch = globalThis.fetch;
   let capturedBody: {
-    tools?: Array<{ function?: { name?: string; strict?: boolean; parameters?: { properties?: { action?: { enum?: string[] }; inputs?: { properties?: { workStore?: { properties?: Record<string, { description?: string }> } } } } } } }>;
+    tools?: Array<{ function?: { name?: string; strict?: boolean; parameters?: CapturedJsonSchema } }>;
     messages?: Array<{ content?: string }>;
   } = {};
 
@@ -379,12 +408,40 @@ test("research-agent backend uses native tool calls by default", async () => {
       "workspace.status"
     ]);
     const workStoreSchema = capturedBody.tools?.[0]?.function?.parameters?.properties?.inputs?.properties?.workStore?.properties;
+    const entitySchema = workStoreSchema?.entity;
+    const typedEntityFields = [
+      "sourceId",
+      "paperId",
+      "extractionId",
+      "field",
+      "value",
+      "text",
+      "claimId",
+      "evidenceCellId",
+      "supportSnippet",
+      "sectionIds",
+      "markdown",
+      "status",
+      "statusReason",
+      "nextInternalActions"
+    ];
+    for (const field of typedEntityFields) {
+      assert.ok(entitySchema?.properties?.[field], `workStore.entity.${field} should be model-facing`);
+    }
+    assert.deepEqual(entitySchema?.required, typedEntityFields);
+    assert.match(entitySchema?.description ?? "", /evidence\.create_cell/i);
+    assert.match(entitySchema?.description ?? "", /claim\.link_support/i);
     assert.match(workStoreSchema?.payloadJson?.description ?? "", /workspace\.status/i);
+    assert.match(workStoreSchema?.payloadJson?.description ?? "", /Fallback JSON object string/i);
     assert.match(workStoreSchema?.patchJson?.description ?? "", /patch fields/i);
     assert.match(workStoreSchema?.filterJson?.description ?? "", /exact-match filters/i);
     assert.match(capturedBody.messages?.[0]?.content ?? "", /Call choose_research_action exactly once/);
     assert.match(capturedBody.messages?.[0]?.content ?? "", /workspace dashboard is an index/i);
     assert.match(capturedBody.messages?.[0]?.content ?? "", /lab manual/i);
+    assert.match(capturedBody.messages?.[0]?.content ?? "", /Action recipes:/);
+    assert.match(capturedBody.messages?.[0]?.content ?? "", /extraction\.create: set workStore\.entity\.sourceId or paperId/i);
+    assert.match(capturedBody.messages?.[0]?.content ?? "", /evidence\.create_cell: set workStore\.entity\.sourceId or paperId/i);
+    assert.match(capturedBody.messages?.[0]?.content ?? "", /claim\.link_support: set workStore\.entity\.claimId/i);
     assert.doesNotMatch(capturedBody.messages?.[0]?.content ?? "", /bounded first-pass/i);
   } finally {
     globalThis.fetch = originalFetch;
@@ -489,6 +546,8 @@ test("research-agent backend falls back to strict JSON when native tool calls ar
     assert.ok(Array.isArray(capturedBodies[0]?.tools));
     assert.equal(capturedBodies[1]?.format, "json");
     assert.equal(capturedBodies[1]?.tools, undefined);
+    assert.match(capturedBodies[1]?.messages?.[0]?.content ?? "", /Action recipes:/);
+    assert.match(capturedBodies[1]?.messages?.[0]?.content ?? "", /claim\.link_support: set workStore\.entity\.claimId/i);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -678,6 +737,8 @@ test("OpenAI Codex backend uses the same OAuth transport for critic review", asy
       },
       workspace: {
         notebook: {
+          missionTarget: "professional_paper",
+          paperMode: "literature_review",
           objective: "Write a serious research note.",
           definitionOfDone: ["Synthesize claims."],
           readiness: "Ready with caveats."
@@ -892,6 +953,8 @@ test("agent-step backend exposes first-class claim and manuscript-section tools"
           userBlockers: []
         },
         notebook: {
+          missionTarget: "professional_paper",
+          paperMode: "literature_review",
           objective: "Test the model-driven research loop.",
           definitionOfDone: ["Create supported claims."],
           currentFocus: "Create claim-led synthesis objects.",

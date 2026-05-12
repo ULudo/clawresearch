@@ -14,6 +14,7 @@ export type { ResearchWorkerCompletion, ResearchWorkerStatus } from "./research-
 export type ResearchWorkerEvidenceSnapshot = {
   canonicalPapers: number;
   includedPapers: number;
+  selectedSourceIds: string[];
   explicitlySelectedEvidencePapers: number;
   selectedPapers: number;
   extractedPapers: number;
@@ -103,6 +104,7 @@ export async function loadResearchWorkerState(
     evidence: store.worker.evidence ?? {
       canonicalPapers: store.objects.canonicalSources.length,
       includedPapers: store.objects.canonicalSources.filter((source) => source.screeningDecision === "include").length,
+      selectedSourceIds: [],
       explicitlySelectedEvidencePapers: 0,
       selectedPapers: 0,
       extractedPapers: store.objects.extractions.length,

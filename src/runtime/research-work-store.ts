@@ -89,6 +89,18 @@ export type ResearchNotebookTaskStatus =
   | "blocked"
   | "abandoned";
 
+export type ResearchMissionTarget =
+  | "research_brief"
+  | "professional_paper"
+  | "status_report";
+
+export type ResearchPaperMode =
+  | "literature_review"
+  | "technical_survey"
+  | "method_paper"
+  | "experimental_paper"
+  | "position_paper";
+
 export type ResearchNotebookTask = {
   id: string;
   title: string;
@@ -107,10 +119,13 @@ export type ResearchNotebookArtifactLink = {
   path: string;
   kind: "paper" | "references" | "checks" | "source_checkpoint" | "trace" | "other";
   createdAt: string;
+  createdBy?: "runtime";
 };
 
 export type ResearchNotebook = {
   schemaVersion: 1;
+  missionTarget: ResearchMissionTarget;
+  paperMode: ResearchPaperMode;
   objective: string;
   definitionOfDone: string[];
   tasks: ResearchNotebookTask[];
@@ -130,6 +145,21 @@ export type ResearchNotebookDiagnosticWarning = {
   suggestedActions: string[];
 };
 
+export type ResearchWorkspaceDispositionDiagnostics = {
+  selectedSourceIds: string[];
+  extractedSourceIds: string[];
+  evidenceCellSourceIds: string[];
+  claimSourceIds: string[];
+  citationSourceIds: string[];
+  renderedReferenceSourceIds: string[];
+  missingSelectedExtractionSourceIds: string[];
+  duplicateExtractionSourceIds: string[];
+  extractedNotEvidenceSourceIds: string[];
+  evidenceNotCitedSourceIds: string[];
+  selectedToRenderedCollapseSourceIds: string[];
+  selectedToRenderedCollapse: boolean;
+};
+
 export type ResearchNotebookDiagnostics = {
   warningCount: number;
   warnings: ResearchNotebookDiagnosticWarning[];
@@ -144,6 +174,7 @@ export type ResearchNotebookDiagnostics = {
   unlinkedSectionIds: string[];
   staleAfterWorkspaceChange: boolean;
   latestWorkspaceChangeAt: string | null;
+  disposition: ResearchWorkspaceDispositionDiagnostics;
 };
 
 export type ResearchCriticReviewSummary = {
@@ -352,6 +383,7 @@ export type ResearchWorkStoreWorker = {
   evidence: {
     canonicalPapers: number;
     includedPapers: number;
+    selectedSourceIds: string[];
     explicitlySelectedEvidencePapers: number;
     selectedPapers: number;
     extractedPapers: number;
@@ -666,6 +698,8 @@ function createEmptyNotebook(now: string, brief: ResearchBrief = createEmptyBrie
 
   return {
     schemaVersion: 1,
+    missionTarget: "professional_paper",
+    paperMode: "literature_review",
     objective: objective.length > 0 ? objective : "Unscoped research objective",
     definitionOfDone: readString(brief.successCriterion) === null ? [] : [readString(brief.successCriterion) as string],
     tasks: [],
@@ -701,6 +735,36 @@ function readBoolean(value: unknown): boolean {
 
 function normalizeTimestamp(value: unknown, fallback: string): string {
   return readString(value) ?? fallback;
+}
+
+export function normalizeResearchMissionTarget(
+  value: unknown,
+  fallback: ResearchMissionTarget = "professional_paper"
+): ResearchMissionTarget {
+  switch (value) {
+    case "research_brief":
+    case "professional_paper":
+    case "status_report":
+      return value;
+    default:
+      return fallback;
+  }
+}
+
+export function normalizeResearchPaperMode(
+  value: unknown,
+  fallback: ResearchPaperMode = "literature_review"
+): ResearchPaperMode {
+  switch (value) {
+    case "literature_review":
+    case "technical_survey":
+    case "method_paper":
+    case "experimental_paper":
+    case "position_paper":
+      return value;
+    default:
+      return fallback;
+  }
 }
 
 function normalizeBrief(value: unknown): ResearchBrief {
@@ -760,6 +824,7 @@ function normalizeWorkerEvidence(value: unknown): ResearchWorkStoreWorker["evide
   return {
     canonicalPapers: readNumber(record.canonicalPapers),
     includedPapers: readNumber(record.includedPapers),
+    selectedSourceIds: readStringArray(record.selectedSourceIds, 500),
     explicitlySelectedEvidencePapers,
     selectedPapers: readNumber(record.selectedPapers) || explicitlySelectedEvidencePapers,
     extractedPapers: readNumber(record.extractedPapers),
@@ -832,7 +897,8 @@ function normalizeNotebookArtifactLink(value: unknown): ResearchNotebookArtifact
     label,
     path: linkPath,
     kind,
-    createdAt
+    createdAt,
+    ...(record.createdBy === "runtime" ? { createdBy: "runtime" as const } : {})
   };
 }
 
@@ -842,6 +908,8 @@ function normalizeNotebook(value: unknown, now: string, brief: ResearchBrief): R
 
   return {
     schemaVersion: 1,
+    missionTarget: normalizeResearchMissionTarget(record.missionTarget, base.missionTarget),
+    paperMode: normalizeResearchPaperMode(record.paperMode, base.paperMode),
     objective: readString(record.objective) ?? base.objective,
     definitionOfDone: readStringArray(record.definitionOfDone, 80),
     tasks: Array.isArray(record.tasks)
@@ -1735,6 +1803,8 @@ export type WorkspacePromptContext = {
     releaseChecks: number;
   };
   notebook: {
+    missionTarget: ResearchMissionTarget;
+    paperMode: ResearchPaperMode;
     objective: string;
     definitionOfDone: string[];
     currentFocus: string | null;
@@ -1841,6 +1911,73 @@ function taskLinkedIds(store: ResearchWorkStore): {
   };
 }
 
+function duplicateSourceIdsForExtractions(extractions: WorkStoreExtraction[]): string[] {
+  const counts = new Map<string, number>();
+  for (const extraction of extractions) {
+    const sourceId = compactText(extraction.sourceId);
+    if (sourceId.length > 0) {
+      counts.set(sourceId, (counts.get(sourceId) ?? 0) + 1);
+    }
+  }
+
+  return [...counts.entries()]
+    .filter(([, count]) => count > 1)
+    .map(([sourceId]) => sourceId)
+    .slice(0, 100);
+}
+
+function explicitSelectedSourceIds(store: ResearchWorkStore): string[] {
+  return uniqueStrings(store.worker.evidence?.selectedSourceIds ?? [], 500);
+}
+
+function diagnosticSelectedSourceIds(store: ResearchWorkStore): string[] {
+  return explicitSelectedSourceIds(store);
+}
+
+export function buildWorkspaceDispositionDiagnostics(
+  store: ResearchWorkStore,
+  options: { renderedReferenceSourceIds?: string[] } = {}
+): ResearchWorkspaceDispositionDiagnostics {
+  const selectedSourceIds = diagnosticSelectedSourceIds(store);
+  const extractedSourceIds = uniqueStrings(store.objects.extractions.map((extraction) => extraction.sourceId), 500);
+  const evidenceCellSourceIds = uniqueStrings(store.objects.evidenceCells.map((cell) => cell.sourceId), 500);
+  const claimSourceIds = uniqueStrings(store.objects.claims.flatMap((claim) => claim.sourceIds), 500);
+  const citationSourceIds = uniqueStrings(store.objects.citations.map((citation) => citation.sourceId), 500);
+  const renderedReferenceSourceIds = uniqueStrings(options.renderedReferenceSourceIds ?? citationSourceIds, 500);
+  const extractedSourceIdSet = new Set(extractedSourceIds);
+  const evidenceCellSourceIdSet = new Set(evidenceCellSourceIds);
+  const citationSourceIdSet = new Set(citationSourceIds);
+  const renderedReferenceSourceIdSet = new Set(renderedReferenceSourceIds);
+  const missingSelectedExtractionSourceIds = selectedSourceIds
+    .filter((sourceId) => !extractedSourceIdSet.has(sourceId))
+    .slice(0, 100);
+  const extractedNotEvidenceSourceIds = extractedSourceIds
+    .filter((sourceId) => !evidenceCellSourceIdSet.has(sourceId))
+    .slice(0, 100);
+  const evidenceNotCitedSourceIds = evidenceCellSourceIds
+    .filter((sourceId) => !citationSourceIdSet.has(sourceId))
+    .slice(0, 100);
+  const selectedToRenderedCollapseSourceIds = selectedSourceIds
+    .filter((sourceId) => !renderedReferenceSourceIdSet.has(sourceId))
+    .slice(0, 100);
+
+  return {
+    selectedSourceIds,
+    extractedSourceIds,
+    evidenceCellSourceIds,
+    claimSourceIds,
+    citationSourceIds,
+    renderedReferenceSourceIds,
+    missingSelectedExtractionSourceIds,
+    duplicateExtractionSourceIds: duplicateSourceIdsForExtractions(store.objects.extractions),
+    extractedNotEvidenceSourceIds,
+    evidenceNotCitedSourceIds,
+    selectedToRenderedCollapseSourceIds,
+    selectedToRenderedCollapse: selectedSourceIds.length >= 4
+      && renderedReferenceSourceIds.length * 2 < selectedSourceIds.length
+  };
+}
+
 function notebookReadinessIsRecorded(readiness: string | null | undefined): boolean {
   const trimmed = typeof readiness === "string" ? readiness.trim() : "";
   return trimmed.length > 0 && trimmed !== defaultNotebookReadiness;
@@ -1852,9 +1989,7 @@ export function buildNotebookDiagnostics(store: ResearchWorkStore): ResearchNote
     .filter((task) => task.status === "todo" || task.status === "in_progress" || task.status === "blocked")
     .length;
   const linkedIds = taskLinkedIds(store);
-  const selectedSourceIds = store.objects.canonicalSources
-    .filter((source) => source.screeningDecision === "include")
-    .map((source) => source.id);
+  const selectedSourceIds = diagnosticSelectedSourceIds(store);
   const unlinkedSelectedSourceIds = selectedSourceIds
     .filter((sourceId) => !linkedIds.sourceIds.has(sourceId))
     .slice(0, 20);
@@ -1870,6 +2005,7 @@ export function buildNotebookDiagnostics(store: ResearchWorkStore): ResearchNote
     .map((section) => section.id)
     .filter((sectionId) => !linkedIds.sectionIds.has(sectionId))
     .slice(0, 20);
+  const disposition = buildWorkspaceDispositionDiagnostics(store);
   const taskText = store.notebook.tasks
     .map((task) => `${task.title} ${task.notes ?? ""}`)
     .join(" ")
@@ -1927,6 +2063,21 @@ export function buildNotebookDiagnostics(store: ResearchWorkStore): ResearchNote
   if (staleAfterWorkspaceChange) {
     addWarning("notebook-stale-after-workspace-change", "Notebook was not updated after the latest state-changing workspace action.", 1, ["notebook.read", "notebook.patch"]);
   }
+  if (disposition.missingSelectedExtractionSourceIds.length > 0) {
+    addWarning("workspace-selected-extractions-missing", `${disposition.missingSelectedExtractionSourceIds.length} selected source(s) do not have structured extractions.`, disposition.missingSelectedExtractionSourceIds.length, ["workspace.list", "extraction.create"]);
+  }
+  if (disposition.duplicateExtractionSourceIds.length > 0) {
+    addWarning("workspace-duplicate-extractions", `${disposition.duplicateExtractionSourceIds.length} source(s) have duplicate extraction records.`, disposition.duplicateExtractionSourceIds.length, ["workspace.list", "workspace.read"]);
+  }
+  if (disposition.extractedNotEvidenceSourceIds.length > 0) {
+    addWarning("workspace-extracted-not-evidence", `${disposition.extractedNotEvidenceSourceIds.length} extracted source(s) do not have evidence cells.`, disposition.extractedNotEvidenceSourceIds.length, ["workspace.list", "evidence.create_cell"]);
+  }
+  if (disposition.evidenceNotCitedSourceIds.length > 0) {
+    addWarning("workspace-evidence-not-cited", `${disposition.evidenceNotCitedSourceIds.length} evidence-cell source(s) are not cited by support links.`, disposition.evidenceNotCitedSourceIds.length, ["workspace.list", "claim.link_support"]);
+  }
+  if (disposition.selectedToRenderedCollapse) {
+    addWarning("workspace-selected-to-rendered-collapse", `${disposition.selectedSourceIds.length} selected source(s) collapse to ${disposition.renderedReferenceSourceIds.length} rendered reference source(s).`, disposition.selectedToRenderedCollapseSourceIds.length, ["workspace.list", "claim.link_support", "section.patch"]);
+  }
 
   return {
     warningCount: warnings.length,
@@ -1941,7 +2092,8 @@ export function buildNotebookDiagnostics(store: ResearchWorkStore): ResearchNote
     unlinkedClaimIds,
     unlinkedSectionIds,
     staleAfterWorkspaceChange,
-    latestWorkspaceChangeAt
+    latestWorkspaceChangeAt,
+    disposition
   };
 }
 
@@ -2008,6 +2160,8 @@ export function buildWorkspacePromptContextFromWorkStore(store: ResearchWorkStor
       releaseChecks: store.objects.releaseChecks.length
     },
 	    notebook: {
+	      missionTarget: store.notebook.missionTarget,
+	      paperMode: store.notebook.paperMode,
 	      objective: store.notebook.objective,
 	      definitionOfDone: store.notebook.definitionOfDone.slice(0, 12),
 	      currentFocus: store.notebook.currentFocus,

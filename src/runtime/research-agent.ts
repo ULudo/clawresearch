@@ -316,6 +316,8 @@ export type ResearchActionRequest = {
       userBlockers: string[];
     };
     notebook: {
+      missionTarget: string;
+      paperMode: string;
       objective: string;
       definitionOfDone: string[];
       currentFocus: string | null;
@@ -447,6 +449,12 @@ function safeJsonRecord(value: unknown, limit = 40): Record<string, unknown> {
   }
 }
 
+function mergedRecord(primary: Record<string, unknown>, fallback: Record<string, unknown>): Record<string, unknown> {
+  return Object.keys(primary).length > 0 || Object.keys(fallback).length > 0
+    ? { ...fallback, ...primary }
+    : {};
+}
+
 function safeFilterRecord(value: unknown, limit = 24): Record<string, string | number | boolean | null> {
   const entries = Object.entries(asObject(value)).flatMap(([key, entry]) => {
     if (
@@ -521,6 +529,7 @@ export function normalizeResearchActionDecision(
   const patchJson = safeJsonRecord(workStore.patchJson);
   const entity = safeRecord(workStore.entity);
   const payloadJson = safeJsonRecord(workStore.payloadJson);
+  const normalizedEntity = mergedRecord(entity, payloadJson);
   const link = asObject(workStore.link);
 
   return {
@@ -544,7 +553,7 @@ export function normalizeResearchActionDecision(
         limit: safeNullableNumber(workStore.limit),
         cursor: safeString(workStore.cursor),
         changes: Object.keys(changes).length > 0 ? changes : patchJson,
-        entity: Object.keys(entity).length > 0 ? entity : payloadJson,
+        entity: normalizedEntity,
         patchJson: safeString(workStore.patchJson),
         payloadJson: safeString(workStore.payloadJson),
         link: {

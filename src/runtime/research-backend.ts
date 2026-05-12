@@ -1,6 +1,8 @@
 import type { ResearchBrief } from "./session-store.js";
 import type { ResearchWorkerState } from "./research-state.js";
 import type {
+  ResearchMissionTarget,
+  ResearchPaperMode,
   ResearchNotebookTaskStatus,
   WorkspacePromptContext
 } from "./research-work-store.js";
@@ -72,6 +74,8 @@ export type ResearchPlanNotebookTask = {
 };
 
 export type ResearchPlanNotebookPatch = {
+  missionTarget?: ResearchMissionTarget;
+  paperMode?: ResearchPaperMode;
   objective?: string;
   definitionOfDone?: string[];
   tasks?: ResearchPlanNotebookTask[];
@@ -275,6 +279,30 @@ function normalizePlanNotebookTask(value: unknown): ResearchPlanNotebookTask | n
   };
 }
 
+function safeMissionTarget(value: unknown): ResearchMissionTarget | null {
+  switch (value) {
+    case "research_brief":
+    case "professional_paper":
+    case "status_report":
+      return value;
+    default:
+      return null;
+  }
+}
+
+function safePaperMode(value: unknown): ResearchPaperMode | null {
+  switch (value) {
+    case "literature_review":
+    case "technical_survey":
+    case "method_paper":
+    case "experimental_paper":
+    case "position_paper":
+      return value;
+    default:
+      return null;
+  }
+}
+
 function normalizePlanNotebookPatch(raw: Record<string, unknown>): ResearchPlanNotebookPatch | null {
   const notebookRecord = safeObject(raw.notebookPatch)
     ?? safeObject(raw.notebook)
@@ -293,6 +321,8 @@ function normalizePlanNotebookPatch(raw: Record<string, unknown>): ResearchPlanN
   const objective = safeString(notebookRecord.objective);
   const currentFocus = safeString(notebookRecord.currentFocus);
   const readiness = safeString(notebookRecord.readiness ?? notebookRecord.readinessSelfAssessment);
+  const missionTarget = safeMissionTarget(notebookRecord.missionTarget);
+  const paperMode = safePaperMode(notebookRecord.paperMode);
   const definitionOfDone = safeStringArray(notebookRecord.definitionOfDone, 40);
   const notes = safeStringArray(notebookRecord.notes, 40);
   const tasks = Array.isArray(notebookRecord.tasks)
@@ -300,6 +330,12 @@ function normalizePlanNotebookPatch(raw: Record<string, unknown>): ResearchPlanN
     : [];
 
   const patch: ResearchPlanNotebookPatch = {};
+  if (missionTarget !== null) {
+    patch.missionTarget = missionTarget;
+  }
+  if (paperMode !== null) {
+    patch.paperMode = paperMode;
+  }
   if (objective !== null) {
     patch.objective = objective;
   }
@@ -449,6 +485,8 @@ function planningInstruction(request: ResearchPlanningRequest): string {
     '  "searchQueries": ["string"],',
 	    '  "localFocus": ["string"],',
 	    '  "notebookPatch": {',
+	    '    "missionTarget": "research_brief|professional_paper|status_report",',
+	    '    "paperMode": "literature_review|technical_survey|method_paper|experimental_paper|position_paper",',
 	    '    "objective": "string",',
 	    '    "definitionOfDone": ["model-authored criteria for this project"],',
 	    '    "tasks": [{ "id": "optional stable task id", "title": "task title", "status": "todo|in_progress|done|blocked|abandoned", "notes": "string or null", "linkedSourceIds": [], "linkedExtractionIds": [], "linkedEvidenceCellIds": [], "linkedClaimIds": [], "linkedSectionIds": [], "linkedArtifactPaths": [] }],',
@@ -564,20 +602,22 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     "The workspace dashboard is an index, not full memory; use workspace.list/search/read to inspect older or complete state.",
 	    "If a custom tool family is unclear, use guidance.search/read/recommend to inspect the ClawResearch lab manual.",
 	    "The notebook is your living project-management contract: objective, definition of done, task list, current focus, readiness assessment, and artifact links.",
+    "The notebook missionTarget and paperMode state what kind of artifact you are trying to finish; do not downgrade a professional_paper mission to a brief just to stop.",
     "Use notebook.read/patch to keep that contract current as research state changes; the runtime will not infer research sufficiency for you.",
     "Use workspace.search/read/list/create/patch/link/unlink to inspect or update the durable SQLite research workspace.",
     "Use source.search, source.merge, source.resolve_access, and source.select_evidence for source discovery and evidence-set construction.",
     "For source.select_evidence, always set workStore.payloadJson or entity to {\"mode\":\"append\"|\"replace\"|\"remove\"}; append adds to the current set, replace overwrites it, remove subtracts ids.",
     "For create/patch tools, put durable research content only in explicit content fields. Never rely on rationale, reason, expectedOutcome, or stopCondition as manuscript, claim, evidence, or extraction content.",
     "section.create/patch require explicit markdown/content/paragraphs. claim.create requires explicit text. evidence.create_cell requires explicit value/text. extraction.create requires explicit source-derived fields.",
+    ...researchActionRecipeLines,
     "Use claim.create/patch/check_support/link_support for claim-led synthesis.",
     "Use section.create/read/patch/link_claim/check_claims for section-level writing.",
     "Use work_item.create/patch when critic or check feedback becomes actionable research debt.",
     "Use guidance.search/read/recommend to inspect advisory research-lab scaffolding. Guidance is not a gate and may be overridden.",
     "Use protocol.create_or_revise when the research protocol itself needs visible revision by the researcher.",
     criticInstruction,
-	    "Use release.verify for final computable release invariants and notebook/project-management diagnostics; it does not decide research completeness or scientific quality.",
-	    "Use manuscript.finalize only when you intentionally want the runtime to write paper.md from workspace sections after hard invariant checks pass and you have explicitly recorded notebook.readiness.",
+	    "Use release.verify for final computable release invariants, artifact-contract diagnostics, and notebook/project-management diagnostics; it does not decide research completeness or scientific quality.",
+	    "Use manuscript.finalize only when you intentionally want the runtime to write paper.md from workspace sections after hard invariant checks pass, the notebook readiness is explicit, and the notebook missionTarget artifact contract is satisfied.",
     "Critic objections, failed release checks, and not-ready tool results are repair signals. Prefer concrete tool steps over stopping.",
     "Recent tool results are authoritative observations from executed tools. Use returned ids, snippets, and previews before repeating the same read action.",
     "Use workspace.status only for a validated external blocker or real user decision; do not stop merely because machine-actionable work remains.",
@@ -603,7 +643,7 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     '      "limit": 12,',
     '      "cursor": "pagination cursor from a previous tool result or null",',
     '      "changes": {},',
-    '      "entity": {},',
+    '      "entity": { "sourceId": "known source id or null", "paperId": "known paper id or null", "extractionId": "known extraction id or null", "field": "evidence field or null", "value": "evidence value string or string[] or null", "text": "claim/text content or null", "claimId": "known claim id or null", "evidenceCellId": "known evidence cell id or null", "supportSnippet": "support snippet or null", "sectionIds": ["known section ids"], "markdown": "section markdown or null", "status": "status or null", "statusReason": "status reason or null", "nextInternalActions": ["machine-actionable follow-up"] },',
     '      "patchJson": "{\\"field\\":\\"patch value\\"} or null",',
     '      "payloadJson": "{\\"kind\\":\\"workItem\\",\\"title\\":\\"optional new work item\\"} or null; for source.select_evidence use {\\"mode\\":\\"append|replace|remove\\"}; for section.create/patch include {\\"markdown\\":\\"...\\"}",',
     '      "link": { "fromCollection": "claims", "fromId": "claim id", "toCollection": "canonicalSources", "toId": "source id", "relation": "supports", "snippet": "optional provenance snippet" }',
@@ -798,6 +838,83 @@ async function ollamaJsonCall<T>(
 
 const researchActionToolName = "choose_research_action";
 
+const commonWorkStoreEntityProperties: Record<string, Record<string, unknown>> = {
+  sourceId: {
+    type: ["string", "null"],
+    description: "Known canonical source id for extraction/evidence/support operations."
+  },
+  paperId: {
+    type: ["string", "null"],
+    description: "Known paper/source id alias when the tool accepts a paper id."
+  },
+  extractionId: {
+    type: ["string", "null"],
+    description: "Known extraction id, especially for evidence.create_cell."
+  },
+  field: {
+    type: ["string", "null"],
+    description: "Evidence matrix field name such as limitations, architecture, evaluationSetup, or successSignals."
+  },
+  value: {
+    type: ["string", "array", "null"],
+    items: {
+      type: "string"
+    },
+    description: "Evidence value for evidence.create_cell; use an array for list-valued evidence fields."
+  },
+  text: {
+    type: ["string", "null"],
+    description: "Primary text for claim.create or another simple text-bearing entity."
+  },
+  claimId: {
+    type: ["string", "null"],
+    description: "Known claim id for claim.link_support or section link operations."
+  },
+  evidenceCellId: {
+    type: ["string", "null"],
+    description: "Known evidence cell id for claim.link_support."
+  },
+  supportSnippet: {
+    type: ["string", "null"],
+    description: "Concise source-grounded snippet explaining why evidence supports a claim."
+  },
+  sectionIds: {
+    type: ["array", "null"],
+    items: {
+      type: "string"
+    },
+    description: "Known manuscript section ids connected to a support link or claim."
+  },
+  markdown: {
+    type: ["string", "null"],
+    description: "Markdown content for section.create or section.patch."
+  },
+  status: {
+    type: ["string", "null"],
+    description: "Status value for workspace.status, work_item.patch, section.patch, or similar updates."
+  },
+  statusReason: {
+    type: ["string", "null"],
+    description: "Short reason explaining a status value."
+  },
+  nextInternalActions: {
+    type: ["array", "null"],
+    items: {
+      type: "string"
+    },
+    description: "Machine-actionable follow-up actions for workspace.status."
+  }
+};
+
+const commonWorkStoreEntityRequired = Object.keys(commonWorkStoreEntityProperties);
+
+const researchActionRecipeLines = [
+  "Action recipes:",
+  "- extraction.create: set workStore.entity.sourceId or paperId to a known canonical source; include source-derived extraction fields such as problemSetting, architecture, evaluationSetup, successSignals, limitations, and evidenceNotes via payloadJson when they are not typed entity fields.",
+  "- evidence.create_cell: set workStore.entity.sourceId or paperId, extractionId when known, field, and value or text; keep the value grounded in the source/extraction.",
+  "- claim.link_support: set workStore.entity.claimId plus evidenceCellId or sourceId, add supportSnippet, and include sectionIds only when the claim is used there."
+];
+
 function researchActionToolDefinition(request: ResearchActionRequest): Record<string, unknown> {
   return {
     type: "function",
@@ -915,8 +1032,9 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
                   entity: {
                     type: "object",
                     additionalProperties: false,
-                    properties: {},
-                    description: "Reserved closed object for native schemas; use payloadJson for dynamic create/status payload fields."
+                    properties: commonWorkStoreEntityProperties,
+                    required: commonWorkStoreEntityRequired,
+                    description: "Typed common create/status/link payload fields. Recipes: extraction.create sets sourceId or paperId here and uses payloadJson for richer source-derived extraction fields; evidence.create_cell sets sourceId or paperId, extractionId, field, and value/text; claim.link_support sets claimId, evidenceCellId or sourceId, supportSnippet, and sectionIds. Use payloadJson as the fallback for fields not listed here."
                   },
                   patchJson: {
                     type: ["string", "null"],
@@ -924,7 +1042,7 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
                   },
                   payloadJson: {
                     type: ["string", "null"],
-                    description: "Optional JSON object string for create/status/notebook payload fields. source.select_evidence must include {\"mode\":\"append|replace|remove\"}. section.create/patch should include {\"markdown\":\"...\"}. notebook.patch may include {\"objective\":\"...\",\"definitionOfDone\":[\"...\"],\"tasks\":[{\"id\":\"task-1\",\"title\":\"...\",\"status\":\"todo\",\"linkedEvidenceCellIds\":[\"...\"]}]}. section.link_claim may include {\"sectionId\":\"...\",\"claimId\":\"...\"}. workspace.status may include {\"status\":\"externally_blocked|needs_user_decision\",\"statusReason\":\"...\",\"nextInternalActions\":[\"...\"]}; non-terminal status notes are returned as observations and do not stop the worker."
+                    description: "Fallback JSON object string for create/status/notebook payload fields not covered by typed workStore.entity fields. source.select_evidence must include {\"mode\":\"append|replace|remove\"}. extraction.create may include source-derived fields such as {\"problemSetting\":\"...\",\"architecture\":\"...\",\"successSignals\":[\"...\"],\"limitations\":[\"...\"]}. section.create/patch should include {\"markdown\":\"...\"}. notebook.patch may include {\"missionTarget\":\"professional_paper|research_brief|status_report\",\"paperMode\":\"literature_review|technical_survey|method_paper|experimental_paper|position_paper\",\"objective\":\"...\",\"definitionOfDone\":[\"...\"],\"tasks\":[{\"id\":\"task-1\",\"title\":\"...\",\"status\":\"todo\",\"linkedEvidenceCellIds\":[\"...\"]}]}. section.link_claim may include {\"sectionId\":\"...\",\"claimId\":\"...\"}. workspace.status may include {\"status\":\"externally_blocked|needs_user_decision\",\"statusReason\":\"...\",\"nextInternalActions\":[\"...\"]}; non-terminal status notes are returned as observations and do not stop the worker."
                   },
                   link: {
                     type: "object",
@@ -1005,20 +1123,22 @@ function nativeAgentStepInstruction(request: ResearchActionRequest): string {
     "The workspace dashboard is an index, not full memory; use workspace.list/search/read to inspect older or complete state.",
 	    "If a custom tool family is unclear, use guidance.search/read/recommend to inspect the ClawResearch lab manual.",
 	    "The notebook is your living project-management contract: objective, definition of done, task list, current focus, readiness assessment, and artifact links.",
+    "The notebook missionTarget and paperMode state what kind of artifact you are trying to finish; do not downgrade a professional_paper mission to a brief just to stop.",
     "Use notebook.read/patch to keep that contract current as research state changes; the runtime will not infer research sufficiency for you.",
     "Use workspace.search/read/list/create/patch/link/unlink to inspect or update the durable SQLite research workspace.",
     "Use source.search, source.merge, source.resolve_access, and source.select_evidence for source discovery and evidence-set construction.",
     "For source.select_evidence, always set workStore.payloadJson or entity to {\"mode\":\"append\"|\"replace\"|\"remove\"}; append adds to the current set, replace overwrites it, remove subtracts ids.",
     "For create/patch tools, put durable research content only in explicit content fields. Never rely on rationale, reason, expectedOutcome, or stopCondition as manuscript, claim, evidence, or extraction content.",
     "section.create/patch require explicit markdown/content/paragraphs. claim.create requires explicit text. evidence.create_cell requires explicit value/text. extraction.create requires explicit source-derived fields.",
+    ...researchActionRecipeLines,
     "Use claim.create/patch/check_support/link_support for claim-led synthesis.",
     "Use section.create/read/patch/link_claim/check_claims for section-level writing.",
     "Use work_item.create/patch when critic or check feedback becomes actionable research debt.",
     "Use guidance.search/read/recommend to inspect advisory research-lab scaffolding. Guidance is not a gate and may be overridden.",
     "Use protocol.create_or_revise when the research protocol itself needs visible revision by the researcher.",
     criticInstruction,
-	    "Use release.verify for final computable release invariants and notebook/project-management diagnostics; it does not decide research completeness or scientific quality.",
-	    "Use manuscript.finalize only when you intentionally want the runtime to write paper.md from workspace sections after hard invariant checks pass and you have explicitly recorded notebook.readiness.",
+	    "Use release.verify for final computable release invariants, artifact-contract diagnostics, and notebook/project-management diagnostics; it does not decide research completeness or scientific quality.",
+	    "Use manuscript.finalize only when you intentionally want the runtime to write paper.md from workspace sections after hard invariant checks pass, the notebook readiness is explicit, and the notebook missionTarget artifact contract is satisfied.",
     "Critic objections, failed release checks, and not-ready tool results are repair signals. Prefer concrete tool steps over stopping.",
     "Recent tool results are authoritative observations from executed tools. Use returned ids, snippets, and previews before repeating the same read action.",
     "Use workspace.status only for a validated external blocker or real user decision; do not stop merely because machine-actionable work remains.",

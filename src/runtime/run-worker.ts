@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -87,11 +88,14 @@ import type { ResearchBrief } from "./session-store.js";
 import {
 	  buildLiteratureContextFromWorkStore,
 	  buildNotebookDiagnostics,
+  buildWorkspaceDispositionDiagnostics,
 	  buildWorkspacePromptContextFromWorkStore,
 	  createResearchWorkStoreEntity,
 	  defaultNotebookReadiness,
 	  loadResearchWorkStore,
   mergeRunSegmentIntoResearchWorkStore,
+  normalizeResearchMissionTarget,
+  normalizeResearchPaperMode,
   patchResearchWorkStoreEntity,
   queryResearchWorkStore,
   readResearchWorkStoreEntity,
@@ -105,6 +109,9 @@ import {
   type ResearchNotebookArtifactLink,
 	  type ResearchNotebookTask,
 	  type ResearchNotebookDiagnostics,
+  type ResearchWorkspaceDispositionDiagnostics,
+  type ResearchMissionTarget,
+  type ResearchPaperMode,
   type WorkStoreCollectionName,
   type WorkStoreCanonicalSource,
   type WorkStoreClaim,
@@ -400,6 +407,8 @@ function workStoreContextForAgent(store: ResearchWorkStore): ResearchActionReque
 	      userBlockers: store.worker.userBlockers.slice(0, 8)
 	    },
 	    notebook: {
+	      missionTarget: store.notebook.missionTarget,
+	      paperMode: store.notebook.paperMode,
 	      objective: store.notebook.objective,
 	      definitionOfDone: store.notebook.definitionOfDone.slice(0, 12),
 	      currentFocus: store.notebook.currentFocus,
@@ -492,6 +501,8 @@ function notebookPreviewForAgent(notebook: ResearchNotebook): AgentVisibleEntity
     title: notebook.objective,
     snippet: compactPreviewText(notebook.readiness, 420),
     fields: {
+      missionTarget: notebook.missionTarget,
+      paperMode: notebook.paperMode,
       definitionOfDoneCount: notebook.definitionOfDone.length,
       taskCount: notebook.tasks.length,
       activeTaskCount: activeTasks.length,
@@ -659,6 +670,8 @@ function patchNotebook(input: {
 
   return {
     schemaVersion: 1,
+    missionTarget: normalizeResearchMissionTarget(input.entity.missionTarget, input.store.notebook.missionTarget),
+    paperMode: normalizeResearchPaperMode(input.entity.paperMode, input.store.notebook.paperMode),
     objective: stringInput(input.entity.objective, input.store.notebook.objective),
     definitionOfDone: stringArrayInput(input.entity.definitionOfDone, 40).length > 0
       ? stringArrayInput(input.entity.definitionOfDone, 40)
@@ -679,6 +692,8 @@ function notebookPatchFromPlan(plan: ResearchPlan): Record<string, unknown> | nu
   }
 
   return {
+    ...(patch.missionTarget === undefined ? {} : { missionTarget: patch.missionTarget }),
+    ...(patch.paperMode === undefined ? {} : { paperMode: patch.paperMode }),
     ...(patch.objective === undefined ? {} : { objective: patch.objective }),
     ...(patch.definitionOfDone === undefined ? {} : { definitionOfDone: patch.definitionOfDone }),
     ...(patch.tasks === undefined ? {} : { tasks: patch.tasks }),
@@ -1315,6 +1330,218 @@ function notebookFinalizationReadinessIssue(notebook: ResearchNotebook): string 
   return null;
 }
 
+type ArtifactContractEvaluation = {
+  missionTarget: ResearchMissionTarget;
+  requestedMissionTarget: ResearchMissionTarget;
+  paperMode: ResearchPaperMode;
+  canFinalize: boolean;
+  supportedCheckpoint: ResearchMissionTarget | null;
+  failures: string[];
+  warnings: string[];
+  nextHints: string[];
+  disposition: ResearchWorkspaceDispositionDiagnostics;
+};
+
+function requestedMissionTargetFromToolInput(input: {
+  entity: Record<string, unknown>;
+  notebook: ResearchNotebook;
+}): ResearchMissionTarget {
+  return normalizeResearchMissionTarget(
+    input.entity.missionTarget
+      ?? input.entity.exportType
+      ?? input.entity.artifactType
+      ?? input.entity.targetArtifact,
+    input.notebook.missionTarget
+  );
+}
+
+function uniqueSourceCount(values: string[]): number {
+  return new Set(values.filter((value) => value.trim().length > 0)).size;
+}
+
+function manuscriptSectionMatches(section: WorkStoreManuscriptSection, pattern: RegExp): boolean {
+  return pattern.test(`${section.sectionId} ${section.role} ${section.title} ${section.markdown}`);
+}
+
+function notebookReadinessAddressesArtifact(notebook: ResearchNotebook): boolean {
+  const readiness = notebook.readiness.toLowerCase();
+  const missionWords = notebook.missionTarget.replace(/_/g, " ").split(/\s+/);
+  const modeWords = notebook.paperMode.replace(/_/g, " ").split(/\s+/);
+  return [...missionWords, ...modeWords, "paper", "review", "manuscript"]
+    .some((word) => word.length > 3 && readiness.includes(word));
+}
+
+function evaluateArtifactContract(input: {
+  run: RunRecord;
+  store: ResearchWorkStore;
+  references: ReferencesArtifact;
+  hardInvariantFailures: ManuscriptCheck[];
+  requestedMissionTarget: ResearchMissionTarget;
+  criticAvailable: boolean;
+}): ArtifactContractEvaluation {
+  const { store, references } = input;
+  const failures: string[] = [];
+  const warnings: string[] = [];
+  const nextHints = new Set<string>();
+  const sections = store.objects.manuscriptSections;
+  const releaseCriticArtifactPath = criticReviewArtifactPath(input.run, "release");
+  const trustedReleaseCriticReviews = criticReviewSummariesFromNotebook(store, {
+    trustedOnly: true,
+    stage: "release",
+    artifactPath: releaseCriticArtifactPath
+  });
+  const untrustedReleaseCriticReviews = criticReviewSummariesFromNotebook(store, {
+    stage: "release",
+    artifactPath: releaseCriticArtifactPath
+  }).length - trustedReleaseCriticReviews.length;
+  const latestReleaseCriticReview = trustedReleaseCriticReviews[trustedReleaseCriticReviews.length - 1] ?? null;
+  const disposition = buildWorkspaceDispositionDiagnostics(store, {
+    renderedReferenceSourceIds: references.references.map((reference) => reference.sourceId)
+  });
+  const hasCorpusOrProtocolSection = sections.some((section) => manuscriptSectionMatches(section, /\b(method|protocol|corpus|source selection|search strategy|included sources)\b/i));
+  const hasLimitationsSection = sections.some((section) => manuscriptSectionMatches(section, /\b(limitation|limitations|threats? to validity|uncertainty|uncertainties|caveat|future work)\b/i));
+
+  if (input.requestedMissionTarget !== store.notebook.missionTarget) {
+    if (store.notebook.missionTarget === "professional_paper") {
+      failures.push(`Notebook missionTarget is professional_paper, but manuscript.finalize requested ${input.requestedMissionTarget}. Do not downgrade the mission to a brief/status export just to stop; continue professional-paper work or explicitly revise the notebook mission with a real user/research reason.`);
+      nextHints.add("workspace.read");
+    } else {
+      warnings.push(`Requested artifact target ${input.requestedMissionTarget} differs from notebook missionTarget ${store.notebook.missionTarget}.`);
+    }
+  }
+
+  if (input.hardInvariantFailures.length > 0) {
+    failures.push(`${input.hardInvariantFailures.length} hard mechanical invariant(s) still fail; repair release checks before finalization.`);
+    nextHints.add("release.verify");
+  }
+
+  if (store.notebook.missionTarget === "research_brief" || store.notebook.missionTarget === "professional_paper") {
+    if (latestReleaseCriticReview === null) {
+      const fakeLinkNote = untrustedReleaseCriticReviews > 0
+        ? " Model-authored notebook artifact links for critic reviews are visible context but do not satisfy this runtime-owned release gate."
+        : "";
+      failures.push(input.criticAvailable
+        ? `No runtime-owned release-scope critic.review pass is recorded. Run critic.review with criticScope release before manuscript.finalize.${fakeLinkNote}`
+        : `A runtime-owned release-scope critic.review pass is required before ${store.notebook.missionTarget} finalization, but no critic backend is currently available. Configure a critic backend or revise the mission instead of exporting paper.md.${fakeLinkNote}`);
+      if (input.criticAvailable) {
+        nextHints.add("critic.review");
+      }
+    } else if (latestReleaseCriticReview.readiness !== "pass") {
+      failures.push(`Latest runtime-owned release critic.review readiness is ${latestReleaseCriticReview.readiness}; ${store.notebook.missionTarget} finalization requires a release critic pass before paper.md is written.`);
+      if (input.criticAvailable) {
+        nextHints.add("critic.review");
+      }
+      nextHints.add("workspace.read");
+      nextHints.add("notebook.patch");
+    }
+
+    if (disposition.selectedToRenderedCollapse) {
+      failures.push(`Selected-to-rendered source disposition collapsed: ${disposition.selectedSourceIds.length} selected source(s), ${disposition.extractedSourceIds.length} extracted source(s), ${disposition.evidenceCellSourceIds.length} evidence-cell source(s), ${disposition.claimSourceIds.length} claim source(s), ${disposition.citationSourceIds.length} citation source(s), and ${disposition.renderedReferenceSourceIds.length} rendered reference source(s). Continue claim/citation/section work before finalization.`);
+      nextHints.add("workspace.list");
+      nextHints.add("claim.link_support");
+      nextHints.add("section.patch");
+    }
+  }
+
+  if (disposition.missingSelectedExtractionSourceIds.length > 0) {
+    warnings.push(`${disposition.missingSelectedExtractionSourceIds.length} selected source(s) are missing structured extraction records.`);
+  }
+  if (disposition.duplicateExtractionSourceIds.length > 0) {
+    warnings.push(`${disposition.duplicateExtractionSourceIds.length} source(s) have duplicate extraction records.`);
+  }
+  if (disposition.extractedNotEvidenceSourceIds.length > 0) {
+    warnings.push(`${disposition.extractedNotEvidenceSourceIds.length} extracted source(s) do not yet have evidence cells.`);
+  }
+  if (disposition.evidenceNotCitedSourceIds.length > 0) {
+    warnings.push(`${disposition.evidenceNotCitedSourceIds.length} evidence-cell source(s) are not cited by support links.`);
+  }
+
+  if (store.notebook.missionTarget === "professional_paper") {
+    if (sections.length < 2) {
+      failures.push(`Only ${sections.length} manuscript section(s) exist. The workspace currently supports a checkpoint brief, not a professional ${store.notebook.paperMode}.`);
+      nextHints.add("section.create");
+      nextHints.add("section.patch");
+    }
+    if (!hasCorpusOrProtocolSection) {
+      failures.push("No manuscript section records the corpus/protocol/search basis for the paper.");
+      nextHints.add("section.create");
+    }
+    if (!hasLimitationsSection) {
+      failures.push("No manuscript section records limitations, caveats, or threats to validity.");
+      nextHints.add("section.create");
+    }
+    if (!notebookReadinessAddressesArtifact(store.notebook)) {
+      failures.push(`Notebook readiness does not explicitly state why ${store.notebook.missionTarget}/${store.notebook.paperMode} is ready. Patch the model-owned readiness assessment before finalization.`);
+      nextHints.add("notebook.patch");
+    }
+  }
+
+  if (store.notebook.missionTarget !== "professional_paper" && latestReleaseCriticReview !== null && latestReleaseCriticReview.readiness === "block") {
+    warnings.push("Latest runtime-owned release critic.review is blocking. This remains visible feedback for the researcher even when the artifact target is not professional_paper.");
+  }
+
+  const supportedCheckpoint = input.hardInvariantFailures.length === 0 && sections.length > 0 && disposition.renderedReferenceSourceIds.length > 0
+    ? "research_brief"
+    : null;
+
+  return {
+    missionTarget: store.notebook.missionTarget,
+    requestedMissionTarget: input.requestedMissionTarget,
+    paperMode: store.notebook.paperMode,
+    canFinalize: failures.length === 0,
+    supportedCheckpoint,
+    failures,
+    warnings,
+    nextHints: [...nextHints].filter((hint) => workspaceResearchActions({ criticAvailable: input.criticAvailable }).includes(hint as never)),
+    disposition
+  };
+}
+
+function artifactContractPreviews(evaluation: ArtifactContractEvaluation): AgentVisibleEntityPreview[] {
+  return [
+    ...evaluation.failures.map((failure, index): AgentVisibleEntityPreview => ({
+      id: `artifact-contract-failure-${index + 1}`,
+      kind: "artifactContractDiagnostic",
+      title: `${evaluation.missionTarget}/${evaluation.paperMode} contract not ready`,
+      status: "not_ready",
+      snippet: compactPreviewText(failure, 360),
+      fields: {
+        missionTarget: evaluation.missionTarget,
+        requestedMissionTarget: evaluation.requestedMissionTarget,
+        paperMode: evaluation.paperMode,
+        supportedCheckpoint: evaluation.supportedCheckpoint,
+        suggestedActions: evaluation.nextHints,
+        selectedSourceIds: evaluation.disposition.selectedSourceIds.slice(0, 20),
+        missingSelectedExtractionSourceIds: evaluation.disposition.missingSelectedExtractionSourceIds.slice(0, 20),
+        extractedNotEvidenceSourceIds: evaluation.disposition.extractedNotEvidenceSourceIds.slice(0, 20),
+        evidenceNotCitedSourceIds: evaluation.disposition.evidenceNotCitedSourceIds.slice(0, 20),
+        selectedToRenderedCollapseSourceIds: evaluation.disposition.selectedToRenderedCollapseSourceIds.slice(0, 20),
+        renderedReferenceSourceIds: evaluation.disposition.renderedReferenceSourceIds.slice(0, 20)
+      }
+    })),
+    ...evaluation.warnings.map((warning, index): AgentVisibleEntityPreview => ({
+      id: `artifact-contract-warning-${index + 1}`,
+      kind: "artifactContractDiagnostic",
+      title: `${evaluation.missionTarget}/${evaluation.paperMode} contract warning`,
+      status: "warning",
+      snippet: compactPreviewText(warning, 360),
+      fields: {
+        missionTarget: evaluation.missionTarget,
+        requestedMissionTarget: evaluation.requestedMissionTarget,
+        paperMode: evaluation.paperMode,
+        supportedCheckpoint: evaluation.supportedCheckpoint,
+        suggestedActions: evaluation.nextHints,
+        selectedSourceIds: evaluation.disposition.selectedSourceIds.slice(0, 20),
+        missingSelectedExtractionSourceIds: evaluation.disposition.missingSelectedExtractionSourceIds.slice(0, 20),
+        extractedNotEvidenceSourceIds: evaluation.disposition.extractedNotEvidenceSourceIds.slice(0, 20),
+        evidenceNotCitedSourceIds: evaluation.disposition.evidenceNotCitedSourceIds.slice(0, 20),
+        selectedToRenderedCollapseSourceIds: evaluation.disposition.selectedToRenderedCollapseSourceIds.slice(0, 20),
+        renderedReferenceSourceIds: evaluation.disposition.renderedReferenceSourceIds.slice(0, 20)
+      }
+    }))
+  ];
+}
+
 function numericTextIdPart(text: string): string {
   return text
     .toLowerCase()
@@ -1327,8 +1554,19 @@ function generatedToolEntityId(prefix: string, run: RunRecord, now: string, hint
   return `${prefix}-${numericTextIdPart(hint)}-${run.id}-${now.replace(/[^0-9]/g, "")}`;
 }
 
+function stableIdHash(parts: Array<string | null>): string {
+  return createHash("sha256")
+    .update(parts.map((part) => part ?? "").join("\u0000"))
+    .digest("hex")
+    .slice(0, 16);
+}
+
 function generatedSupportLinkId(run: RunRecord, claimId: string, sourceId: string, evidenceCellId: string | null): string {
-  return `citation-${numericTextIdPart(`${claimId}-${sourceId}-${evidenceCellId ?? "source"}`)}-${run.id}`;
+  const claimPart = numericTextIdPart(claimId).slice(0, 32);
+  const sourcePart = numericTextIdPart(sourceId).slice(0, 28);
+  const evidencePart = numericTextIdPart(evidenceCellId ?? "source").slice(0, 20);
+  const identityHash = stableIdHash([run.id, claimId, sourceId, evidenceCellId]);
+  return `citation-${claimPart}-${sourcePart}-${evidencePart}-${identityHash}-${run.id}`;
 }
 
 function sourceTitleForSupport(store: ResearchWorkStore, sourceId: string): string {
@@ -2330,7 +2568,8 @@ function criticReviewArtifactLink(input: {
     label: `Critic review: ${input.stage} (${input.review.readiness})`,
     path: criticReviewArtifactPath(input.run, input.stage),
     kind: "other",
-    createdAt: input.nowText
+    createdAt: input.nowText,
+    createdBy: "runtime"
   };
 }
 
@@ -2368,12 +2607,22 @@ function criticReviewSummaryFromArtifactLink(artifact: ResearchNotebookArtifactL
   };
 }
 
-function criticReviewSummariesFromNotebook(store: ResearchWorkStore): Array<Record<string, string | number | null>> {
+function criticReviewSummariesFromNotebook(
+  store: ResearchWorkStore,
+  options: {
+    trustedOnly?: boolean;
+    stage?: CriticReviewScope;
+    artifactPath?: string;
+  } = {}
+): Array<Record<string, string | number | null>> {
   return store.notebook.artifactLinks
+    .filter((artifact) => options.trustedOnly !== true || artifact.createdBy === "runtime")
     .flatMap((artifact) => {
       const summary = criticReviewSummaryFromArtifactLink(artifact);
       return summary === null ? [] : [summary];
     })
+    .filter((summary) => options.stage === undefined || summary.stage === options.stage)
+    .filter((summary) => options.artifactPath === undefined || summary.artifactPath === options.artifactPath)
     .slice(-8);
 }
 
@@ -2413,8 +2662,12 @@ function buildCriticReviewRequest(input: {
     ...input.store.objects.citations.map((citation) => citation.sourceId),
     ...paper.referencedPaperIds
   ]);
+  const disposition = buildWorkspaceDispositionDiagnostics(input.store, {
+    renderedReferenceSourceIds: paper.referencedPaperIds
+  });
+  const selectedSourceIdSet = new Set(disposition.selectedSourceIds);
   const selectedSources = input.store.objects.canonicalSources
-    .filter((source) => source.screeningDecision === "include" || citedSourceIds.has(source.id))
+    .filter((source) => selectedSourceIdSet.has(source.id) || citedSourceIds.has(source.id))
     .slice(0, 40)
     .map(criticSourcePacket);
   const citedSources = input.store.objects.canonicalSources
@@ -2625,7 +2878,7 @@ async function executeNotebookToolAction(input: {
   const args = input.decision.inputs.workStore ?? defaultWorkStoreArgs();
 
   if (input.decision.action === "notebook.read") {
-    const message = `Notebook read: ${input.store.notebook.tasks.length} task(s), ${input.store.notebook.definitionOfDone.length} definition-of-done item(s).`;
+    const message = `Notebook read: mission ${input.store.notebook.missionTarget}/${input.store.notebook.paperMode}, ${input.store.notebook.tasks.length} task(s), ${input.store.notebook.definitionOfDone.length} definition-of-done item(s).`;
     return {
       handled: true,
       store: input.store,
@@ -2696,7 +2949,7 @@ async function executeNotebookToolAction(input: {
     notebook
   };
   await writeResearchWorkStore(nextStore);
-  const message = `Notebook patched: ${notebook.tasks.length} task(s), current focus ${notebook.currentFocus ?? "unset"}.`;
+  const message = `Notebook patched: mission ${notebook.missionTarget}/${notebook.paperMode}, ${notebook.tasks.length} task(s), current focus ${notebook.currentFocus ?? "unset"}.`;
   return {
     handled: true,
     store: nextStore,
@@ -3666,6 +3919,7 @@ async function executeResearchObjectToolAction(input: {
         })
       };
     }
+    const existingCitation = readResearchWorkStoreEntity<WorkStoreCitation>(input.store, "citations", citation.id);
     let nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, citation, nowText);
     const nextClaimSourceIds = uniqueStrings([...claim.sourceIds, citation.sourceId]);
     const nextUsedInSections = uniqueStrings([...claim.usedInSections, ...sectionIds]);
@@ -3691,7 +3945,7 @@ async function executeResearchObjectToolAction(input: {
     }, nowText);
     await writeResearchWorkStore(nextStore);
     const updatedClaim = readResearchWorkStoreEntity<WorkStoreClaim>(nextStore, "claims", claimId);
-    const message = `Support link attached from ${citation.sourceTitle} to claim ${claimId}.`;
+    const message = `Support link ${existingCitation === null ? "attached" : "updated"} from ${citation.sourceTitle} to claim ${claimId}.`;
     return {
       handled: true,
       store: nextStore,
@@ -3707,7 +3961,9 @@ async function executeResearchObjectToolAction(input: {
         totalCount: nextStore.objects.citations.length,
         entity: entityPreviewForAgent(citation, nextStore),
         related: updatedClaim === null ? [] : [entityPreviewForAgent(updatedClaim, nextStore)],
-        stateDelta: { supportLinksCreated: 1 },
+        stateDelta: existingCitation === null
+          ? { supportLinksCreated: 1 }
+          : { supportLinksUpdated: 1 },
         nextHints: ["section.link_claim", "claim.check_support", "release.verify"]
       })
     };
@@ -4091,12 +4347,26 @@ async function executeResearchObjectToolAction(input: {
     await writeJsonArtifact(input.run.artifacts.referencesPath, references);
     await writeJsonArtifact(input.run.artifacts.manuscriptChecksPath, checkBundle);
     const hardFailures = releaseChecks.filter((check) => check.status === "fail" && check.severity === "blocker");
-    const status = hardFailures.length > 0 || notebookReadinessIssue !== null ? "not_ready" : "ok";
+    const requestedMissionTarget = requestedMissionTargetFromToolInput({
+      entity: args.entity,
+      notebook: input.store.notebook
+    });
+    const artifactContract = evaluateArtifactContract({
+      run: input.run,
+      store: input.store,
+      references,
+      hardInvariantFailures: checkBundle.checks.filter((check) => check.status === "fail" && check.severity === "blocker"),
+      requestedMissionTarget,
+      criticAvailable: criticReviewAvailable(input.researchBackend)
+    });
+    const status = hardFailures.length > 0 || notebookReadinessIssue !== null || !artifactContract.canFinalize ? "not_ready" : "ok";
     const message = hardFailures.length > 0
       ? `Mechanical release verification only: found ${hardFailures.length} hard invariant repair item(s); manuscript is not ready yet. This does not assess research quality.`
       : notebookReadinessIssue !== null
         ? `Mechanical release verification only: checks passed with 0 hard invariant blocker(s), but research readiness has not been intentionally recorded for finalization: ${notebookReadinessIssue} This does not assess research quality.`
-        : `Mechanical release verification only: checks passed. Wrote ${releaseChecks.length} check(s): 0 hard invariant blocker(s), ${notebookDiagnostics.warningCount} notebook/project-management warning(s). Passing this does not assess research quality or scientific sufficiency.`;
+        : artifactContract.canFinalize
+          ? `Mechanical release verification only: checks passed. Artifact contract ${artifactContract.missionTarget}/${artifactContract.paperMode} is structurally ready for manuscript.finalize. Passing this does not assess research quality or scientific sufficiency.`
+          : `Mechanical release verification only: checks passed, but artifact contract ${artifactContract.missionTarget}/${artifactContract.paperMode} is not ready for finalization: ${artifactContract.failures.slice(0, 3).join(" ")} Continue machine-actionable research work; do not stop as a brief.`;
     return {
       handled: true,
       store: nextStore,
@@ -4114,21 +4384,30 @@ async function executeResearchObjectToolAction(input: {
         items: releaseChecks.map((check) => entityPreviewForAgent(check, nextStore)),
         related: [
           ...releaseRepairPreviews(hardFailures),
+          ...artifactContractPreviews(artifactContract),
           ...notebookDiagnosticPreviews(notebookDiagnostics)
         ],
         stateDelta: {
           releaseChecksCreated: releaseChecks.length,
           hardInvariantBlockers: hardFailures.length,
+          artifactContractFailures: artifactContract.failures.length,
           notebookDiagnosticWarnings: notebookDiagnostics.warningCount,
           notebookReadinessRecorded: notebookReadinessIssue === null ? 1 : 0
         },
         nextHints: hardFailures.length > 0
           ? ["workspace.read", "claim.link_support", "section.link_claim"]
-          : notebookReadinessIssue !== null || notebookDiagnostics.warningCount > 0
-            ? ["notebook.read", "notebook.patch", "release.verify"]
-            : criticReviewAvailable(input.researchBackend)
-              ? ["manuscript.finalize", "critic.review"]
-              : ["manuscript.finalize"]
+          : !artifactContract.canFinalize
+            ? uniqueStrings([
+              ...artifactContract.nextHints,
+              ...(notebookReadinessIssue !== null ? ["notebook.read", "notebook.patch"] : []),
+              ...(notebookDiagnostics.warningCount > 0 ? ["notebook.read"] : []),
+              "release.verify"
+            ]).filter((hint) => workspaceResearchActions({ criticAvailable: criticReviewAvailable(input.researchBackend) }).includes(hint as never))
+            : notebookReadinessIssue !== null || notebookDiagnostics.warningCount > 0
+              ? ["notebook.read", "notebook.patch", "release.verify"]
+              : criticReviewAvailable(input.researchBackend)
+                ? ["manuscript.finalize", "critic.review"]
+                : ["manuscript.finalize"]
       })
     };
   }
@@ -4143,42 +4422,39 @@ async function executeResearchObjectToolAction(input: {
       references
     });
     const releaseChecks = releaseCheckEntitiesFromChecks(input.run, checkBundle.checks, nowText);
-    const paper = workspacePaperArtifact({
-      run: input.run,
-      store: input.store,
-      references,
-      readinessStatus: checkBundle.readinessStatus
-    });
     const hardFailures = checkBundle.checks.filter((check) => check.status === "fail" && check.severity === "blocker");
     const nextStore = upsertResearchWorkStoreEntities(input.store, releaseChecks, nowText);
     await writeResearchWorkStore(nextStore);
     await writeJsonArtifact(input.run.artifacts.referencesPath, references);
     await writeJsonArtifact(input.run.artifacts.manuscriptChecksPath, checkBundle);
-    await writeJsonArtifact(input.run.artifacts.paperJsonPath, paper);
+    const requestedMissionTarget = requestedMissionTargetFromToolInput({
+      entity: args.entity,
+      notebook: input.store.notebook
+    });
+    const artifactContract = evaluateArtifactContract({
+      run: input.run,
+      store: input.store,
+      references,
+      hardInvariantFailures: hardFailures,
+      requestedMissionTarget,
+      criticAvailable: criticReviewAvailable(input.researchBackend)
+    });
 
-    if (hardFailures.length > 0 || notebookReadinessIssue !== null) {
+    if (hardFailures.length > 0 || notebookReadinessIssue !== null || !artifactContract.canFinalize) {
       const message = notebookReadinessIssue !== null
-        ? `Manuscript finalization is not ready: ${notebookReadinessIssue}`
-        : `Manuscript finalization is not ready: ${hardFailures.length} hard invariant repair item(s) remain.`;
-      await writeFile(
-        input.run.artifacts.paperPath,
-        [
-          "# Review Paper",
-          "",
-          "Manuscript finalization was explicitly requested, but the workspace is not ready for final export.",
-          "",
-          "## Blocking Invariants",
-          "",
-          ...(hardFailures.length === 0 ? ["- Mechanical release invariants passed."] : hardFailures.map((check) => `- ${check.message}`)),
-          "",
-          "## Notebook Readiness",
-          "",
-          notebookReadinessIssue === null
-            ? "- Notebook readiness is recorded."
-            : `- ${notebookReadinessIssue}`
-        ].join("\n"),
-        "utf8"
-      );
+        ? [
+          `Manuscript finalization is not ready: ${notebookReadinessIssue}`,
+          ...artifactContract.failures.slice(0, 1)
+        ].join(" ")
+        : hardFailures.length > 0
+          ? `Manuscript finalization is not ready: ${hardFailures.length} hard invariant repair item(s) remain.`
+          : [
+            `Manuscript finalization is not ready for ${artifactContract.missionTarget}/${artifactContract.paperMode}.`,
+            artifactContract.supportedCheckpoint === null
+              ? "No export was written; continue machine-actionable research work."
+              : `The current workspace may support a ${artifactContract.supportedCheckpoint} checkpoint, but the mission remains ${artifactContract.missionTarget}; continue research instead of stopping.`,
+            ...artifactContract.failures.slice(0, 3)
+          ].join(" ");
       return {
         handled: true,
         store: nextStore,
@@ -4196,22 +4472,35 @@ async function executeResearchObjectToolAction(input: {
           items: releaseChecks.map((check) => entityPreviewForAgent(check, nextStore)),
           related: [
             ...releaseRepairPreviews(releaseChecks.filter((check) => check.status === "fail" && check.severity === "blocker")),
+            ...artifactContractPreviews(artifactContract),
             ...notebookDiagnosticPreviews(notebookDiagnostics)
           ],
           stateDelta: {
             releaseChecksCreated: releaseChecks.length,
             hardInvariantBlockers: hardFailures.length,
+            artifactContractFailures: artifactContract.failures.length,
             notebookDiagnosticWarnings: notebookDiagnostics.warningCount,
             notebookReadinessRecorded: notebookReadinessIssue === null ? 1 : 0,
             manuscriptFinalized: 0
           },
           nextHints: notebookReadinessIssue !== null
-            ? ["notebook.read", "notebook.patch", "release.verify"]
-            : ["workspace.read", "claim.link_support", "section.link_claim", "release.verify"]
+            ? artifactContract.canFinalize
+              ? ["notebook.read", "notebook.patch", "release.verify"]
+              : uniqueStrings([...artifactContract.nextHints, "notebook.read", "notebook.patch", "release.verify"])
+            : artifactContract.canFinalize
+              ? ["workspace.read", "claim.link_support", "section.link_claim", "release.verify"]
+              : artifactContract.nextHints
         })
       };
     }
 
+    const paper = workspacePaperArtifact({
+      run: input.run,
+      store: input.store,
+      references,
+      readinessStatus: checkBundle.readinessStatus
+    });
+    await writeJsonArtifact(input.run.artifacts.paperJsonPath, paper);
     const markdown = renderWorkspacePaperMarkdown(paper, references);
     await writeFile(input.run.artifacts.paperPath, `${markdown}\n`, "utf8");
     const completion: ResearchWorkerCompletion = {
@@ -4511,14 +4800,37 @@ async function persistSourceToolWorkspaceSnapshot(input: {
   workStore: ResearchWorkStore;
 }): Promise<ResearchWorkStore> {
   const timestamp = input.now();
-  const nextStore = mergeRunSegmentIntoResearchWorkStore(input.workStore, {
+  const gathered = input.session.snapshot();
+  const mergedStore = mergeRunSegmentIntoResearchWorkStore(input.workStore, {
     run: input.run,
     plan: input.plan,
-    gathered: input.session.snapshot(),
+    gathered,
     paperExtractions: [],
     criticReports: [],
     now: timestamp
   });
+  const selectedSourceIds = gathered.reviewWorkflow.synthesisPaperIds.slice(0, 500);
+  const includedPapers = mergedStore.objects.canonicalSources
+    .filter((source) => source.screeningDecision === "include")
+    .length;
+  const nextStore = {
+    ...mergedStore,
+    updatedAt: timestamp,
+    worker: {
+      ...mergedStore.worker,
+      updatedAt: timestamp,
+      evidence: {
+        canonicalPapers: mergedStore.objects.canonicalSources.length,
+        includedPapers,
+        selectedSourceIds,
+        explicitlySelectedEvidencePapers: selectedSourceIds.length,
+        selectedPapers: selectedSourceIds.length,
+        extractedPapers: mergedStore.objects.extractions.length,
+        evidenceRows: mergedStore.objects.evidenceCells.length,
+        referencedPapers: new Set(mergedStore.objects.citations.map((citation) => citation.sourceId)).size
+      }
+    }
+  };
   await writeResearchWorkStore(nextStore);
   return nextStore;
 }
@@ -5534,7 +5846,7 @@ function workspaceManuscriptChecks(input: {
     section.claimIds.length === 0 || section.claimIds.some((claimId) => !supportReadiness.supportedClaimIds.has(claimId))
   )).length;
   const emptySectionCount = sections.filter((section) => section.markdown.trim().length === 0).length;
-  const evidenceRows = input.store.objects.extractions.length;
+  const extractionRows = input.store.objects.extractions.length;
   const checks: ManuscriptCheck[] = [
     {
       id: "workspace-sources",
@@ -5556,12 +5868,12 @@ function workspaceManuscriptChecks(input: {
     },
 	    {
 	      id: "evidence-coverage",
-      title: "Evidence coverage diagnostic",
-      status: evidenceRows >= 3 ? "pass" : "warning",
+      title: "Extraction coverage diagnostic",
+      status: extractionRows >= 3 ? "pass" : "warning",
       severity: "warning",
-      message: evidenceRows >= 3
-        ? "The workspace has multiple reviewed evidence rows."
-	        : `Only ${evidenceRows} reviewed evidence row(s) are available. This is a diagnostic for the researcher, not a semantic release blocker.`
+      message: extractionRows >= 3
+        ? "The workspace has multiple structured extraction record(s)."
+	        : `Only ${extractionRows} structured extraction record(s) are available. This is a diagnostic for the researcher, not a semantic release blocker.`
 	    },
 	    {
 	      id: "notebook-readiness-recorded",
@@ -6158,6 +6470,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       evidence: {
         canonicalPapers: workStore.objects.canonicalSources.length,
         includedPapers,
+        selectedSourceIds: gathered.reviewWorkflow.synthesisPaperIds.slice(0, 500),
         explicitlySelectedEvidencePapers,
         selectedPapers: explicitlySelectedEvidencePapers,
         extractedPapers: workStore.objects.extractions.length,
