@@ -915,9 +915,20 @@ function manuscriptSectionWordCount(markdown: string): number {
   return words?.length ?? 0;
 }
 
-function manuscriptSectionHygieneWarnings(section: WorkStoreManuscriptSection): string[] {
+function manuscriptSectionHygieneWarnings(section: WorkStoreManuscriptSection, store?: ResearchWorkStore): string[] {
   const warnings: string[] = [];
   const markdown = section.markdown.trim();
+  const contextText = [
+    section.sectionId,
+    section.role,
+    section.title,
+    store?.notebook.objective,
+    store?.notebook.currentFocus,
+    store?.notebook.readiness,
+    ...(store?.notebook.definitionOfDone ?? []),
+    ...(store?.notebook.tasks.map((task) => `${task.title} ${task.notes ?? ""}`) ?? [])
+  ].join(" ");
+  const toolingOrRuntimeTopic = /\b(?:clawresearch|tool(?:ing)?|runtime|sdk|workspace|research ide|section repair|critic feedback|critic\.review|release\.verify|section\.read|section\.patch|claim\.link_support|workspace\.read|source\.search)\b/i.test(contextText);
 
   if (markdown.length === 0) {
     warnings.push("Section markdown is empty.");
@@ -928,10 +939,15 @@ function manuscriptSectionHygieneWarnings(section: WorkStoreManuscriptSection): 
   if (/\b(?:source|paper|claim|evidence|extraction|citation)[-_][A-Za-z0-9][A-Za-z0-9_.:-]*\b/.test(markdown)) {
     warnings.push("Section prose appears to contain raw workspace ids instead of rendered source/claim language.");
   }
-  if (/\b(?:create|draft|add|patch|link|inspect)\s+(?:a|the|more|new)\b/i.test(markdown)
-    || /\b(?:call|run)\s+(?:critic\.review|release\.verify|section\.patch|workspace\.read)\b/i.test(markdown)
-    || /\bnext step(?:s)?\b/i.test(markdown)) {
+  const imperativeToolInstruction = /\b(?:call|run|invoke|execute)\s+(?:critic\.review|release\.verify|section\.patch|workspace\.read|claim\.link_support|section\.read)\b/i.test(markdown)
+    || /\bnext step(?:s)?\s*:/i.test(markdown)
+    || /\b(?:todo|remaining work|action item|follow-up)\s*:/i.test(markdown)
+    || /\b(?:create|draft|add|patch|link|inspect)\s+(?:a|the|more|new)\b/i.test(markdown);
+  const bareInternalToolMention = /\b(?:critic\.review|release\.verify|section\.patch|workspace\.read|claim\.link_support|section\.read)\b/i.test(markdown);
+  if (imperativeToolInstruction) {
     warnings.push("Section prose looks like process instructions rather than manuscript content.");
+  } else if (bareInternalToolMention && !toolingOrRuntimeTopic) {
+    warnings.push("Section prose mentions internal tool names; verify this is manuscript content rather than a process note.");
   }
   if (section.claimIds.length === 0) {
     warnings.push("Section has no linked claim ids.");
@@ -1098,7 +1114,7 @@ function entityPreviewForAgent(entity: WorkStoreEntity, store: ResearchWorkStore
           role: entity.role,
           wordCount: manuscriptSectionWordCount(entity.markdown),
           blockCount: manuscriptSectionBlocks(entity.markdown).length,
-          hygieneWarnings: manuscriptSectionHygieneWarnings(entity).slice(0, 8)
+          hygieneWarnings: manuscriptSectionHygieneWarnings(entity, store).slice(0, 8)
         }
       };
     case "releaseCheck":
@@ -1545,6 +1561,68 @@ function readCriticReviewArtifact(filePath: string): CriticReviewArtifact | null
   } catch {
     return null;
   }
+}
+
+function criticObjectionStableKey(objection: CriticReviewArtifact["objections"][number]): string {
+  const code = objection.code.trim().toLowerCase();
+  const target = `${objection.target}:${objection.targetId ?? "global"}`;
+  const messageKey = objection.message
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .slice(0, 12)
+    .join(" ");
+  return `${target}|${code || messageKey}`;
+}
+
+function criticObjectionDiff(previous: CriticReviewArtifact | null, current: CriticReviewArtifact): {
+  newObjections: CriticReviewArtifact["objections"];
+  repeatedObjections: CriticReviewArtifact["objections"];
+  resolvedObjections: CriticReviewArtifact["objections"];
+} {
+  if (previous === null) {
+    return {
+      newObjections: current.objections,
+      repeatedObjections: [],
+      resolvedObjections: []
+    };
+  }
+
+  const currentKeys = new Set(current.objections.map(criticObjectionStableKey));
+  const previousKeys = new Set(previous.objections.map(criticObjectionStableKey));
+  return {
+    newObjections: current.objections.filter((objection) => !previousKeys.has(criticObjectionStableKey(objection))),
+    repeatedObjections: current.objections.filter((objection) => previousKeys.has(criticObjectionStableKey(objection))),
+    resolvedObjections: previous.objections.filter((objection) => !currentKeys.has(criticObjectionStableKey(objection)))
+  };
+}
+
+function criticObjectionPreview(
+  objection: CriticReviewArtifact["objections"][number],
+  input: {
+    id: string;
+    kind?: string;
+    titlePrefix?: string;
+  }
+): AgentVisibleEntityPreview {
+  return {
+    id: input.id,
+    kind: input.kind ?? "criticObjection",
+    title: `${input.titlePrefix ?? ""}${objection.severity} objection`.trim(),
+    text: objection.message,
+    snippet: compactPreviewText(objection.suggestedRevision ?? ""),
+    sourceIds: objection.affectedPaperIds.slice(0, 12),
+    claimIds: objection.affectedClaimIds.slice(0, 12),
+    sectionIds: objection.affectedSectionIds.slice(0, 12),
+    fields: {
+      code: objection.code,
+      target: objection.target,
+      targetId: objection.targetId,
+      severity: objection.severity,
+      suggestedRevision: compactPreviewText(objection.suggestedRevision ?? "")
+    }
+  };
 }
 
 function latestTrustedCriticReviewLink(
@@ -2070,7 +2148,7 @@ function sectionRepairRelatedPreviews(store: ResearchWorkStore, section: WorkSto
       || item.targetId === section.sectionId
       || item.affectedClaimIds.some((claimId) => section.claimIds.includes(claimId))
     ));
-  const hygieneWarnings = manuscriptSectionHygieneWarnings(section).map((warning, index): AgentVisibleEntityPreview => ({
+  const hygieneWarnings = manuscriptSectionHygieneWarnings(section, store).map((warning, index): AgentVisibleEntityPreview => ({
     id: `${section.id}-hygiene-${index + 1}`,
     kind: "manuscriptHygieneWarning",
     title: "Mechanical section hygiene warning",
@@ -3349,7 +3427,15 @@ function buildCriticReviewRequest(input: {
     runId: input.run.id,
     stage: input.stage,
     brief: input.run.brief,
-    paper,
+    paper: null,
+    draftManuscriptPreview: paper,
+    paperExportExists: input.store.worker.completion?.kind === "manuscript_finalized"
+      && input.store.worker.completion.artifactPaths.includes(input.run.artifacts.paperPath),
+    finalizedArtifactPaths: input.store.worker.completion?.kind === "manuscript_finalized"
+      ? input.store.worker.completion.artifactPaths
+      : [],
+    releaseChecksExist: input.store.objects.releaseChecks.length > 0,
+    manuscriptFinalized: input.store.worker.completion?.kind === "manuscript_finalized",
     references,
     manuscriptChecks: checks,
     workspace: {
@@ -4054,6 +4140,8 @@ async function executeResearchObjectToolAction(input: {
       };
     }
 
+    const reviewPath = criticReviewArtifactPath(input.run, stage);
+    const previousReview = readCriticReviewArtifact(reviewPath);
     const request = buildCriticReviewRequest({
       run: input.run,
       store: input.store,
@@ -4100,27 +4188,14 @@ async function executeResearchObjectToolAction(input: {
               stage: unavailableReview.stage,
               readiness: unavailableReview.readiness,
               confidence: unavailableReview.confidence,
-              artifactPath: criticReviewArtifactPath(input.run, stage),
+              artifactPath: reviewPath,
               objections: unavailableReview.objections.length,
               positiveFindings: unavailableReview.positiveFindings.length,
               recommendedNextActions: unavailableReview.recommendedNextActions.slice(0, 6)
             }
           },
-          items: unavailableReview.objections.map((objection, index): AgentVisibleEntityPreview => ({
-            id: `${unavailableReview.stage}-critic-objection-${index + 1}`,
-            kind: "criticObjection",
-            title: `${objection.severity} objection`,
-            text: objection.message,
-            snippet: compactPreviewText(objection.suggestedRevision ?? ""),
-            sourceIds: objection.affectedPaperIds.slice(0, 12),
-            claimIds: objection.affectedClaimIds.slice(0, 12),
-            sectionIds: objection.affectedSectionIds.slice(0, 12),
-            fields: {
-              target: objection.target,
-              targetId: objection.targetId,
-              severity: objection.severity,
-              suggestedRevision: compactPreviewText(objection.suggestedRevision ?? "")
-            }
+          items: unavailableReview.objections.map((objection, index) => criticObjectionPreview(objection, {
+            id: `${unavailableReview.stage}-critic-objection-${index + 1}`
           })),
           error: message,
           stateDelta: {
@@ -4158,8 +4233,9 @@ async function executeResearchObjectToolAction(input: {
       ...normalizeCriticReview(review, request),
       reviewedSnapshot: criticFreshnessSnapshotForStore(input.store)
     };
+    const diff = criticObjectionDiff(previousReview, review);
 
-    await writeJsonArtifact(criticReviewArtifactPath(input.run, stage), review);
+    await writeJsonArtifact(reviewPath, review);
     const nextStore = upsertNotebookArtifactLink(input.store, criticReviewArtifactLink({
       run: input.run,
       stage,
@@ -4168,7 +4244,10 @@ async function executeResearchObjectToolAction(input: {
     }), nowText);
     await writeResearchWorkStore(nextStore);
     const blockingObjections = review.objections.filter((objection) => objection.severity === "blocking").length;
-    const message = `Fresh critic review ${stage} persisted as feedback only; readiness ${review.readiness}, ${blockingObjections} blocking objection(s).`;
+    const message = [
+      `Fresh critic review ${stage} persisted as feedback only; readiness ${review.readiness}, ${blockingObjections} blocking objection(s).`,
+      `Objection diff: ${diff.newObjections.length} new, ${diff.repeatedObjections.length} repeated, ${diff.resolvedObjections.length} resolved.`
+    ].join(" ");
     return {
       handled: true,
       store: nextStore,
@@ -4192,38 +4271,45 @@ async function executeResearchObjectToolAction(input: {
             stage: review.stage,
             readiness: review.readiness,
             confidence: review.confidence,
-              artifactPath: criticReviewArtifactPath(input.run, stage),
+              artifactPath: reviewPath,
               objections: review.objections.length,
               positiveFindings: review.positiveFindings.length,
+              newObjections: diff.newObjections.length,
+              repeatedObjections: diff.repeatedObjections.length,
+              resolvedObjections: diff.resolvedObjections.length,
               reviewedFingerprint: review.reviewedSnapshot?.fingerprint ?? null,
               reviewedObjects: review.reviewedSnapshot?.objects.length ?? 0,
               recommendedNextActions: review.recommendedNextActions.slice(0, 6)
             }
         },
-        items: review.objections.slice(0, 12).map((objection, index): AgentVisibleEntityPreview => ({
-          id: `${review.stage}-critic-objection-${index + 1}`,
-          kind: "criticObjection",
-          title: `${objection.severity} objection`,
-          text: objection.message,
-          snippet: compactPreviewText(objection.suggestedRevision ?? ""),
-          sourceIds: objection.affectedPaperIds.slice(0, 12),
-          claimIds: objection.affectedClaimIds.slice(0, 12),
-          sectionIds: objection.affectedSectionIds.slice(0, 12),
-          fields: {
-            target: objection.target,
-            targetId: objection.targetId,
-            severity: objection.severity,
-            suggestedRevision: compactPreviewText(objection.suggestedRevision ?? "")
-          }
+        items: review.objections.slice(0, 12).map((objection, index) => criticObjectionPreview(objection, {
+          id: `${review.stage}-critic-objection-${index + 1}`
         })),
+        related: [
+          ...diff.resolvedObjections.slice(0, 6).map((objection, index) => criticObjectionPreview(objection, {
+            id: `${review.stage}-critic-resolved-objection-${index + 1}`,
+            kind: "criticResolvedObjection",
+            titlePrefix: "resolved "
+          })),
+          ...diff.repeatedObjections.slice(0, 6).map((objection, index) => criticObjectionPreview(objection, {
+            id: `${review.stage}-critic-repeated-objection-${index + 1}`,
+            kind: "criticRepeatedObjection",
+            titlePrefix: "repeated "
+          }))
+        ],
         stateDelta: {
           criticReviewsCreated: 1,
           criticBlockingObjections: blockingObjections,
+          criticNewObjections: diff.newObjections.length,
+          criticRepeatedObjections: diff.repeatedObjections.length,
+          criticResolvedObjections: diff.resolvedObjections.length,
           notebookArtifactLinksCreated: 1
         },
         nextHints: review.readiness === "pass"
           ? ["release.verify", "workspace.status"]
-          : ["workspace.read", "work_item.create", "claim.patch", "source.search"]
+          : blockingObjections === 0
+            ? ["workspace.read", "section.read", "section.patch", "claim.patch", "release.verify"]
+            : ["workspace.read", "work_item.create", "claim.patch", "source.search"]
       })
     };
   }
@@ -4726,6 +4812,7 @@ async function executeResearchObjectToolAction(input: {
     const existingCitation = readResearchWorkStoreEntity<WorkStoreCitation>(input.store, "citations", citation.id);
     let nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, citation, nowText);
     let replacedCount = 0;
+    let replacementTargets: WorkStoreCitation[] = [];
     if (mode === "replace") {
       const replacementEvidenceCellIds = new Set(stringCandidates(
         args.entity.oldEvidenceCellId,
@@ -4736,7 +4823,7 @@ async function executeResearchObjectToolAction(input: {
         args.entity.oldSourceId,
         args.entity.replaceSourceId
       ));
-      const replacementTargets = activeSupportLinks.filter((candidate) => (
+      replacementTargets = activeSupportLinks.filter((candidate) => (
         candidate.id !== citation.id
         && (
           supportLinkIdCandidates.length === 0 && replacementEvidenceCellIds.size === 0 && replacementSourceIds.size === 0
@@ -4805,9 +4892,21 @@ async function executeResearchObjectToolAction(input: {
     }, nowText);
     await writeResearchWorkStore(nextStore);
     const updatedClaim = readResearchWorkStoreEntity<WorkStoreClaim>(nextStore, "claims", claimId);
+    const changedOldSupportPreviews = replacementTargets.flatMap((target) => {
+      const updated = readResearchWorkStoreEntity<WorkStoreCitation>(nextStore, "citations", target.id);
+      return updated === null ? [] : [entityPreviewForAgent(updated, nextStore)];
+    });
     const message = mode === "replace"
-      ? `Support link attached from ${citation.sourceTitle} to claim ${claimId}; superseded ${replacedCount} old support link(s).`
-      : `Support link ${existingCitation === null ? "attached" : "updated"} from ${citation.sourceTitle} to claim ${claimId}.`;
+      ? existingCitation === null
+        ? replacedCount > 0
+          ? `claim.link_support replace created support link ${citation.id} from ${citation.sourceTitle} to claim ${claimId} and superseded ${replacedCount} old support link(s).`
+          : `claim.link_support replace created support link ${citation.id} from ${citation.sourceTitle} to claim ${claimId}; no older active support links matched the replacement criteria.`
+        : replacedCount > 0
+          ? `claim.link_support replace updated existing support link ${citation.id} for claim ${claimId} and superseded ${replacedCount} old support link(s).`
+          : `claim.link_support replace updated existing support link ${citation.id} for claim ${claimId}; no other active support links matched the replacement criteria.`
+      : existingCitation === null
+        ? `claim.link_support append created support link ${citation.id} from ${citation.sourceTitle} to claim ${claimId}.`
+        : `claim.link_support append updated existing support link ${citation.id} from ${citation.sourceTitle} to claim ${claimId}.`;
     return {
       handled: true,
       store: nextStore,
@@ -4822,7 +4921,10 @@ async function executeResearchObjectToolAction(input: {
         count: 1,
         totalCount: nextStore.objects.citations.length,
         entity: entityPreviewForAgent(citation, nextStore),
-        related: updatedClaim === null ? [] : [entityPreviewForAgent(updatedClaim, nextStore)],
+        related: [
+          ...changedOldSupportPreviews,
+          ...(updatedClaim === null ? [] : [entityPreviewForAgent(updatedClaim, nextStore)])
+        ],
         stateDelta: existingCitation === null
           ? { supportLinksCreated: 1, supportLinksSuperseded: replacedCount }
           : { supportLinksUpdated: 1, supportLinksSuperseded: replacedCount },
@@ -5318,7 +5420,7 @@ async function executeResearchObjectToolAction(input: {
     const section = resolveSectionReference(input.store, sectionCandidates);
     const message = section === null
       ? "Section read found no section."
-      : `Section read ${section.title}: ${manuscriptSectionBlocks(section.markdown).length} block(s), ${section.claimIds.length} linked claim(s), ${manuscriptSectionHygieneWarnings(section).length} mechanical hygiene warning(s).`;
+      : `Section read ${section.title}: ${manuscriptSectionBlocks(section.markdown).length} block(s), ${section.claimIds.length} linked claim(s), ${manuscriptSectionHygieneWarnings(section, input.store).length} mechanical hygiene warning(s).`;
     return {
       handled: true,
       store: input.store,
@@ -5383,7 +5485,7 @@ async function executeResearchObjectToolAction(input: {
     }
     const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, section, nowText);
     await writeResearchWorkStore(nextStore);
-    const hygieneWarningCount = manuscriptSectionHygieneWarnings(section).length;
+    const hygieneWarningCount = manuscriptSectionHygieneWarnings(section, nextStore).length;
     const message = `Section updated ${section.id}: ${manuscriptSectionBlocks(section.markdown).length} block(s), ${section.claimIds.length} linked claim(s), ${hygieneWarningCount} mechanical hygiene warning(s).`;
     return {
       handled: true,
@@ -5522,14 +5624,16 @@ async function executeResearchObjectToolAction(input: {
       criticAvailable: criticReviewAvailable(input.researchBackend),
       releaseCriticFreshness
     });
-    const status = hardFailures.length > 0 || notebookReadinessIssue !== null || !artifactContract.canFinalize ? "not_ready" : "ok";
+    const mechanicalChecksPassed = hardFailures.length === 0;
+    const finalizationReady = mechanicalChecksPassed && notebookReadinessIssue === null && artifactContract.canFinalize;
+    const status = mechanicalChecksPassed ? "ok" : "not_ready";
     const message = hardFailures.length > 0
       ? `Mechanical release verification only: found ${hardFailures.length} hard invariant repair item(s); manuscript is not ready yet. This does not assess research quality.`
       : notebookReadinessIssue !== null
-        ? `Mechanical release verification only: checks passed with 0 hard invariant blocker(s), but research readiness has not been intentionally recorded for finalization: ${notebookReadinessIssue} This does not assess research quality.`
+        ? `Mechanical release verification only: checks passed and release checks were persisted, but finalization is not ready because research readiness has not been intentionally recorded: ${notebookReadinessIssue} This is a finalization diagnostic, not a scientific-quality approval.`
         : artifactContract.canFinalize
           ? `Mechanical release verification only: checks passed. Release critic freshness is ${releaseCriticFreshness.status}. Artifact contract ${artifactContract.missionTarget}/${artifactContract.paperMode} is structurally ready for manuscript.finalize. Passing this does not assess research quality or scientific sufficiency.`
-          : `Mechanical release verification only: checks passed, but artifact contract ${artifactContract.missionTarget}/${artifactContract.paperMode} is not ready for finalization: ${artifactContract.failures.slice(0, 3).join(" ")} Continue machine-actionable research work; do not stop as a brief.`;
+          : `Mechanical release verification only: checks passed and release checks were persisted, but finalization is not ready for ${artifactContract.missionTarget}/${artifactContract.paperMode}: ${artifactContract.failures.slice(0, 3).join(" ")} Continue machine-actionable research work; do not stop as a brief.`;
     return {
       handled: true,
       store: nextStore,
@@ -5552,6 +5656,8 @@ async function executeResearchObjectToolAction(input: {
         ],
         stateDelta: {
           releaseChecksCreated: releaseChecks.length,
+          mechanicalReleaseChecksPassed: mechanicalChecksPassed ? 1 : 0,
+          finalizationReady: finalizationReady ? 1 : 0,
           hardInvariantBlockers: hardFailures.length,
           artifactContractFailures: artifactContract.failures.length,
           releaseCriticFreshnessProblems: releaseCriticFreshness.status === "fresh" ? 0 : 1,

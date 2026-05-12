@@ -131,6 +131,11 @@ export type CriticReviewRequest = {
   synthesis?: ResearchSynthesis | null;
   verification?: VerificationReport | null;
   paper?: ReviewPaperArtifact | null;
+  draftManuscriptPreview?: ReviewPaperArtifact | null;
+  paperExportExists?: boolean;
+  finalizedArtifactPaths?: string[];
+  releaseChecksExist?: boolean;
+  manuscriptFinalized?: boolean;
   references?: ReferencesArtifact | null;
   manuscriptChecks?: ManuscriptChecksArtifact | null;
   workspace?: CriticWorkspacePacket | null;

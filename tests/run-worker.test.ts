@@ -4444,6 +4444,165 @@ class CriticFreshnessScenarioBackend extends StubResearchBackend {
   }
 }
 
+class RepeatedCriticReviewDiffBackend extends StubResearchBackend {
+  readonly capabilities = {
+    actionControl: {
+      nativeToolCalls: false,
+      strictJsonFallback: true
+    },
+    criticReview: true
+  };
+  readonly researchRequests: ResearchActionRequest[] = [];
+  readonly criticRequests: CriticReviewRequest[] = [];
+  private step = 0;
+
+  override async planResearch(): Promise<ResearchPlan> {
+    return {
+      researchMode: "literature_synthesis",
+      objective: "Validate critic objection diff observations.",
+      rationale: "The regression test preloads a workspace and runs the release critic twice.",
+      searchQueries: [],
+      localFocus: [],
+      notebookPatch: {
+        missionTarget: "research_brief",
+        paperMode: "literature_review",
+        currentFocus: "Compare repeated critic objections.",
+        readiness: "Not ready until the critic objection diff is visible."
+      }
+    };
+  }
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [],
+      criticScope: "release",
+      reason: null,
+      workStore: {
+        collection: "workItems",
+        entityId: null,
+        filters: {},
+        semanticQuery: null,
+        limit: null,
+        cursor: null,
+        changes: {},
+        entity: {}
+      }
+    };
+    if (this.step < 2) {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "critic.review",
+        rationale: "Run a release critic pass.",
+        confidence: 0.9,
+        inputs: baseInputs,
+        expectedOutcome: "Critic feedback is persisted.",
+        stopCondition: "Run the next critic pass or stop.",
+        transport: "strict_json"
+      };
+    }
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "Stop after critic diff observation.",
+      confidence: 0.8,
+      inputs: {
+        ...baseInputs,
+        criticScope: null,
+        reason: "Critic diff scenario complete.",
+        workStore: terminalUserDecisionWorkStore("Critic diff scenario complete.")
+      },
+      expectedOutcome: "Structured terminal state.",
+      stopCondition: "Structured terminal state reached.",
+      transport: "strict_json"
+    };
+  }
+
+  async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    this.criticRequests.push(request);
+    const firstPass = this.criticRequests.length === 1;
+    const objections: CriticReviewArtifact["objections"] = firstPass
+      ? [
+        {
+          code: "section-too-thin",
+          severity: "major",
+          target: "section",
+          targetId: "section-thin-synthesis",
+          message: "The section is too thin.",
+          affectedPaperIds: [],
+          affectedEvidenceCellIds: [],
+          affectedClaimIds: [],
+          affectedSectionIds: ["section-thin-synthesis"],
+          suggestedRevision: "Expand the synthesis."
+        },
+        {
+          code: "missing-limitations",
+          severity: "major",
+          target: "manuscript",
+          targetId: null,
+          message: "The manuscript lacks limitations.",
+          affectedPaperIds: [],
+          affectedEvidenceCellIds: [],
+          affectedClaimIds: [],
+          affectedSectionIds: [],
+          suggestedRevision: "Add a limitations discussion."
+        }
+      ]
+      : [
+        {
+          code: "missing-limitations",
+          severity: "major",
+          target: "manuscript",
+          targetId: null,
+          message: "The manuscript lacks limitations.",
+          affectedPaperIds: [],
+          affectedEvidenceCellIds: [],
+          affectedClaimIds: [],
+          affectedSectionIds: [],
+          suggestedRevision: "Add a limitations discussion."
+        },
+        {
+          code: "weak-corpus-description",
+          severity: "major",
+          target: "section",
+          targetId: "section-thin-synthesis",
+          message: "The corpus description is weak.",
+          affectedPaperIds: ["source-review-1"],
+          affectedEvidenceCellIds: [],
+          affectedClaimIds: [],
+          affectedSectionIds: ["section-thin-synthesis"],
+          suggestedRevision: "Describe selected source disposition."
+        }
+      ];
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "revise",
+      confidence: 0.8,
+      summary: "The release critic requests revision.",
+      objections,
+      positiveFindings: [],
+      revisionAdvice: {
+        searchQueries: [],
+        evidenceTargets: [],
+        papersToExclude: [],
+        papersToPromote: [],
+        claimsToSoften: []
+      },
+      recommendedNextActions: []
+    };
+  }
+}
+
 class SectionRepairErgonomicsBackend extends StubResearchBackend {
   readonly capabilities = {
     actionControl: {
@@ -6346,8 +6505,10 @@ test("release.verify reports stale critic review after manuscript section change
       ?.find((item) => item.kind === "criticFreshnessDiagnostic");
 
     assert.equal(exitCode, 0);
-    assert.equal(releaseResult?.status, "not_ready");
+    assert.equal(releaseResult?.status, "ok");
     assert.equal(freshnessDiagnostic?.status, "stale");
+    assert.equal(releaseResult?.stateDelta?.mechanicalReleaseChecksPassed, 1);
+    assert.equal(releaseResult?.stateDelta?.finalizationReady, 0);
     assert.ok((freshnessDiagnostic?.fields?.changedObjects as string[] | undefined)?.includes("manuscriptSection:section-thin-synthesis"));
     assert.ok(releaseResult?.nextHints?.includes("critic.review"));
   } finally {
@@ -6396,8 +6557,10 @@ test("release.verify reports incomplete critic review after new evidence is adde
       ?.find((item) => item.kind === "criticFreshnessDiagnostic");
 
     assert.equal(exitCode, 0);
-    assert.equal(releaseResult?.status, "not_ready");
+    assert.equal(releaseResult?.status, "ok");
     assert.equal(freshnessDiagnostic?.status, "incomplete");
+    assert.equal(releaseResult?.stateDelta?.mechanicalReleaseChecksPassed, 1);
+    assert.equal(releaseResult?.stateDelta?.finalizationReady, 0);
     assert.ok((freshnessDiagnostic?.fields?.newObjects as string[] | undefined)?.includes("evidenceCell:evidence-review-added-after-critic"));
     assert.ok(releaseResult?.nextHints?.includes("critic.review"));
   } finally {
@@ -6456,6 +6619,58 @@ test("manuscript.finalize blocks when support links changed after release critic
     assert.ok((freshnessDiagnostic?.fields?.missingObjects as string[] | undefined)?.includes("citation:citation-review-1"));
     assert.equal(workStore.worker.completion, null);
     await assert.rejects(readFile(completedRun.artifacts.paperPath, "utf8"), /ENOENT/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("repeated critic.review returns new repeated and resolved objection diagnostics", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-critic-objection-diff-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "critic objection diff",
+      researchQuestion: "Can repeated critic reviews report what changed?",
+      researchDirection: "Run release critic twice against a seeded workspace.",
+      successCriterion: "The second critic tool result reports new, repeated, and resolved objections."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "critic-diff"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    const backend = new RepeatedCriticReviewDiffBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const criticResults = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .filter((result) => result.action === "critic.review");
+    const secondCriticResult = criticResults.at(-1);
+
+    assert.equal(exitCode, 0);
+    assert.equal(backend.criticRequests.length, 2);
+    assert.equal(secondCriticResult?.stateDelta?.criticNewObjections, 1);
+    assert.equal(secondCriticResult?.stateDelta?.criticRepeatedObjections, 1);
+    assert.equal(secondCriticResult?.stateDelta?.criticResolvedObjections, 1);
+    assert.ok(secondCriticResult?.related?.some((item) => item.kind === "criticResolvedObjection" && /section-too-thin/i.test(String(item.fields?.code ?? ""))));
+    assert.ok(secondCriticResult?.related?.some((item) => item.kind === "criticRepeatedObjection" && /missing-limitations/i.test(String(item.fields?.code ?? ""))));
+    assert.ok(secondCriticResult?.nextHints?.includes("release.verify"));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -6772,6 +6987,12 @@ test("critic review packet uses exact selected and cited sources, not every scre
 
     assert.equal(exitCode, 0);
     assert.equal(backend.criticRequests.length, 1);
+    assert.equal(backend.criticRequests[0]?.paper, null);
+    assert.equal(backend.criticRequests[0]?.draftManuscriptPreview?.sections.length, 1);
+    assert.equal(backend.criticRequests[0]?.paperExportExists, false);
+    assert.deepEqual(backend.criticRequests[0]?.finalizedArtifactPaths, []);
+    assert.equal(backend.criticRequests[0]?.releaseChecksExist, false);
+    assert.equal(backend.criticRequests[0]?.manuscriptFinalized, false);
     assert.deepEqual(criticSelectedIds, ["source-review-1", "source-review-2"]);
     assert.equal(criticSelectedIds?.includes("source-review-3"), false);
     assert.equal(criticSelectedIds?.includes("source-review-4"), false);

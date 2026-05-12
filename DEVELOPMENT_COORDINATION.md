@@ -282,3 +282,29 @@ Validation:
 - Focused section repair tests pass.
 - `npm run check` passes.
 - `npm test` passes.
+
+## Release/Critic Convergence Fixes
+
+Implemented after the section-repair live test showed a critic/release repair loop.
+
+- `release.verify` now reports mechanical release-check execution separately from finalization readiness.
+  - If hard mechanical checks pass, the tool result status is `ok` and release checks are persisted.
+  - Artifact-contract, notebook, and critic-freshness problems remain visible finalization diagnostics with `finalizationReady: 0`.
+  - `manuscript.finalize` still blocks on missing/stale/incomplete/non-passing release critic state for gated artifact targets.
+- The critic packet now labels the manuscript rendering as `draftManuscriptPreview` and separately reports `paperExportExists`, `finalizedArtifactPaths`, `releaseChecksExist`, and `manuscriptFinalized`.
+  - The critic prompt explicitly says not to treat a draft preview as a finalized `paper.md`.
+- Repeated `critic.review` calls now return objection convergence diagnostics:
+  - new objections,
+  - repeated objections,
+  - resolved objections.
+- `claim.link_support` messages now distinguish append/create, append/update, replace/create, replace/update, replacement with zero matched old links, and remove/retire.
+- Manuscript hygiene warnings are now more context-aware:
+  - raw workspace IDs and explicit process instructions remain warnings,
+  - bare tool-name mentions are not warned as process leakage when the topic itself is ClawResearch/tooling/runtime behavior.
+
+Validation:
+
+- `npm run build` passes.
+- Targeted run-worker and research-backend tests pass.
+- `npm run check` passes.
+- `npm test` passes.

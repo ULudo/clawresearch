@@ -524,7 +524,11 @@ function criticReviewInstruction(request: CriticReviewRequest): string {
     releaseChecks: workspacePacket?.releaseChecks ?? [],
     manuscriptChecks: request.manuscriptChecks ?? null,
     references: request.references ?? null,
-    paper: request.paper ?? null
+    draftManuscriptPreview: request.draftManuscriptPreview ?? request.paper ?? null,
+    paperExportExists: request.paperExportExists ?? false,
+    finalizedArtifactPaths: request.finalizedArtifactPaths ?? [],
+    releaseChecksExist: request.releaseChecksExist ?? false,
+    manuscriptFinalized: request.manuscriptFinalized ?? false
   };
 
   return [
@@ -532,6 +536,8 @@ function criticReviewInstruction(request: CriticReviewRequest): string {
     "You are a fresh stateless critic. Review only the provided research workspace packet.",
     "Do not perform new research. Do not invent sources, claims, citations, IDs, or facts.",
     "Do not rewrite the manuscript. Do not continue the research process. Do not assume access to anything not included in the packet.",
+    "The field draftManuscriptPreview is an in-memory rendering of current workspace sections for review only. It is not evidence that paper.md exists or that the manuscript was finalized.",
+    "Treat the manuscript as finalized only when manuscriptFinalized is true and paperExportExists is true; otherwise review it as a draft workspace state.",
     "Your job is to identify concrete weaknesses, unsupported claims, missing synthesis, overstatements, citation/provenance problems, and manuscript-readiness issues.",
     "Distinguish mechanical/provenance issues from scientific/research-quality objections.",
     "Be concrete. For every objection, name the affected claim, section, evidence cell, citation, release check, or source when possible.",
