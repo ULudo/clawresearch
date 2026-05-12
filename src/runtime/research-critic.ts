@@ -68,6 +68,19 @@ export type CriticRevisionAdvice = {
   claimsToSoften: string[];
 };
 
+export type CriticReviewedObjectFingerprint = {
+  kind: string;
+  id: string;
+  fingerprint: string;
+};
+
+export type CriticReviewedWorkspaceSnapshot = {
+  schemaVersion: 1;
+  fingerprint: string;
+  objects: CriticReviewedObjectFingerprint[];
+  counts: Record<string, number>;
+};
+
 export type CriticReviewArtifact = {
   schemaVersion: 1;
   runId: string;
@@ -80,6 +93,7 @@ export type CriticReviewArtifact = {
   positiveFindings: CriticPositiveFinding[];
   revisionAdvice: CriticRevisionAdvice;
   recommendedNextActions: string[];
+  reviewedSnapshot?: CriticReviewedWorkspaceSnapshot;
 };
 
 export type CriticWorkspacePacket = {

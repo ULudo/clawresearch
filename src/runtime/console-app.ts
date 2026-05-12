@@ -67,6 +67,7 @@ import {
   type SourceProviderId
 } from "./provider-registry.js";
 import {
+  appendRunEvent,
   parseRunEventLines,
   readRunEventChunk,
   type RunEventKind,
@@ -1678,6 +1679,10 @@ export function isTerminalRun(run: RunRecord): boolean {
   return run.status === "completed" || run.status === "failed";
 }
 
+function isInterruptedResumableRun(run: RunRecord): boolean {
+  return run.status === "paused" && run.workerPid === null && run.job.signal === "worker_lost";
+}
+
 function createInitialRunCommand(): string[] {
   return ["clawresearch", "research-loop", "--mode", "plan-gather-synthesize"];
 }
@@ -1723,11 +1728,20 @@ export async function reconcileRelevantRun(
       && !runController.isProcessAlive(run.workerPid)
       && run.updatedAt === previousUpdatedAt
     ) {
-      run.status = "failed";
-      run.finishedAt = run.finishedAt ?? now();
+      const interruptedAt = now();
+      run.status = "paused";
+      run.finishedAt = null;
       run.workerPid = null;
-      run.statusMessage = "Detached run worker stopped before the run finished cleanly.";
+      run.job.pid = null;
+      run.job.finishedAt = run.job.finishedAt ?? interruptedAt;
+      run.job.signal = "worker_lost";
+      run.statusMessage = "Detached run worker process disappeared before a terminal checkpoint. The research objective can be resumed with `/go`.";
       await runStore.save(run);
+      await appendRunEvent(run.artifacts.eventsPath, {
+        timestamp: interruptedAt,
+        kind: "run",
+        message: "Detached run worker process disappeared before a terminal checkpoint; marked as resumable."
+      });
       const workerState = await loadResearchWorkerState(session.projectRoot)
         ?? createResearchWorkerState({
           projectRoot: session.projectRoot,
@@ -1742,11 +1756,11 @@ export async function reconcileRelevantRun(
         activeRunId: null,
         lastRunId: run.id,
         segmentCount: Math.max(1, workerState.segmentCount + (workerState.activeRunId === run.id ? 1 : 0)),
-        updatedAt: run.finishedAt,
-        statusReason: "The detached worker process stopped before a terminal checkpoint. The current objective can be retried with `/go` after inspecting diagnostics.",
+        updatedAt: interruptedAt,
+        statusReason: "The detached worker process disappeared before a terminal checkpoint. The current objective can be resumed with `/go`.",
         paperReadiness: workerState.paperReadiness,
         nextInternalActions: [
-          "Inspect the failed run diagnostics and retry the autonomous worker segment."
+          "Resume the autonomous research worker with `/go`."
         ],
         userBlockers: [],
         evidence: workerState.evidence,
@@ -2650,7 +2664,7 @@ export async function handleGoCommand(
 ): Promise<void> {
   const reconciledRun = await reconcileRelevantRun(session, store, runStore, runController, now);
 
-  if (reconciledRun !== null && !isTerminalRun(reconciledRun)) {
+  if (reconciledRun !== null && !isTerminalRun(reconciledRun) && !isInterruptedResumableRun(reconciledRun)) {
     const lines = [
       "A detached research run is already active for this project.",
       `Run id: ${reconciledRun.id}`,
@@ -2765,7 +2779,9 @@ export async function handleGoCommand(
   const responseLines = [
     workerState?.status === "working"
       ? "Research run started. Autonomous research worker continuation segment started."
-      : workerState?.status === "externally_blocked"
+      : workerState?.status === "paused"
+        ? "Research run started. Autonomous research worker recovery segment started after the previous worker process disappeared."
+        : workerState?.status === "externally_blocked"
         ? "Research run started. Autonomous research worker retry segment started after an external blocker."
         : workerObjectiveChanged
           ? "Research run started. Autonomous research worker segment started for the updated objective."

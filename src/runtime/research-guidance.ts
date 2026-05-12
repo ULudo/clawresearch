@@ -87,10 +87,12 @@ const builtinGuidance: ResearchGuidanceObject[] = [
     id: "tool-guide.extractions",
     kind: "ToolGuide",
     title: "Extraction and evidence tools",
-    summary: "Use extraction.create and evidence.create_cell to persist model-authored reading notes and evidence.",
+    summary: "Use extraction/evidence tools to persist, revise, and retire model-authored reading notes and evidence.",
     body: [
       "Use extraction.create only for a known canonical source id and include the extracted research content in the payload.",
+      "Use extraction.patch to revise an extraction or mark a provisional extraction as active, superseded, or retired.",
       "Use evidence.create_cell after an extraction exists for that source; evidence cells are durable support material for claims.",
+      "Use evidence.patch to revise an evidence cell or mark weak/provisional evidence as active, superseded, or retired.",
       "Use evidence.matrix_view as a read-only view over existing extractions/evidence; it must not create evidence by itself.",
       "If the needed source or extraction id is unclear, inspect with workspace.list/search/read first."
     ].join("\n"),
@@ -106,7 +108,8 @@ const builtinGuidance: ResearchGuidanceObject[] = [
     summary: "Use claim tools to create bounded claims and connect them to exact support links.",
     body: [
       "Use claim.create for one bounded research claim, not an entire paper section.",
-      "Use claim.link_support to connect a claim to a known evidence cell/source with a support snippet.",
+      "Use claim.link_support with mode append to connect a claim to a known evidence cell/source with a support snippet.",
+      "Use claim.link_support with mode replace to supersede older support links with better evidence, and mode remove to retire mistaken support without deleting the audit trail.",
       "Use claim.check_support to inspect whether a claim has renderable support.",
       "A manuscript claim should be softened, revised, or marked uncertain when support is weak; do not invent citations."
     ].join("\n"),
@@ -122,7 +125,9 @@ const builtinGuidance: ResearchGuidanceObject[] = [
     summary: "Use section tools to draft and revise manuscript sections from claims and cited support.",
     body: [
       "Use section.create for a durable manuscript section with a clear title, role, markdown, and source/claim ids.",
-      "Use section.patch to revise section text or metadata.",
+      "Use section.read before repairing prose. It returns the full markdown, numbered text blocks, linked claims/evidence/sources, mechanical hygiene warnings, and critic objections that target the section.",
+      "Use section.patch to revise section text or metadata. For targeted repair, set operation to replace_block, insert_after_block, append_paragraph, remove_block, update_title, or set_claim_links.",
+      "For block operations, use the blockIndex returned by section.read. The runtime edits only the selected block and reports the resulting blocks and warnings.",
       "Use section.link_claim to connect an existing section to an existing claim. Provide the manuscript section id or sectionId plus the claim id; if unsure, inspect workspace.list/read results first.",
       "Use section.check_claims to create visible work items when section claims lack support."
     ].join("\n"),

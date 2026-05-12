@@ -192,6 +192,27 @@ export type WorkStoreBaseEntity = {
   updatedAt: string;
 };
 
+export type ResearchObjectLifecycleStatus =
+  | "active"
+  | "superseded"
+  | "retired";
+
+export type ResearchObjectLifecycle = {
+  status?: ResearchObjectLifecycleStatus;
+  supersededBy?: string | null;
+  statusReason?: string | null;
+};
+
+export function researchObjectLifecycleStatus(entity: { status?: unknown }): ResearchObjectLifecycleStatus {
+  return entity.status === "superseded" || entity.status === "retired"
+    ? entity.status
+    : "active";
+}
+
+export function researchObjectIsActive(entity: { status?: unknown }): boolean {
+  return researchObjectLifecycleStatus(entity) === "active";
+}
+
 export type WorkStoreProviderRun = WorkStoreBaseEntity & {
   kind: "providerRun";
   providerId: string;
@@ -253,13 +274,13 @@ export type WorkStoreFullTextRecord = WorkStoreBaseEntity & {
   errors: string[];
 };
 
-export type WorkStoreExtraction = WorkStoreBaseEntity & {
+export type WorkStoreExtraction = WorkStoreBaseEntity & ResearchObjectLifecycle & {
   kind: "extraction";
   sourceId: string;
   extraction: PaperExtraction;
 };
 
-export type WorkStoreEvidenceCell = WorkStoreBaseEntity & {
+export type WorkStoreEvidenceCell = WorkStoreBaseEntity & ResearchObjectLifecycle & {
   kind: "evidenceCell";
   sourceId: string;
   extractionId: string;
@@ -291,7 +312,7 @@ export type WorkStoreClaim = WorkStoreBaseEntity & {
   risk: string | null;
 };
 
-export type WorkStoreCitation = WorkStoreBaseEntity & {
+export type WorkStoreCitation = WorkStoreBaseEntity & ResearchObjectLifecycle & {
   kind: "citation";
   sourceId: string;
   sourceTitle: string;
@@ -1836,6 +1857,8 @@ export type WorkspacePromptContext = {
   recentExtractions: Array<{
     id: string;
     sourceId: string;
+    status: ResearchObjectLifecycleStatus;
+    supersededBy: string | null;
     problemSetting: string;
     systemType: string;
     confidence: string;
@@ -1844,6 +1867,8 @@ export type WorkspacePromptContext = {
     id: string;
     sourceId: string;
     extractionId: string;
+    status: ResearchObjectLifecycleStatus;
+    supersededBy: string | null;
     field: string;
     value: string | string[];
     confidence: string;
@@ -1939,10 +1964,13 @@ export function buildWorkspaceDispositionDiagnostics(
   options: { renderedReferenceSourceIds?: string[] } = {}
 ): ResearchWorkspaceDispositionDiagnostics {
   const selectedSourceIds = diagnosticSelectedSourceIds(store);
-  const extractedSourceIds = uniqueStrings(store.objects.extractions.map((extraction) => extraction.sourceId), 500);
-  const evidenceCellSourceIds = uniqueStrings(store.objects.evidenceCells.map((cell) => cell.sourceId), 500);
+  const activeExtractions = store.objects.extractions.filter(researchObjectIsActive);
+  const activeEvidenceCells = store.objects.evidenceCells.filter(researchObjectIsActive);
+  const activeCitations = store.objects.citations.filter(researchObjectIsActive);
+  const extractedSourceIds = uniqueStrings(activeExtractions.map((extraction) => extraction.sourceId), 500);
+  const evidenceCellSourceIds = uniqueStrings(activeEvidenceCells.map((cell) => cell.sourceId), 500);
   const claimSourceIds = uniqueStrings(store.objects.claims.flatMap((claim) => claim.sourceIds), 500);
-  const citationSourceIds = uniqueStrings(store.objects.citations.map((citation) => citation.sourceId), 500);
+  const citationSourceIds = uniqueStrings(activeCitations.map((citation) => citation.sourceId), 500);
   const renderedReferenceSourceIds = uniqueStrings(options.renderedReferenceSourceIds ?? citationSourceIds, 500);
   const extractedSourceIdSet = new Set(extractedSourceIds);
   const evidenceCellSourceIdSet = new Set(evidenceCellSourceIds);
@@ -1969,7 +1997,7 @@ export function buildWorkspaceDispositionDiagnostics(
     citationSourceIds,
     renderedReferenceSourceIds,
     missingSelectedExtractionSourceIds,
-    duplicateExtractionSourceIds: duplicateSourceIdsForExtractions(store.objects.extractions),
+    duplicateExtractionSourceIds: duplicateSourceIdsForExtractions(activeExtractions),
     extractedNotEvidenceSourceIds,
     evidenceNotCitedSourceIds,
     selectedToRenderedCollapseSourceIds,
@@ -2184,6 +2212,8 @@ export function buildWorkspacePromptContextFromWorkStore(store: ResearchWorkStor
     recentExtractions: store.objects.extractions.slice(-12).map((extraction) => ({
       id: extraction.id,
       sourceId: extraction.sourceId,
+      status: researchObjectLifecycleStatus(extraction),
+      supersededBy: extraction.supersededBy ?? null,
       problemSetting: extraction.extraction.problemSetting,
       systemType: extraction.extraction.systemType,
       confidence: extraction.extraction.confidence
@@ -2192,13 +2222,15 @@ export function buildWorkspacePromptContextFromWorkStore(store: ResearchWorkStor
       id: cell.id,
       sourceId: cell.sourceId,
       extractionId: cell.extractionId,
+      status: researchObjectLifecycleStatus(cell),
+      supersededBy: cell.supersededBy ?? null,
       field: cell.field,
       value: cell.value,
       confidence: cell.confidence
     })),
     recentClaims: store.objects.claims.slice(-16).map((claim) => {
       const citationIds = store.objects.citations
-        .filter((citation) => citation.claimIds.includes(claim.id))
+        .filter((citation) => researchObjectIsActive(citation) && citation.claimIds.includes(claim.id))
         .map((citation) => citation.id);
       return {
         id: claim.id,
@@ -2211,7 +2243,7 @@ export function buildWorkspacePromptContextFromWorkStore(store: ResearchWorkStor
     }),
     recentSections: store.objects.manuscriptSections.slice(-10).map((section) => {
       const citationIds = store.objects.citations
-        .filter((citation) => citation.sectionIds.includes(section.id))
+        .filter((citation) => researchObjectIsActive(citation) && citation.sectionIds.includes(section.id))
         .map((citation) => citation.id);
       return {
         id: section.id,

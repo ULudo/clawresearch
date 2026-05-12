@@ -21,7 +21,9 @@ export type ResearchWorkspaceToolName =
   | "source.resolve_access"
   | "source.select_evidence"
   | "extraction.create"
+  | "extraction.patch"
   | "evidence.create_cell"
+  | "evidence.patch"
   | "evidence.matrix_view"
   | "claim.create"
   | "claim.patch"
@@ -63,7 +65,9 @@ export const researchWorkspaceToolActions: ResearchWorkspaceToolName[] = [
   "source.resolve_access",
   "source.select_evidence",
   "extraction.create",
+  "extraction.patch",
   "evidence.create_cell",
+  "evidence.patch",
   "evidence.matrix_view",
   "claim.create",
   "claim.patch",
@@ -295,6 +299,17 @@ export type ResearchActionRequest = {
         metadataOnlySources: number;
       };
       recentCriticReviews?: Array<Record<string, string | number | null>>;
+      releaseCriticFreshness?: {
+        status: string;
+        stage: string;
+        message: string;
+        reviewArtifactPath: string | null;
+        reviewReadiness: string | null;
+        changedObjects: Array<{ kind: string; id: string; reason: string }>;
+        missingObjects: Array<{ kind: string; id: string; reason: string }>;
+        newObjects: Array<{ kind: string; id: string; reason: string }>;
+        suggestedActions: string[];
+      };
       recentlyChangedIds: Array<{
         collection: string;
         id: string;

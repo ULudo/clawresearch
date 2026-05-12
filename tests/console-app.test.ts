@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   handleGoCommand,
+  reconcileRelevantRun,
   handleUserInput,
   summarizeCompletedRunIfNeeded,
   type ConsoleIo
@@ -17,7 +18,7 @@ import { CredentialStore } from "../src/runtime/credential-store.js";
 import { RunStore } from "../src/runtime/run-store.js";
 import { SessionStore } from "../src/runtime/session-store.js";
 import type { RunController } from "../src/runtime/run-controller.js";
-import { createResearchWorkerState, writeResearchWorkerState } from "../src/runtime/research-state.js";
+import { createResearchWorkerState, loadResearchWorkerState, writeResearchWorkerState } from "../src/runtime/research-state.js";
 
 function createNow(): () => string {
   let step = 0;
@@ -80,6 +81,157 @@ class FakeRunController implements RunController {
 
   async resume(): Promise<void> {}
 }
+
+class RecoveringRunController implements RunController {
+  private nextPid = 9900;
+  readonly launched: number[] = [];
+  readonly alive = new Set<number>();
+
+  launchCommand(run: { id: string; projectRoot: string }): string[] {
+    return ["node", "stub-cli.js", "--run-job", run.id, "--project-root", run.projectRoot];
+  }
+
+  async launch(): Promise<number> {
+    const pid = this.nextPid;
+    this.nextPid += 1;
+    this.alive.add(pid);
+    this.launched.push(pid);
+    return pid;
+  }
+
+  isProcessAlive(workerPid: number): boolean {
+    return this.alive.has(workerPid);
+  }
+
+  async pause(): Promise<void> {}
+
+  async resume(): Promise<void> {}
+}
+
+test("reconcileRelevantRun marks a dead worker process as resumable instead of failed", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-dead-worker-reconcile-"));
+  const now = createNow();
+
+  try {
+    const sessionStore = new SessionStore(projectRoot, "0.7.0", now);
+    const session = await sessionStore.load();
+    session.brief = {
+      topic: "autonomous research runtime recovery",
+      researchQuestion: "Can interrupted workers be resumed?",
+      researchDirection: "Test dead worker reconciliation.",
+      successCriterion: "The run is paused and resumable, not failed."
+    };
+    session.intake.readiness = "ready";
+    await sessionStore.save(session);
+
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create(session.brief, ["clawresearch", "research-loop"]);
+    run.status = "running";
+    run.workerPid = 123456;
+    run.job.pid = 123456;
+    run.startedAt = "2026-04-20T10:00:00.000Z";
+    run.job.startedAt = "2026-04-20T10:00:00.000Z";
+    run.statusMessage = "Worker is running.";
+    await runStore.save(run);
+
+    session.activeRunId = run.id;
+    session.lastRunId = run.id;
+    await sessionStore.save(session);
+    await writeResearchWorkerState(createResearchWorkerState({
+      projectRoot,
+      brief: session.brief,
+      now: now()
+    }));
+
+    const controller = new RecoveringRunController();
+    const reconciled = await reconcileRelevantRun(session, sessionStore, runStore, controller, now);
+    const savedRun = await runStore.load(run.id);
+    const workerState = await loadResearchWorkerState(projectRoot);
+
+    assert.equal(reconciled?.id, run.id);
+    assert.equal(savedRun.status, "paused");
+    assert.equal(savedRun.workerPid, null);
+    assert.equal(savedRun.finishedAt, null);
+    assert.equal(savedRun.job.pid, null);
+    assert.equal(savedRun.job.signal, "worker_lost");
+    assert.match(savedRun.statusMessage ?? "", /resumed with.*go/);
+    assert.equal(session.activeRunId, run.id);
+    assert.equal(workerState?.status, "paused");
+    assert.equal(workerState?.activeRunId, null);
+    assert.match(workerState?.statusReason ?? "", /resumed with.*go/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("handleGoCommand starts a new continuation segment after dead worker recovery", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-dead-worker-go-"));
+  const now = createNow();
+
+  try {
+    const sessionStore = new SessionStore(projectRoot, "0.7.0", now);
+    const session = await sessionStore.load();
+    session.brief = {
+      topic: "autonomous research runtime recovery",
+      researchQuestion: "Can /go resume after a dead worker?",
+      researchDirection: "Start a fresh continuation segment from the same workspace.",
+      successCriterion: "A new run is launched without treating the previous segment as failed."
+    };
+    session.intake.readiness = "ready";
+    session.intake.rationale = "Ready for worker execution.";
+    await sessionStore.save(session);
+
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const oldRun = await runStore.create(session.brief, ["clawresearch", "research-loop"]);
+    oldRun.status = "running";
+    oldRun.workerPid = 123457;
+    oldRun.job.pid = 123457;
+    oldRun.startedAt = "2026-04-20T10:00:00.000Z";
+    oldRun.job.startedAt = "2026-04-20T10:00:00.000Z";
+    await runStore.save(oldRun);
+
+    session.activeRunId = oldRun.id;
+    session.lastRunId = oldRun.id;
+    await sessionStore.save(session);
+    await writeResearchWorkerState({
+      ...createResearchWorkerState({
+        projectRoot,
+        brief: session.brief,
+        now: now()
+      }),
+      status: "working",
+      activeRunId: oldRun.id,
+      lastRunId: oldRun.id
+    });
+
+    const controller = new RecoveringRunController();
+    const sink = captureWriter();
+    await handleGoCommand(
+      sink.writer,
+      session,
+      sessionStore,
+      runStore,
+      { label: "intake:test", async respond() { return readyResponse("Ready."); } },
+      controller,
+      now,
+      false,
+      5
+    );
+
+    const refreshedOldRun = await runStore.load(oldRun.id);
+    const newRun = await runStore.load(session.activeRunId!);
+
+    assert.equal(refreshedOldRun.status, "paused");
+    assert.equal(refreshedOldRun.job.signal, "worker_lost");
+    assert.notEqual(session.activeRunId, oldRun.id);
+    assert.equal(controller.launched.length, 1);
+    assert.equal(newRun.status, "queued");
+    assert.equal(newRun.workerPid, controller.launched[0]);
+    assert.match(sink.readText(), /recovery segment started after the previous worker process disappeared/i);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
 
 test("handleUserInput uses the project assistant backend once a run exists", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-console-project-assistant-"));

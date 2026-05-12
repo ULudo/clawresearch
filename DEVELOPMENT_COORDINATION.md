@@ -206,3 +206,79 @@ Remaining observed issues:
 - The run was intentionally bounded with shell `timeout`; because the process was externally killed, `run.json` remains marked `running` with a stale worker PID. This is a crash/interruption recovery issue, not the original support-link loop.
 - After the support-link fix, the release critic still returned `revise` for substantive paper-quality/provenance issues: duplicate/provisional extractions, placeholder manuscript rows, and benchmark tasks needing more concrete detail.
 - The agent can now repair those issues, but it has not finalized a paper yet. The next improvement area is clean provenance replacement/retirement for stale extractions/support links and better live-run interruption recovery.
+
+## Infrastructure Fix: Quit and Dead-Worker Recovery
+
+Implemented after the `test-09` bounded live run exposed two process-lifecycle issues.
+
+- Terminal UI `/quit` now restores raw mode, removes watchers/listeners, leaves the alternate screen, and pauses stdin so Node can return to the shell without requiring `Ctrl-C`.
+- Dead detached worker PIDs are now reconciled as resumable interruptions, not research failures. A run whose worker process disappeared before a terminal checkpoint is marked `paused`, `workerPid` is cleared, `job.signal` is set to `worker_lost`, and worker state tells the user to resume with `/go`.
+- `/go` treats that interrupted run as recoverable and starts a fresh continuation segment from the existing workspace instead of blocking on “already active.”
+- Added regression tests for terminal quit cleanup, dead-worker reconciliation, and `/go` continuation after dead-worker recovery.
+
+## Provenance Repair Tools
+
+Implemented explicit model-facing repair operations for stale/provisional research objects without reintroducing hidden workflow.
+
+- Added lifecycle state for extraction, evidence-cell, and support-link/citation records: `active`, `superseded`, and `retired`.
+- Added `extraction.patch` and `evidence.patch` so the model can revise content or intentionally mark weak/provisional objects as superseded/retired.
+- Extended `claim.link_support` with `mode: append | replace | remove`.
+  - `append` keeps the existing add/update behavior.
+  - `replace` attaches new support and supersedes matched old support links.
+  - `remove` retires matched support links without hard-deleting audit history.
+- Active support/readiness, reference rendering, evidence matrix views, and notebook disposition diagnostics ignore retired/superseded support/evidence records.
+- Tool prompts, native schemas, and advisory guidance now explain these repair operations as provenance maintenance, not semantic judgment.
+- Added regression coverage for support-link replacement/removal and extraction/evidence lifecycle patching.
+
+Validation:
+
+- `npm run check` passes.
+- `npm test` passes.
+
+## Change-Based Critic Freshness
+
+Implemented explicit freshness tracking for release critic reviews.
+
+- `critic.review` now stores a fingerprinted snapshot of the critic-relevant workspace it reviewed: notebook project state, active extractions, active evidence cells, claims, active support/citation links, and manuscript sections.
+- `release.verify` compares the latest runtime-owned release critic snapshot against the current workspace and returns a visible freshness diagnostic:
+  - `fresh`: reviewed objects still match.
+  - `stale`: reviewed objects changed or disappeared.
+  - `incomplete`: new critic-relevant objects were added after review.
+  - `missing`: no runtime-owned release review exists.
+- `manuscript.finalize` blocks when the release critic is missing, stale, incomplete, or not passing for gated artifact targets.
+- Freshness is change-based, not wall-clock-based. A release check by itself does not stale the critic review because release-check records are not part of the critic-relevant snapshot.
+- No hidden critic call was added. The model must explicitly choose `critic.review`; the runtime only reports whether the stored review still covers the current workspace.
+- The researcher prompt mentions `critic.review` freshness only when that tool is actually available.
+
+Validation:
+
+- `npm run check` passes.
+- Focused critic freshness tests pass.
+- `npm test` passes.
+
+## Manuscript Section Repair Ergonomics
+
+Implemented section repair support without adding hidden manuscript rewriting.
+
+- `section.read` now returns a repair packet:
+  - full section markdown in the entity text,
+  - numbered manuscript blocks for targeted editing,
+  - linked claims, support links/citations, evidence cells, and sources,
+  - relevant runtime-owned critic objections that target the section/manuscript,
+  - mechanical hygiene warnings for placeholder/TODO prose, raw workspace ids, process-tool prose, and missing claim links.
+- `section.patch` now supports explicit targeted operations:
+  - `replace_all`
+  - `replace_block`
+  - `insert_after_block`
+  - `append_paragraph`
+  - `remove_block`
+  - `update_title`
+  - `set_claim_links`
+- The model remains the writer. The runtime does not rewrite prose; it only applies the explicit patch requested by the model and returns before/after repair context.
+- Native tool schemas, prompt recipes, and guidance now expose the targeted section patch contract.
+
+Validation:
+
+- Focused section repair tests pass.
+- `npm run check` passes.
+- `npm test` passes.

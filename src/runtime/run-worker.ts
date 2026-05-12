@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -56,7 +57,8 @@ import {
   normalizeCriticReview,
   type CriticReviewArtifact,
   type CriticReviewRequest,
-  type CriticReviewScope
+  type CriticReviewScope,
+  type CriticReviewedWorkspaceSnapshot
 } from "./research-critic.js";
 import {
   SourceToolRuntime,
@@ -96,9 +98,11 @@ import {
   mergeRunSegmentIntoResearchWorkStore,
   normalizeResearchMissionTarget,
   normalizeResearchPaperMode,
-  patchResearchWorkStoreEntity,
+	  patchResearchWorkStoreEntity,
   queryResearchWorkStore,
   readResearchWorkStoreEntity,
+  researchObjectIsActive,
+  researchObjectLifecycleStatus,
   researchWorkStoreFilePath,
   summarizeResearchWorkStore,
   upsertResearchWorkStoreEntities,
@@ -395,6 +399,10 @@ function workStoreContextForAgent(store: ResearchWorkStore): ResearchActionReque
       sourceAccess,
       notebookDiagnostics,
       recentCriticReviews: criticReviewSummariesFromNotebook(store),
+      releaseCriticFreshness: criticFreshnessEvaluationForStore({
+        store,
+        stage: "release"
+      }),
       recentlyChangedIds: recentlyChangedWorkspaceIds(store),
       suggestedLookupTools: ["workspace.list", "workspace.search", "workspace.read"]
     },
@@ -780,7 +788,9 @@ function isResearchObjectToolAction(action: ResearchActionDecision["action"]): b
     || action === "claim.check_support"
     || action === "claim.link_support"
     || action === "extraction.create"
+    || action === "extraction.patch"
     || action === "evidence.create_cell"
+    || action === "evidence.patch"
     || action === "evidence.matrix_view"
     || action === "critic.review"
     || action === "section.create"
@@ -893,6 +903,43 @@ function compactPreviewList(value: unknown, limit = 4, maxLength = 180): string[
     : [];
 }
 
+function manuscriptSectionBlocks(markdown: string): string[] {
+  return markdown
+    .split(/\n{2,}/)
+    .map((block) => block.trim())
+    .filter((block) => block.length > 0);
+}
+
+function manuscriptSectionWordCount(markdown: string): number {
+  const words = markdown.match(/\b[\p{L}\p{N}][\p{L}\p{N}'-]*\b/gu);
+  return words?.length ?? 0;
+}
+
+function manuscriptSectionHygieneWarnings(section: WorkStoreManuscriptSection): string[] {
+  const warnings: string[] = [];
+  const markdown = section.markdown.trim();
+
+  if (markdown.length === 0) {
+    warnings.push("Section markdown is empty.");
+  }
+  if (/\b(?:TODO|TBD|FIXME|placeholder)\b/i.test(markdown)) {
+    warnings.push("Section contains placeholder/TODO-style prose.");
+  }
+  if (/\b(?:source|paper|claim|evidence|extraction|citation)[-_][A-Za-z0-9][A-Za-z0-9_.:-]*\b/.test(markdown)) {
+    warnings.push("Section prose appears to contain raw workspace ids instead of rendered source/claim language.");
+  }
+  if (/\b(?:create|draft|add|patch|link|inspect)\s+(?:a|the|more|new)\b/i.test(markdown)
+    || /\b(?:call|run)\s+(?:critic\.review|release\.verify|section\.patch|workspace\.read)\b/i.test(markdown)
+    || /\bnext step(?:s)?\b/i.test(markdown)) {
+    warnings.push("Section prose looks like process instructions rather than manuscript content.");
+  }
+  if (section.claimIds.length === 0) {
+    warnings.push("Section has no linked claim ids.");
+  }
+
+  return uniqueStrings(warnings).slice(0, 12);
+}
+
 function previewSourceTitle(store: ResearchWorkStore, sourceId: string): string | undefined {
   return store.objects.canonicalSources.find((source) => (
     source.id === sourceId
@@ -936,9 +983,12 @@ function entityPreviewForAgent(entity: WorkStoreEntity, store: ResearchWorkStore
         kind: entity.kind,
         sourceId: entity.sourceId,
         sourceTitle: previewSourceTitle(store, entity.sourceId),
+        status: researchObjectLifecycleStatus(entity),
         confidence: extraction.confidence,
         snippet: compactPreviewText(extraction.problemSetting),
         fields: {
+          supersededBy: entity.supersededBy ?? null,
+          statusReason: entity.statusReason ?? null,
           problemSetting: compactPreviewText(extraction.problemSetting),
           systemType: compactPreviewText(extraction.systemType),
           architecture: compactPreviewText(extraction.architecture),
@@ -957,9 +1007,12 @@ function entityPreviewForAgent(entity: WorkStoreEntity, store: ResearchWorkStore
         kind: entity.kind,
         sourceId: entity.sourceId,
         sourceTitle: previewSourceTitle(store, entity.sourceId),
+        status: researchObjectLifecycleStatus(entity),
         confidence: entity.confidence,
         snippet: compactPreviewText(entity.value),
         fields: {
+          supersededBy: entity.supersededBy ?? null,
+          statusReason: entity.statusReason ?? null,
           extractionId: entity.extractionId,
           field: entity.field,
           value: Array.isArray(entity.value)
@@ -989,9 +1042,12 @@ function entityPreviewForAgent(entity: WorkStoreEntity, store: ResearchWorkStore
         sourceTitle: entity.sourceTitle || previewSourceTitle(store, entity.sourceId),
         claimIds: entity.claimIds.slice(0, 12),
         sectionIds: entity.sectionIds.slice(0, 12),
+        status: researchObjectLifecycleStatus(entity),
         snippet: compactPreviewText(entity.supportSnippet),
         confidence: entity.confidence ?? undefined,
         fields: {
+          supersededBy: entity.supersededBy ?? null,
+          statusReason: entity.statusReason ?? null,
           evidenceCellId: entity.evidenceCellId,
           relevance: entity.relevance
         }
@@ -1032,13 +1088,17 @@ function entityPreviewForAgent(entity: WorkStoreEntity, store: ResearchWorkStore
         id: entity.id,
         kind: entity.kind,
         title: entity.title,
+        text: entity.markdown,
         status: entity.status,
         sourceIds: entity.sourceIds.slice(0, 12),
         claimIds: entity.claimIds.slice(0, 12),
         snippet: compactPreviewText(entity.markdown),
         fields: {
           sectionId: entity.sectionId,
-          role: entity.role
+          role: entity.role,
+          wordCount: manuscriptSectionWordCount(entity.markdown),
+          blockCount: manuscriptSectionBlocks(entity.markdown).length,
+          hygieneWarnings: manuscriptSectionHygieneWarnings(entity).slice(0, 8)
         }
       };
     case "releaseCheck":
@@ -1330,6 +1390,280 @@ function notebookFinalizationReadinessIssue(notebook: ResearchNotebook): string 
   return null;
 }
 
+type CriticFreshnessStatus =
+  | "missing"
+  | "fresh"
+  | "stale"
+  | "incomplete";
+
+type CriticFreshnessObject = {
+  kind: string;
+  id: string;
+  reason: string;
+};
+
+type CriticFreshnessEvaluation = {
+  status: CriticFreshnessStatus;
+  stage: CriticReviewScope;
+  message: string;
+  reviewArtifactPath: string | null;
+  reviewReadiness: string | null;
+  reviewedFingerprint: string | null;
+  currentFingerprint: string;
+  changedObjects: CriticFreshnessObject[];
+  missingObjects: CriticFreshnessObject[];
+  newObjects: CriticFreshnessObject[];
+  suggestedActions: string[];
+};
+
+function stableJsonString(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => stableJsonString(entry)).join(",")}]`;
+  }
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, entry]) => `${JSON.stringify(key)}:${stableJsonString(entry)}`)
+    .join(",")}}`;
+}
+
+function fingerprintJson(value: unknown): string {
+  return createHash("sha256")
+    .update(stableJsonString(value))
+    .digest("hex")
+    .slice(0, 24);
+}
+
+function criticSnapshotObject(kind: string, id: string, value: unknown): CriticReviewedWorkspaceSnapshot["objects"][number] {
+  return {
+    kind,
+    id,
+    fingerprint: fingerprintJson(value)
+  };
+}
+
+function criticFreshnessSnapshotForStore(store: ResearchWorkStore): CriticReviewedWorkspaceSnapshot {
+  const objects: CriticReviewedWorkspaceSnapshot["objects"] = [
+    criticSnapshotObject("notebook", "current", {
+      missionTarget: store.notebook.missionTarget,
+      paperMode: store.notebook.paperMode,
+      objective: store.notebook.objective,
+      definitionOfDone: store.notebook.definitionOfDone,
+      tasks: store.notebook.tasks.map((task) => ({
+        id: task.id,
+        title: task.title,
+        status: task.status,
+        notes: task.notes,
+        linkedSourceIds: task.linkedSourceIds,
+        linkedExtractionIds: task.linkedExtractionIds,
+        linkedEvidenceCellIds: task.linkedEvidenceCellIds,
+        linkedClaimIds: task.linkedClaimIds,
+        linkedSectionIds: task.linkedSectionIds,
+        linkedArtifactPaths: task.linkedArtifactPaths
+      })),
+      currentFocus: store.notebook.currentFocus,
+      readiness: store.notebook.readiness,
+      notes: store.notebook.notes
+    }),
+    ...store.objects.extractions
+      .filter(researchObjectIsActive)
+      .map((extraction) => criticSnapshotObject("extraction", extraction.id, {
+        sourceId: extraction.sourceId,
+        status: researchObjectLifecycleStatus(extraction),
+        supersededBy: extraction.supersededBy ?? null,
+        statusReason: extraction.statusReason ?? null,
+        extraction: extraction.extraction
+      })),
+    ...store.objects.evidenceCells
+      .filter(researchObjectIsActive)
+      .map((cell) => criticSnapshotObject("evidenceCell", cell.id, {
+        sourceId: cell.sourceId,
+        extractionId: cell.extractionId,
+        field: cell.field,
+        value: cell.value,
+        confidence: cell.confidence,
+        status: researchObjectLifecycleStatus(cell),
+        supersededBy: cell.supersededBy ?? null,
+        statusReason: cell.statusReason ?? null
+      })),
+    ...store.objects.claims.map((claim) => criticSnapshotObject("claim", claim.id, {
+      text: claim.text,
+      evidence: claim.evidence,
+      sourceIds: claim.sourceIds,
+      supportStatus: claim.supportStatus,
+      confidence: claim.confidence,
+      usedInSections: claim.usedInSections,
+      risk: claim.risk
+    })),
+    ...store.objects.citations
+      .filter(researchObjectIsActive)
+      .map((citation) => criticSnapshotObject("citation", citation.id, {
+        sourceId: citation.sourceId,
+        sourceTitle: citation.sourceTitle,
+        evidenceCellId: citation.evidenceCellId,
+        supportSnippet: citation.supportSnippet,
+        confidence: citation.confidence,
+        relevance: citation.relevance,
+        claimIds: citation.claimIds,
+        sectionIds: citation.sectionIds,
+        status: researchObjectLifecycleStatus(citation),
+        supersededBy: citation.supersededBy ?? null,
+        statusReason: citation.statusReason ?? null
+      })),
+    ...store.objects.manuscriptSections.map((section) => criticSnapshotObject("manuscriptSection", section.id, {
+      sectionId: section.sectionId,
+      role: section.role,
+      title: section.title,
+      markdown: section.markdown,
+      sourceIds: section.sourceIds,
+      claimIds: section.claimIds,
+      status: section.status
+    }))
+  ].sort((left, right) => `${left.kind}:${left.id}`.localeCompare(`${right.kind}:${right.id}`));
+
+  const counts = objects.reduce<Record<string, number>>((accumulator, object) => {
+    accumulator[object.kind] = (accumulator[object.kind] ?? 0) + 1;
+    return accumulator;
+  }, {});
+
+  return {
+    schemaVersion: 1,
+    fingerprint: fingerprintJson(objects),
+    objects,
+    counts
+  };
+}
+
+function readCriticReviewArtifact(filePath: string): CriticReviewArtifact | null {
+  try {
+    const value = JSON.parse(readFileSync(filePath, "utf8")) as unknown;
+    return typeof value === "object" && value !== null && (value as { schemaVersion?: unknown }).schemaVersion === 1
+      ? value as CriticReviewArtifact
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function latestTrustedCriticReviewLink(
+  store: ResearchWorkStore,
+  stage: CriticReviewScope,
+  artifactPath?: string
+): ResearchNotebookArtifactLink | null {
+  return store.notebook.artifactLinks
+    .filter((artifact) => artifact.createdBy === "runtime")
+    .filter((artifact) => {
+      const summary = criticReviewSummaryFromArtifactLink(artifact);
+      return summary !== null && summary.stage === stage;
+    })
+    .filter((artifact) => artifactPath === undefined || artifact.path === artifactPath)
+    .slice(-1)[0] ?? null;
+}
+
+function criticFreshnessEvaluationForStore(input: {
+  store: ResearchWorkStore;
+  stage: CriticReviewScope;
+  artifactPath?: string;
+}): CriticFreshnessEvaluation {
+  const currentSnapshot = criticFreshnessSnapshotForStore(input.store);
+  const artifact = latestTrustedCriticReviewLink(input.store, input.stage, input.artifactPath);
+  if (artifact === null) {
+    return {
+      status: "missing",
+      stage: input.stage,
+      message: `No runtime-owned ${input.stage} critic review is recorded.`,
+      reviewArtifactPath: input.artifactPath ?? null,
+      reviewReadiness: null,
+      reviewedFingerprint: null,
+      currentFingerprint: currentSnapshot.fingerprint,
+      changedObjects: [],
+      missingObjects: [],
+      newObjects: [],
+      suggestedActions: ["critic.review"]
+    };
+  }
+
+  const review = readCriticReviewArtifact(artifact.path);
+  const reviewedSnapshot = review?.reviewedSnapshot ?? null;
+  if (review === null || reviewedSnapshot === null) {
+    return {
+      status: "incomplete",
+      stage: input.stage,
+      message: `Latest ${input.stage} critic review has no review snapshot metadata, so it cannot validate the current workspace.`,
+      reviewArtifactPath: artifact.path,
+      reviewReadiness: review?.readiness ?? null,
+      reviewedFingerprint: null,
+      currentFingerprint: currentSnapshot.fingerprint,
+      changedObjects: [],
+      missingObjects: [],
+      newObjects: [],
+      suggestedActions: ["critic.review"]
+    };
+  }
+
+  const reviewedByKey = new Map(reviewedSnapshot.objects.map((object) => [`${object.kind}:${object.id}`, object]));
+  const currentByKey = new Map(currentSnapshot.objects.map((object) => [`${object.kind}:${object.id}`, object]));
+  const changedObjects: CriticFreshnessObject[] = [];
+  const missingObjects: CriticFreshnessObject[] = [];
+  const newObjects: CriticFreshnessObject[] = [];
+
+  for (const [key, reviewed] of reviewedByKey.entries()) {
+    const current = currentByKey.get(key);
+    if (current === undefined) {
+      missingObjects.push({
+        kind: reviewed.kind,
+        id: reviewed.id,
+        reason: `${reviewed.kind} ${reviewed.id} was reviewed but is no longer active/present in the critic-relevant workspace.`
+      });
+      continue;
+    }
+    if (current.fingerprint !== reviewed.fingerprint) {
+      changedObjects.push({
+        kind: reviewed.kind,
+        id: reviewed.id,
+        reason: `${reviewed.kind} ${reviewed.id} changed after the critic review.`
+      });
+    }
+  }
+
+  for (const [key, current] of currentByKey.entries()) {
+    if (!reviewedByKey.has(key)) {
+      newObjects.push({
+        kind: current.kind,
+        id: current.id,
+        reason: `${current.kind} ${current.id} was added after the critic review.`
+      });
+    }
+  }
+
+  const status: CriticFreshnessStatus = changedObjects.length > 0 || missingObjects.length > 0
+    ? "stale"
+    : newObjects.length > 0
+      ? "incomplete"
+      : "fresh";
+  const message = status === "fresh"
+    ? `Latest ${input.stage} critic review is fresh for the current critic-relevant workspace.`
+    : status === "stale"
+      ? `Latest ${input.stage} critic review is stale because reviewed workspace objects changed or disappeared.`
+      : `Latest ${input.stage} critic review is incomplete because new critic-relevant workspace objects were added after review.`;
+
+  return {
+    status,
+    stage: input.stage,
+    message,
+    reviewArtifactPath: artifact.path,
+    reviewReadiness: review.readiness,
+    reviewedFingerprint: reviewedSnapshot.fingerprint,
+    currentFingerprint: currentSnapshot.fingerprint,
+    changedObjects,
+    missingObjects,
+    newObjects,
+    suggestedActions: status === "fresh" ? [] : ["critic.review"]
+  };
+}
+
 type ArtifactContractEvaluation = {
   missionTarget: ResearchMissionTarget;
   requestedMissionTarget: ResearchMissionTarget;
@@ -1340,6 +1674,7 @@ type ArtifactContractEvaluation = {
   warnings: string[];
   nextHints: string[];
   disposition: ResearchWorkspaceDispositionDiagnostics;
+  releaseCriticFreshness: CriticFreshnessEvaluation;
 };
 
 function requestedMissionTargetFromToolInput(input: {
@@ -1378,6 +1713,7 @@ function evaluateArtifactContract(input: {
   hardInvariantFailures: ManuscriptCheck[];
   requestedMissionTarget: ResearchMissionTarget;
   criticAvailable: boolean;
+  releaseCriticFreshness?: CriticFreshnessEvaluation;
 }): ArtifactContractEvaluation {
   const { store, references } = input;
   const failures: string[] = [];
@@ -1385,16 +1721,19 @@ function evaluateArtifactContract(input: {
   const nextHints = new Set<string>();
   const sections = store.objects.manuscriptSections;
   const releaseCriticArtifactPath = criticReviewArtifactPath(input.run, "release");
-  const trustedReleaseCriticReviews = criticReviewSummariesFromNotebook(store, {
-    trustedOnly: true,
-    stage: "release",
-    artifactPath: releaseCriticArtifactPath
-  });
   const untrustedReleaseCriticReviews = criticReviewSummariesFromNotebook(store, {
     stage: "release",
     artifactPath: releaseCriticArtifactPath
-  }).length - trustedReleaseCriticReviews.length;
-  const latestReleaseCriticReview = trustedReleaseCriticReviews[trustedReleaseCriticReviews.length - 1] ?? null;
+  }).length - criticReviewSummariesFromNotebook(store, {
+    trustedOnly: true,
+    stage: "release",
+    artifactPath: releaseCriticArtifactPath
+  }).length;
+  const releaseCriticFreshness = input.releaseCriticFreshness ?? criticFreshnessEvaluationForStore({
+    store,
+    stage: "release",
+    artifactPath: releaseCriticArtifactPath
+  });
   const disposition = buildWorkspaceDispositionDiagnostics(store, {
     renderedReferenceSourceIds: references.references.map((reference) => reference.sourceId)
   });
@@ -1416,7 +1755,7 @@ function evaluateArtifactContract(input: {
   }
 
   if (store.notebook.missionTarget === "research_brief" || store.notebook.missionTarget === "professional_paper") {
-    if (latestReleaseCriticReview === null) {
+    if (releaseCriticFreshness.status === "missing") {
       const fakeLinkNote = untrustedReleaseCriticReviews > 0
         ? " Model-authored notebook artifact links for critic reviews are visible context but do not satisfy this runtime-owned release gate."
         : "";
@@ -1426,13 +1765,19 @@ function evaluateArtifactContract(input: {
       if (input.criticAvailable) {
         nextHints.add("critic.review");
       }
-    } else if (latestReleaseCriticReview.readiness !== "pass") {
-      failures.push(`Latest runtime-owned release critic.review readiness is ${latestReleaseCriticReview.readiness}; ${store.notebook.missionTarget} finalization requires a release critic pass before paper.md is written.`);
+    } else if (releaseCriticFreshness.reviewReadiness !== "pass") {
+      failures.push(`Latest runtime-owned release critic.review readiness is ${releaseCriticFreshness.reviewReadiness ?? "unknown"}; ${store.notebook.missionTarget} finalization requires a release critic pass before paper.md is written.`);
       if (input.criticAvailable) {
         nextHints.add("critic.review");
       }
       nextHints.add("workspace.read");
       nextHints.add("notebook.patch");
+    } else if (releaseCriticFreshness.status !== "fresh") {
+      failures.push(`${releaseCriticFreshness.message} Changed: ${releaseCriticFreshness.changedObjects.length}; missing/retired: ${releaseCriticFreshness.missingObjects.length}; new: ${releaseCriticFreshness.newObjects.length}. Run critic.review with criticScope release again before manuscript.finalize.`);
+      if (input.criticAvailable) {
+        nextHints.add("critic.review");
+      }
+      nextHints.add("workspace.read");
     }
 
     if (disposition.selectedToRenderedCollapse) {
@@ -1476,7 +1821,7 @@ function evaluateArtifactContract(input: {
     }
   }
 
-  if (store.notebook.missionTarget !== "professional_paper" && latestReleaseCriticReview !== null && latestReleaseCriticReview.readiness === "block") {
+  if (store.notebook.missionTarget !== "professional_paper" && releaseCriticFreshness.reviewReadiness === "block") {
     warnings.push("Latest runtime-owned release critic.review is blocking. This remains visible feedback for the researcher even when the artifact target is not professional_paper.");
   }
 
@@ -1493,12 +1838,29 @@ function evaluateArtifactContract(input: {
     failures,
     warnings,
     nextHints: [...nextHints].filter((hint) => workspaceResearchActions({ criticAvailable: input.criticAvailable }).includes(hint as never)),
-    disposition
+    disposition,
+    releaseCriticFreshness
   };
 }
 
 function artifactContractPreviews(evaluation: ArtifactContractEvaluation): AgentVisibleEntityPreview[] {
   return [
+    {
+      id: `critic-freshness-${evaluation.releaseCriticFreshness.stage}`,
+      kind: "criticFreshnessDiagnostic",
+      title: `Release critic freshness: ${evaluation.releaseCriticFreshness.status}`,
+      status: evaluation.releaseCriticFreshness.status,
+      snippet: compactPreviewText(evaluation.releaseCriticFreshness.message, 360),
+      fields: {
+        stage: evaluation.releaseCriticFreshness.stage,
+        reviewReadiness: evaluation.releaseCriticFreshness.reviewReadiness,
+        reviewArtifactPath: evaluation.releaseCriticFreshness.reviewArtifactPath,
+        changedObjects: evaluation.releaseCriticFreshness.changedObjects.slice(0, 8).map((object) => `${object.kind}:${object.id}`),
+        missingObjects: evaluation.releaseCriticFreshness.missingObjects.slice(0, 8).map((object) => `${object.kind}:${object.id}`),
+        newObjects: evaluation.releaseCriticFreshness.newObjects.slice(0, 8).map((object) => `${object.kind}:${object.id}`),
+        suggestedActions: evaluation.releaseCriticFreshness.suggestedActions
+      }
+    },
     ...evaluation.failures.map((failure, index): AgentVisibleEntityPreview => ({
       id: `artifact-contract-failure-${index + 1}`,
       kind: "artifactContractDiagnostic",
@@ -1591,10 +1953,178 @@ function renderableSourceIdForSupport(store: ResearchWorkStore, sourceId: string
 function evidenceCellForSourceSupport(store: ResearchWorkStore, sourceId: string): WorkStoreEvidenceCell | null {
   const equivalentIds = new Set(sourceEquivalentIds(store, sourceId));
   return store.objects.evidenceCells.find((cell) => (
-    equivalentIds.has(cell.sourceId)
+    researchObjectIsActive(cell)
+    && equivalentIds.has(cell.sourceId)
     && cell.field !== "confidence"
     && meaningfulSupportSnippet(cell.value) !== null
   )) ?? null;
+}
+
+function activeCitationsForClaim(store: ResearchWorkStore, claimId: string): WorkStoreCitation[] {
+  return store.objects.citations.filter((citation) => (
+    researchObjectIsActive(citation)
+    && citation.claimIds.includes(claimId)
+  ));
+}
+
+function uniqueEntitiesById<T extends { id: string }>(entities: T[]): T[] {
+  const seen = new Set<string>();
+  const result: T[] = [];
+  for (const entity of entities) {
+    if (seen.has(entity.id)) {
+      continue;
+    }
+    seen.add(entity.id);
+    result.push(entity);
+  }
+  return result;
+}
+
+function canonicalSourceByEquivalentId(store: ResearchWorkStore, sourceId: string): WorkStoreCanonicalSource | null {
+  const equivalentIds = new Set(sourceEquivalentIds(store, sourceId));
+  return store.objects.canonicalSources.find((source) => equivalentIds.has(source.id)) ?? null;
+}
+
+function sectionBlockPreviews(section: WorkStoreManuscriptSection): AgentVisibleEntityPreview[] {
+  return manuscriptSectionBlocks(section.markdown).map((block, index): AgentVisibleEntityPreview => ({
+    id: `${section.id}#block-${index + 1}`,
+    kind: "manuscriptSectionBlock",
+    title: `Block ${index + 1}`,
+    text: block,
+    snippet: compactPreviewText(block, 420),
+    fields: {
+      sectionId: section.id,
+      blockIndex: index + 1,
+      wordCount: manuscriptSectionWordCount(block)
+    }
+  }));
+}
+
+function sectionCriticObjectionPreviews(store: ResearchWorkStore, section: WorkStoreManuscriptSection): AgentVisibleEntityPreview[] {
+  const sectionIds = new Set([section.id, section.sectionId]);
+  return store.notebook.artifactLinks
+    .filter((artifact) => artifact.createdBy === "runtime")
+    .flatMap((artifact) => {
+      const review = readCriticReviewArtifact(artifact.path);
+      return review === null
+        ? []
+        : review.objections.flatMap((objection, index): AgentVisibleEntityPreview[] => {
+          const targetsSection = objection.target === "section"
+            || objection.target === "manuscript"
+            || (objection.targetId !== null && sectionIds.has(objection.targetId))
+            || objection.affectedSectionIds.some((id) => sectionIds.has(id));
+          if (!targetsSection) {
+            return [];
+          }
+          return [{
+            id: `${review.stage}-critic-objection-${index + 1}`,
+            kind: "criticObjection",
+            title: `${objection.severity} ${review.stage} critic objection`,
+            text: objection.message,
+            snippet: compactPreviewText(objection.suggestedRevision ?? objection.message, 420),
+            sourceIds: objection.affectedPaperIds.slice(0, 12),
+            claimIds: objection.affectedClaimIds.slice(0, 12),
+            sectionIds: objection.affectedSectionIds.slice(0, 12),
+            fields: {
+              stage: review.stage,
+              readiness: review.readiness,
+              target: objection.target,
+              targetId: objection.targetId,
+              severity: objection.severity,
+              suggestedRevision: compactPreviewText(objection.suggestedRevision ?? "")
+            }
+          }];
+        });
+    })
+    .slice(-12);
+}
+
+function sectionRepairRelatedPreviews(store: ResearchWorkStore, section: WorkStoreManuscriptSection): AgentVisibleEntityPreview[] {
+  const linkedClaims = section.claimIds.flatMap((claimId) => {
+    const claim = readResearchWorkStoreEntity<WorkStoreClaim>(store, "claims", claimId);
+    return claim === null ? [] : [claim];
+  });
+  const linkedCitations = uniqueEntitiesById(linkedClaims.flatMap((claim) => activeCitationsForClaim(store, claim.id))
+    .filter((citation) => citation.sectionIds.length === 0 || citation.sectionIds.includes(section.id) || citation.claimIds.some((claimId) => section.claimIds.includes(claimId))));
+  const linkedEvidenceCells = uniqueEntitiesById(linkedCitations.flatMap((citation) => {
+    if (citation.evidenceCellId === null) {
+      return [];
+    }
+    const cell = readResearchWorkStoreEntity<WorkStoreEvidenceCell>(store, "evidenceCells", citation.evidenceCellId);
+    return cell === null ? [] : [cell];
+  }));
+  const linkedSources = uniqueEntitiesById([
+    ...section.sourceIds.flatMap((sourceId) => {
+      const source = canonicalSourceByEquivalentId(store, sourceId);
+      return source === null ? [] : [source];
+    }),
+    ...linkedCitations.flatMap((citation) => {
+      const source = canonicalSourceByEquivalentId(store, citation.sourceId);
+      return source === null ? [] : [source];
+    })
+  ]);
+  const workItems = store.objects.workItems
+    .filter((item) => item.status === "open")
+    .filter((item) => (
+      item.targetId === section.id
+      || item.targetId === section.sectionId
+      || item.affectedClaimIds.some((claimId) => section.claimIds.includes(claimId))
+    ));
+  const hygieneWarnings = manuscriptSectionHygieneWarnings(section).map((warning, index): AgentVisibleEntityPreview => ({
+    id: `${section.id}-hygiene-${index + 1}`,
+    kind: "manuscriptHygieneWarning",
+    title: "Mechanical section hygiene warning",
+    status: "warning",
+    snippet: warning,
+    fields: {
+      sectionId: section.id,
+      suggestedActions: ["section.read", "section.patch"]
+    }
+  }));
+
+  return [
+    ...hygieneWarnings,
+    ...linkedClaims.map((claim) => entityPreviewForAgent(claim, store)),
+    ...linkedCitations.map((citation) => entityPreviewForAgent(citation, store)),
+    ...linkedEvidenceCells.map((cell) => entityPreviewForAgent(cell, store)),
+    ...linkedSources.map((source) => entityPreviewForAgent(source, store)),
+    ...workItems.map((item) => entityPreviewForAgent(item, store)),
+    ...sectionCriticObjectionPreviews(store, section)
+  ].slice(0, 40);
+}
+
+function claimSourceIdsAfterSupportRetirement(input: {
+  store: ResearchWorkStore;
+  claim: WorkStoreClaim;
+  retiredSourceIds: string[];
+}): string[] {
+  const retiredSources = new Set(input.retiredSourceIds);
+  const activeSources = new Set(activeCitationsForClaim(input.store, input.claim.id).map((citation) => citation.sourceId));
+  return input.claim.sourceIds.filter((sourceId) => !retiredSources.has(sourceId) || activeSources.has(sourceId));
+}
+
+function safeSupportLinkMode(value: unknown): "append" | "replace" | "remove" {
+  return value === "replace" || value === "remove" ? value : "append";
+}
+
+function safeLifecycleStatus(value: unknown): "active" | "superseded" | "retired" | null {
+  return value === "active" || value === "superseded" || value === "retired" ? value : null;
+}
+
+function lifecyclePatchFromEntity(entity: Record<string, unknown>): Record<string, unknown> {
+  const status = safeLifecycleStatus(entity.status ?? entity.lifecycleStatus ?? entity.lifecycle);
+  const patch: Record<string, unknown> = {};
+  if (status !== null) {
+    patch.status = status;
+  }
+  if (typeof entity.supersededBy === "string" || entity.supersededBy === null) {
+    patch.supersededBy = entity.supersededBy;
+  }
+  const statusReason = stringInput(entity.statusReason ?? entity.reason ?? entity.rationale, "");
+  if (statusReason.length > 0) {
+    patch.statusReason = statusReason;
+  }
+  return patch;
 }
 
 function evidenceCellSupportSnippet(cell: WorkStoreEvidenceCell | null): string {
@@ -1655,6 +2185,9 @@ function supportLinkFromInput(input: {
     runId: input.run.id,
     createdAt: input.now,
     updatedAt: input.now,
+    status: "active",
+    supersededBy: null,
+    statusReason: null,
     sourceId,
     sourceTitle: sourceTitleForSupport(input.store, sourceId),
     evidenceCellId: evidenceCell?.id ?? input.evidenceCellId,
@@ -1696,6 +2229,13 @@ function recentExtractionPreviews(store: ResearchWorkStore, sourceId?: string | 
     .map((extraction) => entityPreviewForAgent(extraction, store));
 }
 
+function recentCitationPreviews(store: ResearchWorkStore, claimId?: string | null): AgentVisibleEntityPreview[] {
+  return store.objects.citations
+    .filter((citation) => claimId === undefined || claimId === null || citation.claimIds.includes(claimId))
+    .slice(-8)
+    .map((citation) => entityPreviewForAgent(citation, store));
+}
+
 function recentSourcePreviews(store: ResearchWorkStore): AgentVisibleEntityPreview[] {
   return store.objects.canonicalSources
     .slice(-8)
@@ -1724,6 +2264,7 @@ function claimLinkSupportBlockedResult(input: {
     related: [
       ...recentEvidenceCellPreviews(input.store, input.sourceId),
       ...recentExtractionPreviews(input.store, input.sourceId),
+      ...recentCitationPreviews(input.store),
       ...(input.sourceId === undefined || input.sourceId === null ? recentSourcePreviews(input.store) : [])
     ].slice(0, 24),
     nextHints: input.nextHints ?? ["workspace.list", "workspace.read", "evidence.create_cell", "claim.link_support", "claim.patch"]
@@ -1796,7 +2337,7 @@ function repairWorkspaceCitationsFromClaimSources(input: {
     }
     for (const sourceId of claim.sourceIds.filter((candidate) => knownSourceIds.has(candidate))) {
       const alreadyLinked = nextStore.objects.citations.some((citation) => (
-        citation.sourceId === sourceId && citation.claimIds.includes(claim.id)
+        researchObjectIsActive(citation) && citation.sourceId === sourceId && citation.claimIds.includes(claim.id)
       ));
       if (alreadyLinked) {
         continue;
@@ -1812,6 +2353,9 @@ function repairWorkspaceCitationsFromClaimSources(input: {
         runId: input.run.id,
         createdAt: input.now,
         updatedAt: input.now,
+        status: "active",
+        supersededBy: null,
+        statusReason: null,
         sourceId,
         sourceTitle: sourceTitleForSupport(input.store, sourceId),
         evidenceCellId: evidenceCell?.id ?? null,
@@ -1942,6 +2486,20 @@ function supportLinkCandidate(input: {
     return { chain: null, issues };
   }
 
+  if (!researchObjectIsActive(evidenceCell)) {
+    issues.push(supportIssue({
+      kind: "missing_evidence_cell",
+      message: `Support link ${input.citation.id} references evidence cell ${evidenceCell.id}, but that evidence cell is ${researchObjectLifecycleStatus(evidenceCell)}.`,
+      sectionId: input.section?.id ?? null,
+      claimId: input.claim.id,
+      citationId: input.citation.id,
+      sourceId: source.id,
+      evidenceCellId: evidenceCell.id,
+      suggestedActions: ["workspace.list", "claim.link_support"]
+    }));
+    return { chain: null, issues };
+  }
+
   if (!evidenceCellMatchesSource(input.store, evidenceCell, source)) {
     issues.push(supportIssue({
       kind: "source_mismatch",
@@ -2027,7 +2585,7 @@ function supportReadinessForWorkspace(store: ResearchWorkStore): SupportReadines
       continue;
     }
 
-    const citations = store.objects.citations.filter((citation) => citation.claimIds.includes(claim.id));
+    const citations = activeCitationsForClaim(store, claim.id);
     if (citations.length === 0) {
       issues.push(supportIssue({
         kind: "missing_support_link",
@@ -2300,6 +2858,9 @@ function paperExtractionFromToolInput(input: {
       runId: input.run.id,
       createdAt: input.now,
       updatedAt: input.now,
+      status: "active",
+      supersededBy: null,
+      statusReason: null,
       sourceId: source.id,
       extraction: paperExtraction
     }
@@ -2374,12 +2935,112 @@ function evidenceCellFromToolInput(input: {
     runId: input.run.id,
     createdAt: input.now,
     updatedAt: input.now,
+    status: "active",
+    supersededBy: null,
+    statusReason: null,
     sourceId: source.id,
     extractionId: extraction.id,
     field,
     value,
     confidence: stringInput(entity.confidence, "medium")
   };
+}
+
+function numberInput(value: unknown): number | null {
+  if (typeof value === "number" && Number.isInteger(value)) {
+    return value;
+  }
+  if (typeof value === "string" && /^[0-9]+$/.test(value.trim())) {
+    return Number.parseInt(value.trim(), 10);
+  }
+  return null;
+}
+
+type SectionPatchOperation =
+  | "replace_all"
+  | "replace_block"
+  | "insert_after_block"
+  | "append_paragraph"
+  | "remove_block"
+  | "update_title"
+  | "set_claim_links";
+
+function safeSectionPatchOperation(value: unknown, fallback: SectionPatchOperation): SectionPatchOperation {
+  return value === "replace_all"
+    || value === "replace_block"
+    || value === "insert_after_block"
+    || value === "append_paragraph"
+    || value === "remove_block"
+    || value === "update_title"
+    || value === "set_claim_links"
+    ? value
+    : fallback;
+}
+
+function safeManuscriptSectionStatus(value: unknown, fallback: WorkStoreManuscriptSection["status"]): WorkStoreManuscriptSection["status"] {
+  return value === "draft" || value === "needs_revision" || value === "checked"
+    ? value
+    : fallback;
+}
+
+function explicitSectionMarkdown(entity: Record<string, unknown>, changes: Record<string, unknown>): string {
+  const paragraphs = stringArrayInput(entity.paragraphs ?? changes.paragraphs, 80);
+  return stringInput(
+    entity.markdown
+      ?? entity.content
+      ?? entity.paragraph
+      ?? entity.text
+      ?? changes.markdown
+      ?? changes.content
+      ?? changes.paragraph
+      ?? changes.text,
+    paragraphs.join("\n\n")
+  );
+}
+
+function patchedSectionMarkdown(input: {
+  existing: WorkStoreManuscriptSection | null | undefined;
+  operation: SectionPatchOperation;
+  blockIndex: number | null;
+  markdown: string;
+}): string | null {
+  if (input.existing === null || input.existing === undefined) {
+    return input.markdown.length > 0 ? input.markdown : null;
+  }
+
+  const blocks = manuscriptSectionBlocks(input.existing.markdown);
+  switch (input.operation) {
+    case "replace_all":
+      return input.markdown.length > 0 ? input.markdown : input.existing.markdown;
+    case "replace_block": {
+      if (input.markdown.length === 0 || input.blockIndex === null || input.blockIndex < 1 || input.blockIndex > blocks.length) {
+        return null;
+      }
+      blocks[input.blockIndex - 1] = input.markdown;
+      return blocks.join("\n\n");
+    }
+    case "insert_after_block": {
+      if (input.markdown.length === 0 || input.blockIndex === null || input.blockIndex < 0 || input.blockIndex > blocks.length) {
+        return null;
+      }
+      blocks.splice(input.blockIndex, 0, input.markdown);
+      return blocks.join("\n\n");
+    }
+    case "append_paragraph":
+      return input.markdown.length === 0
+        ? null
+        : [...blocks, input.markdown].join("\n\n");
+    case "remove_block": {
+      if (input.blockIndex === null || input.blockIndex < 1 || input.blockIndex > blocks.length) {
+        return null;
+      }
+      blocks.splice(input.blockIndex - 1, 1);
+      return blocks.join("\n\n");
+    }
+    case "update_title":
+    case "set_claim_links":
+      return input.existing.markdown;
+  }
 }
 
 function manuscriptSectionFromToolInput(input: {
@@ -2390,18 +3051,26 @@ function manuscriptSectionFromToolInput(input: {
 }): WorkStoreManuscriptSection | null {
   const entity = input.decision.inputs.workStore?.entity ?? {};
   const changes = input.decision.inputs.workStore?.changes ?? {};
+  const operation = safeSectionPatchOperation(
+    entity.operation ?? entity.patchOperation ?? changes.operation ?? changes.patchOperation,
+    "replace_all"
+  );
   const sectionId = stringInput(
     entity.sectionId ?? changes.sectionId,
     input.existing?.sectionId ?? stringInput(input.decision.inputs.workStore?.entityId, "discussion")
   );
-  const paragraphs = stringArrayInput(entity.paragraphs ?? changes.paragraphs, 80);
-  const markdown = stringInput(
-    entity.markdown ?? entity.content ?? entity.paragraph ?? changes.markdown ?? changes.content ?? changes.paragraph,
-    paragraphs.join("\n\n")
-  );
-  if (markdown.length === 0) {
+  const markdown = patchedSectionMarkdown({
+    existing: input.existing,
+    operation,
+    blockIndex: numberInput(entity.blockIndex ?? entity.block ?? changes.blockIndex ?? changes.block),
+    markdown: explicitSectionMarkdown(entity, changes)
+  });
+  if (markdown === null || markdown.length === 0) {
     return null;
   }
+  const exactClaimIds = operation === "set_claim_links"
+    ? stringArrayInput(entity.claimIds ?? changes.claimIds, 40)
+    : null;
 
   return {
     id: input.existing?.id ?? stringInput(entity.id, generatedToolEntityId("section", input.run, input.now, sectionId)),
@@ -2418,11 +3087,11 @@ function manuscriptSectionFromToolInput(input: {
       ...input.decision.inputs.paperIds,
       ...stringArrayInput(entity.sourceIds ?? changes.sourceIds, 40)
     ]),
-    claimIds: uniqueStrings([
+    claimIds: exactClaimIds ?? uniqueStrings([
       ...(input.existing?.claimIds ?? []),
       ...stringArrayInput(entity.claimIds ?? changes.claimIds, 40)
     ]),
-    status: "needs_revision"
+    status: safeManuscriptSectionStatus(entity.status ?? changes.status, "needs_revision")
   };
 }
 
@@ -3485,7 +4154,10 @@ async function executeResearchObjectToolAction(input: {
         })
       };
     }
-    review = normalizeCriticReview(review, request);
+    review = {
+      ...normalizeCriticReview(review, request),
+      reviewedSnapshot: criticFreshnessSnapshotForStore(input.store)
+    };
 
     await writeJsonArtifact(criticReviewArtifactPath(input.run, stage), review);
     const nextStore = upsertNotebookArtifactLink(input.store, criticReviewArtifactLink({
@@ -3520,11 +4192,13 @@ async function executeResearchObjectToolAction(input: {
             stage: review.stage,
             readiness: review.readiness,
             confidence: review.confidence,
-            artifactPath: criticReviewArtifactPath(input.run, stage),
-            objections: review.objections.length,
-            positiveFindings: review.positiveFindings.length,
-            recommendedNextActions: review.recommendedNextActions.slice(0, 6)
-          }
+              artifactPath: criticReviewArtifactPath(input.run, stage),
+              objections: review.objections.length,
+              positiveFindings: review.positiveFindings.length,
+              reviewedFingerprint: review.reviewedSnapshot?.fingerprint ?? null,
+              reviewedObjects: review.reviewedSnapshot?.objects.length ?? 0,
+              recommendedNextActions: review.recommendedNextActions.slice(0, 6)
+            }
         },
         items: review.objections.slice(0, 12).map((objection, index): AgentVisibleEntityPreview => ({
           id: `${review.stage}-critic-objection-${index + 1}`,
@@ -3804,6 +4478,7 @@ async function executeResearchObjectToolAction(input: {
 
   if (input.decision.action === "claim.link_support") {
     const link = args.link ?? defaultWorkStoreArgs().link;
+    const mode = safeSupportLinkMode(args.entity.mode ?? args.entity.supportMode ?? args.entity.operation ?? args.changes.mode);
     const claimCandidates = stringCandidates(
       args.entityId,
       args.entity.claimId,
@@ -3812,8 +4487,24 @@ async function executeResearchObjectToolAction(input: {
       link?.fromCollection === "claims" ? link.fromId : null,
       link?.toCollection === "claims" ? link.toId : null
     );
+    const supportLinkIdCandidates = stringCandidates(
+      args.entity.citationId,
+      args.entity.supportLinkId,
+      args.entity.linkId,
+      args.entity.oldCitationId,
+      args.entity.replaceCitationId,
+      args.entity.previousCitationId,
+      link?.fromCollection === "citations" ? link.fromId : null,
+      link?.toCollection === "citations" ? link.toId : null
+    );
+    const supportLinkCandidate = supportLinkIdCandidates
+      .map((candidate) => readResearchWorkStoreEntity<WorkStoreCitation>(input.store, "citations", candidate))
+      .find((candidate): candidate is WorkStoreCitation => candidate !== null) ?? null;
     const resolvedClaim = resolveClaimReference(input.store, claimCandidates);
-    const claimId = resolvedClaim?.id ?? null;
+    const claimFromSupportLink = supportLinkCandidate?.claimIds[0] === undefined
+      ? null
+      : readResearchWorkStoreEntity<WorkStoreClaim>(input.store, "claims", supportLinkCandidate.claimIds[0]);
+    const claimId = resolvedClaim?.id ?? claimFromSupportLink?.id ?? null;
     const evidenceCellId = stringInput(
       args.entity.evidenceCellId
         ?? stringArrayInput(args.entity.evidenceCellIds, 1)[0]
@@ -3828,6 +4519,8 @@ async function executeResearchObjectToolAction(input: {
       ...input.decision.inputs.paperIds,
       stringInput(args.entity.paperId, ""),
       ...stringArrayInput(args.entity.sourceIds, 20),
+      stringInput(args.entity.oldSourceId, ""),
+      stringInput(args.entity.replaceSourceId, ""),
       link?.toCollection === "canonicalSources" || link?.toCollection === "sources" ? link.toId : null,
       link?.fromCollection === "canonicalSources" || link?.fromCollection === "sources" ? link.fromId : null,
       evidenceCell?.sourceId ?? null
@@ -3836,12 +4529,12 @@ async function executeResearchObjectToolAction(input: {
     const resolvedSourceId = sourceId.length > 0
       ? sourceId
       : evidenceCell?.sourceId ?? "";
-    if (claimId === null || resolvedSourceId.length === 0) {
+    if (claimId === null || (mode !== "remove" && resolvedSourceId.length === 0)) {
       const missing = [
         claimId === null ? "claimId" : null,
-        resolvedSourceId.length === 0 ? "sourceId or evidenceCellId" : null
+        mode !== "remove" && resolvedSourceId.length === 0 ? "sourceId or evidenceCellId" : null
       ].filter((item): item is string => item !== null);
-      const message = `claim.link_support blocked because ${missing.join(" and ")} ${missing.length === 1 ? "is" : "are"} missing or could not be resolved.`;
+      const message = `claim.link_support ${mode} blocked because ${missing.join(" and ")} ${missing.length === 1 ? "is" : "are"} missing or could not be resolved.`;
       return {
         handled: true,
         store: input.store,
@@ -3853,7 +4546,9 @@ async function executeResearchObjectToolAction(input: {
           store: input.store,
           query: {
             missing,
+            mode,
             claimCandidates,
+            supportLinkIdCandidates,
             sourceCandidates: sourceIds,
             evidenceCellId: evidenceCellId || null
           }
@@ -3874,12 +4569,120 @@ async function executeResearchObjectToolAction(input: {
           store: input.store,
           sourceId: resolvedSourceId,
           query: {
+            mode,
             claimId,
             claimCandidates,
+            supportLinkIdCandidates,
             sourceId: resolvedSourceId,
             evidenceCellId: evidenceCellId || null
           },
           nextHints: ["workspace.search", "claim.create", "claim.link_support"]
+        })
+      };
+    }
+    const activeSupportLinks = activeCitationsForClaim(input.store, claimId);
+    if (mode === "remove") {
+      const oldEvidenceCellIds = new Set(stringCandidates(
+        evidenceCell?.id ?? null,
+        evidenceCellId,
+        args.entity.oldEvidenceCellId,
+        args.entity.replaceEvidenceCellId,
+        args.entity.previousEvidenceCellId
+      ));
+      const oldSourceIds = new Set(sourceIds.filter((candidate) => candidate.length > 0));
+      const supportLinksToRetire = activeSupportLinks.filter((citation) => (
+        supportLinkIdCandidates.includes(citation.id)
+        || (oldEvidenceCellIds.size > 0 && citation.evidenceCellId !== null && oldEvidenceCellIds.has(citation.evidenceCellId))
+        || (oldSourceIds.size > 0 && oldSourceIds.has(citation.sourceId))
+      ));
+      if (supportLinksToRetire.length === 0) {
+        const message = "claim.link_support remove blocked because no active support link matched the provided citationId, evidenceCellId, or sourceId.";
+        return {
+          handled: true,
+          store: input.store,
+          message,
+          result: claimLinkSupportBlockedResult({
+            run: input.run,
+            timestamp: nowText,
+            message,
+            store: input.store,
+            sourceId: resolvedSourceId.length > 0 ? resolvedSourceId : null,
+            query: {
+              mode,
+              claimId,
+              supportLinkIdCandidates,
+              evidenceCellId: evidenceCellId || null,
+              sourceCandidates: sourceIds,
+              activeSupportLinkIds: activeSupportLinks.map((citation) => citation.id)
+            },
+            nextHints: ["workspace.list", "workspace.read", "claim.link_support"]
+          })
+        };
+      }
+
+      let nextStore = input.store;
+      const statusReason = stringInput(args.entity.statusReason ?? args.entity.reason ?? input.decision.inputs.reason, "Retired by explicit claim.link_support remove action.");
+      for (const citation of supportLinksToRetire) {
+        nextStore = patchResearchWorkStoreEntity(nextStore, {
+          collection: "citations",
+          id: citation.id,
+          changes: {
+            status: "retired",
+            supersededBy: null,
+            statusReason
+          }
+        }, nowText);
+      }
+      const claimAfterRetire = readResearchWorkStoreEntity<WorkStoreClaim>(nextStore, "claims", claimId) ?? claim;
+      nextStore = patchResearchWorkStoreEntity(nextStore, {
+        collection: "claims",
+        id: claimId,
+        changes: {
+          sourceIds: claimSourceIdsAfterSupportRetirement({
+            store: nextStore,
+            claim: claimAfterRetire,
+            retiredSourceIds: supportLinksToRetire.map((citation) => citation.sourceId)
+          })
+        }
+      }, nowText);
+      const supportReadiness = supportReadinessForWorkspace(nextStore);
+      const supported = supportReadiness.supportedClaimIds.has(claimId);
+      const claimIssues = supportReadiness.issues.filter((issue) => issue.claimId === claimId);
+      nextStore = patchResearchWorkStoreEntity(nextStore, {
+        collection: "claims",
+        id: claimId,
+        changes: {
+          supportStatus: supported ? "supported" : "weak",
+          risk: supported ? null : claimIssues[0]?.message ?? "No active evidence-backed support link currently supports this claim."
+        }
+      }, nowText);
+      await writeResearchWorkStore(nextStore);
+      const updatedClaim = readResearchWorkStoreEntity<WorkStoreClaim>(nextStore, "claims", claimId);
+      const retiredPreviews = supportLinksToRetire.flatMap((citation) => {
+        const updated = readResearchWorkStoreEntity<WorkStoreCitation>(nextStore, "citations", citation.id);
+        return updated === null ? [] : [entityPreviewForAgent(updated, nextStore)];
+      });
+      const message = `Retired ${supportLinksToRetire.length} support link(s) for claim ${claimId}.`;
+      return {
+        handled: true,
+        store: nextStore,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          readOnly: false,
+          message,
+          collection: "citations",
+          count: supportLinksToRetire.length,
+          totalCount: nextStore.objects.citations.length,
+          items: retiredPreviews,
+          related: updatedClaim === null ? [] : [entityPreviewForAgent(updatedClaim, nextStore)],
+          stateDelta: {
+            supportLinksRetired: supportLinksToRetire.length,
+            claimsPatched: 1
+          },
+          nextHints: supported ? ["release.verify", "workspace.read"] : ["claim.link_support", "claim.patch", "workspace.list"]
         })
       };
     }
@@ -3911,6 +4714,7 @@ async function executeResearchObjectToolAction(input: {
           store: input.store,
           sourceId: resolvedSourceId,
           query: {
+            mode,
             claimId,
             sourceId: resolvedSourceId,
             evidenceCellId: evidenceCellId || null
@@ -3921,7 +4725,63 @@ async function executeResearchObjectToolAction(input: {
     }
     const existingCitation = readResearchWorkStoreEntity<WorkStoreCitation>(input.store, "citations", citation.id);
     let nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, citation, nowText);
-    const nextClaimSourceIds = uniqueStrings([...claim.sourceIds, citation.sourceId]);
+    let replacedCount = 0;
+    if (mode === "replace") {
+      const replacementEvidenceCellIds = new Set(stringCandidates(
+        args.entity.oldEvidenceCellId,
+        args.entity.replaceEvidenceCellId,
+        args.entity.previousEvidenceCellId
+      ));
+      const replacementSourceIds = new Set(stringCandidates(
+        args.entity.oldSourceId,
+        args.entity.replaceSourceId
+      ));
+      const replacementTargets = activeSupportLinks.filter((candidate) => (
+        candidate.id !== citation.id
+        && (
+          supportLinkIdCandidates.length === 0 && replacementEvidenceCellIds.size === 0 && replacementSourceIds.size === 0
+            ? true
+            : supportLinkIdCandidates.includes(candidate.id)
+              || (candidate.evidenceCellId !== null && replacementEvidenceCellIds.has(candidate.evidenceCellId))
+              || replacementSourceIds.has(candidate.sourceId)
+        )
+      ));
+      const statusReason = stringInput(args.entity.statusReason ?? args.entity.reason ?? input.decision.inputs.reason, `Superseded by ${citation.id}.`);
+      for (const oldCitation of replacementTargets) {
+        nextStore = patchResearchWorkStoreEntity(nextStore, {
+          collection: "citations",
+          id: oldCitation.id,
+          changes: {
+            status: "superseded",
+            supersededBy: citation.id,
+            statusReason
+          }
+        }, nowText);
+      }
+      replacedCount = replacementTargets.length;
+    }
+    const retiredSourceIds = mode === "replace"
+      ? input.store.objects.citations
+        .filter((candidate) => {
+          const nextCandidate = readResearchWorkStoreEntity<WorkStoreCitation>(nextStore, "citations", candidate.id);
+          return nextCandidate !== null
+            && nextCandidate.claimIds.includes(claimId)
+            && researchObjectLifecycleStatus(nextCandidate) === "superseded";
+        })
+        .map((candidate) => candidate.sourceId)
+      : [];
+    const retainedClaimSourceIds = mode === "replace"
+      ? claimSourceIdsAfterSupportRetirement({
+        store: nextStore,
+        claim,
+        retiredSourceIds
+      })
+      : claim.sourceIds;
+    const nextClaimSourceIds = uniqueStrings([
+      ...retainedClaimSourceIds,
+      ...activeCitationsForClaim(nextStore, claimId).map((activeCitation) => activeCitation.sourceId),
+      citation.sourceId
+    ]);
     const nextUsedInSections = uniqueStrings([...claim.usedInSections, ...sectionIds]);
     nextStore = patchResearchWorkStoreEntity(nextStore, {
       collection: "claims",
@@ -3945,7 +4805,9 @@ async function executeResearchObjectToolAction(input: {
     }, nowText);
     await writeResearchWorkStore(nextStore);
     const updatedClaim = readResearchWorkStoreEntity<WorkStoreClaim>(nextStore, "claims", claimId);
-    const message = `Support link ${existingCitation === null ? "attached" : "updated"} from ${citation.sourceTitle} to claim ${claimId}.`;
+    const message = mode === "replace"
+      ? `Support link attached from ${citation.sourceTitle} to claim ${claimId}; superseded ${replacedCount} old support link(s).`
+      : `Support link ${existingCitation === null ? "attached" : "updated"} from ${citation.sourceTitle} to claim ${claimId}.`;
     return {
       handled: true,
       store: nextStore,
@@ -3962,9 +4824,141 @@ async function executeResearchObjectToolAction(input: {
         entity: entityPreviewForAgent(citation, nextStore),
         related: updatedClaim === null ? [] : [entityPreviewForAgent(updatedClaim, nextStore)],
         stateDelta: existingCitation === null
-          ? { supportLinksCreated: 1 }
-          : { supportLinksUpdated: 1 },
+          ? { supportLinksCreated: 1, supportLinksSuperseded: replacedCount }
+          : { supportLinksUpdated: 1, supportLinksSuperseded: replacedCount },
         nextHints: ["section.link_claim", "claim.check_support", "release.verify"]
+      })
+    };
+  }
+
+  if (input.decision.action === "extraction.patch") {
+    const extractionId = args.entityId ?? stringInput(args.entity.extractionId ?? args.entity.id, "");
+    const extraction = extractionId.length === 0 ? null : readResearchWorkStoreEntity<WorkStoreExtraction>(input.store, "extractions", extractionId);
+    if (extraction === null) {
+      const message = "Extraction patch blocked because no known extraction id was provided.";
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "blocked",
+          readOnly: false,
+          message,
+          collection: "extractions",
+          count: 0,
+          totalCount: input.store.objects.extractions.length,
+          items: recentExtractionPreviews(input.store),
+          nextHints: ["workspace.list", "workspace.read", "extraction.patch"]
+        })
+      };
+    }
+    const lifecyclePatch = lifecyclePatchFromEntity(args.entity);
+    const supersededBy = typeof lifecyclePatch.supersededBy === "string" ? lifecyclePatch.supersededBy : null;
+    if (supersededBy !== null && readResearchWorkStoreEntity<WorkStoreExtraction>(input.store, "extractions", supersededBy) === null) {
+      const message = `Extraction patch blocked because supersededBy extraction ${supersededBy} was not found.`;
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "blocked",
+          readOnly: false,
+          message,
+          collection: "extractions",
+          query: { entityId: extractionId, supersededBy },
+          items: recentExtractionPreviews(input.store, extraction.sourceId),
+          nextHints: ["workspace.list", "workspace.read", "extraction.patch"]
+        })
+      };
+    }
+    const extractionFieldPatch: Partial<PaperExtraction> = {};
+    for (const field of [
+      "problemSetting",
+      "systemType",
+      "architecture",
+      "toolsAndMemory",
+      "planningStyle",
+      "evaluationSetup",
+      "confidence"
+    ] as const) {
+      const value = args.entity[field] ?? args.changes[field];
+      if (typeof value === "string") {
+        (extractionFieldPatch as Record<string, unknown>)[field] = value;
+      }
+    }
+    for (const field of ["successSignals", "failureModes", "limitations", "evidenceNotes"] as const) {
+      const value = args.entity[field] ?? args.changes[field];
+      if (Array.isArray(value)) {
+        (extractionFieldPatch as Record<string, unknown>)[field] = stringArrayInput(value, 80);
+      }
+    }
+    const supportedClaimsValue = args.entity.supportedClaims ?? args.changes.supportedClaims;
+    if (supportedClaimsValue !== undefined) {
+      extractionFieldPatch.supportedClaims = supportedClaimsFromToolInput(supportedClaimsValue);
+    }
+    const changes: Record<string, unknown> = {
+      ...args.changes,
+      ...lifecyclePatch
+    };
+    for (const field of Object.keys(extractionFieldPatch)) {
+      delete changes[field];
+    }
+    if (Object.keys(extractionFieldPatch).length > 0) {
+      changes.extraction = {
+        ...extraction.extraction,
+        ...extractionFieldPatch
+      };
+    }
+    if (Object.keys(changes).length === 0) {
+      const message = `Extraction patch skipped for ${extractionId} because no patch fields were provided.`;
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "noop",
+          readOnly: false,
+          message,
+          collection: "extractions",
+          entity: entityPreviewForAgent(extraction, input.store),
+          nextHints: ["workspace.read", "evidence.patch", "extraction.patch"]
+        })
+      };
+    }
+    const nextStore = patchResearchWorkStoreEntity(input.store, {
+      collection: "extractions",
+      id: extractionId,
+      changes
+    }, nowText);
+    await writeResearchWorkStore(nextStore);
+    const updatedExtraction = readResearchWorkStoreEntity<WorkStoreExtraction>(nextStore, "extractions", extractionId);
+    const message = `Extraction patched ${extractionId}; status is ${updatedExtraction === null ? "unknown" : researchObjectLifecycleStatus(updatedExtraction)}.`;
+    return {
+      handled: true,
+      store: nextStore,
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        readOnly: false,
+        message,
+        collection: "extractions",
+        query: { entityId: extractionId },
+        count: updatedExtraction === null ? 0 : 1,
+        totalCount: nextStore.objects.extractions.length,
+        entity: updatedExtraction === null ? null : entityPreviewForAgent(updatedExtraction, nextStore),
+        stateDelta: { extractionsPatched: 1 },
+        nextHints: ["workspace.read", "evidence.patch", "evidence.create_cell"]
       })
     };
   }
@@ -4032,6 +5026,146 @@ async function executeResearchObjectToolAction(input: {
         nextHints: warnings.length > 0
           ? ["workspace.read", "extraction.create", "evidence.create_cell"]
           : ["evidence.create_cell", "workspace.read", "claim.create"]
+      })
+    };
+  }
+
+  if (input.decision.action === "evidence.patch") {
+    const evidenceCellId = args.entityId ?? stringInput(args.entity.evidenceCellId ?? args.entity.id, "");
+    const cell = evidenceCellId.length === 0 ? null : readResearchWorkStoreEntity<WorkStoreEvidenceCell>(input.store, "evidenceCells", evidenceCellId);
+    if (cell === null) {
+      const message = "Evidence patch blocked because no known evidence cell id was provided.";
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "blocked",
+          readOnly: false,
+          message,
+          collection: "evidenceCells",
+          count: 0,
+          totalCount: input.store.objects.evidenceCells.length,
+          items: recentEvidenceCellPreviews(input.store),
+          nextHints: ["workspace.list", "workspace.read", "evidence.patch"]
+        })
+      };
+    }
+    const lifecyclePatch = lifecyclePatchFromEntity(args.entity);
+    const supersededBy = typeof lifecyclePatch.supersededBy === "string" ? lifecyclePatch.supersededBy : null;
+    if (supersededBy !== null && readResearchWorkStoreEntity<WorkStoreEvidenceCell>(input.store, "evidenceCells", supersededBy) === null) {
+      const message = `Evidence patch blocked because supersededBy evidence cell ${supersededBy} was not found.`;
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "blocked",
+          readOnly: false,
+          message,
+          collection: "evidenceCells",
+          query: { entityId: evidenceCellId, supersededBy },
+          items: recentEvidenceCellPreviews(input.store, cell.sourceId),
+          nextHints: ["workspace.list", "workspace.read", "evidence.patch"]
+        })
+      };
+    }
+    const requestedExtractionId = stringInput(args.entity.extractionId ?? args.changes.extractionId, "");
+    if (requestedExtractionId.length > 0 && readResearchWorkStoreEntity<WorkStoreExtraction>(input.store, "extractions", requestedExtractionId) === null) {
+      const message = `Evidence patch blocked because extraction ${requestedExtractionId} was not found.`;
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "blocked",
+          readOnly: false,
+          message,
+          collection: "evidenceCells",
+          query: { entityId: evidenceCellId, extractionId: requestedExtractionId },
+          related: recentExtractionPreviews(input.store, cell.sourceId),
+          nextHints: ["workspace.list", "workspace.read", "extraction.create"]
+        })
+      };
+    }
+    const changes: Record<string, unknown> = {
+      ...args.changes,
+      ...lifecyclePatch
+    };
+    delete changes.field;
+    delete changes.value;
+    delete changes.text;
+    delete changes.evidenceText;
+    delete changes.confidence;
+    delete changes.extractionId;
+    const field = args.entity.field ?? args.changes.field;
+    if (typeof field === "string" && evidenceCellFields.includes(field as WorkStoreEvidenceCell["field"])) {
+      changes.field = field;
+    }
+    const value = args.entity.value ?? args.entity.evidenceText ?? args.entity.text ?? args.changes.value ?? args.changes.text;
+    if (value !== undefined) {
+      changes.value = Array.isArray(value) ? stringArrayInput(value, 80) : stringInput(value, "");
+    }
+    const confidence = stringInput(args.entity.confidence ?? args.changes.confidence, "");
+    if (confidence.length > 0) {
+      changes.confidence = confidence;
+    }
+    if (requestedExtractionId.length > 0) {
+      changes.extractionId = requestedExtractionId;
+    }
+    if (Object.keys(changes).length === 0) {
+      const message = `Evidence patch skipped for ${evidenceCellId} because no patch fields were provided.`;
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "noop",
+          readOnly: false,
+          message,
+          collection: "evidenceCells",
+          entity: entityPreviewForAgent(cell, input.store),
+          nextHints: ["workspace.read", "evidence.patch", "claim.link_support"]
+        })
+      };
+    }
+    const nextStore = patchResearchWorkStoreEntity(input.store, {
+      collection: "evidenceCells",
+      id: evidenceCellId,
+      changes
+    }, nowText);
+    await writeResearchWorkStore(nextStore);
+    const updatedCell = readResearchWorkStoreEntity<WorkStoreEvidenceCell>(nextStore, "evidenceCells", evidenceCellId);
+    const message = `Evidence cell patched ${evidenceCellId}; status is ${updatedCell === null ? "unknown" : researchObjectLifecycleStatus(updatedCell)}.`;
+    return {
+      handled: true,
+      store: nextStore,
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp: nowText,
+        readOnly: false,
+        message,
+        collection: "evidenceCells",
+        query: { entityId: evidenceCellId },
+        count: updatedCell === null ? 0 : 1,
+        totalCount: nextStore.objects.evidenceCells.length,
+        entity: updatedCell === null ? null : entityPreviewForAgent(updatedCell, nextStore),
+        stateDelta: { evidenceCellsPatched: 1 },
+        nextHints: ["workspace.read", "claim.link_support", "release.verify"]
       })
     };
   }
@@ -4118,7 +5252,9 @@ async function executeResearchObjectToolAction(input: {
     const matrix = buildEvidenceMatrix({
       runId: input.run.id,
       brief: input.run.brief,
-      paperExtractions: input.store.objects.extractions.map((entry) => entry.extraction)
+      paperExtractions: input.store.objects.extractions
+        .filter(researchObjectIsActive)
+        .map((entry) => entry.extraction)
     });
     const rowItems = matrix.rows.slice(0, 20).map((row): AgentVisibleEntityPreview => ({
       id: row.extractionId,
@@ -4172,11 +5308,17 @@ async function executeResearchObjectToolAction(input: {
 
   if (input.decision.action === "section.read") {
     const timestamp = input.now();
-    const sectionId = args.entityId;
-    const section = sectionId === null ? null : readResearchWorkStoreEntity<WorkStoreManuscriptSection>(input.store, "manuscriptSections", sectionId);
+    const sectionCandidates = stringCandidates(
+      args.entityId,
+      args.entity.id,
+      args.entity.sectionId,
+      args.entity.manuscriptSectionId,
+      input.decision.inputs.paperIds[0]
+    );
+    const section = resolveSectionReference(input.store, sectionCandidates);
     const message = section === null
       ? "Section read found no section."
-      : `Section read ${section.title}.`;
+      : `Section read ${section.title}: ${manuscriptSectionBlocks(section.markdown).length} block(s), ${section.claimIds.length} linked claim(s), ${manuscriptSectionHygieneWarnings(section).length} mechanical hygiene warning(s).`;
     return {
       handled: true,
       store: input.store,
@@ -4190,19 +5332,28 @@ async function executeResearchObjectToolAction(input: {
         message,
         collection: "manuscriptSections",
         query: {
-          entityId: sectionId
+          entityId: sectionCandidates[0] ?? null
         },
         count: section === null ? 0 : 1,
         totalCount: section === null ? 0 : 1,
         entity: section === null ? null : entityPreviewForAgent(section, input.store),
+        items: section === null ? [] : sectionBlockPreviews(section),
+        related: section === null ? input.store.objects.manuscriptSections.slice(-8).map((entry) => entityPreviewForAgent(entry, input.store)) : sectionRepairRelatedPreviews(input.store, section),
         nextHints: section === null ? ["section.create"] : ["section.patch", "section.link_claim", "section.check_claims"]
       })
     };
   }
 
   if (input.decision.action === "section.create" || input.decision.action === "section.patch") {
-    const sectionId = args.entityId;
-    const existing = sectionId === null ? null : readResearchWorkStoreEntity<WorkStoreManuscriptSection>(input.store, "manuscriptSections", sectionId);
+    const existing = input.decision.action === "section.patch"
+      ? resolveSectionReference(input.store, stringCandidates(
+        args.entityId,
+        args.entity.id,
+        args.entity.sectionId,
+        args.entity.manuscriptSectionId,
+        input.decision.inputs.paperIds[0]
+      ))
+      : null;
     const section = manuscriptSectionFromToolInput({
       run: input.run,
       now: nowText,
@@ -4210,7 +5361,7 @@ async function executeResearchObjectToolAction(input: {
       existing
     });
     if (section === null) {
-      const message = "Section create/patch blocked because explicit manuscript content is required in workStore.entity.markdown, content, paragraph, or paragraphs; process rationale/expectedOutcome is never persisted as section prose.";
+      const message = "Section create/patch blocked. section.create requires explicit manuscript content in workStore.entity.markdown, content, paragraph, or paragraphs. section.patch accepts replace_all, replace_block, insert_after_block, append_paragraph, remove_block, update_title, or set_claim_links; block operations require a 1-based blockIndex when relevant. Process rationale/expectedOutcome is never persisted as section prose.";
       return {
         handled: true,
         store: input.store,
@@ -4226,13 +5377,14 @@ async function executeResearchObjectToolAction(input: {
           count: 0,
           totalCount: input.store.objects.manuscriptSections.length,
           items: input.store.objects.manuscriptSections.slice(-8).map((entry) => entityPreviewForAgent(entry, input.store)),
-          nextHints: ["workspace.read", "section.create", "section.patch", "notebook.patch"]
+          nextHints: ["section.read", "workspace.read", "section.create", "section.patch", "notebook.patch"]
         })
       };
     }
     const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, section, nowText);
     await writeResearchWorkStore(nextStore);
-    const message = `Section updated ${section.id}.`;
+    const hygieneWarningCount = manuscriptSectionHygieneWarnings(section).length;
+    const message = `Section updated ${section.id}: ${manuscriptSectionBlocks(section.markdown).length} block(s), ${section.claimIds.length} linked claim(s), ${hygieneWarningCount} mechanical hygiene warning(s).`;
     return {
       handled: true,
       store: nextStore,
@@ -4247,10 +5399,15 @@ async function executeResearchObjectToolAction(input: {
         count: 1,
         totalCount: nextStore.objects.manuscriptSections.length,
         entity: entityPreviewForAgent(section, nextStore),
+        items: sectionBlockPreviews(section),
+        related: sectionRepairRelatedPreviews(nextStore, section),
         stateDelta: {
-          [input.decision.action === "section.create" ? "sectionsCreated" : "sectionsPatched"]: 1
+          [input.decision.action === "section.create" ? "sectionsCreated" : "sectionsPatched"]: 1,
+          sectionHygieneWarnings: hygieneWarningCount
         },
-        nextHints: ["section.link_claim", "section.check_claims", "release.verify"]
+        nextHints: hygieneWarningCount > 0
+          ? ["section.read", "section.patch", "section.link_claim", "section.check_claims"]
+          : ["section.link_claim", "section.check_claims", "release.verify"]
       })
     };
   }
@@ -4351,13 +5508,19 @@ async function executeResearchObjectToolAction(input: {
       entity: args.entity,
       notebook: input.store.notebook
     });
+    const releaseCriticFreshness = criticFreshnessEvaluationForStore({
+      store: input.store,
+      stage: "release",
+      artifactPath: criticReviewArtifactPath(input.run, "release")
+    });
     const artifactContract = evaluateArtifactContract({
       run: input.run,
       store: input.store,
       references,
       hardInvariantFailures: checkBundle.checks.filter((check) => check.status === "fail" && check.severity === "blocker"),
       requestedMissionTarget,
-      criticAvailable: criticReviewAvailable(input.researchBackend)
+      criticAvailable: criticReviewAvailable(input.researchBackend),
+      releaseCriticFreshness
     });
     const status = hardFailures.length > 0 || notebookReadinessIssue !== null || !artifactContract.canFinalize ? "not_ready" : "ok";
     const message = hardFailures.length > 0
@@ -4365,7 +5528,7 @@ async function executeResearchObjectToolAction(input: {
       : notebookReadinessIssue !== null
         ? `Mechanical release verification only: checks passed with 0 hard invariant blocker(s), but research readiness has not been intentionally recorded for finalization: ${notebookReadinessIssue} This does not assess research quality.`
         : artifactContract.canFinalize
-          ? `Mechanical release verification only: checks passed. Artifact contract ${artifactContract.missionTarget}/${artifactContract.paperMode} is structurally ready for manuscript.finalize. Passing this does not assess research quality or scientific sufficiency.`
+          ? `Mechanical release verification only: checks passed. Release critic freshness is ${releaseCriticFreshness.status}. Artifact contract ${artifactContract.missionTarget}/${artifactContract.paperMode} is structurally ready for manuscript.finalize. Passing this does not assess research quality or scientific sufficiency.`
           : `Mechanical release verification only: checks passed, but artifact contract ${artifactContract.missionTarget}/${artifactContract.paperMode} is not ready for finalization: ${artifactContract.failures.slice(0, 3).join(" ")} Continue machine-actionable research work; do not stop as a brief.`;
     return {
       handled: true,
@@ -4391,6 +5554,7 @@ async function executeResearchObjectToolAction(input: {
           releaseChecksCreated: releaseChecks.length,
           hardInvariantBlockers: hardFailures.length,
           artifactContractFailures: artifactContract.failures.length,
+          releaseCriticFreshnessProblems: releaseCriticFreshness.status === "fresh" ? 0 : 1,
           notebookDiagnosticWarnings: notebookDiagnostics.warningCount,
           notebookReadinessRecorded: notebookReadinessIssue === null ? 1 : 0
         },
@@ -4431,13 +5595,19 @@ async function executeResearchObjectToolAction(input: {
       entity: args.entity,
       notebook: input.store.notebook
     });
+    const releaseCriticFreshness = criticFreshnessEvaluationForStore({
+      store: input.store,
+      stage: "release",
+      artifactPath: criticReviewArtifactPath(input.run, "release")
+    });
     const artifactContract = evaluateArtifactContract({
       run: input.run,
       store: input.store,
       references,
       hardInvariantFailures: hardFailures,
       requestedMissionTarget,
-      criticAvailable: criticReviewAvailable(input.researchBackend)
+      criticAvailable: criticReviewAvailable(input.researchBackend),
+      releaseCriticFreshness
     });
 
     if (hardFailures.length > 0 || notebookReadinessIssue !== null || !artifactContract.canFinalize) {
@@ -4479,6 +5649,7 @@ async function executeResearchObjectToolAction(input: {
             releaseChecksCreated: releaseChecks.length,
             hardInvariantBlockers: hardFailures.length,
             artifactContractFailures: artifactContract.failures.length,
+            releaseCriticFreshnessProblems: releaseCriticFreshness.status === "fresh" ? 0 : 1,
             notebookDiagnosticWarnings: notebookDiagnostics.warningCount,
             notebookReadinessRecorded: notebookReadinessIssue === null ? 1 : 0,
             manuscriptFinalized: 0
@@ -5734,7 +6905,10 @@ function workspacePaperArtifact(input: {
     sourceIds: section.sourceIds,
     claimIds: section.claimIds
   }));
-  const citationLinks = input.store.objects.citations.map((citation) => ({
+  const activeCitations = input.store.objects.citations.filter(researchObjectIsActive);
+  const activeEvidenceCells = input.store.objects.evidenceCells.filter(researchObjectIsActive);
+  const activeExtractions = input.store.objects.extractions.filter(researchObjectIsActive);
+  const citationLinks = activeCitations.map((citation) => ({
     sourceId: citation.sourceId,
     sourceTitle: citation.sourceTitle,
     evidenceCellId: citation.evidenceCellId,
@@ -5745,7 +6919,7 @@ function workspacePaperArtifact(input: {
     sectionIds: citation.sectionIds
   }));
   const limitations = uniqueStrings([
-    ...input.store.objects.extractions.flatMap((extraction) => extraction.extraction.limitations),
+    ...activeExtractions.flatMap((extraction) => extraction.extraction.limitations),
     ...input.store.objects.claims.flatMap((claim) => claim.risk === null ? [] : [claim.risk]),
     ...input.store.objects.workItems
       .filter((item) => item.status === "open" && item.severity !== "minor")
@@ -5767,7 +6941,7 @@ function workspacePaperArtifact(input: {
     claims,
     citationLinks,
     referencedPaperIds: input.references.references.map((reference) => reference.sourceId),
-    evidenceTableIds: input.store.objects.evidenceCells.map((cell) => cell.id),
+    evidenceTableIds: activeEvidenceCells.map((cell) => cell.id),
     limitations,
     readinessStatus: input.readinessStatus
   };

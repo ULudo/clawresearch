@@ -3126,6 +3126,46 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
         stopCondition: "Section state exists.",
         transport: "strict_json"
       };
+	    } else if (!this.notebookReadinessPatched) {
+	      this.notebookReadinessPatched = true;
+	      action = {
+	        schemaVersion: 1,
+	        action: "notebook.patch",
+	        rationale: "Record the model-owned readiness assessment before finalization.",
+	        confidence: 0.9,
+	        inputs: {
+	          ...baseInputs,
+	          workStore: {
+	            collection: null,
+	            entityId: null,
+	            filters: {},
+	            semanticQuery: null,
+	            limit: null,
+	            cursor: null,
+	            changes: {},
+	            entity: {
+	              missionTarget: "research_brief",
+	              paperMode: "technical_survey",
+	              currentFocus: "Finalize the validated smoke manuscript export.",
+	              readiness: "Ready to finalize with caveats: this is a bounded single-source smoke manuscript whose mechanical provenance and citation invariants have been checked.",
+	              task: {
+	                id: "task-finalize-explicit-tool-smoke",
+	                title: "Finalize explicit tool smoke manuscript",
+	                status: "done",
+	                notes: "The manuscript is acceptable as a bounded smoke test, not as a professional literature review.",
+	                linkedSourceIds: [sourceId],
+	                linkedExtractionIds: this.extractionId === null ? [] : [this.extractionId],
+	                linkedEvidenceCellIds: this.evidenceCellId === null ? [] : [this.evidenceCellId],
+	                linkedClaimIds: claim === undefined ? [] : [claim.id],
+	                linkedSectionIds: section === undefined ? [] : [section.id]
+	              }
+	            }
+	          }
+	        },
+	        expectedOutcome: "Notebook readiness is explicit before critic review and finalization.",
+	        stopCondition: "Notebook readiness records the bounded release decision.",
+	        transport: "strict_json"
+	      };
     } else if (!this.criticReviewed) {
       this.criticReviewed = true;
       action = {
@@ -3175,46 +3215,6 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
         stopCondition: "Release checks exist.",
         transport: "strict_json"
       };
-	    } else if (!this.notebookReadinessPatched) {
-	      this.notebookReadinessPatched = true;
-	      action = {
-	        schemaVersion: 1,
-	        action: "notebook.patch",
-	        rationale: "Record the model-owned readiness assessment before finalization.",
-	        confidence: 0.9,
-	        inputs: {
-	          ...baseInputs,
-	          workStore: {
-	            collection: null,
-	            entityId: null,
-	            filters: {},
-	            semanticQuery: null,
-	            limit: null,
-	            cursor: null,
-	            changes: {},
-	            entity: {
-	              missionTarget: "research_brief",
-	              paperMode: "technical_survey",
-	              currentFocus: "Finalize the validated smoke manuscript export.",
-	              readiness: "Ready to finalize with caveats: this is a bounded single-source smoke manuscript whose mechanical provenance and citation invariants have been checked.",
-	              task: {
-	                id: "task-finalize-explicit-tool-smoke",
-	                title: "Finalize explicit tool smoke manuscript",
-	                status: "done",
-	                notes: "The manuscript is acceptable as a bounded smoke test, not as a professional literature review.",
-	                linkedSourceIds: [sourceId],
-	                linkedExtractionIds: this.extractionId === null ? [] : [this.extractionId],
-	                linkedEvidenceCellIds: this.evidenceCellId === null ? [] : [this.evidenceCellId],
-	                linkedClaimIds: claim === undefined ? [] : [claim.id],
-	                linkedSectionIds: section === undefined ? [] : [section.id]
-	              }
-	            }
-	          }
-	        },
-	        expectedOutcome: "Notebook readiness is explicit before finalization.",
-	        stopCondition: "Notebook readiness records the bounded release decision.",
-	        transport: "strict_json"
-	      };
 	    } else if (!this.manuscriptReleased) {
       this.manuscriptReleased = true;
       action = {
@@ -3556,6 +3556,258 @@ class MultiSourceSupportLinkBackend extends StubResearchBackend {
         workStore: terminalUserDecisionWorkStore("Multi-source support-link regression complete.")
       },
       expectedOutcome: "Structured terminal state for the regression test.",
+      stopCondition: "The regression workspace can be inspected.",
+      transport: "strict_json"
+    };
+  }
+}
+
+class SupportLinkLifecycleBackend extends StubResearchBackend {
+  readonly researchRequests: ResearchActionRequest[] = [];
+  private step = 0;
+
+  constructor(
+    private readonly mode: "replace" | "remove",
+    private readonly claimId: string,
+    private readonly sourceIds: string[],
+    private readonly evidenceCellIds: string[]
+  ) {
+    super();
+  }
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [],
+      criticScope: null,
+      reason: null
+    };
+
+    if (this.step === 0) {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "claim.link_support",
+        rationale: "Attach provisional support before testing explicit repair operations.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          paperIds: [this.sourceIds[0] ?? ""],
+          workStore: {
+            collection: "citations",
+            entityId: this.claimId,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              mode: "append",
+              claimId: this.claimId,
+              sourceId: this.sourceIds[0],
+              evidenceCellId: this.evidenceCellIds[0],
+              supportSnippet: "The first source is provisional support that will be explicitly replaced or retired.",
+              confidence: "medium",
+              relevance: "provisional support"
+            }
+          }
+        },
+        expectedOutcome: "Create provisional support.",
+        stopCondition: "Provisional support link exists.",
+        transport: "strict_json"
+      };
+    }
+
+    if (this.step === 1 && this.mode === "replace") {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "claim.link_support",
+        rationale: "Replace provisional support with stronger support from another evidence cell.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          paperIds: [this.sourceIds[1] ?? ""],
+          reason: "Better evidence supersedes the provisional support link.",
+          workStore: {
+            collection: "citations",
+            entityId: this.claimId,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              mode: "replace",
+              claimId: this.claimId,
+              sourceId: this.sourceIds[1],
+              evidenceCellId: this.evidenceCellIds[1],
+              oldSourceId: this.sourceIds[0],
+              oldEvidenceCellId: this.evidenceCellIds[0],
+              supportSnippet: "The second source gives stronger replacement support with distinct source identity.",
+              confidence: "high",
+              relevance: "replacement support"
+            }
+          }
+        },
+        expectedOutcome: "Supersede provisional support and attach replacement support.",
+        stopCondition: "One support link is superseded and one remains active.",
+        transport: "strict_json"
+      };
+    }
+
+    if (this.step === 1 && this.mode === "remove") {
+      this.step += 1;
+      const supportLinkId = request.toolResults?.find((result) => result.action === "claim.link_support" && result.status === "ok")?.entity?.id ?? null;
+      return {
+        schemaVersion: 1,
+        action: "claim.link_support",
+        rationale: "Retire provisional support without deleting the audit trail.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          reason: "The provisional support is not adequate.",
+          workStore: {
+            collection: "citations",
+            entityId: this.claimId,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              mode: "remove",
+              claimId: this.claimId,
+              citationId: supportLinkId,
+              oldSourceId: this.sourceIds[0],
+              oldEvidenceCellId: this.evidenceCellIds[0],
+              statusReason: "The support was intentionally retired by the researcher."
+            }
+          }
+        },
+        expectedOutcome: "Retire the support link without hard-deleting it.",
+        stopCondition: "The support link is retired.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "Stop after explicit support-link lifecycle operation.",
+      confidence: 0.84,
+      inputs: {
+        ...baseInputs,
+        reason: "Support-link lifecycle regression complete.",
+        workStore: terminalUserDecisionWorkStore("Support-link lifecycle regression complete.")
+      },
+      expectedOutcome: "Structured terminal state for lifecycle regression.",
+      stopCondition: "The regression workspace can be inspected.",
+      transport: "strict_json"
+    };
+  }
+}
+
+class ExtractionEvidencePatchBackend extends StubResearchBackend {
+  readonly researchRequests: ResearchActionRequest[] = [];
+  private step = 0;
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [],
+      criticScope: null,
+      reason: null
+    };
+
+    if (this.step === 0) {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "extraction.patch",
+        rationale: "Mark a provisional extraction as superseded by a better extraction.",
+        confidence: 0.88,
+        inputs: {
+          ...baseInputs,
+          reason: "A newer extraction supersedes this provisional extraction.",
+          workStore: {
+            collection: "extractions",
+            entityId: "extraction-support-1",
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              extractionId: "extraction-support-1",
+              status: "superseded",
+              supersededBy: "extraction-support-2",
+              statusReason: "Replaced by a more useful extraction."
+            }
+          }
+        },
+        expectedOutcome: "Extraction lifecycle status is updated.",
+        stopCondition: "Extraction is superseded.",
+        transport: "strict_json"
+      };
+    }
+
+    if (this.step === 1) {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "evidence.patch",
+        rationale: "Retire a weak evidence cell without deleting it.",
+        confidence: 0.88,
+        inputs: {
+          ...baseInputs,
+          reason: "The evidence cell is too provisional to support claims.",
+          workStore: {
+            collection: "evidenceCells",
+            entityId: "evidence-support-1",
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              evidenceCellId: "evidence-support-1",
+              status: "retired",
+              statusReason: "Retired by explicit evidence.patch after review."
+            }
+          }
+        },
+        expectedOutcome: "Evidence lifecycle status is updated.",
+        stopCondition: "Evidence cell is retired.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "Stop after explicit extraction/evidence patch actions.",
+      confidence: 0.84,
+      inputs: {
+        ...baseInputs,
+        reason: "Extraction/evidence patch regression complete.",
+        workStore: terminalUserDecisionWorkStore("Extraction/evidence patch regression complete.")
+      },
+      expectedOutcome: "Structured terminal state for patch regression.",
       stopCondition: "The regression workspace can be inspected.",
       transport: "strict_json"
     };
@@ -3949,6 +4201,427 @@ class CriticThenFinalizeSeededWorkspaceBackend extends FinalizeSeededWorkspaceBa
         claimsToSoften: []
       },
       recommendedNextActions: []
+    };
+  }
+}
+
+class CriticFreshnessScenarioBackend extends StubResearchBackend {
+  readonly capabilities = {
+    actionControl: {
+      nativeToolCalls: false,
+      strictJsonFallback: true
+    },
+    criticReview: true
+  };
+  readonly researchRequests: ResearchActionRequest[] = [];
+  readonly criticRequests: CriticReviewRequest[] = [];
+  private step = 0;
+
+  constructor(
+    private readonly mutation: "none" | "section" | "evidence" | "support",
+    private readonly terminalAction: "release.verify" | "manuscript.finalize" = "release.verify"
+  ) {
+    super();
+  }
+
+  override async planResearch(): Promise<ResearchPlan> {
+    return {
+      researchMode: "literature_synthesis",
+      objective: "Validate release critic freshness for the current workspace.",
+      rationale: "The regression test preloads a mechanically linked workspace.",
+      searchQueries: [],
+      localFocus: [],
+      notebookPatch: {
+        missionTarget: "research_brief",
+        paperMode: "literature_review",
+        currentFocus: "Validate release critic freshness.",
+        readiness: "Ready to finalize research_brief literature_review with caveats: the seeded workspace satisfies the bounded regression definition of done."
+      }
+    };
+  }
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [],
+      criticScope: null,
+      reason: null
+    };
+
+    if (this.step === 0) {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "critic.review",
+        rationale: "Create a runtime-owned release critic review snapshot.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          criticScope: "release",
+          workStore: {
+            collection: "workItems",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "The release critic pass is persisted with snapshot metadata.",
+        stopCondition: "Continue to the mutation or terminal check.",
+        transport: "strict_json"
+      };
+    }
+
+    if (this.step === 1 && this.mutation === "section") {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "section.patch",
+        rationale: "Change a manuscript section after critic review.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: "section-thin-synthesis",
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              markdown: "This revised section was changed after the release critic reviewed the manuscript.",
+              claimIds: ["claim-review-1"],
+              sourceIds: ["source-review-1"]
+            }
+          }
+        },
+        expectedOutcome: "The section changes after critic review.",
+        stopCondition: "Continue to release verification.",
+        transport: "strict_json"
+      };
+    }
+
+    if (this.step === 1 && this.mutation === "evidence") {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "evidence.create_cell",
+        rationale: "Add new evidence after critic review.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "evidenceCells",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              id: "evidence-review-added-after-critic",
+              sourceId: "source-review-1",
+              extractionId: "extraction-review-1",
+              field: "limitations",
+              value: "This evidence cell was added after the release critic review and was therefore not reviewed.",
+              confidence: "medium"
+            }
+          }
+        },
+        expectedOutcome: "New evidence is persisted after critic review.",
+        stopCondition: "Continue to release verification.",
+        transport: "strict_json"
+      };
+    }
+
+    if (this.step === 1 && this.mutation === "support") {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "claim.link_support",
+        rationale: "Retire a support link after critic review.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "citations",
+            entityId: "claim-review-1",
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              mode: "remove",
+              claimId: "claim-review-1",
+              citationId: "citation-review-1",
+              oldSourceId: "source-review-1",
+              oldEvidenceCellId: "evidence-review-1",
+              statusReason: "Retired after critic review for freshness regression."
+            }
+          }
+        },
+        expectedOutcome: "Support link is retired after critic review.",
+        stopCondition: "Continue to finalization.",
+        transport: "strict_json"
+      };
+    }
+
+    if ((this.step === 1 && this.mutation === "none") || (this.step === 2 && this.mutation !== "none")) {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: this.terminalAction,
+        rationale: "Inspect critic freshness before allowing release.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "releaseChecks",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "Release verification/finalization reports critic freshness.",
+        stopCondition: "Continue to structured test stop.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "Stop after critic freshness scenario.",
+      confidence: 0.8,
+      inputs: {
+        ...baseInputs,
+        reason: "Critic freshness scenario complete.",
+        workStore: terminalUserDecisionWorkStore("Critic freshness scenario complete.")
+      },
+      expectedOutcome: "Structured terminal state.",
+      stopCondition: "Structured test terminal state reached.",
+      transport: "strict_json"
+    };
+  }
+
+  async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    this.criticRequests.push(request);
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "pass",
+      confidence: 0.9,
+      summary: "The release critic approves the current workspace snapshot.",
+      objections: [],
+      positiveFindings: [],
+      revisionAdvice: {
+        searchQueries: [],
+        evidenceTargets: [],
+        papersToExclude: [],
+        papersToPromote: [],
+        claimsToSoften: []
+      },
+      recommendedNextActions: []
+    };
+  }
+}
+
+class SectionRepairErgonomicsBackend extends StubResearchBackend {
+  readonly capabilities = {
+    actionControl: {
+      nativeToolCalls: false,
+      strictJsonFallback: true
+    },
+    criticReview: true
+  };
+  readonly researchRequests: ResearchActionRequest[] = [];
+  readonly criticRequests: CriticReviewRequest[] = [];
+  private step = 0;
+
+  constructor(private readonly scenario: "read" | "replace_block") {
+    super();
+  }
+
+  override async planResearch(): Promise<ResearchPlan> {
+    return {
+      researchMode: "literature_synthesis",
+      objective: "Validate manuscript section repair ergonomics.",
+      rationale: "The regression test preloads a section with linked evidence.",
+      searchQueries: [],
+      localFocus: [],
+      notebookPatch: {
+        missionTarget: "research_brief",
+        paperMode: "literature_review",
+        currentFocus: "Repair manuscript sections from critic feedback and linked evidence.",
+        readiness: "Not sufficient yet; section repair ergonomics are under test."
+      }
+    };
+  }
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [],
+      criticScope: null,
+      reason: null
+    };
+
+    if (this.scenario === "read" && this.step === 0) {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "critic.review",
+        rationale: "Create a critic objection that targets the manuscript section.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          criticScope: "release",
+          workStore: {
+            collection: "workItems",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "A release critic review is available as repair context.",
+        stopCondition: "Continue to section.read.",
+        transport: "strict_json"
+      };
+    }
+
+    if ((this.scenario === "read" && this.step === 1) || (this.scenario === "replace_block" && this.step === 0)) {
+      this.step += 1;
+      if (this.scenario === "replace_block") {
+        return {
+          schemaVersion: 1,
+          action: "section.patch",
+          rationale: "Replace the first section block using the block index contract from section.read.",
+          confidence: 0.9,
+          inputs: {
+            ...baseInputs,
+            workStore: {
+              collection: "manuscriptSections",
+              entityId: "section-thin-synthesis",
+              filters: {},
+              semanticQuery: null,
+              limit: null,
+              cursor: null,
+              changes: {},
+              entity: {
+                operation: "replace_block",
+                blockIndex: 1,
+                markdown: "The repaired synthesis paragraph states the manuscript argument directly and uses the linked claim and evidence instead of raw workspace identifiers.",
+                claimIds: ["claim-review-1"],
+                sourceIds: ["source-review-1"]
+              }
+            }
+          },
+          expectedOutcome: "Only the targeted section block is replaced.",
+          stopCondition: "The patched section remains linked to its claim.",
+          transport: "strict_json"
+        };
+      }
+
+      return {
+        schemaVersion: 1,
+        action: "section.read",
+        rationale: "Inspect full section text, block indexes, linked evidence, and critic objections before repairing.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: "section-thin-synthesis",
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "The model receives a repair packet for the section.",
+        stopCondition: "Section repair context is visible.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "Stop after the section repair ergonomics scenario.",
+      confidence: 0.8,
+      inputs: {
+        ...baseInputs,
+        reason: "Section repair ergonomics regression complete.",
+        workStore: terminalUserDecisionWorkStore("Section repair ergonomics regression complete.")
+      },
+      expectedOutcome: "Structured terminal state.",
+      stopCondition: "Regression complete.",
+      transport: "strict_json"
+    };
+  }
+
+  async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    this.criticRequests.push(request);
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "revise",
+      confidence: 0.9,
+      summary: "The manuscript section needs targeted repair.",
+      objections: [{
+        code: "section_process_prose",
+        severity: "major",
+        target: "section",
+        targetId: "section-thin-synthesis",
+        message: "The section contains placeholder/source-id prose instead of manuscript argument.",
+        affectedPaperIds: ["source-review-1"],
+        affectedEvidenceCellIds: ["evidence-review-1"],
+        affectedClaimIds: ["claim-review-1"],
+        affectedSectionIds: ["section-thin-synthesis"],
+        suggestedRevision: "Replace the placeholder block with a substantive synthesis paragraph grounded in the linked claim and evidence."
+      }],
+      positiveFindings: [],
+      revisionAdvice: {
+        searchQueries: [],
+        evidenceTargets: [],
+        papersToExclude: [],
+        papersToPromote: [],
+        claimsToSoften: []
+      },
+      recommendedNextActions: ["section.read", "section.patch"]
     };
   }
 }
@@ -4564,9 +5237,9 @@ test("explicit researcher tools create extraction, evidence, critic feedback, re
       "claim.create",
       "claim.link_support",
       "section.create",
+      "notebook.patch",
       "critic.review",
       "release.verify",
-      "notebook.patch",
       "manuscript.finalize"
     ]);
     const validActions = new Set(workspaceResearchActions());
@@ -4597,9 +5270,9 @@ test("explicit researcher tools create extraction, evidence, critic feedback, re
     const releaseVerifyResult = backend.researchRequests
       .flatMap((request) => request.toolResults ?? [])
       .find((result) => result.action === "release.verify");
-    assert.equal(releaseVerifyResult?.status, "not_ready");
+    assert.equal(releaseVerifyResult?.status, "ok");
     assert.match(releaseVerifyResult?.message ?? "", /Mechanical release verification only/i);
-    assert.match(releaseVerifyResult?.message ?? "", /research readiness/i);
+    assert.match(releaseVerifyResult?.message ?? "", /Release critic freshness is fresh/i);
     assert.ok(releaseVerifyResult?.related?.some((item) => item.kind === "notebookDiagnostic"));
     assert.equal(workStore.objects.extractions.length, 1);
     assert.equal(workStore.objects.extractions[0]?.sourceId, sourceId);
@@ -4886,6 +5559,161 @@ test("claim.link_support preserves distinct support links for the same long clai
     assert.equal(workStore.objects.claims[0]?.sourceIds.length, seeded.sourceIds.length);
     assert.equal(workStore.objects.claims[0]?.supportStatus, "supported");
     assert.ok(supportResults.every((result) => result.stateDelta?.supportLinksCreated === 1));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("claim.link_support replace supersedes old support without hard-deleting audit history", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-support-link-replace-"));
+  const now = createNow();
+
+  try {
+    const brief = {
+      topic: "support-link replacement",
+      researchQuestion: "Can the researcher explicitly replace provisional support?",
+      researchDirection: "Attach one support link, replace it with another, and preserve lifecycle history.",
+      successCriterion: "Old support is superseded while the replacement remains active."
+    };
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create(brief, ["clawresearch", "research-loop"]);
+    const seeded = await seedSharedClaimSupportWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now
+    });
+
+    const backend = new SupportLinkLifecycleBackend("replace", seeded.claimId, seeded.sourceIds, seeded.evidenceCellIds);
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const superseded = workStore.objects.citations.filter((citation) => citation.status === "superseded");
+    const active = workStore.objects.citations.filter((citation) => citation.status !== "superseded" && citation.status !== "retired");
+    const claim = workStore.objects.claims.find((candidate) => candidate.id === seeded.claimId);
+    const replaceResult = backend.researchRequests.flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "claim.link_support" && result.stateDelta?.supportLinksSuperseded === 1);
+
+    assert.equal(exitCode, 0);
+    assert.equal(workStore.objects.citations.length, 2);
+    assert.equal(superseded.length, 1);
+    assert.equal(active.length, 1);
+    assert.equal(superseded[0]?.sourceId, seeded.sourceIds[0]);
+    assert.equal(active[0]?.sourceId, seeded.sourceIds[1]);
+    assert.equal(superseded[0]?.supersededBy, active[0]?.id);
+    assert.deepEqual(claim?.sourceIds, [seeded.sourceIds[1]]);
+    assert.equal(claim?.supportStatus, "supported");
+    assert.match(replaceResult?.message ?? "", /superseded 1 old support link/i);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("claim.link_support remove retires support without deleting the citation record", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-support-link-remove-"));
+  const now = createNow();
+
+  try {
+    const brief = {
+      topic: "support-link removal",
+      researchQuestion: "Can the researcher explicitly retire mistaken support?",
+      researchDirection: "Attach a support link, remove it, and preserve audit history.",
+      successCriterion: "The support link is retired and no longer supports the claim."
+    };
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create(brief, ["clawresearch", "research-loop"]);
+    const seeded = await seedSharedClaimSupportWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now
+    });
+
+    const backend = new SupportLinkLifecycleBackend("remove", seeded.claimId, seeded.sourceIds, seeded.evidenceCellIds);
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const retired = workStore.objects.citations.filter((citation) => citation.status === "retired");
+    const active = workStore.objects.citations.filter((citation) => citation.status !== "superseded" && citation.status !== "retired");
+    const claim = workStore.objects.claims.find((candidate) => candidate.id === seeded.claimId);
+    const removeResult = backend.researchRequests.flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "claim.link_support" && result.stateDelta?.supportLinksRetired === 1);
+
+    assert.equal(exitCode, 0);
+    assert.equal(workStore.objects.citations.length, 1);
+    assert.equal(retired.length, 1);
+    assert.equal(active.length, 0);
+    assert.equal(retired[0]?.sourceId, seeded.sourceIds[0]);
+    assert.deepEqual(claim?.sourceIds, []);
+    assert.equal(claim?.supportStatus, "weak");
+    assert.match(removeResult?.message ?? "", /Retired 1 support link/i);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("extraction.patch and evidence.patch update lifecycle state explicitly", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-extraction-evidence-patch-"));
+  const now = createNow();
+
+  try {
+    const brief = {
+      topic: "extraction and evidence lifecycle",
+      researchQuestion: "Can the researcher revise provenance objects explicitly?",
+      researchDirection: "Patch lifecycle status on extraction and evidence records.",
+      successCriterion: "Patch tools update lifecycle state without hidden workflow."
+    };
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create(brief, ["clawresearch", "research-loop"]);
+    await seedSharedClaimSupportWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now
+    });
+
+    const backend = new ExtractionEvidencePatchBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const extraction = workStore.objects.extractions.find((candidate) => candidate.id === "extraction-support-1");
+    const evidenceCell = workStore.objects.evidenceCells.find((candidate) => candidate.id === "evidence-support-1");
+    const patchResultActions = new Set(backend.researchRequests.flatMap((request) => request.toolResults ?? [])
+      .filter((result) => result.action === "extraction.patch" || result.action === "evidence.patch")
+      .map((result) => result.action));
+
+    assert.equal(exitCode, 0);
+    assert.equal(extraction?.status, "superseded");
+    assert.equal(extraction?.supersededBy, "extraction-support-2");
+    assert.equal(evidenceCell?.status, "retired");
+    assert.deepEqual([...patchResultActions].sort(), ["evidence.patch", "extraction.patch"]);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -5420,6 +6248,351 @@ test("research_brief without a runtime release critic pass is not ready", async 
     assert.equal(finalizeResult?.status, "not_ready");
     assert.ok(finalizeResult?.nextHints?.includes("critic.review"));
     assert.ok(finalizeResult?.related?.some((item) => item.kind === "artifactContractDiagnostic" && /No runtime-owned release-scope critic\.review pass/i.test(item.snippet ?? "")));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("release.verify reports a fresh release critic review when reviewed objects are unchanged", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-critic-freshness-fresh-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "critic freshness",
+      researchQuestion: "Can release verification recognize a fresh critic pass?",
+      researchDirection: "Run critic.review and then release.verify without changing critic-relevant objects.",
+      successCriterion: "release.verify reports freshness as fresh."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "critic-freshness"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    const backend = new CriticFreshnessScenarioBackend("none");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const releaseResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "release.verify");
+    const freshnessDiagnostic = releaseResult?.related
+      ?.find((item) => item.kind === "criticFreshnessDiagnostic");
+    const criticArtifact = JSON.parse(await readFile(run.artifacts.criticReleaseReviewPath, "utf8")) as CriticReviewArtifact;
+
+    assert.equal(exitCode, 0);
+    assert.equal(backend.criticRequests.length, 1);
+    assert.ok(criticArtifact.reviewedSnapshot?.fingerprint);
+    assert.equal(releaseResult?.status, "ok");
+    assert.equal(freshnessDiagnostic?.status, "fresh");
+    assert.equal(releaseResult?.stateDelta?.releaseCriticFreshnessProblems, 0);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("release.verify reports stale critic review after manuscript section changes", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-critic-freshness-section-stale-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "critic freshness",
+      researchQuestion: "Can section edits stale a critic review?",
+      researchDirection: "Run critic.review, patch a section, and verify release.",
+      successCriterion: "release.verify reports a stale release critic."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "critic-freshness"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    const backend = new CriticFreshnessScenarioBackend("section");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const releaseResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "release.verify");
+    const freshnessDiagnostic = releaseResult?.related
+      ?.find((item) => item.kind === "criticFreshnessDiagnostic");
+
+    assert.equal(exitCode, 0);
+    assert.equal(releaseResult?.status, "not_ready");
+    assert.equal(freshnessDiagnostic?.status, "stale");
+    assert.ok((freshnessDiagnostic?.fields?.changedObjects as string[] | undefined)?.includes("manuscriptSection:section-thin-synthesis"));
+    assert.ok(releaseResult?.nextHints?.includes("critic.review"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("release.verify reports incomplete critic review after new evidence is added", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-critic-freshness-new-evidence-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "critic freshness",
+      researchQuestion: "Can new evidence make a critic review incomplete?",
+      researchDirection: "Run critic.review, add evidence, and verify release.",
+      successCriterion: "release.verify reports an incomplete release critic."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "critic-freshness"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    const backend = new CriticFreshnessScenarioBackend("evidence");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const releaseResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "release.verify");
+    const freshnessDiagnostic = releaseResult?.related
+      ?.find((item) => item.kind === "criticFreshnessDiagnostic");
+
+    assert.equal(exitCode, 0);
+    assert.equal(releaseResult?.status, "not_ready");
+    assert.equal(freshnessDiagnostic?.status, "incomplete");
+    assert.ok((freshnessDiagnostic?.fields?.newObjects as string[] | undefined)?.includes("evidenceCell:evidence-review-added-after-critic"));
+    assert.ok(releaseResult?.nextHints?.includes("critic.review"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("manuscript.finalize blocks when support links changed after release critic review", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-critic-freshness-finalize-stale-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "critic freshness",
+      researchQuestion: "Can finalization trust a critic pass after support links change?",
+      researchDirection: "Run critic.review, retire support, and attempt finalization.",
+      successCriterion: "manuscript.finalize returns not_ready."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "critic-freshness"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    const backend = new CriticFreshnessScenarioBackend("support", "manuscript.finalize");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const finalizeResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "manuscript.finalize");
+    const freshnessDiagnostic = finalizeResult?.related
+      ?.find((item) => item.kind === "criticFreshnessDiagnostic");
+
+    assert.equal(exitCode, 0);
+    assert.equal(finalizeResult?.status, "not_ready");
+    assert.equal(freshnessDiagnostic?.status, "stale");
+    assert.ok((freshnessDiagnostic?.fields?.missingObjects as string[] | undefined)?.includes("citation:citation-review-1"));
+    assert.equal(workStore.worker.completion, null);
+    await assert.rejects(readFile(completedRun.artifacts.paperPath, "utf8"), /ENOENT/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("section.read returns repair context with blocks, linked evidence, hygiene warnings, and critic objections", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-section-read-repair-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "section repair ergonomics",
+      researchQuestion: "Can section.read orient the model for manuscript repair?",
+      researchDirection: "Read a section after critic feedback.",
+      successCriterion: "Section read returns repair context, not just a compact preview."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "section-repair"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+    const seededStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const seededSection = seededStore.objects.manuscriptSections[0];
+    assert.ok(seededSection);
+    const rawSection = {
+      ...seededSection,
+      markdown: "TODO create benchmark detail from source-review-1.\n\nThis second paragraph should remain visible as block two.",
+      updatedAt: now()
+    } as WorkStoreEntity;
+    await writeResearchWorkStore(upsertResearchWorkStoreEntities(seededStore, [rawSection], now()));
+
+    const backend = new SectionRepairErgonomicsBackend("read");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const sectionReadResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "section.read");
+
+    assert.equal(exitCode, 0);
+    assert.equal(backend.criticRequests.length, 1);
+    assert.equal(sectionReadResult?.status, "ok");
+    assert.match(sectionReadResult?.entity?.text ?? "", /TODO create benchmark detail/);
+    assert.equal(sectionReadResult?.items?.filter((item) => item.kind === "manuscriptSectionBlock").length, 2);
+    assert.ok(sectionReadResult?.related?.some((item) => item.kind === "manuscriptHygieneWarning" && /raw workspace ids/i.test(item.snippet ?? "")));
+    assert.ok(sectionReadResult?.related?.some((item) => item.kind === "criticObjection" && item.sectionIds?.includes("section-thin-synthesis")));
+    assert.ok(sectionReadResult?.related?.some((item) => item.kind === "claim" && item.id === "claim-review-1"));
+    assert.ok(sectionReadResult?.related?.some((item) => item.kind === "evidenceCell" && item.id === "evidence-review-1"));
+    assert.ok(sectionReadResult?.related?.some((item) => item.kind === "citation" && item.id === "citation-review-1"));
+    assert.ok(sectionReadResult?.related?.some((item) => item.kind === "canonicalSource" && item.id === "source-review-1"));
+    assert.ok(sectionReadResult?.nextHints?.includes("section.patch"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("section.patch supports targeted block replacement without rewriting the whole section", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-section-patch-block-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "section repair ergonomics",
+      researchQuestion: "Can section.patch replace one manuscript block?",
+      researchDirection: "Patch a targeted section block.",
+      successCriterion: "Only the requested block changes and section links survive."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "section-repair"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+    const seededStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const seededSection = seededStore.objects.manuscriptSections[0];
+    assert.ok(seededSection);
+    const twoBlockSection = {
+      ...seededSection,
+      markdown: "TODO create benchmark detail from source-review-1.\n\nThis second paragraph should remain unchanged.",
+      updatedAt: now()
+    } as WorkStoreEntity;
+    await writeResearchWorkStore(upsertResearchWorkStoreEntities(seededStore, [twoBlockSection], now()));
+
+    const backend = new SectionRepairErgonomicsBackend("replace_block");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const updatedSection = workStore.objects.manuscriptSections.find((section) => section.id === "section-thin-synthesis");
+    const patchResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "section.patch");
+
+    assert.equal(exitCode, 0);
+    assert.ok(updatedSection);
+    assert.match(updatedSection.markdown, /repaired synthesis paragraph/i);
+    assert.match(updatedSection.markdown, /This second paragraph should remain unchanged/);
+    assert.doesNotMatch(updatedSection.markdown, /source-review-1/);
+    assert.deepEqual(updatedSection.claimIds, ["claim-review-1"]);
+    assert.equal(patchResult?.status, "ok");
+    assert.equal(patchResult?.items?.filter((item) => item.kind === "manuscriptSectionBlock").length, 2);
+    assert.ok(patchResult?.related?.some((item) => item.kind === "claim" && item.id === "claim-review-1"));
+    assert.equal(patchResult?.stateDelta?.sectionsPatched, 1);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

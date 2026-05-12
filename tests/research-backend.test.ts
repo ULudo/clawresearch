@@ -148,6 +148,8 @@ function emptyWorkspaceContext(): WorkspacePromptContext {
       id: "evidence-mollifier",
       sourceId: "source-mollifier",
       extractionId: "extraction-mollifier",
+      status: "active",
+      supersededBy: null,
       field: "limitations",
       value: "Prior workspace evidence suggests mollifier limitations are the clearest bounded follow-up.",
       confidence: "medium"
@@ -418,9 +420,17 @@ test("research-agent backend uses native tool calls by default", async () => {
       "text",
       "claimId",
       "evidenceCellId",
+      "citationId",
+      "supportLinkId",
+      "mode",
+      "oldEvidenceCellId",
+      "oldSourceId",
+      "supersededBy",
       "supportSnippet",
       "sectionIds",
       "markdown",
+      "operation",
+      "blockIndex",
       "status",
       "statusReason",
       "nextInternalActions"
@@ -441,7 +451,8 @@ test("research-agent backend uses native tool calls by default", async () => {
     assert.match(capturedBody.messages?.[0]?.content ?? "", /Action recipes:/);
     assert.match(capturedBody.messages?.[0]?.content ?? "", /extraction\.create: set workStore\.entity\.sourceId or paperId/i);
     assert.match(capturedBody.messages?.[0]?.content ?? "", /evidence\.create_cell: set workStore\.entity\.sourceId or paperId/i);
-    assert.match(capturedBody.messages?.[0]?.content ?? "", /claim\.link_support: set workStore\.entity\.claimId/i);
+    assert.match(capturedBody.messages?.[0]?.content ?? "", /claim\.link_support: set workStore\.entity\.mode to append\|replace\|remove/i);
+    assert.match(capturedBody.messages?.[0]?.content ?? "", /section\.patch: use operation replace_all/i);
     assert.doesNotMatch(capturedBody.messages?.[0]?.content ?? "", /bounded first-pass/i);
   } finally {
     globalThis.fetch = originalFetch;
@@ -547,7 +558,7 @@ test("research-agent backend falls back to strict JSON when native tool calls ar
     assert.equal(capturedBodies[1]?.format, "json");
     assert.equal(capturedBodies[1]?.tools, undefined);
     assert.match(capturedBodies[1]?.messages?.[0]?.content ?? "", /Action recipes:/);
-    assert.match(capturedBodies[1]?.messages?.[0]?.content ?? "", /claim\.link_support: set workStore\.entity\.claimId/i);
+    assert.match(capturedBodies[1]?.messages?.[0]?.content ?? "", /claim\.link_support: set workStore\.entity\.mode to append\|replace\|remove/i);
   } finally {
     globalThis.fetch = originalFetch;
   }

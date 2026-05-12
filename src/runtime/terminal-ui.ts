@@ -588,6 +588,7 @@ export class ClawResearchTerminalUi {
     this.input.off("keypress", this.onKeypress);
     this.output.off?.("resize", this.onResize);
     this.input.setRawMode?.(false);
+    this.input.pause();
     this.output.write("\u001b[?25h\u001b[?1049l");
   }
 
