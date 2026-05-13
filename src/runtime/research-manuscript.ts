@@ -116,6 +116,7 @@ export type ReviewPaperArtifact = {
   sections: Array<{
     id: string;
     role: string;
+    orderIndex?: number | null;
     title: string;
     markdown: string;
     sourceIds: string[];

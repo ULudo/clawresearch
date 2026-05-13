@@ -213,6 +213,18 @@ type AgentActionTransportRecord = {
   fallbackKind?: string;
 };
 
+class ActionSelectionProviderUnavailableCheckpoint extends Error {
+  constructor(
+    public readonly phase: string,
+    public readonly diagnostics: ResearchActionDiagnostic[]
+  ) {
+    const lastMessage = diagnostics.at(-1)?.message ?? "provider unavailable";
+    const retryCount = Math.max(0, diagnostics.length - 1);
+    super(`Research agent action provider unavailable after ${retryCount} retry(s) and ${diagnostics.length} failed provider call(s): ${lastMessage}`);
+    this.name = "ActionSelectionProviderUnavailableCheckpoint";
+  }
+}
+
 function markdownBrief(brief: ResearchBrief): string {
   return [
     "# Research Brief",
@@ -1112,6 +1124,7 @@ function entityPreviewForAgent(entity: WorkStoreEntity, store: ResearchWorkStore
         fields: {
           sectionId: entity.sectionId,
           role: entity.role,
+          orderIndex: entity.orderIndex ?? null,
           wordCount: manuscriptSectionWordCount(entity.markdown),
           blockCount: manuscriptSectionBlocks(entity.markdown).length,
           hygieneWarnings: manuscriptSectionHygieneWarnings(entity, store).slice(0, 8)
@@ -1466,22 +1479,7 @@ function criticFreshnessSnapshotForStore(store: ResearchWorkStore): CriticReview
       missionTarget: store.notebook.missionTarget,
       paperMode: store.notebook.paperMode,
       objective: store.notebook.objective,
-      definitionOfDone: store.notebook.definitionOfDone,
-      tasks: store.notebook.tasks.map((task) => ({
-        id: task.id,
-        title: task.title,
-        status: task.status,
-        notes: task.notes,
-        linkedSourceIds: task.linkedSourceIds,
-        linkedExtractionIds: task.linkedExtractionIds,
-        linkedEvidenceCellIds: task.linkedEvidenceCellIds,
-        linkedClaimIds: task.linkedClaimIds,
-        linkedSectionIds: task.linkedSectionIds,
-        linkedArtifactPaths: task.linkedArtifactPaths
-      })),
-      currentFocus: store.notebook.currentFocus,
-      readiness: store.notebook.readiness,
-      notes: store.notebook.notes
+      definitionOfDone: store.notebook.definitionOfDone
     }),
     ...store.objects.extractions
       .filter(researchObjectIsActive)
@@ -1531,6 +1529,7 @@ function criticFreshnessSnapshotForStore(store: ResearchWorkStore): CriticReview
     ...store.objects.manuscriptSections.map((section) => criticSnapshotObject("manuscriptSection", section.id, {
       sectionId: section.sectionId,
       role: section.role,
+      orderIndex: section.orderIndex ?? null,
       title: section.title,
       markdown: section.markdown,
       sourceIds: section.sourceIds,
@@ -1844,11 +1843,11 @@ function evaluateArtifactContract(input: {
         nextHints.add("critic.review");
       }
     } else if (releaseCriticFreshness.reviewReadiness !== "pass") {
-      failures.push(`Latest runtime-owned release critic.review readiness is ${releaseCriticFreshness.reviewReadiness ?? "unknown"}; ${store.notebook.missionTarget} finalization requires a release critic pass before paper.md is written.`);
-      if (input.criticAvailable) {
-        nextHints.add("critic.review");
-      }
+      failures.push(`Latest runtime-owned release critic.review readiness is ${releaseCriticFreshness.reviewReadiness ?? "unknown"}; ${store.notebook.missionTarget} finalization requires addressing that feedback and obtaining a later passing release critic review before paper.md is written.`);
       nextHints.add("workspace.read");
+      nextHints.add("section.read");
+      nextHints.add("section.patch");
+      nextHints.add("claim.patch");
       nextHints.add("notebook.patch");
     } else if (releaseCriticFreshness.status !== "fresh") {
       failures.push(`${releaseCriticFreshness.message} Changed: ${releaseCriticFreshness.changedObjects.length}; missing/retired: ${releaseCriticFreshness.missingObjects.length}; new: ${releaseCriticFreshness.newObjects.length}. Run critic.review with criticScope release again before manuscript.finalize.`);
@@ -3041,6 +3040,7 @@ type SectionPatchOperation =
   | "append_paragraph"
   | "remove_block"
   | "update_title"
+  | "set_order"
   | "set_claim_links";
 
 function safeSectionPatchOperation(value: unknown, fallback: SectionPatchOperation): SectionPatchOperation {
@@ -3050,6 +3050,7 @@ function safeSectionPatchOperation(value: unknown, fallback: SectionPatchOperati
     || value === "append_paragraph"
     || value === "remove_block"
     || value === "update_title"
+    || value === "set_order"
     || value === "set_claim_links"
     ? value
     : fallback;
@@ -3116,9 +3117,19 @@ function patchedSectionMarkdown(input: {
       return blocks.join("\n\n");
     }
     case "update_title":
+    case "set_order":
     case "set_claim_links":
       return input.existing.markdown;
   }
+}
+
+function sectionOrderIndexFromToolInput(
+  entity: Record<string, unknown>,
+  changes: Record<string, unknown>,
+  existing: WorkStoreManuscriptSection | null | undefined
+): number | null {
+  const parsed = numberInput(entity.orderIndex ?? entity.sectionOrder ?? entity.order ?? changes.orderIndex ?? changes.sectionOrder ?? changes.order);
+  return parsed ?? existing?.orderIndex ?? null;
 }
 
 function manuscriptSectionFromToolInput(input: {
@@ -3158,6 +3169,7 @@ function manuscriptSectionFromToolInput(input: {
     updatedAt: input.now,
     sectionId,
     role: stringInput(entity.role ?? changes.role, input.existing?.role ?? "synthesis"),
+    orderIndex: sectionOrderIndexFromToolInput(entity, changes, input.existing),
     title: stringInput(entity.title ?? changes.title, input.existing?.title ?? sectionId.replace(/[-_]+/g, " ")),
     markdown,
     sourceIds: uniqueStrings([
@@ -4149,9 +4161,15 @@ async function executeResearchObjectToolAction(input: {
     });
     let review: CriticReviewArtifact | undefined;
     try {
-      review = await input.researchBackend.reviewResearchArtifact?.(request, {
+      review = await callBackendProviderWithRetries({
+        run: input.run,
+        now: input.now,
         operation: "critic",
-        timeoutMs: input.runtimeConfig.criticTimeoutMs
+        label: "Critic review",
+        call: () => input.researchBackend.reviewResearchArtifact!(request, {
+          operation: "critic",
+          timeoutMs: input.runtimeConfig.criticTimeoutMs
+        })
       });
     } catch (error) {
       const message = `Critic review failed: ${errorMessage(error)}`;
@@ -4308,8 +4326,8 @@ async function executeResearchObjectToolAction(input: {
         nextHints: review.readiness === "pass"
           ? ["release.verify", "workspace.status"]
           : blockingObjections === 0
-            ? ["workspace.read", "section.read", "section.patch", "claim.patch", "release.verify"]
-            : ["workspace.read", "work_item.create", "claim.patch", "source.search"]
+            ? ["workspace.read", "section.read", "section.patch", "claim.patch", "notebook.patch"]
+            : ["workspace.read", "work_item.create", "claim.patch", "section.patch", "source.search"]
       })
     };
   }
@@ -5463,7 +5481,7 @@ async function executeResearchObjectToolAction(input: {
       existing
     });
     if (section === null) {
-      const message = "Section create/patch blocked. section.create requires explicit manuscript content in workStore.entity.markdown, content, paragraph, or paragraphs. section.patch accepts replace_all, replace_block, insert_after_block, append_paragraph, remove_block, update_title, or set_claim_links; block operations require a 1-based blockIndex when relevant. Process rationale/expectedOutcome is never persisted as section prose.";
+      const message = "Section create/patch blocked. section.create requires explicit manuscript content in workStore.entity.markdown, content, paragraph, or paragraphs. section.patch accepts replace_all, replace_block, insert_after_block, append_paragraph, remove_block, update_title, set_order, or set_claim_links; block operations require a 1-based blockIndex when relevant. Use orderIndex with set_order to control model-owned export order. Process rationale/expectedOutcome is never persisted as section prose.";
       return {
         handled: true,
         store: input.store,
@@ -6516,37 +6534,63 @@ async function runModelDrivenResearchSession(input: {
 
   for (let step = 1; ; step += 1) {
     const sourceState = sourceSession.state();
-    const decision = await chooseResearchActionStrict({
-      run: input.run,
-      now: input.now,
-      researchBackend: input.researchBackend,
-      runtimeConfig: input.runtimeConfig,
-      agent: input.agent,
-      diagnostics: input.diagnostics,
-      actionTransports: input.actionTransports,
-      request: {
-        projectRoot: input.run.projectRoot,
-        runId: input.run.id,
-        phase: "research",
-        allowedActions,
-        brief: input.run.brief,
-        plan: input.plan,
-        observations: sessionObservations({ sourceState, workStore, step }),
-        sourceState: sourceStateForAgent(sourceSession),
-        workStore: workStoreContextForAgent(workStore),
-        guidance: guidanceContextForAgent({ brief: input.run.brief, plan: input.plan }),
-        toolResults,
-        criticReports: [],
-        retryInstruction: [
-          "This is a state-driven research session, not a phase workflow.",
-          "Inspect the current workspace/source/tool observations, choose exactly one next action, and let the runtime execute only that action.",
-          criticAvailable
-            ? "All available production tools are available regardless of milestone; do not stop for machine-actionable source, evidence, claim, critic, section, check, or release work."
-            : "All available production tools are available regardless of milestone; do not stop for machine-actionable source, evidence, claim, section, check, or release work.",
-          "Use workspace.status only for a validated external blocker or real user decision that cannot be resolved with tools; otherwise continue working."
-        ].join(" ")
+    let decision: ResearchActionDecision;
+    try {
+      decision = await chooseResearchActionStrict({
+        run: input.run,
+        now: input.now,
+        researchBackend: input.researchBackend,
+        runtimeConfig: input.runtimeConfig,
+        agent: input.agent,
+        diagnostics: input.diagnostics,
+        actionTransports: input.actionTransports,
+        request: {
+          projectRoot: input.run.projectRoot,
+          runId: input.run.id,
+          phase: "research",
+          allowedActions,
+          brief: input.run.brief,
+          plan: input.plan,
+          observations: sessionObservations({ sourceState, workStore, step }),
+          sourceState: sourceStateForAgent(sourceSession),
+          workStore: workStoreContextForAgent(workStore),
+          guidance: guidanceContextForAgent({ brief: input.run.brief, plan: input.plan }),
+          toolResults,
+          criticReports: [],
+          retryInstruction: [
+            "This is a state-driven research session, not a phase workflow.",
+            "Inspect the current workspace/source/tool observations, choose exactly one next action, and let the runtime execute only that action.",
+            criticAvailable
+              ? "All available production tools are available regardless of milestone; do not stop for machine-actionable source, evidence, claim, critic, section, check, or release work."
+              : "All available production tools are available regardless of milestone; do not stop for machine-actionable source, evidence, claim, section, check, or release work.",
+            "Use workspace.status only for a validated external blocker or real user decision that cannot be resolved with tools; otherwise continue working."
+          ].join(" ")
+        }
+      });
+    } catch (error) {
+      if (error instanceof ActionSelectionProviderUnavailableCheckpoint) {
+        const message = `${error.message}. The workspace has been checkpointed and /go can resume when the provider recovers.`;
+        await appendEvent(input.run, input.now, "memory", message);
+        await appendStdout(input.run, message);
+        return {
+          workStore,
+          gathered: await sourceSession.result(),
+          workerStatus: "working",
+          completion: workStore.worker.completion,
+          statusReason: message,
+          paperReadiness: safeManuscriptReadiness(workStore.worker.paperReadiness),
+          nextInternalActions: [
+            "Retry the model-driven research session when the model provider recovers.",
+            "Continue from the latest workspace/source state; do not restart source discovery unless the researcher model chooses it."
+          ],
+          userBlockers: [],
+          terminalAction: "agent_action_provider_unavailable",
+          stepsUsed: step - 1
+        };
       }
-    });
+
+      throw error;
+    }
 
     if (isStatusAction(decision.action)) {
       const outcome = statusDecisionOutcome({ decision, store: workStore, toolResults });
@@ -6766,6 +6810,66 @@ function uniqueStrings(values: Array<string | null | undefined>): string[] {
   return result;
 }
 
+function providerRetryDelayMs(attempt: number): number {
+  const configured = Number.parseInt(process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS ?? "", 10);
+  if (Number.isFinite(configured) && configured >= 0) {
+    return configured;
+  }
+
+  return Math.min(2_000, Math.max(100, attempt * 250));
+}
+
+async function delay(ms: number): Promise<void> {
+  if (ms <= 0) {
+    return;
+  }
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const minimumProviderRetryCount = 10;
+
+function isRetryableBackendProviderFailure(error: unknown, operation?: string): boolean {
+  return error instanceof ResearchBackendError
+    && (operation === undefined || error.operation === operation)
+    && isExternalBlockerMessage(error.message);
+}
+
+function isRetryableAgentProviderFailure(error: unknown): boolean {
+  return isRetryableBackendProviderFailure(error, "agent_step");
+}
+
+async function callBackendProviderWithRetries<T>(input: {
+  run: RunRecord;
+  now: () => string;
+  operation: string;
+  label: string;
+  call: () => Promise<T>;
+}): Promise<T> {
+  let providerFailures = 0;
+
+  for (;;) {
+    try {
+      return await input.call();
+    } catch (error) {
+      if (!isRetryableBackendProviderFailure(error, input.operation)) {
+        throw error;
+      }
+
+      providerFailures += 1;
+      await appendEvent(input.run, input.now, "stderr", `${input.label} provider call failed (${providerFailures}/${minimumProviderRetryCount + 1}): ${errorMessage(error)}`);
+      await appendStdout(input.run, `${input.label} provider unavailable: ${errorMessage(error)}`);
+
+      if (providerFailures > minimumProviderRetryCount) {
+        throw error;
+      }
+
+      const retryDelayMs = providerRetryDelayMs(providerFailures);
+      await appendEvent(input.run, input.now, "next", `${input.label} provider unavailable; retrying (${providerFailures}/${minimumProviderRetryCount}) after ${retryDelayMs} ms.`);
+      await delay(retryDelayMs);
+    }
+  }
+}
+
 async function chooseResearchActionStrict(input: {
   run: RunRecord;
   now: () => string;
@@ -6786,20 +6890,27 @@ async function chooseResearchActionStrict(input: {
     diagnostics,
     actionTransports
   } = input;
-  const maxAttempts = Math.max(1, runtimeConfig.agentInvalidActionBudget);
+  const maxMalformedAttempts = Math.max(1, runtimeConfig.agentInvalidActionBudget);
+  const maxProviderRetries = Math.max(minimumProviderRetryCount, maxMalformedAttempts);
+  const localDiagnostics: ResearchActionDiagnostic[] = [];
+  let malformedAttempts = 0;
+  let providerFailures = 0;
+  let totalAttempts = 0;
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+  while (malformedAttempts < maxMalformedAttempts && providerFailures <= maxProviderRetries) {
+    totalAttempts += 1;
+    const modelAttempt = malformedAttempts + 1;
     const actionRequest: ResearchActionRequest = {
       ...request,
-      attempt,
-      maxAttempts,
-      retryInstruction: attempt === 1
+      attempt: modelAttempt,
+      maxAttempts: maxMalformedAttempts,
+      retryInstruction: malformedAttempts === 0
         ? request.retryInstruction
         : "Your previous response was not a valid structured action. Return exactly one allowed action with valid JSON arguments. Do not explain in prose."
     };
 
     try {
-      await appendEvent(run, now, "next", `Ask research agent for next ${request.phase} action (${attempt}/${maxAttempts}).`);
+      await appendEvent(run, now, "next", `Ask research agent for next ${request.phase} action (${modelAttempt}/${maxMalformedAttempts}; provider retry ${providerFailures}/${maxProviderRetries}).`);
       const decision = await researchBackend.chooseResearchAction(actionRequest, {
         operation: "agent_step",
         timeoutMs: runtimeConfig.agentStepTimeoutMs,
@@ -6822,7 +6933,7 @@ async function chooseResearchActionStrict(input: {
       actionTransports.push({
         phase: request.phase,
         action: decision.action,
-        attempt,
+        attempt: totalAttempts,
         transport,
         ...(decision.transportFallback === undefined
           ? {}
@@ -6850,17 +6961,52 @@ async function chooseResearchActionStrict(input: {
     } catch (error) {
       const diagnostic: ResearchActionDiagnostic = {
         phase: request.phase,
-        attempt,
+        attempt: totalAttempts,
         kind: researchActionDiagnosticKind(error),
         message: errorMessage(error)
       };
+      localDiagnostics.push(diagnostic);
       diagnostics.push(diagnostic);
       await appendEvent(run, now, "stderr", `Research agent action selection failed (${diagnostic.kind}): ${diagnostic.message}`);
       await appendStdout(run, `Research agent action selection failed: ${diagnostic.message}`);
+
+      if (isRetryableAgentProviderFailure(error)) {
+        providerFailures += 1;
+        if (providerFailures <= maxProviderRetries) {
+          const retryDelayMs = providerRetryDelayMs(providerFailures);
+          await appendEvent(run, now, "next", `Provider unavailable during agent action selection; retrying (${providerFailures}/${maxProviderRetries}) after ${retryDelayMs} ms.`);
+          await delay(retryDelayMs);
+          continue;
+        }
+
+        break;
+      }
+
+      malformedAttempts += 1;
     }
   }
 
-  const invalidActions = diagnostics.filter((diagnostic) => diagnostic.phase === request.phase).length;
+  const providerFailureDiagnostics = localDiagnostics.filter((diagnostic) => diagnostic.kind === "provider_failure");
+  const invalidActions = localDiagnostics.filter((diagnostic) => diagnostic.kind !== "provider_failure").length;
+  if (providerFailureDiagnostics.length > maxProviderRetries && invalidActions === 0) {
+    await agent.record({
+      phase: request.phase,
+      action: "agent_action_provider_unavailable",
+      status: "blocked",
+      summary: `Research agent provider unavailable after ${maxProviderRetries} retry(s); checkpointing this worker segment as resumable.`,
+      artifactPaths: [run.artifacts.agentStatePath],
+      counts: {
+        providerFailures: providerFailureDiagnostics.length,
+        providerRetries: maxProviderRetries
+      },
+      metadata: {
+        transport: "none"
+      }
+    });
+    await appendEvent(run, now, "stderr", "Research agent provider stayed unavailable; checkpointing the worker segment as resumable instead of failing the run.");
+    throw new ActionSelectionProviderUnavailableCheckpoint(request.phase, providerFailureDiagnostics);
+  }
+
   await agent.record({
     phase: request.phase,
     action: "agent_action_selection_failed",
@@ -6987,6 +7133,28 @@ function referencesFromWorkStore(run: RunRecord, store: ResearchWorkStore): Refe
   };
 }
 
+function orderedManuscriptSections(sections: WorkStoreManuscriptSection[]): WorkStoreManuscriptSection[] {
+  const hasExplicitOrder = sections.some((section) => typeof section.orderIndex === "number");
+  if (!hasExplicitOrder) {
+    return [...sections];
+  }
+  return [...sections].sort((left, right) => {
+    const leftOrder = typeof left.orderIndex === "number" ? left.orderIndex : Number.POSITIVE_INFINITY;
+    const rightOrder = typeof right.orderIndex === "number" ? right.orderIndex : Number.POSITIVE_INFINITY;
+    if (leftOrder !== rightOrder) {
+      return leftOrder - rightOrder;
+    }
+    return left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id);
+  });
+}
+
+function modelAuthoredAbstractFromSections(sections: WorkStoreManuscriptSection[]): string {
+  const abstractSection = sections.find((section) => (
+    /\babstract\b/i.test(`${section.sectionId} ${section.role} ${section.title}`)
+  ));
+  return abstractSection?.markdown.trim() ?? "";
+}
+
 function workspacePaperArtifact(input: {
   run: RunRecord;
   store: ResearchWorkStore;
@@ -7003,9 +7171,11 @@ function workspacePaperArtifact(input: {
     evidence: claim.evidence,
     sourceIds: claim.sourceIds
   }));
-  const sections = input.store.objects.manuscriptSections.map((section) => ({
+  const orderedSections = orderedManuscriptSections(input.store.objects.manuscriptSections);
+  const sections = orderedSections.map((section) => ({
     id: section.id,
     role: section.role,
+    orderIndex: section.orderIndex ?? null,
     title: section.title,
     markdown: section.markdown,
     sourceIds: section.sourceIds,
@@ -7037,9 +7207,7 @@ function workspacePaperArtifact(input: {
     runId: input.run.id,
     briefFingerprint: briefFingerprint(input.run.brief),
     title,
-    abstract: sections.length > 0
-      ? "This manuscript export is rendered from durable workspace sections, claims, support links, and references."
-      : "No manuscript sections are available for export yet.",
+    abstract: modelAuthoredAbstractFromSections(orderedSections),
     reviewType: "narrative_review",
     structureRationale: "This artifact is an explicit manuscript.finalize export from workspace state, not a hidden synthesis step.",
     scientificRoles: ["workspace_export"],
@@ -7533,16 +7701,22 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
 
     const localFiles = await collectResearchLocalFileHints(run.projectRoot, run.brief);
 
-    let plan = await researchBackend.planResearch({
-      projectRoot: run.projectRoot,
-      brief: run.brief,
-      localFiles,
-      workspaceContext,
-      literatureContext,
-      workerState: previousWorkerState
-    }, {
+    let plan = await callBackendProviderWithRetries({
+      run,
+      now,
       operation: "planning",
-      timeoutMs: runtimeLlmConfig.planningTimeoutMs
+      label: "Planning",
+      call: () => researchBackend.planResearch({
+        projectRoot: run.projectRoot,
+        brief: run.brief,
+        localFiles,
+        workspaceContext,
+        literatureContext,
+        workerState: previousWorkerState
+      }, {
+        operation: "planning",
+        timeoutMs: runtimeLlmConfig.planningTimeoutMs
+      })
     });
     await agent.record({
       phase: "planning",

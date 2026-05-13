@@ -184,6 +184,67 @@ test("research work store persists the living research notebook with task and ar
   }
 });
 
+test("notebook diagnostics accept explicit DoD item mapping and report exact missing items", async () => {
+  const now = "2026-01-01T00:00:00.000Z";
+  const base = createResearchWorkStore({
+    projectRoot: "/tmp/clawresearch-dod-diagnostics",
+    now,
+    brief: {
+      topic: "Notebook diagnostics",
+      researchQuestion: "Can the notebook map definition-of-done items without exact text copying?",
+      researchDirection: "Use explicit DoD item markers.",
+      successCriterion: "Diagnostics identify exact missing DoD items."
+    }
+  });
+  const partiallyMapped = {
+    ...base,
+    notebook: {
+      ...base.notebook,
+      definitionOfDone: [
+        "Extract selected sources into durable evidence.",
+        "Write a source-grounded section.",
+        "Run release verification."
+      ],
+      tasks: [{
+        id: "task-1",
+        title: "DoD-1 complete via selected source extraction",
+        status: "done" as const,
+        notes: "The wording intentionally paraphrases the criterion.",
+        linkedSourceIds: [],
+        linkedExtractionIds: [],
+        linkedEvidenceCellIds: [],
+        linkedClaimIds: [],
+        linkedSectionIds: [],
+        linkedArtifactPaths: []
+      }],
+      currentFocus: "Finish release.",
+      readiness: "DoD-3 is covered by release.verify; DoD-2 still needs model-authored section work.",
+      updatedAt: now
+    }
+  };
+
+  const partialDiagnostics = buildNotebookDiagnostics(partiallyMapped);
+  const partialDodWarning = partialDiagnostics.warnings.find((warning) => warning.code === "notebook-definition-of-done-unaddressed");
+  assert.equal(partialDodWarning, undefined);
+
+  const missingSecond = {
+    ...partiallyMapped,
+    notebook: {
+      ...partiallyMapped.notebook,
+      readiness: "DoD-3 is covered by release.verify.",
+      tasks: partiallyMapped.notebook.tasks.map((task) => ({
+        ...task,
+        title: "DoD-1 complete via selected source extraction"
+      }))
+    }
+  };
+  const missingDiagnostics = buildNotebookDiagnostics(missingSecond);
+  const missingDodWarning = missingDiagnostics.warnings.find((warning) => warning.code === "notebook-definition-of-done-unaddressed");
+  assert.ok(missingDodWarning);
+  assert.match(missingDodWarning.message, /item\(s\): 2/i);
+  assert.doesNotMatch(missingDodWarning.message, /item\(s\): 1/i);
+});
+
 test("notebook diagnostics expose empty, unwritten, unlinked, and stale project-management state", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-work-store-notebook-diagnostics-"));
 

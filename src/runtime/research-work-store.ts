@@ -359,6 +359,7 @@ export type WorkStoreManuscriptSection = WorkStoreBaseEntity & {
   kind: "manuscriptSection";
   sectionId: string;
   role: string;
+  orderIndex?: number | null;
   title: string;
   markdown: string;
   sourceIds: string[];
@@ -2039,11 +2040,26 @@ export function buildNotebookDiagnostics(store: ResearchWorkStore): ResearchNote
     .join(" ")
     .toLowerCase();
   const readinessText = store.notebook.readiness.toLowerCase();
+  const definitionOfDoneMatches = store.notebook.definitionOfDone.map((criterion, index) => {
+    const criterionNumber = index + 1;
+    const explicitMarkerPattern = new RegExp(`\\b(?:dod|definition(?:\\s+of\\s+done)?(?:\\s+item)?)[\\s#:_-]*${criterionNumber}\\b`, "i");
+    const mentioned = explicitMarkerPattern.test(taskText)
+      || explicitMarkerPattern.test(readinessText)
+      || (() => {
+        const lower = criterion.toLowerCase();
+        const prefix = lower.slice(0, Math.min(lower.length, 48));
+        return prefix.length > 0 && (taskText.includes(prefix) || readinessText.includes(prefix));
+      })();
+    return {
+      criterionNumber,
+      mentioned
+    };
+  });
+  const unmatchedDefinitionOfDoneNumbers = definitionOfDoneMatches
+    .filter((entry) => !entry.mentioned)
+    .map((entry) => entry.criterionNumber);
   const definitionOfDoneAddressed = store.notebook.definitionOfDone.length > 0
-    && store.notebook.definitionOfDone.every((criterion) => {
-      const lower = criterion.toLowerCase();
-      return taskText.includes(lower.slice(0, Math.min(lower.length, 48))) || readinessText.includes(lower.slice(0, Math.min(lower.length, 48)));
-    });
+    && unmatchedDefinitionOfDoneNumbers.length === 0;
   const workspaceUpdatedAts = [
     ...store.objects.canonicalSources.map((entity) => entity.updatedAt),
     ...store.objects.extractions.map((entity) => entity.updatedAt),
@@ -2074,7 +2090,14 @@ export function buildNotebookDiagnostics(store: ResearchWorkStore): ResearchNote
     addWarning("notebook-readiness-unwritten", "Research readiness has not been recorded by the model.", 1, ["notebook.patch"]);
   }
   if (!definitionOfDoneAddressed) {
-    addWarning("notebook-definition-of-done-unaddressed", "Notebook readiness/tasks do not explicitly address the definition of done.", store.notebook.definitionOfDone.length, ["notebook.read", "notebook.patch"]);
+    addWarning(
+      "notebook-definition-of-done-unaddressed",
+      store.notebook.definitionOfDone.length === 0
+        ? "Notebook has no definition of done."
+        : `Notebook readiness/tasks do not explicitly address definition-of-done item(s): ${unmatchedDefinitionOfDoneNumbers.join(", ")}. Reference each item with DoD-1, DoD-2, etc. or include the criterion text in task notes/readiness.`,
+      unmatchedDefinitionOfDoneNumbers.length || store.notebook.definitionOfDone.length,
+      ["notebook.read", "notebook.patch"]
+    );
   }
   if (unlinkedSelectedSourceIds.length > 0) {
     addWarning("notebook-selected-sources-unlinked", `${unlinkedSelectedSourceIds.length} selected source(s) are not linked to notebook tasks.`, unlinkedSelectedSourceIds.length, ["notebook.patch", "workspace.list"]);
@@ -2249,6 +2272,7 @@ export function buildWorkspacePromptContextFromWorkStore(store: ResearchWorkStor
         id: section.id,
         title: section.title,
         status: section.status,
+        orderIndex: section.orderIndex ?? null,
         claimIds: section.claimIds,
         citationIds
       };

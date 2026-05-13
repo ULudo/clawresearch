@@ -126,7 +126,8 @@ const builtinGuidance: ResearchGuidanceObject[] = [
     body: [
       "Use section.create for a durable manuscript section with a clear title, role, markdown, and source/claim ids.",
       "Use section.read before repairing prose. It returns the full markdown, numbered text blocks, linked claims/evidence/sources, mechanical hygiene warnings, and critic objections that target the section.",
-      "Use section.patch to revise section text or metadata. For targeted repair, set operation to replace_block, insert_after_block, append_paragraph, remove_block, update_title, or set_claim_links.",
+      "Use section.patch to revise section text or metadata. For targeted repair, set operation to replace_block, insert_after_block, append_paragraph, remove_block, update_title, set_order, or set_claim_links.",
+      "Use section.patch with operation set_order and orderIndex when you want to control manuscript export order. The runtime will not infer a scientific section order for you.",
       "For block operations, use the blockIndex returned by section.read. The runtime edits only the selected block and reports the resulting blocks and warnings.",
       "Use section.link_claim to connect an existing section to an existing claim. Provide the manuscript section id or sectionId plus the claim id; if unsure, inspect workspace.list/read results first.",
       "Use section.check_claims to create visible work items when section claims lack support."

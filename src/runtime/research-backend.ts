@@ -537,7 +537,10 @@ function criticReviewInstruction(request: CriticReviewRequest): string {
     "Do not perform new research. Do not invent sources, claims, citations, IDs, or facts.",
     "Do not rewrite the manuscript. Do not continue the research process. Do not assume access to anything not included in the packet.",
     "The field draftManuscriptPreview is an in-memory rendering of current workspace sections for review only. It is not evidence that paper.md exists or that the manuscript was finalized.",
-    "Treat the manuscript as finalized only when manuscriptFinalized is true and paperExportExists is true; otherwise review it as a draft workspace state.",
+    "For release-stage review, pre-finalization is normal: manuscriptFinalized=false, paperExportExists=false, and empty finalizedArtifactPaths are not objections by themselves. Review whether the current draft workspace is ready for a future manuscript.finalize export.",
+    "For release-stage review, release.verify often runs after critic.review. If releaseChecksExist=false before finalization, recommend release.verify as the next mechanical check, but do not treat missing release checks as an objection unless manuscriptFinalized=true or paperExportExists=true.",
+    "Treat missing or inconsistent final files as objections only when manuscriptFinalized=true or paperExportExists=true.",
+    "draftManuscriptPreview.abstract is empty unless the researcher created a model-authored abstract section. Do not treat runtime preview metadata as authored abstract text.",
     "Your job is to identify concrete weaknesses, unsupported claims, missing synthesis, overstatements, citation/provenance problems, and manuscript-readiness issues.",
     "Distinguish mechanical/provenance issues from scientific/research-quality objections.",
     "Be concrete. For every objection, name the affected claim, section, evidence cell, citation, release check, or source when possible.",
@@ -587,7 +590,7 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     ? "Use critic.review for fresh stateless critique, and check.run for release/support checks."
     : "Use check.run for release/support checks.";
   const criticFreshnessInstruction = request.allowedActions.includes("critic.review")
-    ? "Critic review freshness is change-based: if evidence, claims, support links, sections, or notebook readiness changed after a release critic pass, release.verify/manuscript.finalize will ask for an explicit new critic.review rather than silently trusting the old review."
+    ? "Critic review freshness is change-based: if evidence, claims, support links, sections, or critic-relevant notebook contract fields changed after a release critic pass, release.verify/manuscript.finalize will ask for an explicit new critic.review rather than silently trusting the old review. Notebook task bookkeeping alone does not stale critic review."
     : "release.verify/manuscript.finalize will only trust current workspace state and validated artifact-contract records; use available repair tools for not-ready observations.";
   const criticSummaries = request.criticReports.map((report) => ({
     stage: report.stage,
@@ -926,8 +929,8 @@ const commonWorkStoreEntityProperties: Record<string, Record<string, unknown>> =
   },
   operation: {
     type: ["string", "null"],
-    enum: ["replace_all", "replace_block", "insert_after_block", "append_paragraph", "remove_block", "update_title", "set_claim_links", null],
-    description: "Optional section.patch operation. Use section.read first to inspect numbered blocks; replace_block/remove_block use 1-based blockIndex, insert_after_block inserts after blockIndex where 0 means before the first block."
+    enum: ["replace_all", "replace_block", "insert_after_block", "append_paragraph", "remove_block", "update_title", "set_order", "set_claim_links", null],
+    description: "Optional section.patch operation. Use section.read first to inspect numbered blocks; replace_block/remove_block use 1-based blockIndex, insert_after_block inserts after blockIndex where 0 means before the first block; set_order changes model-owned export order via orderIndex."
   },
   blockIndex: {
     type: ["number", "null"],
@@ -940,6 +943,14 @@ const commonWorkStoreEntityProperties: Record<string, Record<string, unknown>> =
   statusReason: {
     type: ["string", "null"],
     description: "Short reason explaining a status value."
+  },
+  orderIndex: {
+    type: ["number", "null"],
+    description: "Optional model-owned manuscript section order. Lower orderIndex renders earlier. The runtime does not infer semantic section order."
+  },
+  sectionOrder: {
+    type: ["number", "null"],
+    description: "Alias for orderIndex. Lower sectionOrder renders earlier. The runtime does not infer semantic section order."
   },
   nextInternalActions: {
     type: ["array", "null"],
@@ -960,7 +971,7 @@ const researchActionRecipeLines = [
   "- evidence.patch: set workStore.entityId or entity.evidenceCellId; patch field/value/confidence, or set entity.status to active|superseded|retired with supersededBy/statusReason.",
   "- claim.link_support: set workStore.entity.mode to append|replace|remove. append attaches claimId plus evidenceCellId/sourceId and supportSnippet; replace supersedes older support links; remove retires the matched support link without deleting audit history.",
   "- section.read: inspect full markdown, numbered blocks, linked claims/evidence/sources, mechanical hygiene warnings, and relevant critic objections before repairing prose.",
-  "- section.patch: use operation replace_all, replace_block, insert_after_block, append_paragraph, remove_block, update_title, or set_claim_links. Use blockIndex from section.read for block operations."
+  "- section.patch: use operation replace_all, replace_block, insert_after_block, append_paragraph, remove_block, update_title, set_order, or set_claim_links. Use blockIndex from section.read for block operations; use orderIndex or sectionOrder for model-owned export order."
 ];
 
 function researchActionToolDefinition(request: ResearchActionRequest): Record<string, unknown> {
@@ -1090,7 +1101,7 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
                   },
                   payloadJson: {
                     type: ["string", "null"],
-                    description: "Fallback JSON object string for create/status/notebook payload fields not covered by typed workStore.entity fields. source.select_evidence must include {\"mode\":\"append|replace|remove\"}. extraction.create may include source-derived fields such as {\"problemSetting\":\"...\",\"architecture\":\"...\",\"successSignals\":[\"...\"],\"limitations\":[\"...\"]}. extraction.patch/evidence.patch may include {\"status\":\"retired|superseded|active\",\"supersededBy\":\"...\",\"statusReason\":\"...\"}. claim.link_support may include {\"mode\":\"append|replace|remove\",\"oldEvidenceCellId\":\"...\",\"oldSourceId\":\"...\"}. section.create/patch should include {\"markdown\":\"...\"}; targeted section.patch may include {\"operation\":\"replace_block|append_paragraph|remove_block|update_title|set_claim_links\",\"blockIndex\":1}. notebook.patch may include {\"missionTarget\":\"professional_paper|research_brief|status_report\",\"paperMode\":\"literature_review|technical_survey|method_paper|experimental_paper|position_paper\",\"objective\":\"...\",\"definitionOfDone\":[\"...\"],\"tasks\":[{\"id\":\"task-1\",\"title\":\"...\",\"status\":\"todo\",\"linkedEvidenceCellIds\":[\"...\"]}]}. section.link_claim may include {\"sectionId\":\"...\",\"claimId\":\"...\"}. workspace.status may include {\"status\":\"externally_blocked|needs_user_decision\",\"statusReason\":\"...\",\"nextInternalActions\":[\"...\"]}; non-terminal status notes are returned as observations and do not stop the worker."
+                    description: "Fallback JSON object string for create/status/notebook payload fields not covered by typed workStore.entity fields. source.select_evidence must include {\"mode\":\"append|replace|remove\"}. extraction.create may include source-derived fields such as {\"problemSetting\":\"...\",\"architecture\":\"...\",\"successSignals\":[\"...\"],\"limitations\":[\"...\"]}. extraction.patch/evidence.patch may include {\"status\":\"retired|superseded|active\",\"supersededBy\":\"...\",\"statusReason\":\"...\"}. claim.link_support may include {\"mode\":\"append|replace|remove\",\"oldEvidenceCellId\":\"...\",\"oldSourceId\":\"...\"}. section.create/patch should include {\"markdown\":\"...\"}; targeted section.patch may include {\"operation\":\"replace_block|append_paragraph|remove_block|update_title|set_order|set_claim_links\",\"blockIndex\":1,\"orderIndex\":10,\"sectionOrder\":10}. notebook.patch may include {\"missionTarget\":\"professional_paper|research_brief|status_report\",\"paperMode\":\"literature_review|technical_survey|method_paper|experimental_paper|position_paper\",\"objective\":\"...\",\"definitionOfDone\":[\"...\"],\"tasks\":[{\"id\":\"task-1\",\"title\":\"...\",\"status\":\"todo\",\"linkedEvidenceCellIds\":[\"...\"]}]}. section.link_claim may include {\"sectionId\":\"...\",\"claimId\":\"...\"}. workspace.status may include {\"status\":\"externally_blocked|needs_user_decision\",\"statusReason\":\"...\",\"nextInternalActions\":[\"...\"]}; non-terminal status notes are returned as observations and do not stop the worker."
                   },
                   link: {
                     type: "object",
@@ -1164,7 +1175,7 @@ function nativeAgentStepInstruction(request: ResearchActionRequest): string {
     ? "Use critic.review for fresh stateless critique, and check.run for release/support checks."
     : "Use check.run for release/support checks.";
   const criticFreshnessInstruction = request.allowedActions.includes("critic.review")
-    ? "Critic review freshness is change-based: if evidence, claims, support links, sections, or notebook readiness changed after a release critic pass, release.verify/manuscript.finalize will ask for an explicit new critic.review rather than silently trusting the old review."
+    ? "Critic review freshness is change-based: if evidence, claims, support links, sections, or critic-relevant notebook contract fields changed after a release critic pass, release.verify/manuscript.finalize will ask for an explicit new critic.review rather than silently trusting the old review. Notebook task bookkeeping alone does not stale critic review."
     : "release.verify/manuscript.finalize will only trust current workspace state and validated artifact-contract records; use available repair tools for not-ready observations.";
   return [
     "You are the researcher. ClawResearch is the lab runtime.",

@@ -2157,13 +2157,54 @@ class ArchitectureForbiddenWorkflowBackend extends StubResearchBackend {
 }
 
 class PlanningProviderOverloadBackend extends StubResearchBackend {
+  planningCalls = 0;
+
   override async planResearch(): Promise<ResearchPlan> {
+    this.planningCalls += 1;
     throw new ResearchBackendError(
       "http",
       "planning",
       "openai-codex planning provider unavailable: Our servers are currently overloaded. Please try again later.",
       null
     );
+  }
+}
+
+class AgentStepProviderOverloadThenSuccessBackend extends StubResearchBackend {
+  actionCalls = 0;
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase === "research") {
+      this.actionCalls += 1;
+      if (this.actionCalls <= 10) {
+        throw new ResearchBackendError(
+          "http",
+          "agent_step",
+          "openai-codex agent_step provider unavailable: Our servers are currently overloaded. Please try again later.",
+          null
+        );
+      }
+    }
+
+    return super.chooseResearchAction(request);
+  }
+}
+
+class AgentStepProviderOverloadAlwaysBackend extends StubResearchBackend {
+  actionCalls = 0;
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase === "research") {
+      this.actionCalls += 1;
+      throw new ResearchBackendError(
+        "http",
+        "agent_step",
+        "openai-codex agent_step provider unavailable: Our servers are currently overloaded. Please try again later.",
+        null
+      );
+    }
+
+    return super.chooseResearchAction(request);
   }
 }
 
@@ -2240,6 +2281,46 @@ class FailingCriticBackend extends StubResearchBackend {
 
   async reviewResearchArtifact(): Promise<CriticReviewArtifact> {
     throw new ResearchBackendError("http", "critic", "critic provider unavailable in test", null);
+  }
+}
+
+class CriticProviderOverloadThenSuccessBackend extends FailingCriticBackend {
+  criticCalls = 0;
+
+  override async reviewResearchArtifact(request?: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    if (request === undefined) {
+      throw new Error("critic retry test requires a critic review request");
+    }
+
+    this.criticCalls += 1;
+    if (this.criticCalls <= 10) {
+      throw new ResearchBackendError(
+        "http",
+        "critic",
+        "openai-codex critic provider unavailable: Our servers are currently overloaded. Please try again later.",
+        null
+      );
+    }
+
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "pass",
+      confidence: 0.84,
+      summary: "Critic recovered after transient provider overload.",
+      objections: [],
+      positiveFindings: [],
+      revisionAdvice: {
+        searchQueries: [],
+        evidenceTargets: [],
+        papersToExclude: [],
+        papersToPromote: [],
+        claimsToSoften: []
+      },
+      recommendedNextActions: []
+    };
   }
 }
 
@@ -4218,7 +4299,7 @@ class CriticFreshnessScenarioBackend extends StubResearchBackend {
   private step = 0;
 
   constructor(
-    private readonly mutation: "none" | "section" | "evidence" | "support",
+    private readonly mutation: "none" | "notebook" | "section" | "evidence" | "support",
     private readonly terminalAction: "release.verify" | "manuscript.finalize" = "release.verify"
   ) {
     super();
@@ -4307,6 +4388,43 @@ class CriticFreshnessScenarioBackend extends StubResearchBackend {
           }
         },
         expectedOutcome: "The section changes after critic review.",
+        stopCondition: "Continue to release verification.",
+        transport: "strict_json"
+      };
+    }
+
+    if (this.step === 1 && this.mutation === "notebook") {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "notebook.patch",
+        rationale: "Update project-management notes after critic review without changing critic-relevant manuscript content.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: null,
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              currentFocus: "Record critic review and release verification state.",
+              readiness: "Ready to finalize research_brief literature_review with caveats after runtime-owned release checks pass.",
+              tasks: [
+                {
+                  id: "task-freshness-note",
+                  title: "Record critic freshness without changing manuscript content",
+                  status: "done",
+                  linkedArtifactPaths: ["critic-release-review.json"]
+                }
+              ]
+            }
+          }
+        },
+        expectedOutcome: "Notebook project-management state changes without staling the release critic.",
         stopCondition: "Continue to release verification.",
         transport: "strict_json"
       };
@@ -4615,7 +4733,7 @@ class SectionRepairErgonomicsBackend extends StubResearchBackend {
   readonly criticRequests: CriticReviewRequest[] = [];
   private step = 0;
 
-  constructor(private readonly scenario: "read" | "replace_block") {
+  constructor(private readonly scenario: "read" | "replace_block" | "set_order") {
     super();
   }
 
@@ -4677,8 +4795,35 @@ class SectionRepairErgonomicsBackend extends StubResearchBackend {
       };
     }
 
-    if ((this.scenario === "read" && this.step === 1) || (this.scenario === "replace_block" && this.step === 0)) {
+    if ((this.scenario === "read" && this.step === 1) || ((this.scenario === "replace_block" || this.scenario === "set_order") && this.step === 0)) {
       this.step += 1;
+      if (this.scenario === "set_order") {
+        return {
+          schemaVersion: 1,
+          action: "section.patch",
+          rationale: "Set model-owned manuscript section order without changing prose.",
+          confidence: 0.9,
+          inputs: {
+            ...baseInputs,
+            workStore: {
+              collection: "manuscriptSections",
+              entityId: "section-thin-synthesis",
+              filters: {},
+              semanticQuery: null,
+              limit: null,
+              cursor: null,
+              changes: {},
+              entity: {
+                operation: "set_order",
+                orderIndex: 20
+              }
+            }
+          },
+          expectedOutcome: "The section order metadata changes while markdown and links remain intact.",
+          stopCondition: "The patched section has orderIndex 20.",
+          transport: "strict_json"
+        };
+      }
       if (this.scenario === "replace_block") {
         return {
           schemaVersion: 1,
@@ -4981,6 +5126,8 @@ test("architecture contract: critic review scopes are explicit researcher tools,
 test("critic backend failures are linked into notebook context", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-critic-failure-visible-"));
   const now = createNow();
+  const previousDelay = process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS;
+  process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS = "0";
 
   try {
     const runStore = new RunStore(projectRoot, "0.7.0", now);
@@ -5018,6 +5165,59 @@ test("critic backend failures are linked into notebook context", async () => {
     assert.ok(workStore.notebook.artifactLinks.some((artifact) => artifact.label === "Critic review: release (block)" && artifact.path === completedRun.artifacts.criticReleaseReviewPath));
     assert.ok(laterRequest, "failed critic review should remain visible through recentCriticReviews");
   } finally {
+    if (previousDelay === undefined) {
+      delete process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS;
+    } else {
+      process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS = previousDelay;
+    }
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("critic provider overload retries at least ten times before recording review result", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-critic-provider-retry-success-"));
+  const now = createNow();
+  const previousDelay = process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS;
+  process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS = "0";
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "critic provider retry",
+      researchQuestion: "Can transient critic provider overload recover?",
+      researchDirection: "The runtime should retry explicit critic.review transport overload without fabricating a critic failure.",
+      successCriterion: "A recovered critic result is persisted after ten retries."
+    }, ["clawresearch", "research-loop"]);
+
+    const backend = new CriticProviderOverloadThenSuccessBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const criticReview = JSON.parse(await readFile(completedRun.artifacts.criticReleaseReviewPath, "utf8")) as {
+      readiness: string;
+      objections: Array<{ code: string }>;
+      summary: string;
+    };
+    const events = await readFile(completedRun.artifacts.eventsPath, "utf8");
+
+    assert.equal(exitCode, 0);
+    assert.equal(backend.criticCalls, 11);
+    assert.equal(criticReview.readiness, "pass");
+    assert.equal(criticReview.objections.length, 0);
+    assert.match(criticReview.summary, /recovered/i);
+    assert.match(events, /Critic review provider unavailable; retrying \(10\/10\)/i);
+  } finally {
+    if (previousDelay === undefined) {
+      delete process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS;
+    } else {
+      process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS = previousDelay;
+    }
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
@@ -5263,6 +5463,8 @@ test("architecture contract: externally_blocked requires a concrete external blo
 test("provider overload during planning becomes an external blocker instead of a failed run", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-planning-provider-overload-"));
   const now = createNow();
+  const previousDelay = process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS;
+  process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS = "0";
 
   try {
     const runStore = new RunStore(projectRoot, "0.7.0", now);
@@ -5272,13 +5474,14 @@ test("provider overload during planning becomes an external blocker instead of a
       researchDirection: "Provider overload is an external blocker, not malformed research output.",
       successCriterion: "The worker should persist an externally_blocked state and leave /go resumable."
     }, ["clawresearch", "research-loop"]);
+    const backend = new PlanningProviderOverloadBackend();
 
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
       version: "0.7.0",
       now,
-      researchBackend: new PlanningProviderOverloadBackend()
+      researchBackend: backend
     });
 
     const completedRun = await runStore.load(run.id);
@@ -5291,6 +5494,7 @@ test("provider overload during planning becomes an external blocker instead of a
     assert.equal(exitCode, 0);
     assert.equal(completedRun.status, "completed");
     assert.equal(completedRun.job.exitCode, 0);
+    assert.equal(backend.planningCalls, 11);
     assert.match(completedRun.statusMessage ?? "", /external blocker/i);
     assert.equal(workStore.worker.status, "externally_blocked");
     assert.equal(workStore.worker.completion, null);
@@ -5298,6 +5502,107 @@ test("provider overload during planning becomes an external blocker instead of a
     assert.match(paperMarkdown, /external blocker/i);
     assert.match(paperMarkdown, /overloaded/i);
   } finally {
+    if (previousDelay === undefined) {
+      delete process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS;
+    } else {
+      process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS = previousDelay;
+    }
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("agent-step provider overload retries at least ten times before continuing", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-agent-step-provider-retry-success-"));
+  const now = createNow();
+  const previousDelay = process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS;
+  process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS = "0";
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "research agents",
+      researchQuestion: "Can transient action provider overload recover?",
+      researchDirection: "The worker should retry transient agent-step provider overloads before giving up.",
+      successCriterion: "The eleventh action-selection call can succeed after ten retries and the run continues."
+    }, ["clawresearch", "research-loop"]);
+    const backend = new AgentStepProviderOverloadThenSuccessBackend();
+
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const events = await readFile(completedRun.artifacts.eventsPath, "utf8");
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.ok(backend.actionCalls >= 11);
+    assert.match(events, /retrying \(10\/10\)/i);
+    assert.doesNotMatch(completedRun.statusMessage ?? "", /failed/i);
+  } finally {
+    if (previousDelay === undefined) {
+      delete process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS;
+    } else {
+      process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS = previousDelay;
+    }
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("agent-step provider overload after retries checkpoints as resumable instead of failing", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-agent-step-provider-retry-checkpoint-"));
+  const now = createNow();
+  const previousDelay = process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS;
+  process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS = "0";
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "research agents",
+      researchQuestion: "Can persistent action provider overload checkpoint?",
+      researchDirection: "The worker should leave the current workspace resumable when action selection cannot reach the model provider.",
+      successCriterion: "Persistent provider overload does not mark the run failed."
+    }, ["clawresearch", "research-loop"]);
+    const backend = new AgentStepProviderOverloadAlwaysBackend();
+
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const events = await readFile(completedRun.artifacts.eventsPath, "utf8");
+    const agentSteps = await readFile(completedRun.artifacts.agentStepsPath, "utf8");
+
+    assert.equal(exitCode, 0);
+    assert.equal(completedRun.status, "completed");
+    assert.equal(completedRun.job.exitCode, 0);
+    assert.equal(workStore.worker.status, "working");
+    assert.equal(workStore.worker.completion, null);
+    assert.ok(workStore.worker.nextInternalActions.some((action) => /retry/i.test(action)));
+    assert.equal(workStore.worker.userBlockers.length, 0);
+    assert.equal(backend.actionCalls, 11);
+    assert.match(agentSteps, /"action":"agent_action_provider_unavailable"/);
+    assert.match(agentSteps, /"status":"blocked"/);
+    assert.match(events, /checkpointing the worker segment as resumable/i);
+    assert.doesNotMatch(completedRun.statusMessage ?? "", /failed/i);
+  } finally {
+    if (previousDelay === undefined) {
+      delete process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS;
+    } else {
+      process.env.CLAWRESEARCH_AGENT_PROVIDER_RETRY_DELAY_MS = previousDelay;
+    }
     await rm(projectRoot, { recursive: true, force: true });
   }
 });
@@ -6464,6 +6769,56 @@ test("release.verify reports a fresh release critic review when reviewed objects
   }
 });
 
+test("release.verify keeps critic fresh after notebook project-management updates", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-critic-freshness-notebook-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "critic freshness",
+      researchQuestion: "Can notebook project-management updates avoid unnecessary critic reruns?",
+      researchDirection: "Run critic.review, patch notebook task/readiness metadata, and verify release.",
+      successCriterion: "release.verify still reports critic freshness as fresh."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "critic-freshness"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    const backend = new CriticFreshnessScenarioBackend("notebook");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const releaseResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "release.verify");
+    const freshnessDiagnostic = releaseResult?.related
+      ?.find((item) => item.kind === "criticFreshnessDiagnostic");
+
+    assert.equal(exitCode, 0);
+    assert.equal(backend.criticRequests.length, 1);
+    assert.equal(releaseResult?.status, "ok");
+    assert.equal(freshnessDiagnostic?.status, "fresh");
+    assert.equal(releaseResult?.stateDelta?.releaseCriticFreshnessProblems, 0);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("release.verify reports stale critic review after manuscript section changes", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-critic-freshness-section-stale-"));
   const now = createNow();
@@ -6670,7 +7025,8 @@ test("repeated critic.review returns new repeated and resolved objection diagnos
     assert.equal(secondCriticResult?.stateDelta?.criticResolvedObjections, 1);
     assert.ok(secondCriticResult?.related?.some((item) => item.kind === "criticResolvedObjection" && /section-too-thin/i.test(String(item.fields?.code ?? ""))));
     assert.ok(secondCriticResult?.related?.some((item) => item.kind === "criticRepeatedObjection" && /missing-limitations/i.test(String(item.fields?.code ?? ""))));
-    assert.ok(secondCriticResult?.nextHints?.includes("release.verify"));
+    assert.ok(!(secondCriticResult?.nextHints ?? []).includes("release.verify"));
+    assert.ok(secondCriticResult?.nextHints?.includes("section.patch"));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -6808,6 +7164,161 @@ test("section.patch supports targeted block replacement without rewriting the wh
     assert.equal(patchResult?.items?.filter((item) => item.kind === "manuscriptSectionBlock").length, 2);
     assert.ok(patchResult?.related?.some((item) => item.kind === "claim" && item.id === "claim-review-1"));
     assert.equal(patchResult?.stateDelta?.sectionsPatched, 1);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("section.patch set_order stores model-owned export order without rewriting manuscript text", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-section-patch-order-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "section repair ergonomics",
+      researchQuestion: "Can section.patch set manuscript order?",
+      researchDirection: "Patch section order as model-owned metadata.",
+      successCriterion: "Section order changes without hidden runtime ordering."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "section-order"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+    const beforeStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const beforeSection = beforeStore.objects.manuscriptSections.find((section) => section.id === "section-thin-synthesis");
+    assert.ok(beforeSection);
+
+    const backend = new SectionRepairErgonomicsBackend("set_order");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const updatedSection = workStore.objects.manuscriptSections.find((section) => section.id === "section-thin-synthesis");
+    const patchResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "section.patch");
+
+    assert.equal(exitCode, 0);
+    assert.ok(updatedSection);
+    assert.equal(updatedSection.orderIndex, 20);
+    assert.equal(updatedSection.markdown, beforeSection.markdown);
+    assert.deepEqual(updatedSection.claimIds, beforeSection.claimIds);
+    assert.equal(patchResult?.status, "ok");
+    assert.equal(patchResult?.entity?.fields?.orderIndex, 20);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("manuscript export and critic preview use model-owned section order", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-export-section-order-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "section order",
+      researchQuestion: "Does export order follow model-owned metadata?",
+      researchDirection: "Finalize a seeded research brief with explicit section order.",
+      successCriterion: "Rendered paper follows orderIndex instead of creation/update order."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "section-order"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+    const seededStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const thin = seededStore.objects.manuscriptSections[0];
+    assert.ok(thin);
+    const timestamp = now();
+    const orderedStore = upsertResearchWorkStoreEntities(seededStore, [{
+      ...thin,
+      orderIndex: 20,
+      updatedAt: timestamp
+    } as WorkStoreEntity, {
+      id: "section-introduction-order-test",
+      kind: "manuscriptSection" as const,
+      runId: run.id,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      sectionId: "introduction",
+      role: "introduction",
+      orderIndex: 10,
+      title: "Introduction",
+      markdown: "Introductory framing for the ordered export.",
+      sourceIds: ["source-review-1"],
+      claimIds: ["claim-review-1"],
+      status: "checked" as const
+    }, {
+      id: "section-limitations-order-test",
+      kind: "manuscriptSection" as const,
+      runId: run.id,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      sectionId: "limitations",
+      role: "limitations",
+      orderIndex: 30,
+      title: "Limitations",
+      markdown: "Limitations for the ordered export.",
+      sourceIds: ["source-review-1"],
+      claimIds: ["claim-review-1"],
+      status: "checked" as const
+    }], timestamp);
+    await writeResearchWorkStore(orderedStore);
+
+    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_brief");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const paperMarkdown = await readFile(completedRun.artifacts.paperPath, "utf8");
+    const introIndex = paperMarkdown.indexOf("## Introduction");
+    const synthesisIndex = paperMarkdown.indexOf("## Thin Synthesis");
+    const limitationsIndex = paperMarkdown.indexOf("## Limitations");
+
+    assert.equal(exitCode, 0);
+    assert.ok(introIndex >= 0);
+    assert.ok(synthesisIndex > introIndex);
+    assert.ok(limitationsIndex > synthesisIndex);
+    assert.deepEqual(
+      backend.criticRequests[0]?.draftManuscriptPreview?.sections.map((section) => section.title),
+      ["Introduction", "Thin Synthesis", "Limitations"]
+    );
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -6989,6 +7500,11 @@ test("critic review packet uses exact selected and cited sources, not every scre
     assert.equal(backend.criticRequests.length, 1);
     assert.equal(backend.criticRequests[0]?.paper, null);
     assert.equal(backend.criticRequests[0]?.draftManuscriptPreview?.sections.length, 1);
+    assert.equal(backend.criticRequests[0]?.draftManuscriptPreview?.abstract, "");
+    assert.doesNotMatch(
+      backend.criticRequests[0]?.draftManuscriptPreview?.abstract ?? "",
+      /rendered from durable workspace sections/i
+    );
     assert.equal(backend.criticRequests[0]?.paperExportExists, false);
     assert.deepEqual(backend.criticRequests[0]?.finalizedArtifactPaths, []);
     assert.equal(backend.criticRequests[0]?.releaseChecksExist, false);

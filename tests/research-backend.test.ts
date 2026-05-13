@@ -430,11 +430,13 @@ test("research-agent backend uses native tool calls by default", async () => {
       "sectionIds",
       "markdown",
       "operation",
-      "blockIndex",
-      "status",
-      "statusReason",
-      "nextInternalActions"
-    ];
+	      "blockIndex",
+	      "status",
+	      "statusReason",
+	      "orderIndex",
+	      "sectionOrder",
+	      "nextInternalActions"
+	    ];
     for (const field of typedEntityFields) {
       assert.ok(entitySchema?.properties?.[field], `workStore.entity.${field} should be model-facing`);
     }
@@ -451,8 +453,9 @@ test("research-agent backend uses native tool calls by default", async () => {
     assert.match(capturedBody.messages?.[0]?.content ?? "", /Action recipes:/);
     assert.match(capturedBody.messages?.[0]?.content ?? "", /extraction\.create: set workStore\.entity\.sourceId or paperId/i);
     assert.match(capturedBody.messages?.[0]?.content ?? "", /evidence\.create_cell: set workStore\.entity\.sourceId or paperId/i);
-    assert.match(capturedBody.messages?.[0]?.content ?? "", /claim\.link_support: set workStore\.entity\.mode to append\|replace\|remove/i);
-    assert.match(capturedBody.messages?.[0]?.content ?? "", /section\.patch: use operation replace_all/i);
+	    assert.match(capturedBody.messages?.[0]?.content ?? "", /claim\.link_support: set workStore\.entity\.mode to append\|replace\|remove/i);
+	    assert.match(capturedBody.messages?.[0]?.content ?? "", /section\.patch: use operation replace_all/i);
+	    assert.match(capturedBody.messages?.[0]?.content ?? "", /set_order/i);
     assert.doesNotMatch(capturedBody.messages?.[0]?.content ?? "", /bounded first-pass/i);
   } finally {
     globalThis.fetch = originalFetch;
@@ -746,7 +749,7 @@ test("OpenAI Codex backend uses the same OAuth transport for critic review", asy
         researchDirection: "Review release readiness.",
         successCriterion: "Return concrete critic objections."
       },
-      workspace: {
+	      workspace: {
         notebook: {
           missionTarget: "professional_paper",
           paperMode: "literature_review",
@@ -773,11 +776,31 @@ test("OpenAI Codex backend uses the same OAuth transport for critic review", asy
           title: "Synthesis",
           markdown: "Draft."
         }],
-        releaseChecks: []
-      }
-    }, {
-      operation: "critic",
-      timeoutMs: 300_000
+	        releaseChecks: []
+	      },
+	      draftManuscriptPreview: {
+	        schemaVersion: 1,
+	        runId: "run-critic",
+	        briefFingerprint: "brief",
+	        title: "Draft",
+	        abstract: "",
+	        reviewType: "narrative_review",
+	        structureRationale: "Preview only.",
+	        scientificRoles: [],
+	        sections: [],
+	        claims: [],
+	        citationLinks: [],
+	        referencedPaperIds: [],
+	        evidenceTableIds: [],
+	        limitations: [],
+	        readinessStatus: "ready_for_revision"
+	      },
+	      paperExportExists: false,
+	      finalizedArtifactPaths: [],
+	      manuscriptFinalized: false
+	    }, {
+	      operation: "critic",
+	      timeoutMs: 300_000
     });
 
     assert.equal(review?.readiness, "revise");
@@ -787,9 +810,14 @@ test("OpenAI Codex backend uses the same OAuth transport for critic review", asy
     assert.equal(capturedAuth, "Bearer codex-access-token");
     assert.equal(capturedBody.model, "gpt-test");
     assert.equal(capturedBody.stream, true);
-    assert.match(capturedBody.instructions ?? "", /independent scientific reviewer/i);
-    assert.match(capturedBody.instructions ?? "", /Use IDs only if they appear in the packet/i);
-  } finally {
+	    assert.match(capturedBody.instructions ?? "", /independent scientific reviewer/i);
+	    assert.match(capturedBody.instructions ?? "", /Use IDs only if they appear in the packet/i);
+	    assert.match(capturedBody.instructions ?? "", /pre-finalization is normal/i);
+	    assert.match(capturedBody.instructions ?? "", /not objections by themselves/i);
+	    assert.match(capturedBody.instructions ?? "", /release\.verify often runs after critic\.review/i);
+	    assert.match(capturedBody.instructions ?? "", /do not treat missing release checks as an objection/i);
+	    assert.match(capturedBody.instructions ?? "", /empty unless the researcher created a model-authored abstract section/i);
+	  } finally {
     globalThis.fetch = originalFetch;
   }
 });
