@@ -10,3 +10,4 @@ build/
 .clawresearch/
 .DS_Store
 *.tsbuildinfo
+DEVELOPMENT_COORDINATION.md
