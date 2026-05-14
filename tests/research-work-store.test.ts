@@ -757,6 +757,11 @@ test("workspace prompt context is a derived SQLite projection without pseudo-mem
     assert.equal(context.notebook.objective, "Write a claim-led review from workspace evidence.");
     assert.equal(context.notebook.activeTasks[0]?.linkedEvidenceCellIds[0], "evidence-1");
     assert.equal(context.notebook.recentCriticReviews?.length, 0);
+    assert.equal(context.corpus_view.diagnosticOnly, true);
+    assert.equal(context.corpus_view.selectedSourceCount, 0);
+    assert.equal(context.synthesis_view.diagnosticOnly, true);
+    assert.equal(context.synthesis_view.claimCount, 1);
+    assert.deepEqual(context.synthesis_view.claimsWithoutCitationSupportIds, ["claim-1"]);
     assert.equal(context.recentEvidenceCells[0]?.id, "evidence-1");
     assert.equal(context.recentClaims[0]?.id, "claim-1");
     assert.equal(context.openWorkItems[0]?.id, "workitem-1");

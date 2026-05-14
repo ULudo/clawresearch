@@ -4479,7 +4479,7 @@ export class SourceToolRuntime {
     await emitSourceProgress(this.request.progress, {
       phase: "completed",
       status: "completed",
-      message: `Source tool runtime checkpointed with ${snapshot.canonicalPapers.length} canonical papers and ${snapshot.reviewedPapers.length} selected papers.`,
+      message: `Source tool session checkpointed with ${snapshot.canonicalPapers.length} newly merged canonical paper(s) and ${snapshot.reviewedPapers.length} source-tool selected paper(s). Workspace corpus is reported separately from the canonical work store.`,
       counts: {
         rawSources: snapshot.sources.length,
         canonicalPapers: snapshot.canonicalPapers.length,

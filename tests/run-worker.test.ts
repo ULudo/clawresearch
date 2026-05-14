@@ -2781,7 +2781,7 @@ async function seedThinReviewWorkspace(input: {
     sectionId: "thin-synthesis",
     role: "synthesis",
     title: "Thin Synthesis",
-    markdown: "This deliberately thin section cites only a few sources despite a larger selected and extracted source set.",
+    markdown: `This deliberately thin section cites only a few sources despite a larger selected and extracted source set.${citedSourceIds.length > 0 ? ` ${citedSourceIds.map((sourceId) => `[${sourceId}]`).join(" ")}` : ""}`,
     sourceIds: citedSourceIds,
     claimIds: claims.map((claim) => claim.id),
     status: "checked"
@@ -3197,7 +3197,7 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
               sectionId: "tool-loop-architecture",
               role: "synthesis",
               title: "Tool-Loop Architecture",
-              paragraph: "Explicit researcher tools keep semantic judgment with the model while the runtime validates provenance and export invariants.",
+              paragraph: `Explicit researcher tools keep semantic judgment with the model while the runtime validates provenance and export invariants. [${sourceId}]`,
               claimIds: [claim.id],
               sourceIds: [sourceId]
             }
@@ -4039,6 +4039,224 @@ class SectionLinkClaimBackend extends StubResearchBackend {
   }
 }
 
+class ProvenancePropagationBackend extends StubResearchBackend {
+  readonly researchRequests: ResearchActionRequest[] = [];
+  private step = 0;
+
+  constructor(
+    private readonly mode: "sectionCreateWithClaim" | "sectionLinkClaim" | "supportAfterSection",
+    private readonly claimId: string,
+    private readonly sourceId: string,
+    private readonly evidenceCellId: string
+  ) {
+    super();
+  }
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [],
+      criticScope: null,
+      reason: null
+    };
+
+    if (this.mode === "sectionCreateWithClaim" && this.step === 0) {
+      this.step += 1;
+      return this.linkSupportAction(baseInputs);
+    }
+
+    if (this.mode === "sectionCreateWithClaim" && this.step === 1) {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "section.create",
+        rationale: "Create a section that directly links the already supported claim.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              sectionId: "synthesis",
+              title: "Synthesis",
+              role: "synthesis",
+              claimIds: [this.claimId],
+              paragraph: `The supported claim is discussed with its source marker [${this.sourceId}].`
+            }
+          }
+        },
+        expectedOutcome: "The section derives sourceIds from linked claim support.",
+        stopCondition: "Continue to inspect the propagated provenance.",
+        transport: "strict_json"
+      };
+    }
+
+    if (this.mode === "sectionLinkClaim" && this.step === 0) {
+      this.step += 1;
+      return this.linkSupportAction(baseInputs);
+    }
+
+    if (this.mode === "sectionLinkClaim" && this.step === 1) {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "section.create",
+        rationale: "Create a section before linking the supported claim.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              sectionId: "discussion",
+              title: "Discussion",
+              role: "synthesis",
+              paragraph: `This section will be linked to a supported claim [${this.sourceId}].`
+            }
+          }
+        },
+        expectedOutcome: "The section exists before claim linking.",
+        stopCondition: "Continue to section.link_claim.",
+        transport: "strict_json"
+      };
+    }
+
+    if (this.mode === "sectionLinkClaim" && this.step === 2) {
+      this.step += 1;
+      const section = request.workStore?.recentSections[0];
+      return {
+        schemaVersion: 1,
+        action: "section.link_claim",
+        rationale: "Link the section to the already supported claim.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              sectionId: section?.id ?? section?.sectionId,
+              claimId: this.claimId
+            }
+          }
+        },
+        expectedOutcome: "Support-link section IDs and section source IDs are repaired mechanically.",
+        stopCondition: "Continue to inspect the propagated provenance.",
+        transport: "strict_json"
+      };
+    }
+
+    if (this.mode === "supportAfterSection" && this.step === 0) {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "section.create",
+        rationale: "Create a claim-linked section before support is attached.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              sectionId: "background",
+              title: "Background",
+              role: "background",
+              claimIds: [this.claimId],
+              paragraph: `This section already uses the claim and will cite the linked source [${this.sourceId}].`
+            }
+          }
+        },
+        expectedOutcome: "The section is linked to the claim before support exists.",
+        stopCondition: "Continue to claim.link_support.",
+        transport: "strict_json"
+      };
+    }
+
+    if (this.mode === "supportAfterSection" && this.step === 1) {
+      this.step += 1;
+      return this.linkSupportAction(baseInputs);
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "Checkpoint after provenance propagation regression.",
+      confidence: 0.8,
+      inputs: {
+        ...baseInputs,
+        reason: "Provenance propagation test complete.",
+        workStore: terminalUserDecisionWorkStore("Provenance propagation test complete.")
+      },
+      expectedOutcome: "Structured terminal state.",
+      stopCondition: "Structured test terminal state reached.",
+      transport: "strict_json"
+    };
+  }
+
+  private linkSupportAction(baseInputs: ResearchActionDecision["inputs"]): ResearchActionDecision {
+    return {
+      schemaVersion: 1,
+      action: "claim.link_support",
+      rationale: "Attach evidence-backed support to the seeded claim.",
+      confidence: 0.9,
+      inputs: {
+        ...baseInputs,
+        paperIds: [this.sourceId],
+        workStore: {
+          collection: "citations",
+          entityId: this.claimId,
+          filters: {},
+          semanticQuery: null,
+          limit: null,
+          cursor: null,
+          changes: {},
+          entity: {
+            mode: "append",
+            claimId: this.claimId,
+            sourceId: this.sourceId,
+            evidenceCellId: this.evidenceCellId,
+            supportSnippet: "The seeded evidence directly supports the provenance propagation claim.",
+            confidence: "high",
+            relevance: "direct support"
+          }
+        }
+      },
+      expectedOutcome: "A durable support link is created.",
+      stopCondition: "Continue to section provenance propagation.",
+      transport: "strict_json"
+    };
+  }
+}
+
 class ExplicitManuscriptFinalizeBlockedBackend extends StubResearchBackend {
   private releaseRequested = false;
   readonly researchRequests: ResearchActionRequest[] = [];
@@ -4381,7 +4599,7 @@ class CriticFreshnessScenarioBackend extends StubResearchBackend {
             cursor: null,
             changes: {},
             entity: {
-              markdown: "This revised section was changed after the release critic reviewed the manuscript.",
+              markdown: "This revised section was changed after the release critic reviewed the manuscript. [source-review-1]",
               claimIds: ["claim-review-1"],
               sourceIds: ["source-review-1"]
             }
@@ -4733,7 +4951,7 @@ class SectionRepairErgonomicsBackend extends StubResearchBackend {
   readonly criticRequests: CriticReviewRequest[] = [];
   private step = 0;
 
-  constructor(private readonly scenario: "read" | "replace_block" | "set_order") {
+  constructor(private readonly scenario: "read" | "replace_block" | "set_order" | "ready_status" | "invalid_status") {
     super();
   }
 
@@ -4795,7 +5013,7 @@ class SectionRepairErgonomicsBackend extends StubResearchBackend {
       };
     }
 
-    if ((this.scenario === "read" && this.step === 1) || ((this.scenario === "replace_block" || this.scenario === "set_order") && this.step === 0)) {
+    if ((this.scenario === "read" && this.step === 1) || ((this.scenario === "replace_block" || this.scenario === "set_order" || this.scenario === "ready_status" || this.scenario === "invalid_status") && this.step === 0)) {
       this.step += 1;
       if (this.scenario === "set_order") {
         return {
@@ -4821,6 +5039,35 @@ class SectionRepairErgonomicsBackend extends StubResearchBackend {
           },
           expectedOutcome: "The section order metadata changes while markdown and links remain intact.",
           stopCondition: "The patched section has orderIndex 20.",
+          transport: "strict_json"
+        };
+      }
+      if (this.scenario === "ready_status" || this.scenario === "invalid_status") {
+        return {
+          schemaVersion: 1,
+          action: "section.patch",
+          rationale: "Patch a manuscript section status explicitly.",
+          confidence: 0.9,
+          inputs: {
+            ...baseInputs,
+            workStore: {
+              collection: "manuscriptSections",
+              entityId: "section-thin-synthesis",
+              filters: {},
+              semanticQuery: null,
+              limit: null,
+              cursor: null,
+              changes: {},
+              entity: {
+                operation: "replace_block",
+                blockIndex: 1,
+                markdown: "The status patch keeps explicit manuscript prose and a workspace inline citation. [source-review-1]",
+                status: this.scenario === "ready_status" ? "ready_for_review" : "done"
+              }
+            }
+          },
+          expectedOutcome: "The section status contract either accepts or rejects the requested status.",
+          stopCondition: "The tool result reports the status outcome.",
           transport: "strict_json"
         };
       }
@@ -5779,6 +6026,9 @@ test("explicit researcher tools create extraction, evidence, critic feedback, re
     assert.match(agentSteps, /"manuscriptFinalized":1/);
     assert.equal(workStore.worker.status, "working");
     assert.equal(workStore.worker.completion?.kind, "manuscript_finalized");
+    assert.match(workStore.notebook.readiness, /Runtime finalization record: manuscript_finalized/i);
+    assert.match(workStore.notebook.readiness, /not a runtime judgment of scientific quality/i);
+    assert.ok(workStore.notebook.notes.some((note) => /Pre-finalization notebook readiness/i.test(note)));
     assert.deepEqual(workStore.worker.completion?.artifactPaths, [
       completedRun.artifacts.paperPath,
       completedRun.artifacts.paperJsonPath,
@@ -6542,6 +6792,7 @@ test("explicit manuscript.finalize fails visibly when release invariants are mis
     assert.equal(releaseResult?.status, "not_ready");
     assert.equal(releaseResult?.stateDelta?.manuscriptFinalized, 0);
     assert.ok(releaseResult?.related?.some((item) => item.kind === "releaseRepair" && item.fields?.suggestedActions !== undefined));
+    assert.ok(releaseResult?.related?.some((item) => item.kind === "notebookReadinessRepair" && item.fields?.patchTarget === "notebook.readiness"));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -6657,6 +6908,216 @@ test("professional_paper mission cannot be finalized as a research_brief downgra
     assert.equal(workStore.worker.completion, null);
     assert.equal(finalizeResult?.status, "not_ready");
     assert.ok(finalizeResult?.related?.some((item) => item.kind === "artifactContractDiagnostic" && /downgrade/i.test(item.snippet ?? "")));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("manuscript compiler blocks duplicate top-level headings and missing inline citations", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-manuscript-compiler-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "model-driven research workspaces",
+      researchQuestion: "Can manuscript.finalize report compiler-style section errors?",
+      researchDirection: "Use a seeded workspace with malformed section markdown.",
+      successCriterion: "Compiler diagnostics block export with exact repair information."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "manuscript-compiler"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+    const seededStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const seededSection = seededStore.objects.manuscriptSections[0];
+    assert.ok(seededSection);
+    const badSection = {
+      ...seededSection,
+      markdown: "# Duplicate Paper Title\n\nThis section is linked to a renderable reference but does not contain an inline workspace citation marker.",
+      updatedAt: now()
+    } as WorkStoreEntity;
+    await writeResearchWorkStore(upsertResearchWorkStoreEntities(seededStore, [badSection], now()));
+
+    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_brief");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const checks = JSON.parse(await readFile(completedRun.artifacts.manuscriptChecksPath, "utf8")) as {
+      checks: Array<{ id: string; status: string; severity: string; message: string }>;
+    };
+    const finalizeResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "manuscript.finalize");
+
+    assert.equal(exitCode, 0);
+    await assert.rejects(readFile(completedRun.artifacts.paperPath, "utf8"), /ENOENT/);
+    assert.ok(checks.checks.some((check) => check.id === "manuscript-compiler" && check.status === "fail" && check.severity === "blocker"));
+    assert.equal(finalizeResult?.status, "not_ready");
+    assert.ok(backend.researchRequests.every((request) => request.workStore?.dashboard?.corpus_view?.diagnosticOnly === true));
+    assert.ok(backend.researchRequests.every((request) => request.workStore?.dashboard?.synthesis_view?.diagnosticOnly === true));
+    assert.ok(finalizeResult?.related?.some((item) => item.kind === "manuscriptCompilerDiagnostic" && item.fields?.code === "manuscript.top_level_heading_inside_section"));
+    assert.ok(finalizeResult?.related?.some((item) => item.kind === "manuscriptCompilerDiagnostic" && item.fields?.code === "manuscript.missing_inline_workspace_citation"));
+    assert.match(finalizeResult?.message ?? "", /hard invariant repair item/i);
+    assert.ok(backend.criticRequests[0]?.workspace?.corpus_view);
+    assert.ok(backend.criticRequests[0]?.workspace?.synthesis_view);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("manuscript compiler blocks duplicated section-title headings without deleting them", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-manuscript-duplicate-section-heading-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "model-driven research workspaces",
+      researchQuestion: "Can manuscript.finalize report duplicate section heading errors?",
+      researchDirection: "Use a seeded workspace with a section title repeated inside section markdown.",
+      successCriterion: "Compiler diagnostics block export with exact duplicate-heading repair information."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "manuscript-compiler"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+    const seededStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const seededSection = seededStore.objects.manuscriptSections[0];
+    assert.ok(seededSection);
+    const badSection = {
+      ...seededSection,
+      markdown: "## Thin Synthesis\n\nThis section contains an inline citation marker, so only the duplicate section-heading compiler error should block export. [source-review-1]",
+      updatedAt: now()
+    } as WorkStoreEntity;
+    await writeResearchWorkStore(upsertResearchWorkStoreEntities(seededStore, [badSection], now()));
+
+    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_brief");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const finalizeResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "manuscript.finalize");
+
+    assert.equal(exitCode, 0);
+    await assert.rejects(readFile(completedRun.artifacts.paperPath, "utf8"), /ENOENT/);
+    assert.equal(finalizeResult?.status, "not_ready");
+    assert.ok(finalizeResult?.related?.some((item) => (
+      item.kind === "manuscriptCompilerDiagnostic"
+      && item.fields?.code === "manuscript.duplicate_section_heading"
+      && item.fields?.sectionId === "section-thin-synthesis"
+      && item.fields?.lineNumber === 1
+    )));
+    assert.ok(finalizeResult?.related?.every((item) => item.fields?.code !== "manuscript.missing_inline_workspace_citation"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("manuscript compiler blocks inline citation and support-link provenance mismatches", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-manuscript-provenance-compiler-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "model-driven research provenance",
+      researchQuestion: "Can manuscript.finalize report section provenance mismatches?",
+      researchDirection: "Use a seeded workspace with stale section/source/support metadata.",
+      successCriterion: "Compiler diagnostics block export with exact provenance repair hints."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "manuscript-compiler"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+    const seededStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const section = seededStore.objects.manuscriptSections[0];
+    const citation = seededStore.objects.citations[0];
+    assert.ok(section);
+    assert.ok(citation);
+    const staleSection = {
+      ...section,
+      markdown: "This section cites a known source but omits section.sourceIds, and also cites an unknown source marker. [source-review-1] [source-missing-1]",
+      sourceIds: [],
+      updatedAt: now()
+    } as WorkStoreEntity;
+    const staleCitation = {
+      ...citation,
+      sectionIds: [],
+      updatedAt: now()
+    } as WorkStoreEntity;
+    await writeResearchWorkStore(upsertResearchWorkStoreEntities(seededStore, [staleSection, staleCitation], now()));
+
+    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_brief");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const finalizeResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "manuscript.finalize");
+    const checks = JSON.parse(await readFile(completedRun.artifacts.manuscriptChecksPath, "utf8")) as {
+      checks: Array<{ id: string; status: string; severity: string; message: string }>;
+    };
+
+    assert.equal(exitCode, 0);
+    await assert.rejects(readFile(completedRun.artifacts.paperPath, "utf8"), /ENOENT/);
+    assert.equal(finalizeResult?.status, "not_ready");
+    assert.ok(checks.checks.some((check) => check.id === "manuscript-compiler" && check.status === "fail" && check.severity === "blocker"));
+    assert.ok(finalizeResult?.related?.some((item) => item.kind === "manuscriptCompilerDiagnostic" && item.fields?.code === "manuscript.section_provenance_mismatch"));
+    assert.ok(finalizeResult?.related?.some((item) => item.kind === "manuscriptCompilerDiagnostic" && item.fields?.code === "manuscript.support_link_section_mismatch"));
+    assert.ok(finalizeResult?.related?.some((item) => item.kind === "manuscriptCompilerDiagnostic" && item.fields?.code === "manuscript.unknown_inline_workspace_citation"));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -6865,6 +7326,8 @@ test("release.verify reports stale critic review after manuscript section change
     assert.equal(releaseResult?.stateDelta?.mechanicalReleaseChecksPassed, 1);
     assert.equal(releaseResult?.stateDelta?.finalizationReady, 0);
     assert.ok((freshnessDiagnostic?.fields?.changedObjects as string[] | undefined)?.includes("manuscriptSection:section-thin-synthesis"));
+    assert.ok((freshnessDiagnostic?.fields?.changedObjectReasons as string[] | undefined)?.some((reason) => /changed after the critic review/i.test(reason)));
+    assert.equal(freshnessDiagnostic?.fields?.repairClass, "critic_review_freshness");
     assert.ok(releaseResult?.nextHints?.includes("critic.review"));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
@@ -7160,10 +7623,75 @@ test("section.patch supports targeted block replacement without rewriting the wh
     assert.match(updatedSection.markdown, /This second paragraph should remain unchanged/);
     assert.doesNotMatch(updatedSection.markdown, /source-review-1/);
     assert.deepEqual(updatedSection.claimIds, ["claim-review-1"]);
+    assert.equal(updatedSection.status, "checked");
     assert.equal(patchResult?.status, "ok");
     assert.equal(patchResult?.items?.filter((item) => item.kind === "manuscriptSectionBlock").length, 2);
     assert.ok(patchResult?.related?.some((item) => item.kind === "claim" && item.id === "claim-review-1"));
     assert.equal(patchResult?.stateDelta?.sectionsPatched, 1);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("section.patch accepts ready_for_review and rejects invalid statuses without fallback", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-section-status-contract-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "section repair ergonomics",
+      researchQuestion: "Can section.patch persist explicit status without silent fallback?",
+      researchDirection: "Patch section status values.",
+      successCriterion: "Valid status persists and invalid status blocks visibly."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "section-status"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    const readyBackend = new SectionRepairErgonomicsBackend("ready_status");
+    await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: readyBackend
+    });
+    let workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    assert.equal(workStore.objects.manuscriptSections[0]?.status, "ready_for_review");
+
+    const invalidBackend = new SectionRepairErgonomicsBackend("invalid_status");
+    await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: invalidBackend
+    });
+    workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const invalidResult = invalidBackend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "section.patch");
+
+    assert.equal(workStore.objects.manuscriptSections[0]?.status, "ready_for_review");
+    assert.equal(invalidResult?.status, "blocked");
+    assert.match(invalidResult?.message ?? "", /Invalid manuscript section status "done"/);
+    assert.match(invalidResult?.message ?? "", /ready_for_review/);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -7261,9 +7789,21 @@ test("manuscript export and critic preview use model-owned section order", async
     const thin = seededStore.objects.manuscriptSections[0];
     assert.ok(thin);
     const timestamp = now();
+    const citation = seededStore.objects.citations[0];
+    const claim = seededStore.objects.claims[0];
+    assert.ok(citation);
+    assert.ok(claim);
     const orderedStore = upsertResearchWorkStoreEntities(seededStore, [{
       ...thin,
       orderIndex: 20,
+      updatedAt: timestamp
+    } as WorkStoreEntity, {
+      ...citation,
+      sectionIds: ["section-thin-synthesis", "section-introduction-order-test", "section-limitations-order-test"],
+      updatedAt: timestamp
+    } as WorkStoreEntity, {
+      ...claim,
+      usedInSections: ["section-thin-synthesis", "section-introduction-order-test", "section-limitations-order-test"],
       updatedAt: timestamp
     } as WorkStoreEntity, {
       id: "section-introduction-order-test",
@@ -7275,7 +7815,7 @@ test("manuscript export and critic preview use model-owned section order", async
       role: "introduction",
       orderIndex: 10,
       title: "Introduction",
-      markdown: "Introductory framing for the ordered export.",
+      markdown: "Introductory framing for the ordered export. [source-review-1]",
       sourceIds: ["source-review-1"],
       claimIds: ["claim-review-1"],
       status: "checked" as const
@@ -7289,7 +7829,7 @@ test("manuscript export and critic preview use model-owned section order", async
       role: "limitations",
       orderIndex: 30,
       title: "Limitations",
-      markdown: "Limitations for the ordered export.",
+      markdown: "Limitations for the ordered export. [source-review-1]",
       sourceIds: ["source-review-1"],
       claimIds: ["claim-review-1"],
       status: "checked" as const
@@ -7437,6 +7977,70 @@ test("research_brief mission can finalize after a runtime release critic pass", 
   }
 });
 
+test("research observations distinguish source-session counts from persisted workspace corpus counts", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-source-session-workspace-counts-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "source observation counts",
+      researchQuestion: "Can the model distinguish a clean source session from an already seeded workspace corpus?",
+      researchDirection: "Seed workspace sources without running source tools.",
+      successCriterion: "Observation counts label source-session and workspace-corpus state separately."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "source-observations"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 4,
+      extractedCount: 2,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    const backend = new FinalizeSeededWorkspaceBackend(null, "research_brief");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+    const completedRun = await runStore.load(run.id);
+    const sourcesArtifact = JSON.parse(await readFile(completedRun.artifacts.sourcesPath, "utf8")) as {
+      sourceToolState?: {
+        canonicalPapers?: number;
+        selectedPapers?: number;
+      } | null;
+      workspaceCorpus?: {
+        canonicalSourceCount?: number;
+        selectedSourceCount?: number;
+      };
+    };
+    const firstRequest = backend.researchRequests[0];
+
+    assert.equal(exitCode, 0);
+    assert.ok(firstRequest);
+    assert.equal(firstRequest.observations.sourceSessionCanonicalSources, 0);
+    assert.equal(firstRequest.observations.sourceSessionSelectedPapers, 0);
+    assert.equal(firstRequest.observations.workspaceCanonicalSources, 4);
+    assert.equal(firstRequest.observations.workspaceSelectedSourceIds, 4);
+    assert.equal(firstRequest.observations.canonicalSources, 4);
+    assert.equal(firstRequest.observations.selectedPapers, 0);
+    assert.equal(firstRequest.workStore?.dashboard?.corpus_view.canonicalSourceCount, 4);
+    assert.equal(firstRequest.workStore?.dashboard?.corpus_view.selectedSourceCount, 4);
+    assert.equal(sourcesArtifact.sourceToolState?.canonicalPapers, 0);
+    assert.equal(sourcesArtifact.workspaceCorpus?.canonicalSourceCount, 4);
+    assert.equal(sourcesArtifact.workspaceCorpus?.selectedSourceCount, 4);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("critic review packet uses exact selected and cited sources, not every screened include", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-critic-exact-selection-"));
   const now = createNow();
@@ -7560,6 +8164,70 @@ test("section.link_claim resolves natural and swapped section/claim ids", async 
       assert.equal(linkResult?.query?.sectionId, section.id);
       assert.equal(linkResult?.query?.claimId, claim.id);
       assert.ok(linkResult?.related?.some((item) => item.kind === "claim" && item.id === claim.id));
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("section and support tools propagate mechanical provenance between claims, sources, and sections", async () => {
+  for (const mode of ["sectionCreateWithClaim", "sectionLinkClaim", "supportAfterSection"] as const) {
+    const projectRoot = await mkdtemp(path.join(os.tmpdir(), `clawresearch-provenance-propagation-${mode}-`));
+    const now = createNow();
+
+    try {
+      const brief = {
+        topic: "provenance propagation",
+        researchQuestion: "Can section, claim, and support-link metadata stay mechanically consistent?",
+        researchDirection: "Exercise section.create, section.link_claim, and claim.link_support propagation paths.",
+        successCriterion: "Sections cite sources through supported claims without stale support metadata."
+      };
+      const runStore = new RunStore(projectRoot, "0.7.0", now);
+      const run = await runStore.create(brief, ["clawresearch", "provenance-propagation"]);
+      const seeded = await seedSharedClaimSupportWorkspace({
+        projectRoot,
+        runId: run.id,
+        brief,
+        now
+      });
+      const backend = new ProvenancePropagationBackend(mode, seeded.claimId, seeded.sourceIds[0], seeded.evidenceCellIds[0]);
+
+      const exitCode = await runDetachedJobWorker({
+        projectRoot,
+        runId: run.id,
+        version: "0.7.0",
+        now,
+        researchBackend: backend
+      });
+
+      const workStore = await loadResearchWorkStore({
+        projectRoot,
+        now: now()
+      });
+      const section = workStore.objects.manuscriptSections[0];
+      const citation = workStore.objects.citations.find((candidate) => candidate.sourceId === seeded.sourceIds[0]);
+      const toolResults = backend.researchRequests.flatMap((request) => request.toolResults ?? []);
+      const propagationResult = [...toolResults]
+        .reverse()
+        .find((result) => (
+          result.action === "section.create"
+          || result.action === "section.link_claim"
+          || result.action === "claim.link_support"
+        ));
+
+      assert.equal(exitCode, 0);
+      assert.ok(section);
+      assert.ok(citation);
+      assert.ok(section.claimIds.includes(seeded.claimId));
+      assert.ok(section.sourceIds.includes(seeded.sourceIds[0]));
+      assert.ok(citation.sectionIds.includes(section.id));
+      assert.ok((propagationResult?.stateDelta?.sourceIdsAdded ?? 0) >= 1);
+      if (mode === "supportAfterSection") {
+        assert.equal(propagationResult?.action, "claim.link_support");
+        assert.equal(propagationResult?.stateDelta?.supportLinksCreated, 1);
+      } else {
+        assert.ok((propagationResult?.stateDelta?.supportLinksAttachedToSections ?? 0) >= 1);
+      }
     } finally {
       await rm(projectRoot, { recursive: true, force: true });
     }
@@ -7695,6 +8363,10 @@ test("run worker lets the research agent choose source provider order and source
         canonicalMergeCompleted?: boolean;
         recentActions?: Array<{ action: string }>;
       } | null;
+      workspaceCorpus?: {
+        canonicalSourceCount?: number;
+        selectedSourceCount?: number;
+      };
     };
     const stdout = await readFile(completedRun.artifacts.stdoutPath, "utf8");
     const workStore = await loadResearchWorkStore({
@@ -7707,6 +8379,8 @@ test("run worker lets the research agent choose source provider order and source
     assert.equal(sourcesArtifact.retrievalDiagnostics?.providerAttempts?.[0]?.providerId, "arxiv");
     assert.ok((sourcesArtifact.reviewWorkflow?.counts?.selectedForSynthesis ?? 0) > 0);
     assert.equal(sourcesArtifact.sourceToolState?.canonicalMergeCompleted, true);
+    assert.ok((sourcesArtifact.workspaceCorpus?.canonicalSourceCount ?? 0) > 0);
+    assert.ok((sourcesArtifact.workspaceCorpus?.selectedSourceCount ?? 0) > 0);
     assert.ok(sourcesArtifact.sourceToolState?.recentActions?.some((action) => action.action === "source.select_evidence"));
     assert.deepEqual(backend.sourceActions.map((action) => action.action).slice(0, 4), [
       "source.search",

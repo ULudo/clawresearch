@@ -93,6 +93,41 @@ function emptyWorkspaceContext(): WorkspacePromptContext {
       manuscriptSections: 0,
       releaseChecks: 0
     },
+    corpus_view: {
+      diagnosticOnly: true,
+      note: "Fixture diagnostic corpus view.",
+      canonicalSourceCount: 0,
+      selectedSourceCount: 0,
+      extractedSourceCount: 0,
+      evidenceSourceCount: 0,
+      citationSourceCount: 0,
+      renderedReferenceSourceCount: 0,
+      accessModeCounts: {},
+      screeningDecisionCounts: {},
+      providerRunCount: 0,
+      sourceCandidateCount: 0,
+      missingSelectedExtractionSourceIds: [],
+      duplicateExtractionSourceIds: [],
+      extractedNotEvidenceSourceIds: [],
+      evidenceNotCitedSourceIds: [],
+      selectedToRenderedCollapseSourceIds: []
+    },
+    synthesis_view: {
+      diagnosticOnly: true,
+      note: "Fixture diagnostic synthesis view.",
+      activeExtractionCount: 0,
+      activeEvidenceCellCount: 1,
+      activeCitationCount: 0,
+      claimCount: 0,
+      claimsWithCitationSupportCount: 0,
+      claimsWithoutCitationSupportIds: [],
+      manuscriptSectionCount: 0,
+      sectionsWithClaimLinksCount: 0,
+      sectionsWithoutClaimLinksIds: [],
+      sectionsWithoutCitationLinksIds: [],
+      evidenceCellIdsWithoutCitationLinks: ["evidence-mollifier"],
+      selectedSourceIdsNotCited: []
+    },
 	    notebook: {
 	      missionTarget: "professional_paper",
 	      paperMode: "literature_review",
@@ -761,6 +796,14 @@ test("OpenAI Codex backend uses the same OAuth transport for critic review", asy
           claims: 1,
           manuscriptSections: 1
         },
+        corpus_view: {
+          diagnosticOnly: true,
+          note: "Fixture critic corpus view."
+        },
+        synthesis_view: {
+          diagnosticOnly: true,
+          note: "Fixture critic synthesis view."
+        },
         selectedSources: [],
         citedSources: [],
         protocols: [],
@@ -817,6 +860,10 @@ test("OpenAI Codex backend uses the same OAuth transport for critic review", asy
 	    assert.match(capturedBody.instructions ?? "", /release\.verify often runs after critic\.review/i);
 	    assert.match(capturedBody.instructions ?? "", /do not treat missing release checks as an objection/i);
 	    assert.match(capturedBody.instructions ?? "", /empty unless the researcher created a model-authored abstract section/i);
+    assert.match(capturedBody.instructions ?? "", /"corpus_view"/);
+    assert.match(capturedBody.instructions ?? "", /Fixture critic corpus view/);
+    assert.match(capturedBody.instructions ?? "", /"synthesis_view"/);
+    assert.match(capturedBody.instructions ?? "", /Fixture critic synthesis view/);
 	  } finally {
     globalThis.fetch = originalFetch;
   }

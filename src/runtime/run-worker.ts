@@ -90,6 +90,8 @@ import type { ResearchBrief } from "./session-store.js";
 import {
 	  buildLiteratureContextFromWorkStore,
 	  buildNotebookDiagnostics,
+  buildResearchCorpusDiagnosticView,
+  buildResearchSynthesisDiagnosticView,
   buildWorkspaceDispositionDiagnostics,
 	  buildWorkspacePromptContextFromWorkStore,
 	  createResearchWorkStoreEntity,
@@ -389,6 +391,8 @@ function workStoreContextForAgent(store: ResearchWorkStore): ResearchActionReque
   const openWorkItems = store.objects.workItems.filter((item) => item.status === "open");
   const failedReleaseChecks = store.objects.releaseChecks.filter((check) => check.status === "fail");
   const notebookDiagnostics = buildNotebookDiagnostics(store);
+  const corpusView = buildResearchCorpusDiagnosticView(store);
+  const synthesisView = buildResearchSynthesisDiagnosticView(store);
   const sourceAccess = {
     sourceCandidates: store.objects.sources.length,
     canonicalSources: store.objects.canonicalSources.length,
@@ -416,7 +420,9 @@ function workStoreContextForAgent(store: ResearchWorkStore): ResearchActionReque
         stage: "release"
       }),
       recentlyChangedIds: recentlyChangedWorkspaceIds(store),
-      suggestedLookupTools: ["workspace.list", "workspace.search", "workspace.read"]
+      suggestedLookupTools: ["workspace.list", "workspace.search", "workspace.read"],
+      corpus_view: corpusView,
+      synthesis_view: synthesisView
     },
 	    worker: {
 	      status: store.worker.status,
@@ -927,9 +933,236 @@ function manuscriptSectionWordCount(markdown: string): number {
   return words?.length ?? 0;
 }
 
+type ManuscriptCompilerDiagnostic = {
+  code: string;
+  severity: "error" | "warning";
+  sectionId: string;
+  sectionTitle: string;
+  blockIndex: number | null;
+  lineNumber: number | null;
+  message: string;
+  repairHint: string;
+  sourceIds: string[];
+  claimIds: string[];
+};
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeMarkdownHeadingText(value: string): string {
+  return value
+    .replace(/^#+\s+/, "")
+    .replace(/\s+#+\s*$/, "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+function markdownContainsWorkspaceCitation(markdown: string, sourceIds: string[]): boolean {
+  if (sourceIds.length === 0) {
+    return true;
+  }
+  return sourceIds.some((sourceId) => {
+    const pattern = new RegExp(`\\[[^\\]]*@?${escapeRegExp(sourceId)}[^\\]]*\\]`);
+    return pattern.test(markdown);
+  });
+}
+
+function markdownWorkspaceCitationMarkers(markdown: string, knownSourceIds: string[]): Array<{
+  sourceId: string;
+  known: boolean;
+  lineNumber: number;
+}> {
+  const knownSourceIdSet = new Set(knownSourceIds);
+  const markers: Array<{ sourceId: string; known: boolean; lineNumber: number }> = [];
+  const seen = new Set<string>();
+  const bracketPattern = /\[([^\]\n]+)\]/g;
+  for (const [lineIndex, line] of markdown.split(/\r?\n/).entries()) {
+    bracketPattern.lastIndex = 0;
+    for (let match = bracketPattern.exec(line); match !== null; match = bracketPattern.exec(line)) {
+      const content = match[1] ?? "";
+      const rawTokens = content
+        .split(/[\s,;]+/)
+        .map((token) => token.trim().replace(/^@/, "").replace(/^[({]+/, "").replace(/[.)}]+$/, ""))
+        .filter((token) => token.length > 0);
+      for (const token of rawTokens) {
+        const sourceId = knownSourceIdSet.has(token)
+          ? token
+          : /^source[-_:][A-Za-z0-9_.:-]+$/i.test(token)
+            ? token
+            : null;
+        if (sourceId === null) {
+          continue;
+        }
+        const key = `${sourceId}:${lineIndex + 1}`;
+        if (seen.has(key)) {
+          continue;
+        }
+        seen.add(key);
+        markers.push({
+          sourceId,
+          known: knownSourceIdSet.has(sourceId),
+          lineNumber: lineIndex + 1
+        });
+      }
+    }
+  }
+  return markers;
+}
+
+function manuscriptCompilerDiagnostics(input: {
+  store: ResearchWorkStore;
+  references: ReferencesArtifact;
+}): ManuscriptCompilerDiagnostic[] {
+  const diagnostics: ManuscriptCompilerDiagnostic[] = [];
+  const activeCitations = input.store.objects.citations.filter(researchObjectIsActive);
+  const referenceSourceIds = new Set(input.references.references.map((reference) => reference.sourceId));
+  const knownSourceIds = uniqueStrings(input.store.objects.canonicalSources.map((source) => source.id));
+
+  for (const section of input.store.objects.manuscriptSections) {
+    const inlineCitationMarkers = markdownWorkspaceCitationMarkers(section.markdown, knownSourceIds);
+    for (const marker of inlineCitationMarkers.filter((candidate) => !candidate.known)) {
+      diagnostics.push({
+        code: "manuscript.unknown_inline_workspace_citation",
+        severity: "error",
+        sectionId: section.id,
+        sectionTitle: section.title,
+        blockIndex: null,
+        lineNumber: marker.lineNumber,
+        message: `Section ${section.id} contains inline citation marker [${marker.sourceId}], but no canonical workspace source has that id.`,
+        repairHint: "Use workspace.list or workspace.search to inspect source ids, then use section.patch to replace the marker with a known source id or remove the unsupported marker.",
+        sourceIds: [marker.sourceId],
+        claimIds: section.claimIds.slice(0, 12)
+      });
+    }
+    for (const marker of inlineCitationMarkers.filter((candidate) => candidate.known && !section.sourceIds.includes(candidate.sourceId))) {
+      diagnostics.push({
+        code: "manuscript.section_provenance_mismatch",
+        severity: "error",
+        sectionId: section.id,
+        sectionTitle: section.title,
+        blockIndex: null,
+        lineNumber: marker.lineNumber,
+        message: `Section ${section.id} cites [${marker.sourceId}] inline, but section.sourceIds does not include ${marker.sourceId}.`,
+        repairHint: `Use section.patch with sourceIds including ${marker.sourceId}, or link a supported claim/source to this section so provenance can be propagated mechanically.`,
+        sourceIds: [marker.sourceId],
+        claimIds: section.claimIds.slice(0, 12)
+      });
+    }
+    for (const claimId of section.claimIds) {
+      const claimSupportLinks = activeCitations.filter((citation) => citation.claimIds.includes(claimId));
+      const missingSectionLinks = claimSupportLinks.filter((citation) => !citation.sectionIds.includes(section.id));
+      for (const citation of missingSectionLinks.slice(0, 8)) {
+        diagnostics.push({
+          code: "manuscript.support_link_section_mismatch",
+          severity: "error",
+          sectionId: section.id,
+          sectionTitle: section.title,
+          blockIndex: null,
+          lineNumber: null,
+          message: `Section ${section.id} links claim ${claimId}, but active support link ${citation.id} for source ${citation.sourceId} is not attached to the section.`,
+          repairHint: `Use section.link_claim for section ${section.id} and claim ${claimId}, or claim.link_support with sectionIds including ${section.id}, so the support link and section metadata agree.`,
+          sourceIds: [citation.sourceId],
+          claimIds: [claimId]
+        });
+      }
+    }
+    const blocks = manuscriptSectionBlocks(section.markdown);
+    const firstContentLine = section.markdown
+      .split(/\r?\n/)
+      .map((line, index) => ({ line: line.trim(), index }))
+      .find((entry) => entry.line.length > 0);
+    if (
+      firstContentLine !== undefined
+      && /^#{2,6}\s+/.test(firstContentLine.line)
+      && normalizeMarkdownHeadingText(firstContentLine.line) === normalizeMarkdownHeadingText(section.title)
+    ) {
+      diagnostics.push({
+        code: "manuscript.duplicate_section_heading",
+        severity: "error",
+        sectionId: section.id,
+        sectionTitle: section.title,
+        blockIndex: null,
+        lineNumber: firstContentLine.index + 1,
+        message: `Section ${section.id} starts with a markdown heading that duplicates the stored section title "${section.title}". The exporter already renders "## ${section.title}" for this section.`,
+        repairHint: "Use section.patch to remove the duplicated leading heading from section.markdown, or change it to a real lower-level subsection title if it is different from the section title.",
+        sourceIds: section.sourceIds.slice(0, 12),
+        claimIds: section.claimIds.slice(0, 12)
+      });
+    }
+    for (const [blockIndex, block] of blocks.entries()) {
+      const lines = block.split(/\r?\n/);
+      for (const [lineIndex, line] of lines.entries()) {
+        if (/^#\s+/.test(line.trim())) {
+          diagnostics.push({
+            code: "manuscript.top_level_heading_inside_section",
+            severity: "error",
+            sectionId: section.id,
+            sectionTitle: section.title,
+            blockIndex: blockIndex + 1,
+            lineNumber: lineIndex + 1,
+            message: `Section ${section.id} contains a top-level "# " heading inside section block ${blockIndex + 1}, line ${lineIndex + 1}. The exporter already renders the paper title and the section title.`,
+            repairHint: "Use section.patch to remove the inner top-level heading or convert it to a lower-level subsection heading such as ### if it is genuinely needed.",
+            sourceIds: section.sourceIds.slice(0, 12),
+            claimIds: section.claimIds.slice(0, 12)
+          });
+        }
+      }
+    }
+
+    const supportedSectionSourceIds = uniqueStrings(activeCitations
+      .filter((citation) => (
+        citation.sectionIds.includes(section.id)
+        || citation.claimIds.some((claimId) => section.claimIds.includes(claimId))
+      ))
+      .map((citation) => citation.sourceId)
+      .filter((sourceId) => referenceSourceIds.has(sourceId)));
+    if (supportedSectionSourceIds.length > 0 && !markdownContainsWorkspaceCitation(section.markdown, supportedSectionSourceIds)) {
+      diagnostics.push({
+        code: "manuscript.missing_inline_workspace_citation",
+        severity: "error",
+        sectionId: section.id,
+        sectionTitle: section.title,
+        blockIndex: null,
+        lineNumber: null,
+        message: `Section ${section.id} is linked to renderable workspace references but contains no inline workspace citation marker for those sources.`,
+        repairHint: `Use section.patch to add inline citation markers with rendered source ids, for example [${supportedSectionSourceIds[0]}].`,
+        sourceIds: supportedSectionSourceIds.slice(0, 12),
+        claimIds: section.claimIds.slice(0, 12)
+      });
+    }
+  }
+
+  return diagnostics;
+}
+
+function manuscriptCompilerDiagnosticPreviews(diagnostics: ManuscriptCompilerDiagnostic[]): AgentVisibleEntityPreview[] {
+  return diagnostics.slice(0, 16).map((diagnostic, index) => ({
+    id: `manuscript-compiler-${index + 1}`,
+    kind: "manuscriptCompilerDiagnostic",
+    title: diagnostic.code,
+    status: diagnostic.severity,
+    snippet: diagnostic.message,
+    sourceIds: diagnostic.sourceIds,
+    claimIds: diagnostic.claimIds,
+    fields: {
+      code: diagnostic.code,
+      severity: diagnostic.severity,
+      sectionId: diagnostic.sectionId,
+      sectionTitle: diagnostic.sectionTitle,
+      blockIndex: diagnostic.blockIndex,
+      lineNumber: diagnostic.lineNumber,
+      repairHint: diagnostic.repairHint,
+      suggestedActions: ["section.read", "section.patch", "release.verify"]
+    }
+  }));
+}
+
 function manuscriptSectionHygieneWarnings(section: WorkStoreManuscriptSection, store?: ResearchWorkStore): string[] {
   const warnings: string[] = [];
   const markdown = section.markdown.trim();
+  const markdownWithoutCitationMarkers = markdown.replace(/\[[^\]]*(?:source|paper|claim|evidence|extraction|citation)[-_][^\]]+\]/gi, "");
   const contextText = [
     section.sectionId,
     section.role,
@@ -948,7 +1181,7 @@ function manuscriptSectionHygieneWarnings(section: WorkStoreManuscriptSection, s
   if (/\b(?:TODO|TBD|FIXME|placeholder)\b/i.test(markdown)) {
     warnings.push("Section contains placeholder/TODO-style prose.");
   }
-  if (/\b(?:source|paper|claim|evidence|extraction|citation)[-_][A-Za-z0-9][A-Za-z0-9_.:-]*\b/.test(markdown)) {
+  if (/\b(?:source|paper|claim|evidence|extraction|citation)[-_][A-Za-z0-9][A-Za-z0-9_.:-]*\b/.test(markdownWithoutCitationMarkers)) {
     warnings.push("Section prose appears to contain raw workspace ids instead of rendered source/claim language.");
   }
   const imperativeToolInstruction = /\b(?:call|run|invoke|execute)\s+(?:critic\.review|release\.verify|section\.patch|workspace\.read|claim\.link_support|section\.read)\b/i.test(markdown)
@@ -1402,6 +1635,24 @@ function notebookDiagnosticPreviews(diagnostics: ResearchNotebookDiagnostics): A
   }));
 }
 
+function notebookReadinessRepairPreviews(issue: string | null): AgentVisibleEntityPreview[] {
+  if (issue === null) {
+    return [];
+  }
+  return [{
+    id: "notebook-readiness-finalization-repair",
+    kind: "notebookReadinessRepair",
+    title: "Notebook readiness must be explicit before finalization",
+    status: "not_ready",
+    snippet: compactPreviewText(issue, 320),
+    fields: {
+      repairClass: "notebook_only",
+      patchTarget: "notebook.readiness",
+      suggestedActions: ["notebook.read", "notebook.patch", "release.verify"]
+    }
+  }];
+}
+
 function notebookReadinessTextIsExplicitRelease(readiness: string): boolean {
   return /\b(ready|finali[sz]e|release|submit|export)\b/i.test(readiness)
     && /\b(caveat|limitation|bounded|despite|sufficient|complete|meets?|satisfies|acceptable)\b/i.test(readiness);
@@ -1417,6 +1668,36 @@ function notebookFinalizationReadinessIssue(notebook: ResearchNotebook): string 
     return "Notebook readiness currently says the project is not sufficient or not ready. Patch notebook.readiness to an intentional release statement with caveats before manuscript.finalize.";
   }
   return null;
+}
+
+function notebookAfterManuscriptFinalization(input: {
+  notebook: ResearchNotebook;
+  completion: NonNullable<ResearchWorkerCompletion>;
+  artifactLinks: ResearchNotebookArtifactLink[];
+  now: string;
+}): ResearchNotebook {
+  const previousReadiness = input.notebook.readiness.trim();
+  const notes = [...input.notebook.notes];
+  if (previousReadiness.length > 0 && previousReadiness !== defaultNotebookReadiness) {
+    const note = `Pre-finalization notebook readiness (${input.now}): ${previousReadiness}`;
+    if (!notes.includes(note)) {
+      notes.push(note);
+    }
+  }
+
+  const paperPath = input.completion.artifactPaths.find((artifactPath) => artifactPath.endsWith("paper.md"))
+    ?? input.completion.artifactPaths[0]
+    ?? "paper.md";
+  return {
+    ...input.notebook,
+    readiness: [
+      `Runtime finalization record: manuscript_finalized at ${input.completion.finalizedAt}; ${path.basename(paperPath)} was written after explicit model-selected manuscript.finalize and hard mechanical checks passed.`,
+      "This records export completion only; it is not a runtime judgment of scientific quality."
+    ].join(" "),
+    notes: notes.slice(-40),
+    artifactLinks: input.artifactLinks,
+    updatedAt: input.now
+  };
 }
 
 type CriticFreshnessStatus =
@@ -1932,9 +2213,13 @@ function artifactContractPreviews(evaluation: ArtifactContractEvaluation): Agent
         stage: evaluation.releaseCriticFreshness.stage,
         reviewReadiness: evaluation.releaseCriticFreshness.reviewReadiness,
         reviewArtifactPath: evaluation.releaseCriticFreshness.reviewArtifactPath,
+        repairClass: evaluation.releaseCriticFreshness.status === "fresh" ? "none" : "critic_review_freshness",
         changedObjects: evaluation.releaseCriticFreshness.changedObjects.slice(0, 8).map((object) => `${object.kind}:${object.id}`),
+        changedObjectReasons: evaluation.releaseCriticFreshness.changedObjects.slice(0, 8).map((object) => object.reason),
         missingObjects: evaluation.releaseCriticFreshness.missingObjects.slice(0, 8).map((object) => `${object.kind}:${object.id}`),
+        missingObjectReasons: evaluation.releaseCriticFreshness.missingObjects.slice(0, 8).map((object) => object.reason),
         newObjects: evaluation.releaseCriticFreshness.newObjects.slice(0, 8).map((object) => `${object.kind}:${object.id}`),
+        newObjectReasons: evaluation.releaseCriticFreshness.newObjects.slice(0, 8).map((object) => object.reason),
         suggestedActions: evaluation.releaseCriticFreshness.suggestedActions
       }
     },
@@ -2042,6 +2327,93 @@ function activeCitationsForClaim(store: ResearchWorkStore, claimId: string): Wor
     researchObjectIsActive(citation)
     && citation.claimIds.includes(claimId)
   ));
+}
+
+function sectionIdsUsingClaim(store: ResearchWorkStore, claimId: string, claim?: WorkStoreClaim | null): string[] {
+  const claimEntity = claim ?? readResearchWorkStoreEntity<WorkStoreClaim>(store, "claims", claimId);
+  const knownSectionIds = new Set(store.objects.manuscriptSections.map((section) => section.id));
+  return uniqueStrings([
+    ...(claimEntity?.usedInSections ?? []),
+    ...store.objects.manuscriptSections
+      .filter((section) => section.claimIds.includes(claimId))
+      .map((section) => section.id)
+  ]).filter((sectionId) => knownSectionIds.has(sectionId));
+}
+
+function activeSupportSourceIdsForClaims(store: ResearchWorkStore, claimIds: string[]): string[] {
+  const claimIdSet = new Set(claimIds);
+  return uniqueStrings(store.objects.citations
+    .filter((citation) => (
+      researchObjectIsActive(citation)
+      && citation.claimIds.some((claimId) => claimIdSet.has(claimId))
+    ))
+    .map((citation) => citation.sourceId));
+}
+
+function propagateClaimSupportToSections(input: {
+  store: ResearchWorkStore;
+  claimIds: string[];
+  sectionIds: string[];
+  now: string;
+}): {
+  store: ResearchWorkStore;
+  sectionIdsUpdated: number;
+  sourceIdsAdded: number;
+  supportLinksAttachedToSections: number;
+} {
+  const claimIds = uniqueStrings(input.claimIds);
+  const sectionIds = uniqueStrings(input.sectionIds);
+  const claimIdSet = new Set(claimIds);
+  let nextStore = input.store;
+  let sectionIdsUpdated = 0;
+  let sourceIdsAdded = 0;
+  let supportLinksAttachedToSections = 0;
+
+  for (const sectionId of sectionIds) {
+    const section = readResearchWorkStoreEntity<WorkStoreManuscriptSection>(nextStore, "manuscriptSections", sectionId);
+    if (section === null) {
+      continue;
+    }
+    const relevantSupportLinks = nextStore.objects.citations.filter((citation) => (
+      researchObjectIsActive(citation)
+      && citation.claimIds.some((claimId) => claimIdSet.has(claimId))
+    ));
+    const supportSourceIds = uniqueStrings(relevantSupportLinks.map((citation) => citation.sourceId));
+    const missingSourceIds = supportSourceIds.filter((sourceId) => !section.sourceIds.includes(sourceId));
+    if (missingSourceIds.length > 0) {
+      nextStore = patchResearchWorkStoreEntity(nextStore, {
+        collection: "manuscriptSections",
+        id: section.id,
+        changes: {
+          sourceIds: uniqueStrings([...section.sourceIds, ...missingSourceIds])
+        }
+      }, input.now);
+      sectionIdsUpdated += 1;
+      sourceIdsAdded += missingSourceIds.length;
+    }
+
+    for (const supportLink of relevantSupportLinks) {
+      const latestSupportLink = readResearchWorkStoreEntity<WorkStoreCitation>(nextStore, "citations", supportLink.id);
+      if (latestSupportLink === null || latestSupportLink.sectionIds.includes(section.id)) {
+        continue;
+      }
+      nextStore = patchResearchWorkStoreEntity(nextStore, {
+        collection: "citations",
+        id: latestSupportLink.id,
+        changes: {
+          sectionIds: uniqueStrings([...latestSupportLink.sectionIds, section.id])
+        }
+      }, input.now);
+      supportLinksAttachedToSections += 1;
+    }
+  }
+
+  return {
+    store: nextStore,
+    sectionIdsUpdated,
+    sourceIdsAdded,
+    supportLinksAttachedToSections
+  };
 }
 
 function uniqueEntitiesById<T extends { id: string }>(entities: T[]): T[] {
@@ -3056,10 +3428,43 @@ function safeSectionPatchOperation(value: unknown, fallback: SectionPatchOperati
     : fallback;
 }
 
+const validManuscriptSectionStatuses = ["draft", "needs_revision", "ready_for_review", "checked"] as const;
+
 function safeManuscriptSectionStatus(value: unknown, fallback: WorkStoreManuscriptSection["status"]): WorkStoreManuscriptSection["status"] {
-  return value === "draft" || value === "needs_revision" || value === "checked"
-    ? value
+  return typeof value === "string" && (validManuscriptSectionStatuses as readonly string[]).includes(value)
+    ? value as WorkStoreManuscriptSection["status"]
     : fallback;
+}
+
+function manuscriptSectionStatusValidation(input: {
+  entity: Record<string, unknown>;
+  changes: Record<string, unknown>;
+}): {
+  ok: boolean;
+  status: WorkStoreManuscriptSection["status"] | null;
+  invalidValue: string | null;
+} {
+  const rawStatus = input.entity.status ?? input.changes.status;
+  if (rawStatus === undefined || rawStatus === null || rawStatus === "") {
+    return {
+      ok: true,
+      status: null,
+      invalidValue: null
+    };
+  }
+  if (typeof rawStatus === "string" && (validManuscriptSectionStatuses as readonly string[]).includes(rawStatus)) {
+    return {
+      ok: true,
+      status: rawStatus as WorkStoreManuscriptSection["status"],
+      invalidValue: null
+    };
+  }
+  const serialized = JSON.stringify(rawStatus);
+  return {
+    ok: false,
+    status: null,
+    invalidValue: typeof rawStatus === "string" ? rawStatus : serialized ?? String(rawStatus)
+  };
 }
 
 function explicitSectionMarkdown(entity: Record<string, unknown>, changes: Record<string, unknown>): string {
@@ -3181,7 +3586,7 @@ function manuscriptSectionFromToolInput(input: {
       ...(input.existing?.claimIds ?? []),
       ...stringArrayInput(entity.claimIds ?? changes.claimIds, 40)
     ]),
-    status: safeManuscriptSectionStatus(entity.status ?? changes.status, "needs_revision")
+    status: safeManuscriptSectionStatus(entity.status ?? changes.status, input.existing?.status ?? "needs_revision")
   };
 }
 
@@ -3453,6 +3858,12 @@ function buildCriticReviewRequest(input: {
     workspace: {
       notebook: input.store.notebook,
       workspaceSummary: summarizeResearchWorkStore(input.store),
+      corpus_view: buildResearchCorpusDiagnosticView(input.store, {
+        renderedReferenceSourceIds: paper.referencedPaperIds
+      }),
+      synthesis_view: buildResearchSynthesisDiagnosticView(input.store, {
+        renderedReferenceSourceIds: paper.referencedPaperIds
+      }),
       selectedSources,
       citedSources,
       protocols: input.store.objects.protocols.slice(-6).map((protocol) => ({
@@ -4790,7 +5201,12 @@ async function executeResearchObjectToolAction(input: {
         })
       };
     }
-    const sectionIds = stringArrayInput(args.entity.sectionIds, 20);
+    const requestedSectionIds = stringArrayInput(args.entity.sectionIds, 20)
+      .filter((sectionId) => readResearchWorkStoreEntity<WorkStoreManuscriptSection>(input.store, "manuscriptSections", sectionId) !== null);
+    const sectionIds = uniqueStrings([
+      ...requestedSectionIds,
+      ...sectionIdsUsingClaim(input.store, claimId, claim)
+    ]);
     const citation = supportLinkFromInput({
       run: input.run,
       now: nowText,
@@ -4908,8 +5324,19 @@ async function executeResearchObjectToolAction(input: {
         risk: supported ? null : claimIssues[0]?.message ?? claim.risk
       }
     }, nowText);
+    const propagation = propagateClaimSupportToSections({
+      store: nextStore,
+      claimIds: [claimId],
+      sectionIds,
+      now: nowText
+    });
+    nextStore = propagation.store;
     await writeResearchWorkStore(nextStore);
     const updatedClaim = readResearchWorkStoreEntity<WorkStoreClaim>(nextStore, "claims", claimId);
+    const updatedSectionPreviews = sectionIds.flatMap((sectionId) => {
+      const section = readResearchWorkStoreEntity<WorkStoreManuscriptSection>(nextStore, "manuscriptSections", sectionId);
+      return section === null ? [] : [entityPreviewForAgent(section, nextStore)];
+    });
     const changedOldSupportPreviews = replacementTargets.flatMap((target) => {
       const updated = readResearchWorkStoreEntity<WorkStoreCitation>(nextStore, "citations", target.id);
       return updated === null ? [] : [entityPreviewForAgent(updated, nextStore)];
@@ -4941,11 +5368,24 @@ async function executeResearchObjectToolAction(input: {
         entity: entityPreviewForAgent(citation, nextStore),
         related: [
           ...changedOldSupportPreviews,
+          ...updatedSectionPreviews,
           ...(updatedClaim === null ? [] : [entityPreviewForAgent(updatedClaim, nextStore)])
         ],
         stateDelta: existingCitation === null
-          ? { supportLinksCreated: 1, supportLinksSuperseded: replacedCount }
-          : { supportLinksUpdated: 1, supportLinksSuperseded: replacedCount },
+          ? {
+            supportLinksCreated: 1,
+            supportLinksSuperseded: replacedCount,
+            supportLinksAttachedToSections: propagation.supportLinksAttachedToSections,
+            sectionIdsUpdated: propagation.sectionIdsUpdated,
+            sourceIdsAdded: propagation.sourceIdsAdded
+          }
+          : {
+            supportLinksUpdated: 1,
+            supportLinksSuperseded: replacedCount,
+            supportLinksAttachedToSections: propagation.supportLinksAttachedToSections,
+            sectionIdsUpdated: propagation.sectionIdsUpdated,
+            sourceIdsAdded: propagation.sourceIdsAdded
+          },
         nextHints: ["section.link_claim", "claim.check_support", "release.verify"]
       })
     };
@@ -5465,6 +5905,31 @@ async function executeResearchObjectToolAction(input: {
   }
 
   if (input.decision.action === "section.create" || input.decision.action === "section.patch") {
+    const statusValidation = manuscriptSectionStatusValidation({
+      entity: args.entity,
+      changes: args.changes
+    });
+    if (!statusValidation.ok) {
+      const message = `Section create/patch blocked. Invalid manuscript section status "${statusValidation.invalidValue ?? "(unknown)"}". Use one of: ${validManuscriptSectionStatuses.join(", ")}. No section was persisted.`;
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "blocked",
+          readOnly: false,
+          message,
+          collection: "manuscriptSections",
+          count: 0,
+          totalCount: input.store.objects.manuscriptSections.length,
+          items: input.store.objects.manuscriptSections.slice(-8).map((entry) => entityPreviewForAgent(entry, input.store)),
+          nextHints: ["section.read", "section.patch", "section.check_claims"]
+        })
+      };
+    }
     const existing = input.decision.action === "section.patch"
       ? resolveSectionReference(input.store, stringCandidates(
         args.entityId,
@@ -5501,10 +5966,25 @@ async function executeResearchObjectToolAction(input: {
         })
       };
     }
-    const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, section, nowText);
+    const supportSourceIds = activeSupportSourceIdsForClaims(input.store, section.claimIds);
+    const sectionSourceIdsBefore = new Set(section.sourceIds);
+    const sectionWithDerivedProvenance = {
+      ...section,
+      sourceIds: uniqueStrings([...section.sourceIds, ...supportSourceIds])
+    };
+    let nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, sectionWithDerivedProvenance, nowText);
+    const propagation = propagateClaimSupportToSections({
+      store: nextStore,
+      claimIds: sectionWithDerivedProvenance.claimIds,
+      sectionIds: [sectionWithDerivedProvenance.id],
+      now: nowText
+    });
+    nextStore = propagation.store;
     await writeResearchWorkStore(nextStore);
-    const hygieneWarningCount = manuscriptSectionHygieneWarnings(section, nextStore).length;
-    const message = `Section updated ${section.id}: ${manuscriptSectionBlocks(section.markdown).length} block(s), ${section.claimIds.length} linked claim(s), ${hygieneWarningCount} mechanical hygiene warning(s).`;
+    const updatedSection = readResearchWorkStoreEntity<WorkStoreManuscriptSection>(nextStore, "manuscriptSections", sectionWithDerivedProvenance.id) ?? sectionWithDerivedProvenance;
+    const sourceIdsAddedOnCreate = updatedSection.sourceIds.filter((sourceId) => !sectionSourceIdsBefore.has(sourceId)).length;
+    const hygieneWarningCount = manuscriptSectionHygieneWarnings(updatedSection, nextStore).length;
+    const message = `Section updated ${updatedSection.id}: ${manuscriptSectionBlocks(updatedSection.markdown).length} block(s), ${updatedSection.claimIds.length} linked claim(s), ${hygieneWarningCount} mechanical hygiene warning(s).`;
     return {
       handled: true,
       store: nextStore,
@@ -5518,12 +5998,15 @@ async function executeResearchObjectToolAction(input: {
         collection: "manuscriptSections",
         count: 1,
         totalCount: nextStore.objects.manuscriptSections.length,
-        entity: entityPreviewForAgent(section, nextStore),
-        items: sectionBlockPreviews(section),
-        related: sectionRepairRelatedPreviews(nextStore, section),
+        entity: entityPreviewForAgent(updatedSection, nextStore),
+        items: sectionBlockPreviews(updatedSection),
+        related: sectionRepairRelatedPreviews(nextStore, updatedSection),
         stateDelta: {
           [input.decision.action === "section.create" ? "sectionsCreated" : "sectionsPatched"]: 1,
-          sectionHygieneWarnings: hygieneWarningCount
+          sectionHygieneWarnings: hygieneWarningCount,
+          sectionIdsUpdated: propagation.sectionIdsUpdated,
+          sourceIdsAdded: sourceIdsAddedOnCreate + propagation.sourceIdsAdded,
+          supportLinksAttachedToSections: propagation.supportLinksAttachedToSections
         },
         nextHints: hygieneWarningCount > 0
           ? ["section.read", "section.patch", "section.link_claim", "section.check_claims"]
@@ -5569,23 +6052,35 @@ async function executeResearchObjectToolAction(input: {
     }
     const section = targets.section;
     const claim = targets.claim;
+    const supportSourceIds = activeSupportSourceIdsForClaims(input.store, [claim.id]);
+    const sourceIdsBefore = new Set(section.sourceIds);
     const sectionPatched = patchResearchWorkStoreEntity(input.store, {
       collection: "manuscriptSections",
       id: section.id,
       changes: {
-        claimIds: uniqueStrings([...section.claimIds, claim.id])
+        claimIds: uniqueStrings([...section.claimIds, claim.id]),
+        sourceIds: uniqueStrings([...section.sourceIds, ...supportSourceIds])
       }
     }, nowText);
-    const nextStore = patchResearchWorkStoreEntity(sectionPatched, {
+    let nextStore = patchResearchWorkStoreEntity(sectionPatched, {
       collection: "claims",
       id: claim.id,
       changes: {
         usedInSections: uniqueStrings([...claim.usedInSections, section.id])
       }
     }, nowText);
+    const propagation = propagateClaimSupportToSections({
+      store: nextStore,
+      claimIds: [claim.id],
+      sectionIds: [section.id],
+      now: nowText
+    });
+    nextStore = propagation.store;
     await writeResearchWorkStore(nextStore);
     const updatedSection = readResearchWorkStoreEntity<WorkStoreManuscriptSection>(nextStore, "manuscriptSections", section.id);
     const updatedClaim = readResearchWorkStoreEntity<WorkStoreClaim>(nextStore, "claims", claim.id);
+    const sourceIdsAddedBeforePropagation = (updatedSection?.sourceIds ?? [])
+      .filter((sourceId) => !sourceIdsBefore.has(sourceId)).length;
     const message = `Section ${section.id} linked to claim ${claim.id}.`;
     return {
       handled: true,
@@ -5603,7 +6098,12 @@ async function executeResearchObjectToolAction(input: {
         totalCount: nextStore.objects.manuscriptSections.length,
         entity: updatedSection === null ? null : entityPreviewForAgent(updatedSection, nextStore),
         related: updatedClaim === null ? [] : [entityPreviewForAgent(updatedClaim, nextStore)],
-        stateDelta: { sectionClaimLinksCreated: 1 },
+        stateDelta: {
+          sectionClaimLinksCreated: 1,
+          sectionIdsUpdated: propagation.sectionIdsUpdated,
+          sourceIdsAdded: sourceIdsAddedBeforePropagation + propagation.sourceIdsAdded,
+          supportLinksAttachedToSections: propagation.supportLinksAttachedToSections
+        },
         nextHints: ["section.check_claims", "release.verify", "workspace.read"]
       })
     };
@@ -5615,6 +6115,10 @@ async function executeResearchObjectToolAction(input: {
     const notebookReadinessIssue = notebookFinalizationReadinessIssue(input.store.notebook);
     const checkBundle = workspaceManuscriptChecks({
       run: input.run,
+      store: input.store,
+      references
+    });
+    const compilerDiagnostics = manuscriptCompilerDiagnostics({
       store: input.store,
       references
     });
@@ -5669,7 +6173,9 @@ async function executeResearchObjectToolAction(input: {
         items: releaseChecks.map((check) => entityPreviewForAgent(check, nextStore)),
         related: [
           ...releaseRepairPreviews(hardFailures),
+          ...manuscriptCompilerDiagnosticPreviews(compilerDiagnostics),
           ...artifactContractPreviews(artifactContract),
+          ...notebookReadinessRepairPreviews(notebookReadinessIssue),
           ...notebookDiagnosticPreviews(notebookDiagnostics)
         ],
         stateDelta: {
@@ -5677,6 +6183,7 @@ async function executeResearchObjectToolAction(input: {
           mechanicalReleaseChecksPassed: mechanicalChecksPassed ? 1 : 0,
           finalizationReady: finalizationReady ? 1 : 0,
           hardInvariantBlockers: hardFailures.length,
+          manuscriptCompilerErrors: compilerDiagnostics.filter((diagnostic) => diagnostic.severity === "error").length,
           artifactContractFailures: artifactContract.failures.length,
           releaseCriticFreshnessProblems: releaseCriticFreshness.status === "fresh" ? 0 : 1,
           notebookDiagnosticWarnings: notebookDiagnostics.warningCount,
@@ -5706,6 +6213,10 @@ async function executeResearchObjectToolAction(input: {
     const notebookReadinessIssue = notebookFinalizationReadinessIssue(input.store.notebook);
     const checkBundle = workspaceManuscriptChecks({
       run: input.run,
+      store: input.store,
+      references
+    });
+    const compilerDiagnostics = manuscriptCompilerDiagnostics({
       store: input.store,
       references
     });
@@ -5766,12 +6277,15 @@ async function executeResearchObjectToolAction(input: {
           items: releaseChecks.map((check) => entityPreviewForAgent(check, nextStore)),
           related: [
             ...releaseRepairPreviews(releaseChecks.filter((check) => check.status === "fail" && check.severity === "blocker")),
+            ...manuscriptCompilerDiagnosticPreviews(compilerDiagnostics),
             ...artifactContractPreviews(artifactContract),
+            ...notebookReadinessRepairPreviews(notebookReadinessIssue),
             ...notebookDiagnosticPreviews(notebookDiagnostics)
           ],
           stateDelta: {
             releaseChecksCreated: releaseChecks.length,
             hardInvariantBlockers: hardFailures.length,
+            manuscriptCompilerErrors: compilerDiagnostics.filter((diagnostic) => diagnostic.severity === "error").length,
             artifactContractFailures: artifactContract.failures.length,
             releaseCriticFreshnessProblems: releaseCriticFreshness.status === "fresh" ? 0 : 1,
             notebookDiagnosticWarnings: notebookDiagnostics.warningCount,
@@ -5825,11 +6339,12 @@ async function executeResearchObjectToolAction(input: {
     }
     const completedStore = {
       ...nextStore,
-      notebook: {
-        ...nextStore.notebook,
+      notebook: notebookAfterManuscriptFinalization({
+        notebook: nextStore.notebook,
+        completion,
         artifactLinks,
-        updatedAt: nowText
-      },
+        now: nowText
+      }),
       worker: {
         ...nextStore.worker,
         completion,
@@ -6369,6 +6884,7 @@ function sessionObservations(input: {
     input.workStore.objects.canonicalSources.filter((source) => source.accessMode !== "metadata_only").length
   );
   const explicitlySelectedEvidenceSources = input.sourceState.selectedPapers;
+  const workspaceSelectedSourceIds = input.workStore.worker.evidence?.selectedSourceIds.length ?? 0;
 
   return {
     sourceCandidates: Math.max(input.sourceState.rawSources, input.workStore.objects.sources.length),
@@ -6376,6 +6892,12 @@ function sessionObservations(input: {
     screenedInSources,
     explicitlySelectedEvidenceSources,
     resolvedAccessSources,
+    sourceSessionCandidates: input.sourceState.rawSources,
+    sourceSessionCanonicalSources: input.sourceState.canonicalPapers,
+    sourceSessionSelectedPapers: input.sourceState.selectedPapers,
+    workspaceSourceCandidates: input.workStore.objects.sources.length,
+    workspaceCanonicalSources: input.workStore.objects.canonicalSources.length,
+    workspaceSelectedSourceIds,
     canonicalPapers: canonicalSources,
     selectedPapers: explicitlySelectedEvidenceSources,
     extractedPapers: input.workStore.objects.extractions.length,
@@ -7295,6 +7817,8 @@ function workspaceManuscriptChecks(input: {
   )).length;
   const emptySectionCount = sections.filter((section) => section.markdown.trim().length === 0).length;
   const extractionRows = input.store.objects.extractions.length;
+  const compilerDiagnostics = manuscriptCompilerDiagnostics(input);
+  const compilerErrors = compilerDiagnostics.filter((diagnostic) => diagnostic.severity === "error");
   const checks: ManuscriptCheck[] = [
     {
       id: "workspace-sources",
@@ -7369,6 +7893,15 @@ function workspaceManuscriptChecks(input: {
         : emptySectionCount === 0
           ? "All manuscript sections contain explicit markdown content."
           : `${emptySectionCount} manuscript section(s) have empty markdown content.`
+    },
+    {
+      id: "manuscript-compiler",
+      title: "Manuscript markdown compiles structurally",
+      status: compilerErrors.length === 0 ? "pass" : "fail",
+      severity: "blocker",
+      message: compilerErrors.length === 0
+        ? "Manuscript sections have no compiler-level markdown/provenance errors."
+        : `${compilerErrors.length} manuscript compiler error(s): ${compilerErrors.slice(0, 4).map((diagnostic) => `${diagnostic.code} in ${diagnostic.sectionId}${diagnostic.blockIndex === null ? "" : ` block ${diagnostic.blockIndex}`}: ${diagnostic.repairHint}`).join(" ")}`
     },
     {
       id: "claim-citation-support",
@@ -7826,6 +8359,7 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
     });
     workStore = sessionOutcome.workStore;
     const gathered = sessionOutcome.gathered;
+    const workspaceCorpus = buildResearchCorpusDiagnosticView(workStore);
 
     await writeJsonArtifact(run.artifacts.sourcesPath, {
       sourceConfig: {
@@ -7854,11 +8388,12 @@ export async function runDetachedJobWorker(options: WorkerOptions): Promise<numb
       reviewWorkflow: gathered.reviewWorkflow,
       relevanceAssessments: gathered.relevanceAssessments ?? [],
       sourceToolState: gathered.sourceToolState ?? null,
+      workspaceCorpus,
       mergeDiagnostics: gathered.mergeDiagnostics,
       literatureReview: gathered.literatureReview ?? null
     });
-    await appendTrace(run, now, `Model-driven research session ${sessionSegment} gathered ${gathered.sources.length} raw sources and ${gathered.canonicalPapers.length} canonical papers.`);
-    await appendEvent(run, now, "summary", `Model-driven research session ${sessionSegment} observed ${gathered.canonicalPapers.length} canonical papers.`);
+    await appendTrace(run, now, `Model-driven research session ${sessionSegment} source tool session gathered ${gathered.sources.length} raw sources and ${gathered.canonicalPapers.length} newly merged canonical papers. Workspace corpus has ${workspaceCorpus.canonicalSourceCount} canonical source(s) and ${workspaceCorpus.selectedSourceCount} selected source(s).`);
+    await appendEvent(run, now, "summary", `Model-driven research session ${sessionSegment}: source tool session observed ${gathered.canonicalPapers.length} newly merged canonical papers; workspace corpus contains ${workspaceCorpus.canonicalSourceCount} canonical source(s).`);
     await appendEvent(
       run,
       now,

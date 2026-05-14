@@ -99,6 +99,8 @@ export type CriticReviewArtifact = {
 export type CriticWorkspacePacket = {
   notebook: unknown;
   workspaceSummary: Record<string, unknown>;
+  corpus_view: unknown;
+  synthesis_view: unknown;
   selectedSources: Array<Record<string, unknown>>;
   citedSources: Array<Record<string, unknown>>;
   protocols: Array<Record<string, unknown>>;

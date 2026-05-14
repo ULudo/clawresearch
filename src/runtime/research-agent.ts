@@ -2,7 +2,11 @@ import type { ResearchBrief } from "./session-store.js";
 import type { ResearchPlan } from "./research-backend.js";
 import type { CriticReviewArtifact } from "./research-critic.js";
 import type { ResearchGuidanceContext } from "./research-guidance.js";
-import type { ResearchNotebookDiagnostics } from "./research-work-store.js";
+import type {
+  ResearchCorpusDiagnosticView,
+  ResearchNotebookDiagnostics,
+  ResearchSynthesisDiagnosticView
+} from "./research-work-store.js";
 
 export type ResearchWorkspaceToolName =
   | "protocol.create_or_revise"
@@ -216,6 +220,12 @@ export type ResearchActionRequest = {
     screenedInSources: number;
     explicitlySelectedEvidenceSources: number;
     resolvedAccessSources: number;
+    sourceSessionCandidates?: number;
+    sourceSessionCanonicalSources?: number;
+    sourceSessionSelectedPapers?: number;
+    workspaceSourceCandidates?: number;
+    workspaceCanonicalSources?: number;
+    workspaceSelectedSourceIds?: number;
     canonicalPapers: number;
     selectedPapers: number;
     extractedPapers: number;
@@ -317,6 +327,8 @@ export type ResearchActionRequest = {
       }>;
 	      suggestedLookupTools: string[];
 	      notebookDiagnostics: ResearchNotebookDiagnostics;
+      corpus_view: ResearchCorpusDiagnosticView;
+      synthesis_view: ResearchSynthesisDiagnosticView;
 	    };
     worker: {
       status: string;

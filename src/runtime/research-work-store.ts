@@ -160,6 +160,43 @@ export type ResearchWorkspaceDispositionDiagnostics = {
   selectedToRenderedCollapse: boolean;
 };
 
+export type ResearchCorpusDiagnosticView = {
+  diagnosticOnly: true;
+  note: string;
+  canonicalSourceCount: number;
+  selectedSourceCount: number;
+  extractedSourceCount: number;
+  evidenceSourceCount: number;
+  citationSourceCount: number;
+  renderedReferenceSourceCount: number;
+  accessModeCounts: Record<string, number>;
+  screeningDecisionCounts: Record<string, number>;
+  providerRunCount: number;
+  sourceCandidateCount: number;
+  missingSelectedExtractionSourceIds: string[];
+  duplicateExtractionSourceIds: string[];
+  extractedNotEvidenceSourceIds: string[];
+  evidenceNotCitedSourceIds: string[];
+  selectedToRenderedCollapseSourceIds: string[];
+};
+
+export type ResearchSynthesisDiagnosticView = {
+  diagnosticOnly: true;
+  note: string;
+  activeExtractionCount: number;
+  activeEvidenceCellCount: number;
+  activeCitationCount: number;
+  claimCount: number;
+  claimsWithCitationSupportCount: number;
+  claimsWithoutCitationSupportIds: string[];
+  manuscriptSectionCount: number;
+  sectionsWithClaimLinksCount: number;
+  sectionsWithoutClaimLinksIds: string[];
+  sectionsWithoutCitationLinksIds: string[];
+  evidenceCellIdsWithoutCitationLinks: string[];
+  selectedSourceIdsNotCited: string[];
+};
+
 export type ResearchNotebookDiagnostics = {
   warningCount: number;
   warnings: ResearchNotebookDiagnosticWarning[];
@@ -364,7 +401,7 @@ export type WorkStoreManuscriptSection = WorkStoreBaseEntity & {
   markdown: string;
   sourceIds: string[];
   claimIds: string[];
-  status: "draft" | "needs_revision" | "checked";
+  status: "draft" | "needs_revision" | "ready_for_review" | "checked";
 };
 
 export type WorkStoreReleaseCheck = WorkStoreBaseEntity & {
@@ -1824,6 +1861,8 @@ export type WorkspacePromptContext = {
     manuscriptSections: number;
     releaseChecks: number;
   };
+  corpus_view: ResearchCorpusDiagnosticView;
+  synthesis_view: ResearchSynthesisDiagnosticView;
   notebook: {
     missionTarget: ResearchMissionTarget;
     paperMode: ResearchPaperMode;
@@ -2004,6 +2043,84 @@ export function buildWorkspaceDispositionDiagnostics(
     selectedToRenderedCollapseSourceIds,
     selectedToRenderedCollapse: selectedSourceIds.length >= 4
       && renderedReferenceSourceIds.length * 2 < selectedSourceIds.length
+  };
+}
+
+function countBy(values: string[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const value of values) {
+    const key = compactText(value) || "unknown";
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+  return counts;
+}
+
+export function buildResearchCorpusDiagnosticView(
+  store: ResearchWorkStore,
+  options: { renderedReferenceSourceIds?: string[] } = {}
+): ResearchCorpusDiagnosticView {
+  const disposition = buildWorkspaceDispositionDiagnostics(store, options);
+
+  return {
+    diagnosticOnly: true,
+    note: "Derived corpus bookkeeping only. The researcher and critic interpret what these counts mean for the research objective.",
+    canonicalSourceCount: store.objects.canonicalSources.length,
+    selectedSourceCount: disposition.selectedSourceIds.length,
+    extractedSourceCount: disposition.extractedSourceIds.length,
+    evidenceSourceCount: disposition.evidenceCellSourceIds.length,
+    citationSourceCount: disposition.citationSourceIds.length,
+    renderedReferenceSourceCount: disposition.renderedReferenceSourceIds.length,
+    accessModeCounts: countBy(store.objects.canonicalSources.map((source) => source.accessMode)),
+    screeningDecisionCounts: countBy(store.objects.canonicalSources.map((source) => source.screeningDecision)),
+    providerRunCount: store.objects.providerRuns.length,
+    sourceCandidateCount: store.objects.sources.length,
+    missingSelectedExtractionSourceIds: disposition.missingSelectedExtractionSourceIds.slice(0, 40),
+    duplicateExtractionSourceIds: disposition.duplicateExtractionSourceIds.slice(0, 40),
+    extractedNotEvidenceSourceIds: disposition.extractedNotEvidenceSourceIds.slice(0, 40),
+    evidenceNotCitedSourceIds: disposition.evidenceNotCitedSourceIds.slice(0, 40),
+    selectedToRenderedCollapseSourceIds: disposition.selectedToRenderedCollapseSourceIds.slice(0, 40)
+  };
+}
+
+export function buildResearchSynthesisDiagnosticView(
+  store: ResearchWorkStore,
+  options: { renderedReferenceSourceIds?: string[] } = {}
+): ResearchSynthesisDiagnosticView {
+  const activeExtractions = store.objects.extractions.filter(researchObjectIsActive);
+  const activeEvidenceCells = store.objects.evidenceCells.filter(researchObjectIsActive);
+  const activeCitations = store.objects.citations.filter(researchObjectIsActive);
+  const citationClaimIds = new Set(activeCitations.flatMap((citation) => citation.claimIds));
+  const citationEvidenceCellIds = new Set(activeCitations.flatMap((citation) => citation.evidenceCellId === null ? [] : [citation.evidenceCellId]));
+  const citationSectionIds = new Set(activeCitations.flatMap((citation) => citation.sectionIds));
+  const disposition = buildWorkspaceDispositionDiagnostics(store, options);
+
+  return {
+    diagnosticOnly: true,
+    note: "Derived synthesis/provenance bookkeeping only. This is not a scientific-quality verdict or hidden workflow gate.",
+    activeExtractionCount: activeExtractions.length,
+    activeEvidenceCellCount: activeEvidenceCells.length,
+    activeCitationCount: activeCitations.length,
+    claimCount: store.objects.claims.length,
+    claimsWithCitationSupportCount: store.objects.claims.filter((claim) => citationClaimIds.has(claim.id)).length,
+    claimsWithoutCitationSupportIds: store.objects.claims
+      .filter((claim) => !citationClaimIds.has(claim.id))
+      .map((claim) => claim.id)
+      .slice(0, 40),
+    manuscriptSectionCount: store.objects.manuscriptSections.length,
+    sectionsWithClaimLinksCount: store.objects.manuscriptSections.filter((section) => section.claimIds.length > 0).length,
+    sectionsWithoutClaimLinksIds: store.objects.manuscriptSections
+      .filter((section) => section.claimIds.length === 0)
+      .map((section) => section.id)
+      .slice(0, 40),
+    sectionsWithoutCitationLinksIds: store.objects.manuscriptSections
+      .filter((section) => !citationSectionIds.has(section.id))
+      .map((section) => section.id)
+      .slice(0, 40),
+    evidenceCellIdsWithoutCitationLinks: activeEvidenceCells
+      .filter((cell) => !citationEvidenceCellIds.has(cell.id))
+      .map((cell) => cell.id)
+      .slice(0, 40),
+    selectedSourceIdsNotCited: disposition.selectedToRenderedCollapseSourceIds.slice(0, 40)
   };
 }
 
@@ -2210,6 +2327,8 @@ export function buildWorkspacePromptContextFromWorkStore(store: ResearchWorkStor
       manuscriptSections: store.objects.manuscriptSections.length,
       releaseChecks: store.objects.releaseChecks.length
     },
+    corpus_view: buildResearchCorpusDiagnosticView(store),
+    synthesis_view: buildResearchSynthesisDiagnosticView(store),
 	    notebook: {
 	      missionTarget: store.notebook.missionTarget,
 	      paperMode: store.notebook.paperMode,
