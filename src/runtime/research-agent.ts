@@ -4,6 +4,7 @@ import type { CriticReviewArtifact } from "./research-critic.js";
 import type { ResearchGuidanceContext } from "./research-guidance.js";
 import type {
   ResearchCorpusDiagnosticView,
+  ResearchContract,
   ResearchNotebookDiagnostics,
   ResearchSynthesisDiagnosticView
 } from "./research-work-store.js";
@@ -309,6 +310,17 @@ export type ResearchActionRequest = {
         metadataOnlySources: number;
       };
       recentCriticReviews?: Array<Record<string, string | number | null>>;
+      researchContractCriticFreshness?: {
+        status: string;
+        stage: string;
+        message: string;
+        reviewArtifactPath: string | null;
+        reviewReadiness: string | null;
+        changedObjects: Array<{ kind: string; id: string; reason: string }>;
+        missingObjects: Array<{ kind: string; id: string; reason: string }>;
+        newObjects: Array<{ kind: string; id: string; reason: string }>;
+        suggestedActions: string[];
+      };
       releaseCriticFreshness?: {
         status: string;
         stage: string;
@@ -346,7 +358,8 @@ export type ResearchActionRequest = {
       missionTarget: string;
       paperMode: string;
       objective: string;
-      definitionOfDone: string[];
+      researchContract: ResearchContract;
+      legacyDefinitionOfDone: string[];
       currentFocus: string | null;
       readiness: string;
       tasks: Array<{

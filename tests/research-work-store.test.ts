@@ -140,6 +140,12 @@ test("research work store persists the living research notebook with task and ar
         missionTarget: "professional_paper" as const,
         paperMode: "literature_review" as const,
         objective: "Produce a professional literature review from the workspace.",
+        researchContract: {
+          researchObjectives: ["Explain what the workspace evidence establishes."],
+          coveragePlan: ["Use selected, extracted, and cited sources to defend coverage."],
+          adequacyRationale: ["The final paper should be credible because claims are linked to source-derived evidence."],
+          knownUncertainties: ["Coverage may remain incomplete until the critic reviews the contract."]
+        },
         definitionOfDone: ["Extract selected sources", "Support central claims", "Finalize paper.md"],
         currentFocus: "Extract selected sources",
         readiness: "Not sufficient because no claims are linked yet.",
@@ -175,6 +181,8 @@ test("research work store persists the living research notebook with task and ar
     assert.equal(loaded.notebook.objective, "Produce a professional literature review from the workspace.");
     assert.equal(loaded.notebook.missionTarget, "professional_paper");
     assert.equal(loaded.notebook.paperMode, "literature_review");
+    assert.deepEqual(loaded.notebook.researchContract.researchObjectives, ["Explain what the workspace evidence establishes."]);
+    assert.deepEqual(loaded.notebook.researchContract.adequacyRationale, ["The final paper should be credible because claims are linked to source-derived evidence."]);
     assert.deepEqual(loaded.notebook.definitionOfDone, ["Extract selected sources", "Support central claims", "Finalize paper.md"]);
     assert.equal(loaded.notebook.tasks[0]?.status, "in_progress");
     assert.deepEqual(loaded.notebook.tasks[0]?.linkedEvidenceCellIds, ["evidence-1"]);
@@ -182,6 +190,56 @@ test("research work store persists the living research notebook with task and ar
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
+});
+
+test("notebook diagnostics expose weak or unreviewed research contracts without judging scientific quality", () => {
+  const now = "2026-01-01T00:00:00.000Z";
+  const base = createResearchWorkStore({
+    projectRoot: "/tmp/clawresearch-contract-diagnostics",
+    now,
+    brief: {
+      topic: "Notebook research contracts",
+      researchQuestion: "Can diagnostics keep the model's research contract visible?",
+      researchDirection: "Use structural diagnostics only.",
+      successCriterion: "Avoid hiding semantic review inside runtime rules."
+    }
+  });
+
+  const weakContractStore = {
+    ...base,
+    notebook: {
+      ...base.notebook,
+      researchContract: {
+        researchObjectives: ["Cite at least 5 sources."],
+        coveragePlan: [],
+        adequacyRationale: [],
+        knownUncertainties: []
+      },
+      currentFocus: "Plan source coverage.",
+      readiness: "Not sufficient yet.",
+      tasks: [{
+        id: "task-contract",
+        title: "Revise the research contract",
+        status: "in_progress" as const,
+        notes: "The contract should explain adequacy, not just counts.",
+        linkedSourceIds: [],
+        linkedExtractionIds: [],
+        linkedEvidenceCellIds: [],
+        linkedClaimIds: [],
+        linkedSectionIds: [],
+        linkedArtifactPaths: []
+      }],
+      updatedAt: now
+    }
+  };
+
+  const diagnostics = buildNotebookDiagnostics(weakContractStore);
+  const warningCodes = diagnostics.warnings.map((warning) => warning.code);
+  assert.equal(diagnostics.researchContractComplete, false);
+  assert.equal(diagnostics.researchContractCriticReviewed, false);
+  assert.ok(warningCodes.includes("notebook-research-contract-incomplete"));
+  assert.ok(warningCodes.includes("notebook-research-contract-count-dominant"));
+  assert.ok(warningCodes.includes("notebook-research-contract-not-critic-reviewed"));
 });
 
 test("notebook diagnostics accept explicit DoD item mapping and report exact missing items", async () => {
@@ -686,6 +744,12 @@ test("workspace prompt context is a derived SQLite projection without pseudo-mem
       notebook: {
         ...store.notebook,
         objective: "Write a claim-led review from workspace evidence.",
+        researchContract: {
+          researchObjectives: ["Explain how research notebooks orient long-running model researchers."],
+          coveragePlan: ["Connect workspace evidence, claims, and open work items."],
+          adequacyRationale: ["The prompt context is adequate when every field is derived from SQLite workspace state."],
+          knownUncertainties: ["The test fixture does not assess real scientific quality."]
+        },
         definitionOfDone: ["Use selected evidence", "Support central claims"],
         currentFocus: "Support central claims",
         readiness: "Not sufficient because only one claim exists.",
@@ -755,6 +819,8 @@ test("workspace prompt context is a derived SQLite projection without pseudo-mem
     assert.equal(context.notebook.missionTarget, "professional_paper");
     assert.equal(context.notebook.paperMode, "literature_review");
     assert.equal(context.notebook.objective, "Write a claim-led review from workspace evidence.");
+    assert.deepEqual(context.notebook.researchContract.researchObjectives, ["Explain how research notebooks orient long-running model researchers."]);
+    assert.deepEqual(context.notebook.legacyDefinitionOfDone, ["Use selected evidence", "Support central claims"]);
     assert.equal(context.notebook.activeTasks[0]?.linkedEvidenceCellIds[0], "evidence-1");
     assert.equal(context.notebook.recentCriticReviews?.length, 0);
     assert.equal(context.corpus_view.diagnosticOnly, true);

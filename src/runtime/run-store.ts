@@ -40,6 +40,7 @@ export type RunArtifactRecord = {
   sourcesPath: string;
   reviewProtocolPath: string;
   reviewProtocolMarkdownPath: string;
+  criticResearchContractReviewPath: string;
   criticProtocolReviewPath: string;
   criticSourceSelectionPath: string;
   criticEvidenceReviewPath: string;
@@ -142,6 +143,7 @@ function createRunArtifacts(projectRoot: string, runId: string): RunArtifactReco
     sourcesPath: path.join(runDirectory, "sources.json"),
     reviewProtocolPath: path.join(runDirectory, "review-protocol.json"),
     reviewProtocolMarkdownPath: path.join(runDirectory, "review-protocol.md"),
+    criticResearchContractReviewPath: path.join(runDirectory, "critic-research-contract-review.json"),
     criticProtocolReviewPath: path.join(runDirectory, "critic-protocol-review.json"),
     criticSourceSelectionPath: path.join(runDirectory, "critic-source-selection.json"),
     criticEvidenceReviewPath: path.join(runDirectory, "critic-evidence-review.json"),
@@ -172,6 +174,7 @@ function mergeRunArtifacts(raw: unknown, projectRoot: string, runId: string): Ru
     sourcesPath: readString(artifacts.sourcesPath) ?? defaults.sourcesPath,
     reviewProtocolPath: readString(artifacts.reviewProtocolPath) ?? defaults.reviewProtocolPath,
     reviewProtocolMarkdownPath: readString(artifacts.reviewProtocolMarkdownPath) ?? defaults.reviewProtocolMarkdownPath,
+    criticResearchContractReviewPath: readString(artifacts.criticResearchContractReviewPath) ?? defaults.criticResearchContractReviewPath,
     criticProtocolReviewPath: readString(artifacts.criticProtocolReviewPath) ?? defaults.criticProtocolReviewPath,
     criticSourceSelectionPath: readString(artifacts.criticSourceSelectionPath) ?? defaults.criticSourceSelectionPath,
     criticEvidenceReviewPath: readString(artifacts.criticEvidenceReviewPath) ?? defaults.criticEvidenceReviewPath,

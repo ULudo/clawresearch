@@ -21,7 +21,8 @@ import type {
 } from "../src/runtime/research-agent.js";
 import type {
   CriticReviewArtifact,
-  CriticReviewRequest
+  CriticReviewRequest,
+  CriticReviewScope
 } from "../src/runtime/research-critic.js";
 import type {
   ResearchSourceToolRequest,
@@ -33,6 +34,7 @@ import { runDirectoryPath, runFilePath, RunStore } from "../src/runtime/run-stor
 import { runDetachedJobWorker } from "../src/runtime/run-worker.js";
 import { loadResearchWorkerState, researchWorkerStatePath } from "../src/runtime/research-state.js";
 import {
+  buildNotebookDiagnostics,
   createResearchWorkStore,
   loadResearchWorkStore,
   researchWorkStoreFilePath,
@@ -362,10 +364,20 @@ class StubResearchBackend implements ResearchBackend {
 	      ],
 	      notebookPatch: {
 	        objective: "Map the main proof-technique families and their limitations.",
-	        definitionOfDone: [
-	          "Research tasks are tracked in the notebook.",
-	          "Central claims are supported by evidence before finalization."
-	        ],
+	        researchContract: {
+	          researchObjectives: [
+	            "Map proof-technique families and explain their known limitations."
+	          ],
+	          coveragePlan: [
+	            "Start from durable workspace protocol/source/evidence state, then inspect gaps before widening retrieval."
+	          ],
+	          adequacyRationale: [
+	            "A credible synthesis needs supported claims about technique families and limitations, not merely a finished export."
+	          ],
+	          knownUncertainties: [
+	            "The initial workspace has not yet established source coverage or claim support."
+	          ]
+	        },
 	        currentFocus: "Establish the initial research workspace.",
 	        readiness: "Not sufficient yet; the notebook has only been initialized before research actions.",
 	        tasks: [{
@@ -2471,6 +2483,20 @@ class NotebookToolBackend extends StubResearchBackend {
             changes: {},
             entity: {
               objective: "Produce a professional review of model-driven research workspaces.",
+              researchContract: {
+                researchObjectives: [
+                  "Explain how model-driven research workspaces support long-running synthesis."
+                ],
+                coveragePlan: [
+                  "Track selected sources, extracted evidence, supported claims, and manuscript sections through notebook-linked tasks."
+                ],
+                adequacyRationale: [
+                  "The notebook is useful only if it keeps substantive research obligations visible to the model."
+                ],
+                knownUncertainties: [
+                  "This tool smoke test does not prove scientific adequacy."
+                ]
+              },
               definitionOfDone: [
                 "Representative sources are extracted.",
                 "Central claims are supported by citations.",
@@ -2797,6 +2823,13 @@ async function seedThinReviewWorkspace(input: {
       missionTarget: input.missionTarget,
       paperMode: "literature_review",
       objective: "Produce an artifact-contract regression review.",
+      researchContract: {
+        researchObjectives: ["Demonstrate that a thin export cannot satisfy a professional-paper artifact contract."],
+        coveragePlan: ["Use a deliberately small seeded corpus so the contract failure is observable."],
+        adequacyRationale: ["The seeded workspace is intentionally inadequate for a professional artifact."],
+        knownUncertainties: ["This fixture is a regression test, not a real review."]
+      },
+      researchContractUpdatedAt: timestamp,
       definitionOfDone: ["Do not confuse a checkpoint brief with a professional paper."],
       tasks: [{
         id: "task-thin-synthesis",
@@ -4518,7 +4551,8 @@ class CriticFreshnessScenarioBackend extends StubResearchBackend {
 
   constructor(
     private readonly mutation: "none" | "notebook" | "section" | "evidence" | "support",
-    private readonly terminalAction: "release.verify" | "manuscript.finalize" = "release.verify"
+    private readonly terminalAction: "release.verify" | "manuscript.finalize" = "release.verify",
+    private readonly criticScope: CriticReviewScope = "release"
   ) {
     super();
   }
@@ -4559,11 +4593,11 @@ class CriticFreshnessScenarioBackend extends StubResearchBackend {
       return {
         schemaVersion: 1,
         action: "critic.review",
-        rationale: "Create a runtime-owned release critic review snapshot.",
+        rationale: `Create a runtime-owned ${this.criticScope} critic review snapshot.`,
         confidence: 0.9,
         inputs: {
           ...baseInputs,
-          criticScope: "release",
+          criticScope: this.criticScope,
           workStore: {
             collection: "workItems",
             entityId: null,
@@ -4575,7 +4609,7 @@ class CriticFreshnessScenarioBackend extends StubResearchBackend {
             entity: {}
           }
         },
-        expectedOutcome: "The release critic pass is persisted with snapshot metadata.",
+        expectedOutcome: `The ${this.criticScope} critic pass is persisted with snapshot metadata.`,
         stopCondition: "Continue to the mutation or terminal check.",
         transport: "strict_json"
       };
@@ -4951,7 +4985,7 @@ class SectionRepairErgonomicsBackend extends StubResearchBackend {
   readonly criticRequests: CriticReviewRequest[] = [];
   private step = 0;
 
-  constructor(private readonly scenario: "read" | "replace_block" | "set_order" | "ready_status" | "invalid_status") {
+  constructor(private readonly scenario: "read" | "replace_block" | "set_order" | "ready_status" | "invalid_status" | "missing_section") {
     super();
   }
 
@@ -5013,8 +5047,35 @@ class SectionRepairErgonomicsBackend extends StubResearchBackend {
       };
     }
 
-    if ((this.scenario === "read" && this.step === 1) || ((this.scenario === "replace_block" || this.scenario === "set_order" || this.scenario === "ready_status" || this.scenario === "invalid_status") && this.step === 0)) {
+    if ((this.scenario === "read" && this.step === 1) || ((this.scenario === "replace_block" || this.scenario === "set_order" || this.scenario === "ready_status" || this.scenario === "invalid_status" || this.scenario === "missing_section") && this.step === 0)) {
       this.step += 1;
+      if (this.scenario === "missing_section") {
+        return {
+          schemaVersion: 1,
+          action: "section.patch",
+          rationale: "Attempt to patch a section id that does not exist.",
+          confidence: 0.9,
+          inputs: {
+            ...baseInputs,
+            workStore: {
+              collection: "manuscriptSections",
+              entityId: "section-does-not-exist",
+              filters: {},
+              semanticQuery: null,
+              limit: null,
+              cursor: null,
+              changes: {},
+              entity: {
+                operation: "replace_all",
+                markdown: "This text must not create a new section through section.patch."
+              }
+            }
+          },
+          expectedOutcome: "The patch is blocked and valid section previews are returned.",
+          stopCondition: "The tool result reports that section.patch cannot create sections.",
+          transport: "strict_json"
+        };
+      }
       if (this.scenario === "set_order") {
         return {
           schemaVersion: 1,
@@ -5090,7 +5151,7 @@ class SectionRepairErgonomicsBackend extends StubResearchBackend {
               entity: {
                 operation: "replace_block",
                 blockIndex: 1,
-                markdown: "The repaired synthesis paragraph states the manuscript argument directly and uses the linked claim and evidence instead of raw workspace identifiers.",
+                markdown: "The repaired synthesis paragraph states the manuscript argument directly and uses the linked claim and evidence instead of raw workspace identifiers. [source-review-1]",
                 claimIds: ["claim-review-1"],
                 sourceIds: ["source-review-1"]
               }
@@ -5370,6 +5431,144 @@ test("architecture contract: critic review scopes are explicit researcher tools,
   }
 });
 
+test("critic.review can explicitly review the model-owned research contract", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-contract-critic-tool-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "research contract review",
+      researchQuestion: "Can the critic review the notebook research contract?",
+      researchDirection: "The model explicitly requests a contract review before research proceeds.",
+      successCriterion: "research_contract critic.review is persisted as runtime-owned feedback."
+    }, ["clawresearch", "research-loop"]);
+
+    class ResearchContractCriticBackend extends StubResearchBackend {
+      readonly capabilities = {
+        actionControl: {
+          nativeToolCalls: false,
+          strictJsonFallback: true
+        },
+        criticReview: true
+      };
+      readonly criticRequests: CriticReviewRequest[] = [];
+      private reviewed = false;
+
+      override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+        if (request.phase !== "research") {
+          return super.chooseResearchAction(request);
+        }
+        if (!this.reviewed) {
+          this.reviewed = true;
+          return {
+            schemaVersion: 1,
+            action: "critic.review",
+            rationale: "Ask the critic to challenge the model-owned research contract.",
+            confidence: 0.9,
+            inputs: {
+              providerIds: [],
+              searchQueries: [],
+              evidenceTargets: [],
+              paperIds: [],
+              criticScope: "research_contract",
+              reason: null,
+              workStore: {
+                collection: "workItems",
+                entityId: null,
+                filters: {},
+                semanticQuery: null,
+                limit: null,
+                cursor: null,
+                changes: {},
+                entity: {}
+              }
+            },
+            expectedOutcome: "A research-contract critic artifact is recorded.",
+            stopCondition: "Continue after the review result.",
+            transport: "strict_json"
+          };
+        }
+        return {
+          schemaVersion: 1,
+          action: "workspace.status",
+          rationale: "Stop after explicit contract review.",
+          confidence: 0.8,
+          inputs: {
+            providerIds: [],
+            searchQueries: [],
+            evidenceTargets: [],
+            paperIds: [],
+            criticScope: null,
+            reason: "Contract critic regression complete.",
+            workStore: terminalUserDecisionWorkStore("Contract critic regression complete.")
+          },
+          expectedOutcome: "Structured stop.",
+          stopCondition: "Test complete.",
+          transport: "strict_json"
+        };
+      }
+
+      async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+        this.criticRequests.push(request);
+        return {
+          schemaVersion: 1,
+          runId: request.runId,
+          stage: request.stage,
+          reviewer: "ephemeral_critic",
+          readiness: "pass",
+          confidence: 0.88,
+          summary: "The research contract is coherent enough to start.",
+          objections: [],
+          positiveFindings: [{
+            target: "notebook",
+            targetId: null,
+            message: "The contract separates coverage, adequacy rationale, and uncertainties."
+          }],
+          revisionAdvice: {
+            searchQueries: [],
+            evidenceTargets: [],
+            papersToExclude: [],
+            papersToPromote: [],
+            claimsToSoften: []
+          },
+          recommendedNextActions: []
+        };
+      }
+    }
+
+    const backend = new ResearchContractCriticBackend();
+    await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const review = JSON.parse(await readFile(completedRun.artifacts.criticResearchContractReviewPath, "utf8")) as CriticReviewArtifact;
+    const diagnostics = buildNotebookDiagnostics(workStore);
+
+    assert.equal(backend.criticRequests.length, 1);
+    assert.equal(backend.criticRequests[0]?.stage, "research_contract");
+    assert.equal(review.stage, "research_contract");
+    assert.equal(review.readiness, "pass");
+    assert.ok(workStore.notebook.artifactLinks.some((artifact) => (
+      artifact.label === "Critic review: research_contract (pass)"
+        && artifact.path === completedRun.artifacts.criticResearchContractReviewPath
+        && artifact.createdBy === "runtime"
+    )));
+    assert.equal(diagnostics.researchContractCriticReviewed, true);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("critic backend failures are linked into notebook context", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-critic-failure-visible-"));
   const now = createNow();
@@ -5584,6 +5783,9 @@ test("notebook.read and notebook.patch are explicit model-facing tools with arti
     const readResult = toolResults.find((result) => result.action === "notebook.read");
 
     assert.equal(workStore.notebook.objective, "Produce a professional review of model-driven research workspaces.");
+    assert.deepEqual(workStore.notebook.researchContract.researchObjectives, [
+      "Explain how model-driven research workspaces support long-running synthesis."
+    ]);
     assert.deepEqual(workStore.notebook.definitionOfDone, [
       "Representative sources are extracted.",
       "Central claims are supported by citations.",
@@ -5596,6 +5798,11 @@ test("notebook.read and notebook.patch are explicit model-facing tools with arti
 	    assert.ok(backend.researchRequests[1]?.workStore?.notebook.tasks.some((task) => task.title === "Build claim-led synthesis from selected evidence"));
     assert.equal(readResult?.collection, "notebook");
     assert.equal(readResult?.items?.[0]?.kind, "notebookTask");
+    assert.ok((readResult?.entity?.fields?.researchObjectives as string[] | undefined)?.includes("Explain how model-driven research workspaces support long-running synthesis."));
+    assert.ok(readResult?.related?.some((item) => (
+      item.kind === "researchContract"
+        && ((item.fields?.coveragePlan as string[] | undefined) ?? []).includes("Track selected sources, extracted evidence, supported claims, and manuscript sections through notebook-linked tasks.")
+    )));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -5629,6 +5836,10 @@ test("planning persists the model-authored notebook patch before research action
     const agentSteps = await readFile((await runStore.load(run.id)).artifacts.agentStepsPath, "utf8");
 
     assert.ok(workStore.notebook.tasks.some((task) => task.id === "task-initialize-research-workspace"));
+    assert.deepEqual(workStore.notebook.researchContract.researchObjectives, [
+      "Map proof-technique families and explain their known limitations."
+    ]);
+    assert.match(workStore.notebook.researchContract.adequacyRationale[0] ?? "", /supported claims/i);
     assert.equal(workStore.notebook.currentFocus, "Establish the initial research workspace.");
     assert.match(workStore.notebook.readiness, /Not sufficient yet/);
     assert.match(agentSteps, /protocol\.create_or_revise/);
@@ -6864,6 +7075,65 @@ test("test-08-shaped source collapse blocks finalization and keeps working", asy
   }
 });
 
+test("professional_paper finalization requires an explicit research_contract critic review", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-professional-contract-critic-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "model-driven research workspaces",
+      researchQuestion: "Can professional finalization skip contract review?",
+      researchDirection: "Run release critic but no research-contract critic.",
+      successCriterion: "Professional papers require explicit contract challenge."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "artifact-contract"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "professional_paper",
+      sourceCount: 12,
+      extractedCount: 12,
+      evidenceCount: 12,
+      citedCount: 12
+    });
+
+    const backend = new CriticThenFinalizeSeededWorkspaceBackend("professional_paper");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const finalizeResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "manuscript.finalize");
+
+    assert.equal(exitCode, 0);
+    assert.equal(backend.criticRequests.length, 1);
+    assert.equal(backend.criticRequests[0]?.stage, "release");
+    await assert.rejects(readFile(completedRun.artifacts.paperPath, "utf8"), /ENOENT/);
+    assert.equal(workStore.worker.completion, null);
+    assert.equal(finalizeResult?.status, "not_ready");
+    assert.ok(finalizeResult?.related?.some((item) => (
+      item.kind === "artifactContractDiagnostic"
+        && /research_contract critic\.review/i.test(item.snippet ?? "")
+    )));
+    assert.ok(finalizeResult?.nextHints?.includes("critic.review"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("professional_paper mission cannot be finalized as a research_brief downgrade", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-professional-no-brief-downgrade-"));
   const now = createNow();
@@ -7280,6 +7550,56 @@ test("release.verify keeps critic fresh after notebook project-management update
   }
 });
 
+test("release.verify keeps research-contract critic fresh after evidence changes", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-contract-critic-fresh-after-evidence-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "critic freshness",
+      researchQuestion: "Can evidence changes avoid staling an earlier research-contract review?",
+      researchDirection: "Run research_contract critic.review, add evidence, and verify release.",
+      successCriterion: "release.verify reports the research-contract critic as fresh because only contract fields define that scope."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "critic-freshness"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    const backend = new CriticFreshnessScenarioBackend("evidence", "release.verify", "research_contract");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const releaseResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "release.verify");
+    const contractFreshnessDiagnostic = releaseResult?.related
+      ?.find((item) => item.kind === "criticFreshnessDiagnostic" && item.fields?.stage === "research_contract");
+
+    assert.equal(exitCode, 0);
+    assert.equal(backend.criticRequests.length, 1);
+    assert.equal(backend.criticRequests[0]?.stage, "research_contract");
+    assert.equal(contractFreshnessDiagnostic?.status, "fresh");
+    assert.equal(contractFreshnessDiagnostic?.fields?.recommendedCriticScope, "research_contract");
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("release.verify reports stale critic review after manuscript section changes", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-critic-freshness-section-stale-"));
   const now = createNow();
@@ -7321,7 +7641,7 @@ test("release.verify reports stale critic review after manuscript section change
       ?.find((item) => item.kind === "criticFreshnessDiagnostic");
 
     assert.equal(exitCode, 0);
-    assert.equal(releaseResult?.status, "ok");
+    assert.equal(releaseResult?.status, "not_ready");
     assert.equal(freshnessDiagnostic?.status, "stale");
     assert.equal(releaseResult?.stateDelta?.mechanicalReleaseChecksPassed, 1);
     assert.equal(releaseResult?.stateDelta?.finalizationReady, 0);
@@ -7375,7 +7695,7 @@ test("release.verify reports incomplete critic review after new evidence is adde
       ?.find((item) => item.kind === "criticFreshnessDiagnostic");
 
     assert.equal(exitCode, 0);
-    assert.equal(releaseResult?.status, "ok");
+    assert.equal(releaseResult?.status, "not_ready");
     assert.equal(freshnessDiagnostic?.status, "incomplete");
     assert.equal(releaseResult?.stateDelta?.mechanicalReleaseChecksPassed, 1);
     assert.equal(releaseResult?.stateDelta?.finalizationReady, 0);
@@ -7621,7 +7941,7 @@ test("section.patch supports targeted block replacement without rewriting the wh
     assert.ok(updatedSection);
     assert.match(updatedSection.markdown, /repaired synthesis paragraph/i);
     assert.match(updatedSection.markdown, /This second paragraph should remain unchanged/);
-    assert.doesNotMatch(updatedSection.markdown, /source-review-1/);
+    assert.match(updatedSection.markdown, /\[source-review-1\]/);
     assert.deepEqual(updatedSection.claimIds, ["claim-review-1"]);
     assert.equal(updatedSection.status, "checked");
     assert.equal(patchResult?.status, "ok");
@@ -7692,6 +8012,58 @@ test("section.patch accepts ready_for_review and rejects invalid statuses withou
     assert.equal(invalidResult?.status, "blocked");
     assert.match(invalidResult?.message ?? "", /Invalid manuscript section status "done"/);
     assert.match(invalidResult?.message ?? "", /ready_for_review/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("section.patch blocks unknown section ids instead of creating a new section", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-section-patch-missing-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "section repair ergonomics",
+      researchQuestion: "Can section.patch avoid silent creation?",
+      researchDirection: "Patch a missing section id.",
+      successCriterion: "section.patch returns a repair packet and preserves the existing section set."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "section-status"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    const backend = new SectionRepairErgonomicsBackend("missing_section");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const patchResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "section.patch");
+
+    assert.equal(exitCode, 0);
+    assert.equal(workStore.objects.manuscriptSections.length, 1);
+    assert.equal(patchResult?.status, "blocked");
+    assert.match(patchResult?.message ?? "", /could not resolve the requested section id/i);
+    assert.ok(patchResult?.items?.some((item) => item.id === "section-thin-synthesis"));
+    assert.ok(patchResult?.nextHints?.includes("section.create"));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

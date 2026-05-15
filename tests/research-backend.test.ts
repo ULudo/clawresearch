@@ -132,7 +132,13 @@ function emptyWorkspaceContext(): WorkspacePromptContext {
 	      missionTarget: "professional_paper",
 	      paperMode: "literature_review",
 	      objective: "Follow the mollifier thread.",
-	      definitionOfDone: ["Explain which obstacles limit mollifier methods."],
+	      researchContract: {
+	        researchObjectives: ["Explain which obstacles limit mollifier methods."],
+	        coveragePlan: ["Use the existing mollifier evidence before searching again."],
+	        adequacyRationale: ["A good plan names the obstacle class and required synthesis evidence."],
+	        knownUncertainties: ["The thread still needs synthesis before any readiness claim."]
+	      },
+	      legacyDefinitionOfDone: ["Explain which obstacles limit mollifier methods."],
 	      currentFocus: "Mollifier limitations remain central.",
 	      readiness: "Not ready; prior workspace evidence says the mollifier limitations thread still needs synthesis.",
       activeTasks: [{
@@ -154,6 +160,9 @@ function emptyWorkspaceContext(): WorkspacePromptContext {
 	        activeTaskCount: 1,
 	        readinessRecorded: true,
 	        currentFocusSet: true,
+	        researchContractComplete: true,
+	        researchContractCriticReviewed: false,
+	        researchContractCriticFresh: false,
 	        definitionOfDoneAddressed: true,
 	        unlinkedSelectedSourceIds: [],
 	        unlinkedEvidenceCellIds: [],
@@ -249,7 +258,12 @@ test("planning backend includes derived SQLite workspace context in the prompt i
 	              missionTarget: "professional_paper",
 	              paperMode: "literature_review",
 	              objective: "Follow prior mollifier limitations work.",
-	              definitionOfDone: ["Explain which obstacles limit mollifier methods."],
+	              researchContract: {
+	                researchObjectives: ["Explain which obstacles limit mollifier methods."],
+	                coveragePlan: ["Use prior workspace evidence before widening the search."],
+	                adequacyRationale: ["The next review pass should clarify method limitations before claims are strengthened."],
+	                knownUncertainties: ["The workspace evidence may not cover all mollifier variants."]
+	              },
 	              currentFocus: "Synthesize mollifier limitations.",
 	              readiness: "Not sufficient yet; planning initialized the notebook.",
 	              tasks: [{
@@ -286,6 +300,7 @@ test("planning backend includes derived SQLite workspace context in the prompt i
 	    assert.equal(plan.researchMode, "literature_synthesis");
 	    assert.equal(plan.notebookPatch?.missionTarget, "professional_paper");
 	    assert.equal(plan.notebookPatch?.paperMode, "literature_review");
+	    assert.deepEqual(plan.notebookPatch?.researchContract?.researchObjectives, ["Explain which obstacles limit mollifier methods."]);
 	    assert.equal(plan.notebookPatch?.tasks?.[0]?.id, "task-mollifier-limitations");
 	    assert.equal(plan.notebookPatch?.currentFocus, "Synthesize mollifier limitations.");
 	    assert.match(capturedPrompt, /Workspace context:/);
@@ -1042,7 +1057,13 @@ test("agent-step backend exposes first-class claim and manuscript-section tools"
           missionTarget: "professional_paper",
           paperMode: "literature_review",
           objective: "Test the model-driven research loop.",
-          definitionOfDone: ["Create supported claims."],
+          researchContract: {
+            researchObjectives: ["Create supported claims."],
+            coveragePlan: ["Use workspace claims and evidence cells."],
+            adequacyRationale: ["The loop should operate from explicit workspace state."],
+            knownUncertainties: ["The test does not exercise real scientific sufficiency."]
+          },
+          legacyDefinitionOfDone: ["Create supported claims."],
           currentFocus: "Create claim-led synthesis objects.",
           readiness: "Not sufficient yet.",
           tasks: [],

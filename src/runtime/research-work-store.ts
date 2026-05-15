@@ -122,11 +122,20 @@ export type ResearchNotebookArtifactLink = {
   createdBy?: "runtime";
 };
 
+export type ResearchContract = {
+  researchObjectives: string[];
+  coveragePlan: string[];
+  adequacyRationale: string[];
+  knownUncertainties: string[];
+};
+
 export type ResearchNotebook = {
   schemaVersion: 1;
   missionTarget: ResearchMissionTarget;
   paperMode: ResearchPaperMode;
   objective: string;
+  researchContract: ResearchContract;
+  researchContractUpdatedAt: string;
   definitionOfDone: string[];
   tasks: ResearchNotebookTask[];
   currentFocus: string | null;
@@ -204,6 +213,9 @@ export type ResearchNotebookDiagnostics = {
   activeTaskCount: number;
   readinessRecorded: boolean;
   currentFocusSet: boolean;
+  researchContractComplete: boolean;
+  researchContractCriticReviewed: boolean;
+  researchContractCriticFresh: boolean;
   definitionOfDoneAddressed: boolean;
   unlinkedSelectedSourceIds: string[];
   unlinkedEvidenceCellIds: string[];
@@ -747,6 +759,15 @@ function createEmptyWorker(now: string): ResearchWorkStoreWorker {
   };
 }
 
+function createEmptyResearchContract(): ResearchContract {
+  return {
+    researchObjectives: [],
+    coveragePlan: [],
+    adequacyRationale: [],
+    knownUncertainties: []
+  };
+}
+
 function createEmptyNotebook(now: string, brief: ResearchBrief = createEmptyBrief()): ResearchNotebook {
   const objective = [
     brief.topic,
@@ -760,7 +781,9 @@ function createEmptyNotebook(now: string, brief: ResearchBrief = createEmptyBrie
     missionTarget: "professional_paper",
     paperMode: "literature_review",
     objective: objective.length > 0 ? objective : "Unscoped research objective",
-    definitionOfDone: readString(brief.successCriterion) === null ? [] : [readString(brief.successCriterion) as string],
+    researchContract: createEmptyResearchContract(),
+    researchContractUpdatedAt: now,
+    definitionOfDone: [],
     tasks: [],
     currentFocus: null,
     readiness: defaultNotebookReadiness,
@@ -961,15 +984,28 @@ function normalizeNotebookArtifactLink(value: unknown): ResearchNotebookArtifact
   };
 }
 
+function normalizeResearchContract(value: unknown): ResearchContract {
+  const record = asObject(value);
+  return {
+    researchObjectives: readStringArray(record.researchObjectives ?? record.objectives, 80),
+    coveragePlan: readStringArray(record.coveragePlan ?? record.coverage, 80),
+    adequacyRationale: readStringArray(record.adequacyRationale ?? record.adequacyCriteria ?? record.rationale, 80),
+    knownUncertainties: readStringArray(record.knownUncertainties ?? record.uncertainties, 80)
+  };
+}
+
 function normalizeNotebook(value: unknown, now: string, brief: ResearchBrief): ResearchNotebook {
   const base = createEmptyNotebook(now, brief);
   const record = asObject(value);
+  const researchContract = normalizeResearchContract(record.researchContract);
 
   return {
     schemaVersion: 1,
     missionTarget: normalizeResearchMissionTarget(record.missionTarget, base.missionTarget),
     paperMode: normalizeResearchPaperMode(record.paperMode, base.paperMode),
     objective: readString(record.objective) ?? base.objective,
+    researchContract,
+    researchContractUpdatedAt: normalizeTimestamp(record.researchContractUpdatedAt, normalizeTimestamp(record.updatedAt, now)),
     definitionOfDone: readStringArray(record.definitionOfDone, 80),
     tasks: Array.isArray(record.tasks)
       ? record.tasks.flatMap((entry) => normalizeNotebookTask(entry) ?? [])
@@ -1867,7 +1903,8 @@ export type WorkspacePromptContext = {
     missionTarget: ResearchMissionTarget;
     paperMode: ResearchPaperMode;
     objective: string;
-    definitionOfDone: string[];
+    researchContract: ResearchContract;
+    legacyDefinitionOfDone: string[];
     currentFocus: string | null;
     readiness: string;
 	    activeTasks: Array<{
@@ -2129,6 +2166,41 @@ function notebookReadinessIsRecorded(readiness: string | null | undefined): bool
   return trimmed.length > 0 && trimmed !== defaultNotebookReadiness;
 }
 
+function researchContractMissingFields(contract: ResearchContract): string[] {
+  return [
+    contract.researchObjectives.length === 0 ? "researchObjectives" : null,
+    contract.coveragePlan.length === 0 ? "coveragePlan" : null,
+    contract.adequacyRationale.length === 0 ? "adequacyRationale" : null,
+    contract.knownUncertainties.length === 0 ? "knownUncertainties" : null
+  ].filter((field): field is string => field !== null);
+}
+
+function textUsesCountDominantCompletion(value: string): boolean {
+  return /\b(?:at\s+least|minimum|no\s+fewer\s+than|>=)?\s*\d+\s+(?:papers?|sources?|citations?|references?|studies?|systems?|claims?|sections?)\b/i.test(value)
+    || /\b(?:papers?|sources?|citations?|references?|studies?|systems?|claims?|sections?)\s*(?:>=|>|=)\s*\d+\b/i.test(value);
+}
+
+function researchContractIsCountDominant(contract: ResearchContract, legacyDefinitionOfDone: string[]): boolean {
+  const texts = [
+    ...contract.researchObjectives,
+    ...contract.coveragePlan,
+    ...contract.adequacyRationale,
+    ...contract.knownUncertainties,
+    ...legacyDefinitionOfDone
+  ];
+  const countBased = texts.filter(textUsesCountDominantCompletion).length;
+  return countBased > 0
+    && contract.adequacyRationale.length === 0
+    && contract.knownUncertainties.length === 0;
+}
+
+function latestContractCriticReviewSummary(store: ResearchWorkStore): ResearchCriticReviewSummary | null {
+  const summaries = criticReviewSummariesFromNotebook(store)
+    .filter((summary) => summary.stage === "research_contract")
+    .sort((left, right) => parseTimestampMs(right.createdAt) - parseTimestampMs(left.createdAt));
+  return summaries[0] ?? null;
+}
+
 export function buildNotebookDiagnostics(store: ResearchWorkStore): ResearchNotebookDiagnostics {
   const warnings: ResearchNotebookDiagnosticWarning[] = [];
   const activeTaskCount = store.notebook.tasks
@@ -2152,6 +2224,12 @@ export function buildNotebookDiagnostics(store: ResearchWorkStore): ResearchNote
     .filter((sectionId) => !linkedIds.sectionIds.has(sectionId))
     .slice(0, 20);
   const disposition = buildWorkspaceDispositionDiagnostics(store);
+  const missingResearchContractFields = researchContractMissingFields(store.notebook.researchContract);
+  const researchContractComplete = missingResearchContractFields.length === 0;
+  const contractReview = latestContractCriticReviewSummary(store);
+  const researchContractCriticReviewed = contractReview !== null;
+  const researchContractCriticFresh = contractReview !== null
+    && parseTimestampMs(contractReview.createdAt) >= parseTimestampMs(store.notebook.researchContractUpdatedAt);
   const taskText = store.notebook.tasks
     .map((task) => `${task.title} ${task.notes ?? ""}`)
     .join(" ")
@@ -2175,8 +2253,8 @@ export function buildNotebookDiagnostics(store: ResearchWorkStore): ResearchNote
   const unmatchedDefinitionOfDoneNumbers = definitionOfDoneMatches
     .filter((entry) => !entry.mentioned)
     .map((entry) => entry.criterionNumber);
-  const definitionOfDoneAddressed = store.notebook.definitionOfDone.length > 0
-    && unmatchedDefinitionOfDoneNumbers.length === 0;
+  const definitionOfDoneAddressed = store.notebook.definitionOfDone.length === 0
+    || unmatchedDefinitionOfDoneNumbers.length === 0;
   const workspaceUpdatedAts = [
     ...store.objects.canonicalSources.map((entity) => entity.updatedAt),
     ...store.objects.extractions.map((entity) => entity.updatedAt),
@@ -2206,7 +2284,38 @@ export function buildNotebookDiagnostics(store: ResearchWorkStore): ResearchNote
   if (!notebookReadinessIsRecorded(store.notebook.readiness)) {
     addWarning("notebook-readiness-unwritten", "Research readiness has not been recorded by the model.", 1, ["notebook.patch"]);
   }
-  if (!definitionOfDoneAddressed) {
+  if (!researchContractComplete) {
+    addWarning(
+      "notebook-research-contract-incomplete",
+      `Model-authored research contract is missing: ${missingResearchContractFields.join(", ")}.`,
+      missingResearchContractFields.length,
+      ["notebook.read", "notebook.patch"]
+    );
+  }
+  if (researchContractIsCountDominant(store.notebook.researchContract, store.notebook.definitionOfDone)) {
+    addWarning(
+      "notebook-research-contract-count-dominant",
+      "Research contract appears count-dominant without adequacy rationale or uncertainty notes. Counts can be bookkeeping, but the researcher should record why the plan is substantively adequate.",
+      1,
+      ["notebook.patch", "critic.review"]
+    );
+  }
+  if (!researchContractCriticReviewed) {
+    addWarning(
+      "notebook-research-contract-not-critic-reviewed",
+      "No runtime-owned research_contract critic review is recorded for the model-authored research contract.",
+      1,
+      ["critic.review"]
+    );
+  } else if (!researchContractCriticFresh) {
+    addWarning(
+      "notebook-research-contract-review-stale",
+      "Research contract was changed after the latest research_contract critic review.",
+      1,
+      ["critic.review"]
+    );
+  }
+  if (store.notebook.definitionOfDone.length > 0 && !definitionOfDoneAddressed) {
     addWarning(
       "notebook-definition-of-done-unaddressed",
       store.notebook.definitionOfDone.length === 0
@@ -2254,6 +2363,9 @@ export function buildNotebookDiagnostics(store: ResearchWorkStore): ResearchNote
     activeTaskCount,
     readinessRecorded: notebookReadinessIsRecorded(store.notebook.readiness),
     currentFocusSet: store.notebook.currentFocus !== null,
+    researchContractComplete,
+    researchContractCriticReviewed,
+    researchContractCriticFresh,
     definitionOfDoneAddressed,
     unlinkedSelectedSourceIds,
     unlinkedEvidenceCellIds,
@@ -2333,7 +2445,13 @@ export function buildWorkspacePromptContextFromWorkStore(store: ResearchWorkStor
 	      missionTarget: store.notebook.missionTarget,
 	      paperMode: store.notebook.paperMode,
 	      objective: store.notebook.objective,
-	      definitionOfDone: store.notebook.definitionOfDone.slice(0, 12),
+	      researchContract: {
+	        researchObjectives: store.notebook.researchContract.researchObjectives.slice(0, 12),
+	        coveragePlan: store.notebook.researchContract.coveragePlan.slice(0, 12),
+	        adequacyRationale: store.notebook.researchContract.adequacyRationale.slice(0, 12),
+	        knownUncertainties: store.notebook.researchContract.knownUncertainties.slice(0, 12)
+	      },
+	      legacyDefinitionOfDone: store.notebook.definitionOfDone.slice(0, 12),
 	      currentFocus: store.notebook.currentFocus,
 	      readiness: store.notebook.readiness,
 	      activeTasks,

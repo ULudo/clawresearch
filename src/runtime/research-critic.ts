@@ -12,6 +12,7 @@ import type { ResearchBrief } from "./session-store.js";
 import type { VerificationReport } from "./verifier.js";
 
 export type CriticReviewScope =
+  | "research_contract"
   | "protocol"
   | "sources"
   | "evidence"
@@ -236,7 +237,7 @@ function normalizeTarget(value: unknown, stage: CriticReviewScope): CriticObject
     case "release":
       return "release";
     default:
-      return stage === "sources" ? "sources" : stage;
+      return stage === "sources" ? "sources" : stage === "research_contract" ? "notebook" : stage;
   }
 }
 
