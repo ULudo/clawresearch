@@ -127,6 +127,7 @@ import {
   type WorkStoreEntity,
   type WorkStoreEntityKind,
   type WorkStoreExtraction,
+  type WorkStoreFilter,
   type WorkStoreManuscriptSection,
   type WorkStoreProtocol,
   type WorkStoreReleaseCheck,
@@ -865,6 +866,7 @@ function isResearchObjectToolAction(action: ResearchActionDecision["action"]): b
     || action === "section.create"
     || action === "section.read"
     || action === "section.patch"
+    || action === "section.delete"
     || action === "section.link_claim"
     || action === "section.check_claims"
     || action === "work_item.create"
@@ -947,6 +949,224 @@ function defaultWorkStoreArgs(): NonNullable<ResearchActionDecision["inputs"]["w
       toId: null,
       relation: null,
       snippet: null
+    }
+  };
+}
+
+const commonWorkspaceFilterFields = [
+  "id",
+  "kind",
+  "runId",
+  "createdAt",
+  "updatedAt"
+];
+
+const workspaceFilterFieldHints: Record<WorkStoreCollectionName, string[]> = {
+  providerRuns: [
+    ...commonWorkspaceFilterFields,
+    "providerId",
+    "query",
+    "status",
+    "resultCount",
+    "newCanonicalSources"
+  ],
+  sources: [
+    ...commonWorkspaceFilterFields,
+    "providerId",
+    "providerSourceId",
+    "title",
+    "year",
+    "doi",
+    "arxivId",
+    "canonicalSourceId"
+  ],
+  canonicalSources: [
+    ...commonWorkspaceFilterFields,
+    "key",
+    "title",
+    "year",
+    "venue",
+    "screeningDecision",
+    "accessMode",
+    "tags"
+  ],
+  screeningDecisions: [
+    ...commonWorkspaceFilterFields,
+    "sourceId",
+    "decision",
+    "rationale",
+    "confidence"
+  ],
+  fullTextRecords: [
+    ...commonWorkspaceFilterFields,
+    "sourceId",
+    "status",
+    "accessMode",
+    "url"
+  ],
+  extractions: [
+    ...commonWorkspaceFilterFields,
+    "sourceId",
+    "extractionId",
+    "status",
+    "confidence",
+    "extraction.confidence"
+  ],
+  evidenceCells: [
+    ...commonWorkspaceFilterFields,
+    "sourceId",
+    "extractionId",
+    "field",
+    "confidence",
+    "status"
+  ],
+  claims: [
+    ...commonWorkspaceFilterFields,
+    "text",
+    "supportStatus",
+    "confidence",
+    "sourceIds",
+    "usedInSections"
+  ],
+  citations: [
+    ...commonWorkspaceFilterFields,
+    "sourceId",
+    "sourceTitle",
+    "evidenceCellId",
+    "claimIds",
+    "sectionIds",
+    "confidence"
+  ],
+  protocols: [
+    ...commonWorkspaceFilterFields,
+    "objective",
+    "status",
+    "researchQuestions",
+    "paperMode",
+    "missionTarget"
+  ],
+  workItems: [
+    ...commonWorkspaceFilterFields,
+    "type",
+    "status",
+    "severity",
+    "targetCollection",
+    "targetId"
+  ],
+  manuscriptSections: [
+    ...commonWorkspaceFilterFields,
+    "sectionId",
+    "role",
+    "orderIndex",
+    "title",
+    "sourceIds",
+    "claimIds",
+    "status"
+  ],
+  releaseChecks: [
+    ...commonWorkspaceFilterFields,
+    "checkType",
+    "status",
+    "severity",
+    "targetCollection",
+    "targetId"
+  ]
+};
+
+function workStoreCollectionItems(store: ResearchWorkStore, collection: WorkStoreCollectionName): WorkStoreEntity[] {
+  return store.objects[collection] as WorkStoreEntity[];
+}
+
+function hasObjectFieldPath(value: unknown, dottedPath: string): boolean {
+  const parts = dottedPath.split(".").filter((part) => part.length > 0);
+  let current: unknown = value;
+  for (const part of parts) {
+    if (typeof current !== "object" || current === null || Array.isArray(current)) {
+      return false;
+    }
+    const record = current as Record<string, unknown>;
+    if (!Object.prototype.hasOwnProperty.call(record, part)) {
+      return false;
+    }
+    current = record[part];
+  }
+  return parts.length > 0;
+}
+
+function collectWorkspaceFilterFields(value: unknown, prefix = "", depth = 0): string[] {
+  if (typeof value !== "object" || value === null || Array.isArray(value) || depth > 2) {
+    return [];
+  }
+  return Object.entries(value as Record<string, unknown>).flatMap(([key, nestedValue]) => {
+    const fieldPath = prefix.length > 0 ? `${prefix}.${key}` : key;
+    const nestedPaths = typeof nestedValue === "object" && nestedValue !== null && !Array.isArray(nestedValue)
+      ? collectWorkspaceFilterFields(nestedValue, fieldPath, depth + 1)
+      : [];
+    return [fieldPath, ...nestedPaths];
+  });
+}
+
+function validWorkspaceFilterFields(store: ResearchWorkStore, collection: WorkStoreCollectionName): string[] {
+  const derivedFields = workStoreCollectionItems(store, collection)
+    .flatMap((entity) => collectWorkspaceFilterFields(entity));
+  return Array.from(new Set([
+    ...workspaceFilterFieldHints[collection],
+    ...derivedFields
+  ])).sort((left, right) => left.localeCompare(right));
+}
+
+function validateWorkspaceFilters(input: {
+  store: ResearchWorkStore;
+  collection: WorkStoreCollectionName;
+  filters: WorkStoreFilter | undefined;
+}): {
+  filters: WorkStoreFilter | undefined;
+  ignoredUnsupportedFilters: string[];
+  validFields: string[];
+} {
+  const filters = input.filters ?? {};
+  const entries = Object.entries(filters);
+  if (entries.length === 0) {
+    return {
+      filters: input.filters,
+      ignoredUnsupportedFilters: [],
+      validFields: validWorkspaceFilterFields(input.store, input.collection)
+    };
+  }
+  const collectionItems = workStoreCollectionItems(input.store, input.collection);
+  const validFields = validWorkspaceFilterFields(input.store, input.collection);
+  const validFieldSet = new Set(validFields);
+  const acceptedEntries = entries.filter(([field]) => {
+    return validFieldSet.has(field) || collectionItems.some((entity) => hasObjectFieldPath(entity, field));
+  });
+  const ignoredUnsupportedFilters = entries
+    .filter(([field]) => !acceptedEntries.some(([acceptedField]) => acceptedField === field))
+    .map(([field]) => field);
+  return {
+    filters: acceptedEntries.length > 0 ? Object.fromEntries(acceptedEntries) as WorkStoreFilter : {},
+    ignoredUnsupportedFilters,
+    validFields
+  };
+}
+
+function workspaceFilterDiagnosticPreview(input: {
+  collection: WorkStoreCollectionName;
+  ignoredUnsupportedFilters: string[];
+  validFields: string[];
+}): AgentVisibleEntityPreview | null {
+  if (input.ignoredUnsupportedFilters.length === 0) {
+    return null;
+  }
+  const visibleFields = input.validFields.slice(0, 16);
+  return {
+    id: `workspace-filter-diagnostic-${input.collection}`,
+    kind: "workspaceFilterDiagnostic",
+    title: "Unsupported workspace filter ignored",
+    snippet: `Ignored unsupported filter(s): ${input.ignoredUnsupportedFilters.join(", ")}. Valid ${input.collection} filters include: ${visibleFields.join(", ")}.`,
+    fields: {
+      collection: input.collection,
+      ignoredUnsupportedFilters: input.ignoredUnsupportedFilters,
+      validFilterFields: visibleFields
     }
   };
 }
@@ -2509,11 +2729,91 @@ function activeSupportSourceIdsForClaims(store: ResearchWorkStore, claimIds: str
     .map((citation) => citation.sourceId));
 }
 
+function sectionProvenanceDelta(input: {
+  store: ResearchWorkStore;
+  before: WorkStoreManuscriptSection | null;
+  after: WorkStoreManuscriptSection;
+  sourceIdsMode: SectionSourceIdsMode;
+}): {
+  query: Record<string, unknown>;
+  preview: AgentVisibleEntityPreview;
+  sourceIdsAdded: string[];
+  sourceIdsRemoved: string[];
+  claimIdsAdded: string[];
+  claimIdsRemoved: string[];
+  sectionSourceIdsWithoutActiveSupport: string[];
+  inlineCitationIdsMissingFromSectionSourceIds: string[];
+} {
+  const sourceIdsBefore = input.before?.sourceIds ?? [];
+  const sourceIdsAfter = input.after.sourceIds;
+  const claimIdsBefore = input.before?.claimIds ?? [];
+  const claimIdsAfter = input.after.claimIds;
+  const activeSupportSourceIdsForLinkedClaims = activeSupportSourceIdsForClaims(input.store, claimIdsAfter);
+  const activeSupportSet = new Set(activeSupportSourceIdsForLinkedClaims);
+  const knownSourceIds = uniqueStrings(input.store.objects.canonicalSources.map((source) => source.id));
+  const inlineCitationSourceIds = uniqueStrings(markdownWorkspaceCitationMarkers(input.after.markdown, knownSourceIds)
+    .filter((marker) => marker.known)
+    .map((marker) => marker.sourceId));
+  const sectionSourceIdSet = new Set(sourceIdsAfter);
+  const sourceIdsAdded = sourceIdsAfter.filter((sourceId) => !sourceIdsBefore.includes(sourceId));
+  const sourceIdsRemoved = sourceIdsBefore.filter((sourceId) => !sourceIdsAfter.includes(sourceId));
+  const claimIdsAdded = claimIdsAfter.filter((claimId) => !claimIdsBefore.includes(claimId));
+  const claimIdsRemoved = claimIdsBefore.filter((claimId) => !claimIdsAfter.includes(claimId));
+  const sectionSourceIdsWithoutActiveSupport = sourceIdsAfter.filter((sourceId) => !activeSupportSet.has(sourceId));
+  const inlineCitationIdsMissingFromSectionSourceIds = inlineCitationSourceIds.filter((sourceId) => !sectionSourceIdSet.has(sourceId));
+  const query = {
+    sourceIdsMode: input.sourceIdsMode,
+    sourceIdsBefore,
+    sourceIdsAfter,
+    sourceIdsAdded,
+    sourceIdsRemoved,
+    claimIdsBefore,
+    claimIdsAfter,
+    claimIdsAdded,
+    claimIdsRemoved,
+    activeSupportSourceIdsForLinkedClaims,
+    sectionSourceIdsWithoutActiveSupport,
+    inlineCitationSourceIds,
+    inlineCitationIdsMissingFromSectionSourceIds
+  };
+  return {
+    query,
+    preview: {
+      id: `${input.after.id}-provenance-delta`,
+      kind: "sectionProvenanceDelta",
+      title: "Section provenance delta",
+      snippet: `sourceIds ${sourceIdsBefore.length} -> ${sourceIdsAfter.length}; added ${sourceIdsAdded.length}; removed ${sourceIdsRemoved.length}; mode ${input.sourceIdsMode}.`,
+      sourceIds: sourceIdsAfter.slice(0, 20),
+      claimIds: claimIdsAfter.slice(0, 20),
+      fields: {
+        sourceIdsMode: input.sourceIdsMode,
+        sourceIdsBefore: sourceIdsBefore.slice(0, 20),
+        sourceIdsAfter: sourceIdsAfter.slice(0, 20),
+        sourceIdsAdded: sourceIdsAdded.slice(0, 20),
+        sourceIdsRemoved: sourceIdsRemoved.slice(0, 20),
+        claimIdsBefore: claimIdsBefore.slice(0, 20),
+        claimIdsAfter: claimIdsAfter.slice(0, 20),
+        activeSupportSourceIdsForLinkedClaims: activeSupportSourceIdsForLinkedClaims.slice(0, 20),
+        sectionSourceIdsWithoutActiveSupport: sectionSourceIdsWithoutActiveSupport.slice(0, 20),
+        inlineCitationSourceIds: inlineCitationSourceIds.slice(0, 20),
+        inlineCitationIdsMissingFromSectionSourceIds: inlineCitationIdsMissingFromSectionSourceIds.slice(0, 20)
+      }
+    },
+    sourceIdsAdded,
+    sourceIdsRemoved,
+    claimIdsAdded,
+    claimIdsRemoved,
+    sectionSourceIdsWithoutActiveSupport,
+    inlineCitationIdsMissingFromSectionSourceIds
+  };
+}
+
 function propagateClaimSupportToSections(input: {
   store: ResearchWorkStore;
   claimIds: string[];
   sectionIds: string[];
   now: string;
+  addMissingSourceIds?: boolean;
 }): {
   store: ResearchWorkStore;
   sectionIdsUpdated: number;
@@ -2539,7 +2839,7 @@ function propagateClaimSupportToSections(input: {
     ));
     const supportSourceIds = uniqueStrings(relevantSupportLinks.map((citation) => citation.sourceId));
     const missingSourceIds = supportSourceIds.filter((sourceId) => !section.sourceIds.includes(sourceId));
-    if (missingSourceIds.length > 0) {
+    if (input.addMissingSourceIds !== false && missingSourceIds.length > 0) {
       nextStore = patchResearchWorkStoreEntity(nextStore, {
         collection: "manuscriptSections",
         id: section.id,
@@ -2857,15 +3157,20 @@ function claimLinkSupportBlockedResult(input: {
   store: ResearchWorkStore;
   query?: Record<string, unknown>;
   sourceId?: string | null;
+  includeCaution?: boolean;
   nextHints?: string[];
 }): AgentToolResult {
+  const message = input.includeCaution === false
+    ? input.message
+    : `${input.message} ${supportLinkCaution()}`;
+
   return makeAgentToolResult({
     run: input.run,
     action: "claim.link_support",
     timestamp: input.timestamp,
     status: "blocked",
     readOnly: false,
-    message: `${input.message} ${supportLinkCaution()}`,
+    message,
     collection: "citations",
     query: input.query,
     items: recentClaimPreviews(input.store),
@@ -3578,6 +3883,12 @@ type SectionPatchOperation =
   | "set_order"
   | "set_claim_links";
 
+type SectionSourceIdsMode =
+  | "append"
+  | "replace"
+  | "remove"
+  | "recompute_from_claims";
+
 function safeSectionPatchOperation(value: unknown, fallback: SectionPatchOperation): SectionPatchOperation {
   return value === "replace_all"
     || value === "replace_block"
@@ -3587,6 +3898,15 @@ function safeSectionPatchOperation(value: unknown, fallback: SectionPatchOperati
     || value === "update_title"
     || value === "set_order"
     || value === "set_claim_links"
+    ? value
+    : fallback;
+}
+
+function safeSectionSourceIdsMode(value: unknown, fallback: SectionSourceIdsMode): SectionSourceIdsMode {
+  return value === "append"
+    || value === "replace"
+    || value === "remove"
+    || value === "recompute_from_claims"
     ? value
     : fallback;
 }
@@ -3628,6 +3948,14 @@ function manuscriptSectionStatusValidation(input: {
     status: null,
     invalidValue: typeof rawStatus === "string" ? rawStatus : serialized ?? String(rawStatus)
   };
+}
+
+function invalidSectionStatusRepairHint(value: string | null): string {
+  const base = `Use one of: ${validManuscriptSectionStatuses.join(", ")}.`;
+  if (value !== null && /^(retired|delete|deleted|archive|archived|non[-_ ]?export|inactive)$/i.test(value)) {
+    return `${base} To remove a section from the active manuscript, use section.delete with the sectionId/id instead.`;
+  }
+  return base;
 }
 
 function explicitSectionMarkdown(entity: Record<string, unknown>, changes: Record<string, unknown>): string {
@@ -3700,10 +4028,58 @@ function sectionOrderIndexFromToolInput(
   return parsed ?? existing?.orderIndex ?? null;
 }
 
+function sectionSourceIdsModeFromToolInput(
+  entity: Record<string, unknown>,
+  changes: Record<string, unknown>,
+  operation: SectionPatchOperation
+): SectionSourceIdsMode {
+  return safeSectionSourceIdsMode(
+    entity.sourceIdsMode ?? entity.sourceMode ?? changes.sourceIdsMode ?? changes.sourceMode,
+    operation === "set_claim_links" ? "recompute_from_claims" : "append"
+  );
+}
+
+function requestedSectionSourceIds(input: {
+  decision: ResearchActionDecision;
+  entity: Record<string, unknown>;
+  changes: Record<string, unknown>;
+}): string[] {
+  return uniqueStrings([
+    ...input.decision.inputs.paperIds,
+    ...stringArrayInput(input.entity.sourceIds ?? input.changes.sourceIds, 80)
+  ]);
+}
+
+function sectionSourceIdsForMode(input: {
+  store: ResearchWorkStore;
+  existing: WorkStoreManuscriptSection | null | undefined;
+  claimIds: string[];
+  requestedSourceIds: string[];
+  mode: SectionSourceIdsMode;
+}): string[] {
+  switch (input.mode) {
+    case "append":
+      return uniqueStrings([
+        ...(input.existing?.sourceIds ?? []),
+        ...input.requestedSourceIds,
+        ...activeSupportSourceIdsForClaims(input.store, input.claimIds)
+      ]);
+    case "replace":
+      return input.requestedSourceIds;
+    case "remove": {
+      const removals = new Set(input.requestedSourceIds);
+      return (input.existing?.sourceIds ?? []).filter((sourceId) => !removals.has(sourceId));
+    }
+    case "recompute_from_claims":
+      return activeSupportSourceIdsForClaims(input.store, input.claimIds);
+  }
+}
+
 function manuscriptSectionFromToolInput(input: {
   run: RunRecord;
   now: string;
   decision: ResearchActionDecision;
+  store: ResearchWorkStore;
   existing?: WorkStoreManuscriptSection | null;
 }): WorkStoreManuscriptSection | null {
   const entity = input.decision.inputs.workStore?.entity ?? {};
@@ -3728,6 +4104,11 @@ function manuscriptSectionFromToolInput(input: {
   const exactClaimIds = operation === "set_claim_links"
     ? stringArrayInput(entity.claimIds ?? changes.claimIds, 40)
     : null;
+  const claimIds = exactClaimIds ?? uniqueStrings([
+    ...(input.existing?.claimIds ?? []),
+    ...stringArrayInput(entity.claimIds ?? changes.claimIds, 40)
+  ]);
+  const sourceIdsMode = sectionSourceIdsModeFromToolInput(entity, changes, operation);
 
   return {
     id: input.existing?.id ?? stringInput(entity.id, generatedToolEntityId("section", input.run, input.now, sectionId)),
@@ -3740,15 +4121,18 @@ function manuscriptSectionFromToolInput(input: {
     orderIndex: sectionOrderIndexFromToolInput(entity, changes, input.existing),
     title: stringInput(entity.title ?? changes.title, input.existing?.title ?? sectionId.replace(/[-_]+/g, " ")),
     markdown,
-    sourceIds: uniqueStrings([
-      ...(input.existing?.sourceIds ?? []),
-      ...input.decision.inputs.paperIds,
-      ...stringArrayInput(entity.sourceIds ?? changes.sourceIds, 40)
-    ]),
-    claimIds: exactClaimIds ?? uniqueStrings([
-      ...(input.existing?.claimIds ?? []),
-      ...stringArrayInput(entity.claimIds ?? changes.claimIds, 40)
-    ]),
+    sourceIds: sectionSourceIdsForMode({
+      store: input.store,
+      existing: input.existing,
+      claimIds,
+      requestedSourceIds: requestedSectionSourceIds({
+        decision: input.decision,
+        entity,
+        changes
+      }),
+      mode: sourceIdsMode
+    }),
+    claimIds,
     status: safeManuscriptSectionStatus(entity.status ?? changes.status, input.existing?.status ?? "needs_revision")
   };
 }
@@ -3786,6 +4170,85 @@ function resolveSectionReference(store: ResearchWorkStore, candidates: string[])
   return candidates.length === 0 && store.objects.manuscriptSections.length === 1
     ? store.objects.manuscriptSections[0] ?? null
     : null;
+}
+
+function deleteManuscriptSectionFromActiveWorkspace(input: {
+  store: ResearchWorkStore;
+  section: WorkStoreManuscriptSection;
+  now: string;
+}): {
+  store: ResearchWorkStore;
+  claimsUpdated: number;
+  citationsUpdated: number;
+  notebookTasksUpdated: number;
+  workItemsRemoved: number;
+} {
+  const sectionId = input.section.id;
+  let claimsUpdated = 0;
+  const claims = input.store.objects.claims.map((claim) => {
+    if (!claim.usedInSections.includes(sectionId)) {
+      return claim;
+    }
+    claimsUpdated += 1;
+    return {
+      ...claim,
+      usedInSections: claim.usedInSections.filter((id) => id !== sectionId),
+      updatedAt: input.now
+    };
+  });
+
+  let citationsUpdated = 0;
+  const citations = input.store.objects.citations.map((citation) => {
+    if (!citation.sectionIds.includes(sectionId)) {
+      return citation;
+    }
+    citationsUpdated += 1;
+    return {
+      ...citation,
+      sectionIds: citation.sectionIds.filter((id) => id !== sectionId),
+      updatedAt: input.now
+    };
+  });
+
+  let notebookTasksUpdated = 0;
+  const tasks = input.store.notebook.tasks.map((task) => {
+    if (!task.linkedSectionIds.includes(sectionId)) {
+      return task;
+    }
+    notebookTasksUpdated += 1;
+    return {
+      ...task,
+      linkedSectionIds: task.linkedSectionIds.filter((id) => id !== sectionId)
+    };
+  });
+
+  const workItems = input.store.objects.workItems.filter((item) => !(
+    item.targetKind === "manuscriptSection" && item.targetId === sectionId
+  ));
+  const workItemsRemoved = input.store.objects.workItems.length - workItems.length;
+
+  return {
+    store: {
+      ...input.store,
+      updatedAt: input.now,
+      notebook: {
+        ...input.store.notebook,
+        tasks,
+        updatedAt: notebookTasksUpdated > 0 ? input.now : input.store.notebook.updatedAt
+      },
+      objects: {
+        ...input.store.objects,
+        claims,
+        citations,
+        workItems,
+        manuscriptSections: input.store.objects.manuscriptSections.filter((section) => section.id !== sectionId)
+      }
+    },
+    claimsUpdated,
+    citationsUpdated,
+    notebookTasksUpdated,
+    workItemsRemoved
+  };
 }
 
 function resolveClaimReference(store: ResearchWorkStore, candidates: string[]): WorkStoreClaim | null {
@@ -4393,14 +4856,27 @@ async function executeWorkStoreToolAction(input: {
   if (input.decision.action === "workspace.search" || input.decision.action === "workspace.list") {
     const queryCollection = collection ?? "workItems";
     const timestamp = input.now();
+    const filterValidation = validateWorkspaceFilters({
+      store: input.store,
+      collection: queryCollection,
+      filters: args.filters
+    });
     const result = queryResearchWorkStore(input.store, {
       collection: queryCollection,
-      filters: args.filters,
+      filters: filterValidation.filters,
       semanticQuery: input.decision.action === "workspace.list" ? null : args.semanticQuery,
       limit: args.limit ?? 12,
       cursor: args.cursor ?? null
     });
-    const message = `Workspace ${input.decision.action === "workspace.list" ? "list" : "search"} ${queryCollection} returned ${result.count}/${result.totalCount} item(s).${result.hasMore ? ` More available with cursor ${result.nextCursor}.` : ""}`;
+    const filterDiagnostic = workspaceFilterDiagnosticPreview({
+      collection: queryCollection,
+      ignoredUnsupportedFilters: filterValidation.ignoredUnsupportedFilters,
+      validFields: filterValidation.validFields
+    });
+    const ignoredFilterMessage = filterValidation.ignoredUnsupportedFilters.length > 0
+      ? ` Ignored unsupported filter(s): ${filterValidation.ignoredUnsupportedFilters.join(", ")}. Valid ${queryCollection} filters include: ${filterValidation.validFields.slice(0, 16).join(", ")}.`
+      : "";
+    const message = `Workspace ${input.decision.action === "workspace.list" ? "list" : "search"} ${queryCollection} returned ${result.count}/${result.totalCount} item(s).${result.hasMore ? ` More available with cursor ${result.nextCursor}.` : ""}${ignoredFilterMessage}`;
     return {
       handled: true,
       store: input.store,
@@ -4413,7 +4889,9 @@ async function executeWorkStoreToolAction(input: {
         message,
         collection: queryCollection,
         query: {
-          filters: args.filters,
+          requestedFilters: args.filters,
+          filters: filterValidation.filters,
+          ignoredUnsupportedFilters: filterValidation.ignoredUnsupportedFilters,
           semanticQuery: input.decision.action === "workspace.list" ? null : args.semanticQuery,
           limit: args.limit ?? 12,
           cursor: args.cursor ?? null
@@ -4424,6 +4902,7 @@ async function executeWorkStoreToolAction(input: {
         hasMore: result.hasMore,
         nextCursor: result.nextCursor,
         items: result.items.map((entity) => entityPreviewForAgent(entity, input.store)),
+        related: filterDiagnostic === null ? [] : [filterDiagnostic],
         nextHints: queryCollection === "extractions" || queryCollection === "evidenceCells"
           ? ["claim.create", "workspace.read", "workspace.search"]
           : ["workspace.read", "workspace.search"]
@@ -5333,26 +5812,49 @@ async function executeResearchObjectToolAction(input: {
         || (oldSourceIds.size > 0 && oldSourceIds.has(citation.sourceId))
       ));
       if (supportLinksToRetire.length === 0) {
-        const message = "claim.link_support remove blocked because no active support link matched the provided citationId, evidenceCellId, or sourceId.";
+        const supportLinkMatchesRemoveRequest = (citation: WorkStoreCitation): boolean => (
+          supportLinkIdCandidates.includes(citation.id)
+          || (oldEvidenceCellIds.size > 0 && citation.evidenceCellId !== null && oldEvidenceCellIds.has(citation.evidenceCellId))
+          || (oldSourceIds.size > 0 && oldSourceIds.has(citation.sourceId))
+        );
+        const inactiveMatchingSupportLinks = input.store.objects.citations.filter((citation) => (
+          !researchObjectIsActive(citation)
+          && citation.claimIds.includes(claimId)
+          && supportLinkMatchesRemoveRequest(citation)
+        ));
+        const activeRelatedSupportLinks = activeSupportLinks.filter((citation) => (
+          supportLinkMatchesRemoveRequest(citation)
+          || citation.claimIds.includes(claimId)
+        ));
+        const inactiveIds = inactiveMatchingSupportLinks.map((citation) => `${citation.id}:${researchObjectLifecycleStatus(citation)}`);
+        const activeIds = activeRelatedSupportLinks.map((citation) => citation.id);
+        const message = [
+          "claim.link_support remove blocked because no active support link matched the provided citationId, evidenceCellId, or sourceId.",
+          `Matching retired/inactive support links: ${inactiveIds.length > 0 ? inactiveIds.join(", ") : "none"}.`,
+          `Active support links still attached to this claim/source/evidence: ${activeIds.length > 0 ? activeIds.join(", ") : "none"}.`
+        ].join(" ");
         return {
           handled: true,
           store: input.store,
           message,
-          result: claimLinkSupportBlockedResult({
+          result: makeAgentToolResult({
             run: input.run,
+            action: "claim.link_support",
             timestamp: nowText,
+            status: "blocked",
+            readOnly: false,
             message,
-            store: input.store,
-            sourceId: resolvedSourceId.length > 0 ? resolvedSourceId : null,
+            collection: "citations",
             query: {
               mode,
               claimId,
               supportLinkIdCandidates,
               evidenceCellId: evidenceCellId || null,
               sourceCandidates: sourceIds,
-              activeSupportLinkIds: activeSupportLinks.map((citation) => citation.id)
+              retiredOrInactiveMatchingSupportLinkIds: inactiveMatchingSupportLinks.map((citation) => citation.id),
+              activeSupportLinkIds: activeRelatedSupportLinks.map((citation) => citation.id)
             },
-            nextHints: ["workspace.list", "workspace.read", "claim.link_support"]
+            nextHints: []
           })
         };
       }
@@ -6126,13 +6628,117 @@ async function executeResearchObjectToolAction(input: {
     };
   }
 
+  if (input.decision.action === "section.delete") {
+    const timestamp = input.now();
+    const sectionCandidates = stringCandidates(
+      args.entityId,
+      args.entity.id,
+      args.entity.sectionId,
+      args.entity.manuscriptSectionId,
+      input.decision.inputs.paperIds[0]
+    );
+    if (sectionCandidates.length === 0) {
+      const message = "Section delete blocked. section.delete is destructive for the active manuscript and requires an explicit known section id or sectionId. Use section.read or workspace.list to inspect active section ids first.";
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp,
+          status: "blocked",
+          readOnly: false,
+          message,
+          collection: "manuscriptSections",
+          count: 0,
+          totalCount: input.store.objects.manuscriptSections.length,
+          items: input.store.objects.manuscriptSections.slice(-8).map((entry) => entityPreviewForAgent(entry, input.store)),
+          nextHints: ["workspace.list", "section.read", "section.delete"]
+        })
+      };
+    }
+    const section = resolveSectionReference(input.store, sectionCandidates);
+    if (section === null) {
+      const message = "Section delete blocked. section.delete removes an existing manuscript section from the active manuscript, but no known section id/sectionId could be resolved. Use section.read or workspace.list to inspect active section ids.";
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp,
+          status: "blocked",
+          readOnly: false,
+          message,
+          collection: "manuscriptSections",
+          query: {
+            sectionCandidates
+          },
+          count: 0,
+          totalCount: input.store.objects.manuscriptSections.length,
+          items: input.store.objects.manuscriptSections.slice(-8).map((entry) => entityPreviewForAgent(entry, input.store)),
+          nextHints: ["workspace.list", "section.read", "section.delete"]
+        })
+      };
+    }
+
+    const deletion = deleteManuscriptSectionFromActiveWorkspace({
+      store: input.store,
+      section,
+      now: timestamp
+    });
+    await writeResearchWorkStore(deletion.store);
+    const reason = stringInput(args.entity.reason ?? args.entity.statusReason ?? args.changes.reason ?? args.changes.statusReason ?? input.decision.inputs.reason, "");
+    const message = [
+      `Section deleted ${section.id}. It will no longer appear in active manuscript section lists, critic packets, release.verify, manuscript.finalize, or paper.md.`,
+      "Claims, evidence, sources, and support links were preserved.",
+      reason.length > 0 ? `Reason: ${reason}` : null
+    ].filter((part): part is string => part !== null).join(" ");
+    await appendEvent(input.run, input.now, "summary", `section.deleted ${section.id}${reason.length > 0 ? `: ${reason}` : ""}`);
+    return {
+      handled: true,
+      store: deletion.store,
+      message,
+      result: makeAgentToolResult({
+        run: input.run,
+        action: input.decision.action,
+        timestamp,
+        status: "ok",
+        readOnly: false,
+        message,
+        collection: "manuscriptSections",
+        query: {
+          sectionId: section.id,
+          sectionTitle: section.title,
+          reason: reason.length > 0 ? reason : null
+        },
+        count: 1,
+        totalCount: deletion.store.objects.manuscriptSections.length,
+        entity: entityPreviewForAgent(section, input.store),
+        items: deletion.store.objects.manuscriptSections.slice(-8).map((entry) => entityPreviewForAgent(entry, deletion.store)),
+        stateDelta: {
+          sectionsDeleted: 1,
+          activeManuscriptSections: deletion.store.objects.manuscriptSections.length,
+          claimsUpdated: deletion.claimsUpdated,
+          citationsUpdated: deletion.citationsUpdated,
+          notebookTasksUpdated: deletion.notebookTasksUpdated,
+          workItemsRemoved: deletion.workItemsRemoved
+        },
+        nextHints: ["workspace.list", "critic.review", "release.verify"]
+      })
+    };
+  }
+
   if (input.decision.action === "section.create" || input.decision.action === "section.patch") {
     const statusValidation = manuscriptSectionStatusValidation({
       entity: args.entity,
       changes: args.changes
     });
     if (!statusValidation.ok) {
-      const message = `Section create/patch blocked. Invalid manuscript section status "${statusValidation.invalidValue ?? "(unknown)"}". Use one of: ${validManuscriptSectionStatuses.join(", ")}. No section was persisted.`;
+      const statusRepairHint = invalidSectionStatusRepairHint(statusValidation.invalidValue);
+      const message = `Section create/patch blocked. Invalid manuscript section status "${statusValidation.invalidValue ?? "(unknown)"}". ${statusRepairHint} No section was persisted.`;
       return {
         handled: true,
         store: input.store,
@@ -6148,7 +6754,9 @@ async function executeResearchObjectToolAction(input: {
           count: 0,
           totalCount: input.store.objects.manuscriptSections.length,
           items: input.store.objects.manuscriptSections.slice(-8).map((entry) => entityPreviewForAgent(entry, input.store)),
-          nextHints: ["section.read", "section.patch", "section.check_claims"]
+          nextHints: statusRepairHint.includes("section.delete")
+            ? ["section.read", "section.delete", "section.patch", "section.check_claims"]
+            : ["section.read", "section.patch", "section.check_claims"]
         })
       };
     }
@@ -6186,6 +6794,7 @@ async function executeResearchObjectToolAction(input: {
       run: input.run,
       now: nowText,
       decision: input.decision,
+      store: input.store,
       existing
     });
     if (section === null) {
@@ -6209,23 +6818,28 @@ async function executeResearchObjectToolAction(input: {
         })
       };
     }
-    const supportSourceIds = activeSupportSourceIdsForClaims(input.store, section.claimIds);
-    const sectionSourceIdsBefore = new Set(section.sourceIds);
-    const sectionWithDerivedProvenance = {
-      ...section,
-      sourceIds: uniqueStrings([...section.sourceIds, ...supportSourceIds])
-    };
-    let nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, sectionWithDerivedProvenance, nowText);
+    const operation = safeSectionPatchOperation(
+      args.entity.operation ?? args.entity.patchOperation ?? args.changes.operation ?? args.changes.patchOperation,
+      "replace_all"
+    );
+    const sourceIdsMode = sectionSourceIdsModeFromToolInput(args.entity, args.changes, operation);
+    let nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, section, nowText);
     const propagation = propagateClaimSupportToSections({
       store: nextStore,
-      claimIds: sectionWithDerivedProvenance.claimIds,
-      sectionIds: [sectionWithDerivedProvenance.id],
-      now: nowText
+      claimIds: section.claimIds,
+      sectionIds: [section.id],
+      now: nowText,
+      addMissingSourceIds: sourceIdsMode === "append" || sourceIdsMode === "recompute_from_claims"
     });
     nextStore = propagation.store;
     await writeResearchWorkStore(nextStore);
-    const updatedSection = readResearchWorkStoreEntity<WorkStoreManuscriptSection>(nextStore, "manuscriptSections", sectionWithDerivedProvenance.id) ?? sectionWithDerivedProvenance;
-    const sourceIdsAddedOnCreate = updatedSection.sourceIds.filter((sourceId) => !sectionSourceIdsBefore.has(sourceId)).length;
+    const updatedSection = readResearchWorkStoreEntity<WorkStoreManuscriptSection>(nextStore, "manuscriptSections", section.id) ?? section;
+    const provenanceDelta = sectionProvenanceDelta({
+      store: nextStore,
+      before: existing,
+      after: updatedSection,
+      sourceIdsMode
+    });
     const hygieneWarnings = manuscriptSectionHygieneWarnings(updatedSection, nextStore);
     const references = referencesFromWorkStore(input.run, nextStore);
     const compilerDiagnostics = manuscriptCompilerDiagnostics({
@@ -6255,9 +6869,11 @@ async function executeResearchObjectToolAction(input: {
         collection: "manuscriptSections",
         count: 1,
         totalCount: nextStore.objects.manuscriptSections.length,
+        query: provenanceDelta.query,
         entity: entityPreviewForAgent(updatedSection, nextStore),
         items: sectionBlockPreviews(updatedSection),
         related: [
+          provenanceDelta.preview,
           ...manuscriptCompilerDiagnosticPreviews(compilerDiagnostics),
           ...sectionRepairRelatedPreviews(nextStore, updatedSection)
         ],
@@ -6267,7 +6883,12 @@ async function executeResearchObjectToolAction(input: {
           sectionHygieneWarnings: hygieneWarnings.length,
           sectionCompilerDiagnostics: compilerDiagnostics.length,
           sectionIdsUpdated: propagation.sectionIdsUpdated,
-          sourceIdsAdded: sourceIdsAddedOnCreate + propagation.sourceIdsAdded,
+          sourceIdsAdded: provenanceDelta.sourceIdsAdded.length,
+          sourceIdsRemoved: provenanceDelta.sourceIdsRemoved.length,
+          claimIdsAdded: provenanceDelta.claimIdsAdded.length,
+          claimIdsRemoved: provenanceDelta.claimIdsRemoved.length,
+          sectionSourceIdsWithoutActiveSupport: provenanceDelta.sectionSourceIdsWithoutActiveSupport.length,
+          inlineCitationIdsMissingFromSectionSourceIds: provenanceDelta.inlineCitationIdsMissingFromSectionSourceIds.length,
           supportLinksAttachedToSections: propagation.supportLinksAttachedToSections
         },
         nextHints: sectionIssueCount > 0

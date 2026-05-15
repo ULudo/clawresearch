@@ -463,12 +463,14 @@ test("research-agent backend uses native tool calls by default", async () => {
     const entitySchema = workStoreSchema?.entity;
     const typedEntityFields = [
       "sourceId",
+      "sourceIds",
       "paperId",
       "extractionId",
       "field",
       "value",
       "text",
       "claimId",
+      "claimIds",
       "evidenceCellId",
       "citationId",
       "supportLinkId",
@@ -480,6 +482,7 @@ test("research-agent backend uses native tool calls by default", async () => {
       "sectionIds",
       "markdown",
       "operation",
+      "sourceIdsMode",
 	      "blockIndex",
 	      "status",
 	      "statusReason",
@@ -505,6 +508,7 @@ test("research-agent backend uses native tool calls by default", async () => {
     assert.match(capturedBody.messages?.[0]?.content ?? "", /evidence\.create_cell: set workStore\.entity\.sourceId or paperId/i);
 	    assert.match(capturedBody.messages?.[0]?.content ?? "", /claim\.link_support: set workStore\.entity\.mode to append\|replace\|remove/i);
 	    assert.match(capturedBody.messages?.[0]?.content ?? "", /section\.patch: use operation replace_all/i);
+    assert.match(capturedBody.messages?.[0]?.content ?? "", /sourceIdsMode append\|replace\|remove\|recompute_from_claims/i);
 	    assert.match(capturedBody.messages?.[0]?.content ?? "", /set_order/i);
     assert.doesNotMatch(capturedBody.messages?.[0]?.content ?? "", /bounded first-pass/i);
   } finally {

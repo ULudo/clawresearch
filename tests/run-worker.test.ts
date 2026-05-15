@@ -3010,6 +3010,202 @@ async function seedSharedClaimSupportWorkspace(input: {
   };
 }
 
+async function seedSectionProvenanceWorkspace(input: {
+  projectRoot: string;
+  runId: string;
+  brief: Parameters<typeof createResearchWorkStore>[0]["brief"];
+  now: () => string;
+}): Promise<{
+  claimId: string;
+  sectionId: string;
+  activeSourceId: string;
+  retiredSourceId: string;
+  staleSourceId: string;
+  activeCitationId: string;
+  retiredCitationId: string;
+  activeEvidenceCellId: string;
+  retiredEvidenceCellId: string;
+}> {
+  const timestamp = input.now();
+  const activeSourceId = "source-provenance-active";
+  const retiredSourceId = "source-provenance-retired";
+  const staleSourceId = "source-provenance-stale";
+  const sourceIds = [activeSourceId, retiredSourceId, staleSourceId];
+  const claimId = "claim-provenance-cleanup";
+  const sectionId = "section-provenance-cleanup";
+  const activeEvidenceCellId = "evidence-provenance-active";
+  const retiredEvidenceCellId = "evidence-provenance-retired";
+  const activeCitationId = "citation-provenance-active";
+  const retiredCitationId = "citation-provenance-retired";
+  const canonicalSources: WorkStoreEntity[] = sourceIds.map((sourceId, index) => ({
+    id: sourceId,
+    kind: "canonicalSource" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    key: `doi:10.5555/provenance-${index + 1}`,
+    title: `Section provenance source ${index + 1}`,
+    citation: `Provenance Author ${index + 1} (2026). Section provenance source ${index + 1}.`,
+    abstract: "A seeded source used to test exact section source provenance repair.",
+    year: 2026,
+    authors: [`Provenance Author ${index + 1}`],
+    venue: "Provenance Regression Journal",
+    providerIds: ["test"],
+    identifiers: {
+      doi: `10.5555/provenance-${index + 1}`,
+      pmid: null,
+      pmcid: null,
+      arxivId: null
+    },
+    accessMode: "fulltext_open",
+    bestAccessUrl: `https://example.org/provenance-${index + 1}.pdf`,
+    screeningDecision: "include",
+    screeningRationale: "Seeded for source provenance tests.",
+    tags: ["section-provenance-regression"]
+  }));
+  const extractions: WorkStoreEntity[] = sourceIds.map((sourceId, index) => ({
+    id: `extraction-provenance-${index + 1}`,
+    kind: "extraction" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    sourceId,
+    extraction: {
+      id: `extraction-provenance-${index + 1}`,
+      paperId: sourceId,
+      runId: input.runId,
+      problemSetting: "Section source provenance must be editable without preserving stale source IDs.",
+      systemType: "section provenance fixture",
+      architecture: "one claim, one active support link, one retired support link, and stale section metadata",
+      toolsAndMemory: "section.patch sourceIdsMode repairs section provenance",
+      planningStyle: "scripted regression test",
+      evaluationSetup: "patch section sourceIds through explicit modes",
+      successSignals: ["stale section sourceIds can be removed"],
+      failureModes: ["append-only provenance loops"],
+      limitations: ["synthetic fixture"],
+      supportedClaims: [{
+        claim: "Section source provenance should be exact when requested.",
+        support: "explicit" as const
+      }],
+      confidence: "high" as const,
+      evidenceNotes: ["Synthetic extraction for section source provenance regression."]
+    }
+  }));
+  const evidenceCells: WorkStoreEntity[] = [{
+    id: activeEvidenceCellId,
+    kind: "evidenceCell" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    sourceId: activeSourceId,
+    extractionId: "extraction-provenance-1",
+    field: "successSignals" as const,
+    value: "The active source supports the provenance cleanup claim.",
+    confidence: "high"
+  }, {
+    id: retiredEvidenceCellId,
+    kind: "evidenceCell" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    sourceId: retiredSourceId,
+    extractionId: "extraction-provenance-2",
+    field: "successSignals" as const,
+    value: "The retired source used to support the claim but should no longer drive section provenance.",
+    confidence: "medium"
+  }];
+  const claim: WorkStoreEntity = {
+    id: claimId,
+    kind: "claim" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    text: "Section provenance can be repaired exactly without preserving stale source IDs.",
+    evidence: "The active support link is sufficient for the regression claim.",
+    sourceIds: [activeSourceId],
+    supportStatus: "supported",
+    confidence: "high",
+    usedInSections: [sectionId],
+    risk: null
+  };
+  const activeCitation: WorkStoreEntity = {
+    id: activeCitationId,
+    kind: "citation" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    status: "active",
+    supersededBy: null,
+    statusReason: null,
+    sourceId: activeSourceId,
+    sourceTitle: "Section provenance source 1",
+    evidenceCellId: activeEvidenceCellId,
+    supportSnippet: "The active source supports the provenance cleanup claim.",
+    confidence: "high",
+    relevance: "direct support",
+    claimIds: [claimId],
+    sectionIds: [sectionId]
+  };
+  const retiredCitation: WorkStoreEntity = {
+    id: retiredCitationId,
+    kind: "citation" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    status: "retired",
+    supersededBy: null,
+    statusReason: "Seeded retired support link.",
+    sourceId: retiredSourceId,
+    sourceTitle: "Section provenance source 2",
+    evidenceCellId: retiredEvidenceCellId,
+    supportSnippet: "The retired source should be visible as retired only.",
+    confidence: "medium",
+    relevance: "retired support",
+    claimIds: [claimId],
+    sectionIds: [sectionId]
+  };
+  const section: WorkStoreEntity = {
+    id: sectionId,
+    kind: "manuscriptSection" as const,
+    runId: input.runId,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+    sectionId: "provenance-cleanup",
+    role: "synthesis",
+    orderIndex: 10,
+    title: "Provenance Cleanup",
+    markdown: `This section cites only the active support source. [${activeSourceId}]`,
+    sourceIds: [activeSourceId, retiredSourceId, staleSourceId],
+    claimIds: [claimId],
+    status: "ready_for_review"
+  };
+  const store = upsertResearchWorkStoreEntities(createResearchWorkStore({
+    projectRoot: input.projectRoot,
+    brief: input.brief,
+    now: timestamp
+  }), [
+    ...canonicalSources,
+    ...extractions,
+    ...evidenceCells,
+    claim,
+    activeCitation,
+    retiredCitation,
+    section
+  ], timestamp);
+  await writeResearchWorkStore(store);
+  return {
+    claimId,
+    sectionId,
+    activeSourceId,
+    retiredSourceId,
+    staleSourceId,
+    activeCitationId,
+    retiredCitationId,
+    activeEvidenceCellId,
+    retiredEvidenceCellId
+  };
+}
+
 class ExplicitResearchToolBackend extends StubResearchBackend {
   readonly capabilities = {
     actionControl: {
@@ -5234,6 +5430,471 @@ class SectionRepairErgonomicsBackend extends StubResearchBackend {
         claimsToSoften: []
       },
       recommendedNextActions: ["section.read", "section.patch"]
+    };
+  }
+}
+
+class SectionSourceIdsModeBackend extends StubResearchBackend {
+  readonly researchRequests: ResearchActionRequest[] = [];
+  private step = 0;
+
+  constructor(
+    private readonly input: {
+      sectionId: string;
+      claimId: string;
+      sourceIds: string[];
+      scenario: "append" | "replace" | "remove" | "recompute_from_claims" | "set_claim_links_default";
+    }
+  ) {
+    super();
+  }
+
+  override async planResearch(): Promise<ResearchPlan> {
+    return {
+      researchMode: "literature_synthesis",
+      objective: "Validate exact section source provenance repair.",
+      rationale: "The regression test preloads stale section sourceIds and asks the model to patch them mechanically.",
+      searchQueries: [],
+      localFocus: [],
+      notebookPatch: {
+        missionTarget: "research_brief",
+        paperMode: "literature_review",
+        currentFocus: "Repair section source provenance.",
+        readiness: "Not sufficient yet; section source provenance modes are under test."
+      }
+    };
+  }
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [],
+      criticScope: null,
+      reason: null
+    };
+
+    if (this.step === 0) {
+      this.step += 1;
+      const operation = this.input.scenario === "set_claim_links_default" ? "set_claim_links" : "update_title";
+      const entity: Record<string, unknown> = {
+        operation,
+        title: "Provenance Cleanup",
+        claimIds: [this.input.claimId]
+      };
+      if (this.input.scenario !== "set_claim_links_default") {
+        entity.sourceIdsMode = this.input.scenario;
+        entity.sourceIds = this.input.sourceIds;
+      }
+      return {
+        schemaVersion: 1,
+        action: "section.patch",
+        rationale: `Patch section source provenance with scenario ${this.input.scenario}.`,
+        confidence: 0.92,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: this.input.sectionId,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity
+          }
+        },
+        expectedOutcome: "The section provenance delta reports the exact sourceId change.",
+        stopCondition: "The section.patch tool result is visible.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "Stop after the section source provenance mode scenario.",
+      confidence: 0.8,
+      inputs: {
+        ...baseInputs,
+        reason: "Section source provenance regression complete.",
+        workStore: terminalUserDecisionWorkStore("Section source provenance regression complete.")
+      },
+      expectedOutcome: "Structured terminal state.",
+      stopCondition: "Regression complete.",
+      transport: "strict_json"
+    };
+  }
+}
+
+class SupportRemoveRetiredOnlyBackend extends StubResearchBackend {
+  readonly researchRequests: ResearchActionRequest[] = [];
+  private step = 0;
+
+  constructor(
+    private readonly input: {
+      claimId: string;
+      sourceId: string;
+      evidenceCellId: string;
+    }
+  ) {
+    super();
+  }
+
+  override async planResearch(): Promise<ResearchPlan> {
+    return {
+      researchMode: "literature_synthesis",
+      objective: "Validate retired-only support remove diagnostics.",
+      rationale: "The regression test asks claim.link_support remove to remove support that is already retired.",
+      searchQueries: [],
+      localFocus: [],
+      notebookPatch: {
+        missionTarget: "research_brief",
+        paperMode: "literature_review",
+        currentFocus: "Inspect claim.link_support remove diagnostics.",
+        readiness: "Not sufficient yet; support remove diagnostics are under test."
+      }
+    };
+  }
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [],
+      criticScope: null,
+      reason: null
+    };
+
+    if (this.step === 0) {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "claim.link_support",
+        rationale: "Attempt to remove a support link that is already retired.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "citations",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              mode: "remove",
+              claimId: this.input.claimId,
+              sourceId: this.input.sourceId,
+              evidenceCellId: this.input.evidenceCellId
+            }
+          }
+        },
+        expectedOutcome: "The tool reports retired matches and active related support links without guessing intent.",
+        stopCondition: "The blocked tool result is visible.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "Stop after the support remove diagnostic scenario.",
+      confidence: 0.8,
+      inputs: {
+        ...baseInputs,
+        reason: "Support remove diagnostic regression complete.",
+        workStore: terminalUserDecisionWorkStore("Support remove diagnostic regression complete.")
+      },
+      expectedOutcome: "Structured terminal state.",
+      stopCondition: "Regression complete.",
+      transport: "strict_json"
+    };
+  }
+}
+
+class SectionDeleteBackend extends StubResearchBackend {
+  readonly capabilities = {
+    actionControl: {
+      nativeToolCalls: false,
+      strictJsonFallback: true
+    },
+    criticReview: true
+  };
+  readonly researchRequests: ResearchActionRequest[] = [];
+  readonly criticRequests: CriticReviewRequest[] = [];
+  private step = 0;
+
+  constructor(
+    private readonly targetSectionId: string,
+    private readonly mode: "critic_only" | "verify" | "finalize"
+  ) {
+    super();
+  }
+
+  override async planResearch(): Promise<ResearchPlan> {
+    return {
+      researchMode: "literature_synthesis",
+      objective: "Validate active manuscript section deletion.",
+      rationale: "The regression test preloads manuscript sections and asks the model to remove one from the active paper.",
+      searchQueries: [],
+      localFocus: [],
+      notebookPatch: {
+        missionTarget: "research_brief",
+        paperMode: "literature_review",
+        currentFocus: "Delete a stale manuscript section and validate active manuscript state.",
+        readiness: "Ready to finalize research_brief literature_review after the stale section is deleted and release critic passes."
+      }
+    };
+  }
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [],
+      criticScope: null,
+      reason: null
+    };
+
+    if (this.step === 0) {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "section.delete",
+        rationale: "Remove the stale manuscript section from the active paper instead of retiring it through status metadata.",
+        confidence: 0.95,
+        inputs: {
+          ...baseInputs,
+          reason: "Superseded by the active manuscript draft.",
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: this.targetSectionId,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              reason: "Superseded by the active manuscript draft."
+            }
+          }
+        },
+        expectedOutcome: "The section disappears from active manuscript views while research memory remains.",
+        stopCondition: "The section.delete tool result reports active manuscript cleanup.",
+        transport: "strict_json"
+      };
+    }
+
+    if (this.mode === "verify" && this.step === 1) {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "release.verify",
+        rationale: "Verify the active manuscript after section deletion.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "Release verification sees only active sections.",
+        stopCondition: "The release verification result is visible.",
+        transport: "strict_json"
+      };
+    }
+
+    if ((this.mode === "critic_only" || this.mode === "finalize") && this.step === 1) {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "critic.review",
+        rationale: "Inspect the active manuscript after section deletion.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          criticScope: "release",
+          workStore: {
+            collection: "workItems",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "The critic packet contains only active sections.",
+        stopCondition: "The critic result is visible.",
+        transport: "strict_json"
+      };
+    }
+
+    if (this.mode === "finalize" && this.step === 2) {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "manuscript.finalize",
+        rationale: "Finalize the active manuscript after deleting the stale section and obtaining release critic approval.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "paper.md contains only active sections.",
+        stopCondition: "The finalize result is visible.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "Stop after section deletion validation.",
+      confidence: 0.8,
+      inputs: {
+        ...baseInputs,
+        reason: "Section deletion validation complete.",
+        workStore: terminalUserDecisionWorkStore("Section deletion validation complete.")
+      },
+      expectedOutcome: "Structured terminal state.",
+      stopCondition: "Structured terminal state reached.",
+      transport: "strict_json"
+    };
+  }
+
+  async reviewResearchArtifact(request: CriticReviewRequest): Promise<CriticReviewArtifact> {
+    this.criticRequests.push(request);
+    return {
+      schemaVersion: 1,
+      runId: request.runId,
+      stage: request.stage,
+      reviewer: "ephemeral_critic",
+      readiness: "pass",
+      confidence: 0.9,
+      summary: "The active manuscript no longer contains the stale section.",
+      objections: [],
+      positiveFindings: [],
+      revisionAdvice: {
+        searchQueries: [],
+        evidenceTargets: [],
+        papersToExclude: [],
+        papersToPromote: [],
+        claimsToSoften: []
+      },
+      recommendedNextActions: []
+    };
+  }
+}
+
+class WorkspaceListFilterBackend extends StubResearchBackend {
+  readonly researchRequests: ResearchActionRequest[] = [];
+  private step = 0;
+
+  override async planResearch(): Promise<ResearchPlan> {
+    return {
+      researchMode: "literature_synthesis",
+      objective: "Inspect workspace list filter behavior.",
+      rationale: "The regression test verifies that unsupported workspace filters are diagnostic, not silent empty lists.",
+      searchQueries: [],
+      localFocus: [],
+      notebookPatch: {
+        missionTarget: "research_brief",
+        paperMode: "literature_review",
+        currentFocus: "List active manuscript sections.",
+        readiness: "Not ready; this test only inspects workspace observations."
+      }
+    };
+  }
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [],
+      criticScope: null,
+      reason: null
+    };
+
+    if (this.step === 0) {
+      this.step += 1;
+      return {
+        schemaVersion: 1,
+        action: "workspace.list",
+        rationale: "List active manuscript sections using the filter shape the live model tried.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: null,
+            filters: {
+              active: true
+            },
+            semanticQuery: null,
+            limit: 10,
+            cursor: null,
+            changes: {},
+            entity: {}
+          }
+        },
+        expectedOutcome: "The runtime returns active sections and warns that active is not a supported persisted filter.",
+        stopCondition: "The workspace.list tool result is visible.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "End the regression run after observing the workspace.list result.",
+      confidence: 0.9,
+      inputs: {
+        ...baseInputs,
+        workStore: terminalUserDecisionWorkStore("Unsupported-filter diagnostic regression complete.")
+      },
+      expectedOutcome: "The worker stops with a validated user decision so the test can inspect prior tool results.",
+      stopCondition: "Regression complete.",
+      transport: "strict_json"
     };
   }
 }
@@ -7953,6 +8614,169 @@ test("section.patch supports targeted block replacement without rewriting the wh
   }
 });
 
+test("section.patch sourceIdsMode controls exact section provenance without preserving stale ids", async () => {
+  const scenarios: Array<{
+    name: "append" | "replace" | "remove" | "recompute_from_claims" | "set_claim_links_default";
+    sourceIds: (seeded: Awaited<ReturnType<typeof seedSectionProvenanceWorkspace>>) => string[];
+    expectedSourceIds: (seeded: Awaited<ReturnType<typeof seedSectionProvenanceWorkspace>>) => string[];
+    expectedRemoved: (seeded: Awaited<ReturnType<typeof seedSectionProvenanceWorkspace>>) => string[];
+    expectedMode: string;
+  }> = [{
+    name: "append",
+    sourceIds: () => [],
+    expectedSourceIds: (seeded) => [seeded.activeSourceId, seeded.retiredSourceId, seeded.staleSourceId],
+    expectedRemoved: () => [],
+    expectedMode: "append"
+  }, {
+    name: "replace",
+    sourceIds: (seeded) => [seeded.activeSourceId],
+    expectedSourceIds: (seeded) => [seeded.activeSourceId],
+    expectedRemoved: (seeded) => [seeded.retiredSourceId, seeded.staleSourceId],
+    expectedMode: "replace"
+  }, {
+    name: "remove",
+    sourceIds: (seeded) => [seeded.retiredSourceId],
+    expectedSourceIds: (seeded) => [seeded.activeSourceId, seeded.staleSourceId],
+    expectedRemoved: (seeded) => [seeded.retiredSourceId],
+    expectedMode: "remove"
+  }, {
+    name: "recompute_from_claims",
+    sourceIds: (seeded) => [seeded.retiredSourceId, seeded.staleSourceId],
+    expectedSourceIds: (seeded) => [seeded.activeSourceId],
+    expectedRemoved: (seeded) => [seeded.retiredSourceId, seeded.staleSourceId],
+    expectedMode: "recompute_from_claims"
+  }, {
+    name: "set_claim_links_default",
+    sourceIds: () => [],
+    expectedSourceIds: (seeded) => [seeded.activeSourceId],
+    expectedRemoved: (seeded) => [seeded.retiredSourceId, seeded.staleSourceId],
+    expectedMode: "recompute_from_claims"
+  }];
+
+  for (const scenario of scenarios) {
+    const projectRoot = await mkdtemp(path.join(os.tmpdir(), `clawresearch-section-sourceids-${scenario.name}-`));
+    const now = createNow();
+
+    try {
+      const runStore = new RunStore(projectRoot, "0.7.0", now);
+      const brief = {
+        topic: "section provenance cleanup",
+        researchQuestion: "Can section.patch remove stale section sourceIds exactly?",
+        researchDirection: "Patch section provenance with explicit sourceIdsMode.",
+        successCriterion: "The section provenance delta reports the requested sourceIds change."
+      };
+      const run = await runStore.create(brief, ["clawresearch", "section-sourceids-mode"]);
+      const seeded = await seedSectionProvenanceWorkspace({
+        projectRoot,
+        runId: run.id,
+        brief,
+        now
+      });
+      const backend = new SectionSourceIdsModeBackend({
+        sectionId: seeded.sectionId,
+        claimId: seeded.claimId,
+        sourceIds: scenario.sourceIds(seeded),
+        scenario: scenario.name
+      });
+      const exitCode = await runDetachedJobWorker({
+        projectRoot,
+        runId: run.id,
+        version: "0.7.0",
+        now,
+        researchBackend: backend
+      });
+      const workStore = await loadResearchWorkStore({
+        projectRoot,
+        now: now()
+      });
+      const section = workStore.objects.manuscriptSections.find((candidate) => candidate.id === seeded.sectionId);
+      const patchResult = backend.researchRequests
+        .flatMap((request) => request.toolResults ?? [])
+        .find((result) => result.action === "section.patch");
+
+      assert.equal(exitCode, 0);
+      assert.ok(section);
+      assert.deepEqual(section.sourceIds, scenario.expectedSourceIds(seeded));
+      assert.deepEqual(section.claimIds, [seeded.claimId]);
+      assert.equal(patchResult?.status, "ok");
+      assert.equal(patchResult?.query?.sourceIdsMode, scenario.expectedMode);
+      assert.deepEqual(patchResult?.query?.sourceIdsAfter, scenario.expectedSourceIds(seeded));
+      assert.deepEqual(patchResult?.query?.sourceIdsRemoved, scenario.expectedRemoved(seeded));
+      assert.deepEqual(patchResult?.query?.activeSupportSourceIdsForLinkedClaims, [seeded.activeSourceId]);
+      assert.ok(patchResult?.related?.some((item) => item.kind === "sectionProvenanceDelta"));
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("claim.link_support remove reports retired-only matches without mutating support state", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-support-remove-retired-only-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "support-link diagnostics",
+      researchQuestion: "Can claim.link_support remove explain retired-only support matches?",
+      researchDirection: "Attempt to retire an already-retired support link.",
+      successCriterion: "The blocked result reports retired and active support-link ids mechanically."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "support-remove-retired-only"]);
+    const seeded = await seedSectionProvenanceWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now
+    });
+    const beforeStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const beforeCitations = beforeStore.objects.citations.map((citation) => ({
+      id: citation.id,
+      status: citation.status
+    }));
+    const backend = new SupportRemoveRetiredOnlyBackend({
+      claimId: seeded.claimId,
+      sourceId: seeded.retiredSourceId,
+      evidenceCellId: seeded.retiredEvidenceCellId
+    });
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+    const afterStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const removeResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "claim.link_support");
+    const afterCitations = afterStore.objects.citations.map((citation) => ({
+      id: citation.id,
+      status: citation.status
+    }));
+
+    assert.equal(exitCode, 0);
+    assert.equal(removeResult?.status, "blocked");
+    assert.match(removeResult?.message ?? "", /No active support link matched/i);
+    assert.ok(removeResult?.message?.includes(seeded.retiredCitationId));
+    assert.ok(removeResult?.message?.includes(seeded.activeCitationId));
+    assert.deepEqual(removeResult?.query?.retiredOrInactiveMatchingSupportLinkIds, [seeded.retiredCitationId]);
+    assert.deepEqual(removeResult?.query?.activeSupportLinkIds, [seeded.activeCitationId]);
+    assert.deepEqual(removeResult?.nextHints, []);
+    assert.equal(removeResult?.items, undefined);
+    assert.equal(removeResult?.related, undefined);
+    assert.deepEqual(afterCitations, beforeCitations);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("section.patch accepts ready_for_review and rejects invalid statuses without fallback", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-section-status-contract-"));
   const now = createNow();
@@ -8012,6 +8836,450 @@ test("section.patch accepts ready_for_review and rejects invalid statuses withou
     assert.equal(invalidResult?.status, "blocked");
     assert.match(invalidResult?.message ?? "", /Invalid manuscript section status "done"/);
     assert.match(invalidResult?.message ?? "", /ready_for_review/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("section.patch suggests section.delete for retired status", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-section-retired-hint-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "section lifecycle ergonomics",
+      researchQuestion: "Does invalid retired status teach the model to use section.delete?",
+      researchDirection: "Patch a section with retired status.",
+      successCriterion: "The tool result points to section.delete."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "section-status"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    class RetiredStatusBackend extends SectionRepairErgonomicsBackend {
+      override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+        const decision = await super.chooseResearchAction(request);
+        if (decision.action === "section.patch" && decision.inputs.workStore !== undefined) {
+          decision.inputs.workStore.entity.status = "retired";
+        }
+        return decision;
+      }
+    }
+
+    const backend = new RetiredStatusBackend("ready_status");
+    await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const invalidResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "section.patch");
+
+    assert.equal(workStore.objects.manuscriptSections.length, 1);
+    assert.equal(invalidResult?.status, "blocked");
+    assert.match(invalidResult?.message ?? "", /Invalid manuscript section status "retired"/);
+    assert.match(invalidResult?.message ?? "", /section\.delete/);
+    assert.ok(invalidResult?.nextHints?.includes("section.delete"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("section.delete removes active manuscript section without deleting research memory or critic-clean active state", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-section-delete-active-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "section lifecycle ergonomics",
+      researchQuestion: "Can the model delete a stale manuscript section?",
+      researchDirection: "Remove a section from the active manuscript.",
+      successCriterion: "The active manuscript is clean while sources, evidence, claims, and support stay in memory."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "section-delete"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    const backend = new SectionDeleteBackend("section-thin-synthesis", "critic_only");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const deleteResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "section.delete");
+    const events = await readFile(run.artifacts.eventsPath, "utf8");
+
+    assert.equal(exitCode, 0);
+    assert.equal(deleteResult?.status, "ok");
+    assert.equal(deleteResult?.stateDelta?.sectionsDeleted, 1);
+    assert.equal(workStore.objects.manuscriptSections.length, 0);
+    assert.equal(workStore.objects.canonicalSources.length, 1);
+    assert.equal(workStore.objects.extractions.length, 1);
+    assert.equal(workStore.objects.evidenceCells.length, 1);
+    assert.equal(workStore.objects.claims.length, 1);
+    assert.equal(workStore.objects.citations.length, 1);
+    assert.deepEqual(workStore.objects.claims[0]?.usedInSections, []);
+    assert.deepEqual(workStore.objects.citations[0]?.sectionIds, []);
+    assert.deepEqual(workStore.notebook.tasks[0]?.linkedSectionIds, []);
+    assert.equal(backend.criticRequests[0]?.workspace?.manuscriptSections.length, 0);
+    assert.match(events, /section\.deleted section-thin-synthesis/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("workspace.list ignores unsupported filters visibly instead of hiding existing sections", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-workspace-list-filter-diagnostic-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "workspace observation ergonomics",
+      researchQuestion: "Does an unsupported workspace filter return a diagnostic and still show existing data?",
+      researchDirection: "List manuscript sections with an unsupported active filter.",
+      successCriterion: "The tool result returns sections and explains the ignored filter."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "workspace-list-filter"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    const backend = new WorkspaceListFilterBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+    const listResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "workspace.list");
+
+    assert.equal(exitCode, 0);
+    assert.equal(listResult?.status, "ok");
+    assert.equal(listResult?.collection, "manuscriptSections");
+    assert.equal(listResult?.count, 1);
+    assert.equal(listResult?.totalCount, 1);
+    assert.equal(listResult?.items?.[0]?.id, "section-thin-synthesis");
+    assert.match(listResult?.message ?? "", /Ignored unsupported filter\(s\): active/);
+    assert.deepEqual(listResult?.query?.ignoredUnsupportedFilters, ["active"]);
+    assert.deepEqual(listResult?.query?.filters, {});
+    assert.ok(listResult?.related?.some((preview) => preview.kind === "workspaceFilterDiagnostic"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("section.delete requires an explicit section id even when only one section exists", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-section-delete-explicit-id-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "section lifecycle ergonomics",
+      researchQuestion: "Does section.delete require an explicit id?",
+      researchDirection: "Attempt deletion without a section id.",
+      successCriterion: "The active section is preserved and a repair packet is returned."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "section-delete-explicit-id"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+
+    class SectionDeleteNoIdBackend extends StubResearchBackend {
+      readonly researchRequests: ResearchActionRequest[] = [];
+      private step = 0;
+
+      override async planResearch(): Promise<ResearchPlan> {
+        return {
+          researchMode: "literature_synthesis",
+          objective: "Validate destructive section deletion requires explicit ids.",
+          rationale: "The test preloads one section.",
+          searchQueries: [],
+          localFocus: [],
+          notebookPatch: {
+            missionTarget: "research_brief",
+            paperMode: "literature_review",
+            currentFocus: "Attempt section.delete without id.",
+            readiness: "Not ready."
+          }
+        };
+      }
+
+      override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+        if (request.phase !== "research") {
+          return super.chooseResearchAction(request);
+        }
+        this.researchRequests.push(request);
+        const baseInputs = {
+          providerIds: [],
+          searchQueries: [],
+          evidenceTargets: [],
+          paperIds: [],
+          criticScope: null,
+          reason: null
+        };
+        if (this.step === 0) {
+          this.step += 1;
+          return {
+            schemaVersion: 1,
+            action: "section.delete",
+            rationale: "Attempt delete without an explicit id.",
+            confidence: 0.8,
+            inputs: {
+              ...baseInputs,
+              workStore: {
+                collection: "manuscriptSections",
+                entityId: null,
+                filters: {},
+                semanticQuery: null,
+                limit: null,
+                cursor: null,
+                changes: {},
+                entity: {}
+              }
+            },
+            expectedOutcome: "Deletion is blocked.",
+            stopCondition: "The repair packet is visible.",
+            transport: "strict_json"
+          };
+        }
+        return {
+          schemaVersion: 1,
+          action: "workspace.status",
+          rationale: "Stop after delete-without-id result.",
+          confidence: 0.8,
+          inputs: {
+            ...baseInputs,
+            reason: "Delete without id test complete.",
+            workStore: terminalUserDecisionWorkStore("Delete without id test complete.")
+          },
+          expectedOutcome: "Structured terminal state.",
+          stopCondition: "Structured terminal state reached.",
+          transport: "strict_json"
+        };
+      }
+    }
+
+    const backend = new SectionDeleteNoIdBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const deleteResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "section.delete");
+
+    assert.equal(exitCode, 0);
+    assert.equal(deleteResult?.status, "blocked");
+    assert.match(deleteResult?.message ?? "", /requires an explicit known section id/i);
+    assert.equal(workStore.objects.manuscriptSections.length, 1);
+    assert.equal(workStore.objects.manuscriptSections[0]?.id, "section-thin-synthesis");
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("release.verify after section.delete ignores deleted manuscript sections", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-section-delete-release-verify-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "section lifecycle ergonomics",
+      researchQuestion: "Does release.verify ignore deleted sections?",
+      researchDirection: "Delete one stale section and run release verification.",
+      successCriterion: "release.verify sees only active manuscript sections."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "section-delete-release-verify"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+    const store = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    await writeResearchWorkStore(upsertResearchWorkStoreEntities(store, [{
+      id: "section-delete-me",
+      kind: "manuscriptSection",
+      runId: run.id,
+      createdAt: now(),
+      updatedAt: now(),
+      sectionId: "delete-me",
+      role: "synthesis",
+      orderIndex: 99,
+      title: "Delete Me",
+      markdown: "This stale section has no valid claim support and should disappear before release verification.",
+      sourceIds: [],
+      claimIds: [],
+      status: "needs_revision"
+    } satisfies WorkStoreEntity], now()));
+
+    const backend = new SectionDeleteBackend("section-delete-me", "verify");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+    const completedRun = await runStore.load(run.id);
+    const checks = JSON.parse(await readFile(completedRun.artifacts.manuscriptChecksPath, "utf8")) as {
+      checks: Array<{ id: string; message: string }>;
+    };
+    const releaseResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "release.verify");
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+
+    assert.equal(exitCode, 0);
+    assert.equal(workStore.objects.manuscriptSections.some((section) => section.id === "section-delete-me"), false);
+    assert.equal(releaseResult?.status, "not_ready");
+    assert.match(releaseResult?.message ?? "", /checks passed/i);
+    assert.ok(checks.checks.some((check) => check.id === "workspace-sections" && /1 manuscript section/i.test(check.message)));
+    assert.equal(JSON.stringify(checks).includes("section-delete-me"), false);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("section.delete keeps deleted sections out of finalized paper", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-section-delete-paper-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "section lifecycle ergonomics",
+      researchQuestion: "Are deleted sections excluded from paper export?",
+      researchDirection: "Delete one stale section and finalize the remaining active section.",
+      successCriterion: "paper.md contains only active manuscript sections."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "section-delete-paper"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      missionTarget: "research_brief",
+      sourceCount: 1,
+      extractedCount: 1,
+      evidenceCount: 1,
+      citedCount: 1
+    });
+    const store = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    await writeResearchWorkStore(upsertResearchWorkStoreEntities(store, [{
+      id: "section-delete-me",
+      kind: "manuscriptSection",
+      runId: run.id,
+      createdAt: now(),
+      updatedAt: now(),
+      sectionId: "delete-me",
+      role: "synthesis",
+      orderIndex: 99,
+      title: "Delete Me",
+      markdown: "This stale section must not appear in the finalized paper. [source-review-1]",
+      sourceIds: ["source-review-1"],
+      claimIds: ["claim-review-1"],
+      status: "checked"
+    } satisfies WorkStoreEntity], now()));
+
+    const backend = new SectionDeleteBackend("section-delete-me", "finalize");
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+    const completedRun = await runStore.load(run.id);
+    const paperMarkdown = await readFile(completedRun.artifacts.paperPath, "utf8");
+    const paperJson = JSON.parse(await readFile(completedRun.artifacts.paperJsonPath, "utf8")) as {
+      sections: Array<{ id: string; title: string; markdown: string }>;
+    };
+
+    assert.equal(exitCode, 0);
+    assert.match(paperMarkdown, /Thin Synthesis/);
+    assert.doesNotMatch(paperMarkdown, /Delete Me/);
+    assert.doesNotMatch(paperMarkdown, /stale section must not appear/);
+    assert.deepEqual(paperJson.sections.map((section) => section.id), ["section-thin-synthesis"]);
+    assert.equal(backend.criticRequests[0]?.workspace?.manuscriptSections.some((section) => section.id === "section-delete-me"), false);
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

@@ -25,6 +25,7 @@ const expectedToolFamilies = [
   "claim.link_support",
   "section.create",
   "section.patch",
+  "section.delete",
   "critic.review",
   "check.run",
   "release.verify",

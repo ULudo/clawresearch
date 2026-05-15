@@ -38,6 +38,7 @@ export type ResearchWorkspaceToolName =
   | "section.create"
   | "section.read"
   | "section.patch"
+  | "section.delete"
   | "section.link_claim"
   | "section.check_claims"
   | "work_item.create"
@@ -82,6 +83,7 @@ export const researchWorkspaceToolActions: ResearchWorkspaceToolName[] = [
   "section.create",
   "section.read",
   "section.patch",
+  "section.delete",
   "section.link_claim",
   "section.check_claims",
   "work_item.create",
