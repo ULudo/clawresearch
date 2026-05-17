@@ -20,6 +20,8 @@ import {
 	  type WorkStoreCitation,
 	  type WorkStoreCanonicalSource,
   type WorkStoreClaim,
+  type WorkStoreDocument,
+  type WorkStoreDocumentChunk,
   type WorkStoreEvidenceCell,
   type WorkStoreEntity,
   type WorkStoreManuscriptSection,
@@ -72,6 +74,36 @@ test("research work store supports create, query, read, and patch operations", a
       suggestedActions: ["soften the claim", "find empirical evidence"],
       source: "critic"
     } satisfies WorkStoreCreateInput<WorkStoreWorkItem>, now);
+    store = createResearchWorkStoreEntity<WorkStoreDocument>(store, {
+      id: "document-1",
+      kind: "document",
+      runId: "run-1",
+      sourceId: "paper-1",
+      url: "data:text/plain,Durable%20research%20memory",
+      format: "text",
+      status: "parsed",
+      fetchedAt: now,
+      parsedAt: now,
+      parser: "plain-text",
+      contentPath: "/tmp/document-1/source.txt",
+      textPath: "/tmp/document-1/parsed.txt",
+      textHash: "hash-document-1",
+      error: null
+    } satisfies WorkStoreCreateInput<WorkStoreDocument>, now);
+    store = createResearchWorkStoreEntity<WorkStoreDocumentChunk>(store, {
+      id: "document-1-chunk-1",
+      kind: "documentChunk",
+      runId: "run-1",
+      documentId: "document-1",
+      sourceId: "paper-1",
+      chunkIndex: 0,
+      sectionTitle: "Abstract",
+      sectionType: null,
+      pageStart: null,
+      pageEnd: null,
+      text: "Durable research memory helps the model inspect source text before synthesis.",
+      tokenCount: 11
+    } satisfies WorkStoreCreateInput<WorkStoreDocumentChunk>, now);
 
     assert.equal(queryResearchWorkStore(store, {
       collection: "claims",
@@ -83,6 +115,10 @@ test("research work store supports create, query, read, and patch operations", a
         status: "open",
         type: "critic_objection"
       }
+    }).count, 1);
+    assert.equal(queryResearchWorkStore(store, {
+      collection: "documentChunks",
+      semanticQuery: "inspect source text"
     }).count, 1);
 
     const item = readResearchWorkStoreEntity(store, "workItems", "item-1");
@@ -113,6 +149,8 @@ test("research work store supports create, query, read, and patch operations", a
     });
     assert.equal(loaded.objects.claims[0]?.text, "Persistent work stores improve long-horizon research.");
     assert.equal(loaded.objects.workItems[0]?.status, "resolved");
+    assert.equal(loaded.objects.documents[0]?.status, "parsed");
+    assert.equal(loaded.objects.documentChunks[0]?.documentId, "document-1");
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -137,8 +175,7 @@ test("research work store persists the living research notebook with task and ar
       ...store,
       notebook: {
         ...store.notebook,
-        missionTarget: "professional_paper" as const,
-        paperMode: "literature_review" as const,
+        artifactType: "review_paper" as const,
         objective: "Produce a professional literature review from the workspace.",
         researchContract: {
           researchObjectives: ["Explain what the workspace evidence establishes."],
@@ -179,8 +216,7 @@ test("research work store persists the living research notebook with task and ar
     });
 
     assert.equal(loaded.notebook.objective, "Produce a professional literature review from the workspace.");
-    assert.equal(loaded.notebook.missionTarget, "professional_paper");
-    assert.equal(loaded.notebook.paperMode, "literature_review");
+    assert.equal(loaded.notebook.artifactType, "review_paper");
     assert.deepEqual(loaded.notebook.researchContract.researchObjectives, ["Explain what the workspace evidence establishes."]);
     assert.deepEqual(loaded.notebook.researchContract.adequacyRationale, ["The final paper should be credible because claims are linked to source-derived evidence."]);
     assert.deepEqual(loaded.notebook.definitionOfDone, ["Extract selected sources", "Support central claims", "Finalize paper.md"]);
@@ -816,8 +852,7 @@ test("workspace prompt context is a derived SQLite projection without pseudo-mem
     assert.equal(context.counts.evidenceCells, 1);
     assert.equal(context.counts.claims, 1);
     assert.equal(context.counts.openWorkItems, 1);
-    assert.equal(context.notebook.missionTarget, "professional_paper");
-    assert.equal(context.notebook.paperMode, "literature_review");
+    assert.equal(context.notebook.artifactType, "review_paper");
     assert.equal(context.notebook.objective, "Write a claim-led review from workspace evidence.");
     assert.deepEqual(context.notebook.researchContract.researchObjectives, ["Explain how research notebooks orient long-running model researchers."]);
     assert.deepEqual(context.notebook.legacyDefinitionOfDone, ["Use selected evidence", "Support central claims"]);

@@ -83,6 +83,8 @@ function emptyWorkspaceContext(): WorkspacePromptContext {
       canonicalSources: 0,
       screeningDecisions: 0,
       fullTextRecords: 0,
+      documents: 0,
+      documentChunks: 0,
       extractions: 0,
       evidenceCells: 1,
       claims: 0,
@@ -106,6 +108,13 @@ function emptyWorkspaceContext(): WorkspacePromptContext {
       screeningDecisionCounts: {},
       providerRunCount: 0,
       sourceCandidateCount: 0,
+      documentCount: 0,
+      parsedDocumentCount: 0,
+      documentChunkCount: 0,
+      selectedFullTextNotFetchedSourceIds: [],
+      selectedFullTextNotParsedSourceIds: [],
+      selectedSourcesWithoutChunkGroundedExtractionIds: [],
+      evidenceCellsWithoutChunkGroundingIds: [],
       missingSelectedExtractionSourceIds: [],
       duplicateExtractionSourceIds: [],
       extractedNotEvidenceSourceIds: [],
@@ -129,8 +138,7 @@ function emptyWorkspaceContext(): WorkspacePromptContext {
       selectedSourceIdsNotCited: []
     },
 	    notebook: {
-	      missionTarget: "professional_paper",
-	      paperMode: "literature_review",
+	      artifactType: "review_paper",
 	      objective: "Follow the mollifier thread.",
 	      researchContract: {
 	        researchObjectives: ["Explain which obstacles limit mollifier methods."],
@@ -255,8 +263,7 @@ test("planning backend includes derived SQLite workspace context in the prompt i
 	            searchQueries: ["mollifier methods Riemann Hypothesis limitations"],
 	            localFocus: ["mollifier methods"],
 	            notebookPatch: {
-	              missionTarget: "professional_paper",
-	              paperMode: "literature_review",
+	              artifactType: "review_paper",
 	              objective: "Follow prior mollifier limitations work.",
 	              researchContract: {
 	                researchObjectives: ["Explain which obstacles limit mollifier methods."],
@@ -298,8 +305,7 @@ test("planning backend includes derived SQLite workspace context in the prompt i
     });
 
 	    assert.equal(plan.researchMode, "literature_synthesis");
-	    assert.equal(plan.notebookPatch?.missionTarget, "professional_paper");
-	    assert.equal(plan.notebookPatch?.paperMode, "literature_review");
+	    assert.equal(plan.notebookPatch?.artifactType, "review_paper");
 	    assert.deepEqual(plan.notebookPatch?.researchContract?.researchObjectives, ["Explain which obstacles limit mollifier methods."]);
 	    assert.equal(plan.notebookPatch?.tasks?.[0]?.id, "task-mollifier-limitations");
 	    assert.equal(plan.notebookPatch?.currentFocus, "Synthesize mollifier limitations.");
@@ -466,6 +472,11 @@ test("research-agent backend uses native tool calls by default", async () => {
       "sourceIds",
       "paperId",
       "extractionId",
+      "documentId",
+      "documentChunkId",
+      "documentChunkIds",
+      "url",
+      "readLevel",
       "field",
       "value",
       "text",
@@ -805,8 +816,7 @@ test("OpenAI Codex backend uses the same OAuth transport for critic review", asy
       },
 	      workspace: {
         notebook: {
-          missionTarget: "professional_paper",
-          paperMode: "literature_review",
+          artifactType: "review_paper",
           objective: "Write a serious research note.",
           definitionOfDone: ["Synthesize claims."],
           readiness: "Ready with caveats."
@@ -1058,8 +1068,7 @@ test("agent-step backend exposes first-class claim and manuscript-section tools"
           userBlockers: []
         },
         notebook: {
-          missionTarget: "professional_paper",
-          paperMode: "literature_review",
+          artifactType: "review_paper",
           objective: "Test the model-driven research loop.",
           researchContract: {
             researchObjectives: ["Create supported claims."],
@@ -1096,7 +1105,7 @@ test("agent-step backend exposes first-class claim and manuscript-section tools"
     assert.match(capturedPrompt, /section\.create/i);
     assert.match(capturedPrompt, /section\.check_claims/i);
     assert.doesNotMatch(capturedPrompt, /critic\.review/i);
-    assert.doesNotMatch(capturedPrompt, /synthesize_clustered|finalize_status_report|write_final_report/i);
+    assert.doesNotMatch(capturedPrompt, /synthesize_clustered|finalize_research_report|write_final_report/i);
   } finally {
     globalThis.fetch = originalFetch;
   }

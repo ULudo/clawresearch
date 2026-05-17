@@ -23,6 +23,8 @@ export type WorkStoreEntityKind =
   | "canonicalSource"
   | "screeningDecision"
   | "fullTextRecord"
+  | "document"
+  | "documentChunk"
   | "extraction"
   | "evidenceCell"
   | "claim"
@@ -38,6 +40,8 @@ export type WorkStoreCollectionName =
   | "canonicalSources"
   | "screeningDecisions"
   | "fullTextRecords"
+  | "documents"
+  | "documentChunks"
   | "extractions"
   | "evidenceCells"
   | "claims"
@@ -89,14 +93,11 @@ export type ResearchNotebookTaskStatus =
   | "blocked"
   | "abandoned";
 
-export type ResearchMissionTarget =
-  | "research_brief"
-  | "professional_paper"
-  | "status_report";
-
-export type ResearchPaperMode =
-  | "literature_review"
-  | "technical_survey"
+export type ResearchArtifactType =
+  | "research_report"
+  | "technical_report"
+  | "review_paper"
+  | "survey_paper"
   | "method_paper"
   | "experimental_paper"
   | "position_paper";
@@ -131,8 +132,7 @@ export type ResearchContract = {
 
 export type ResearchNotebook = {
   schemaVersion: 1;
-  missionTarget: ResearchMissionTarget;
-  paperMode: ResearchPaperMode;
+  artifactType: ResearchArtifactType;
   objective: string;
   researchContract: ResearchContract;
   researchContractUpdatedAt: string;
@@ -182,6 +182,13 @@ export type ResearchCorpusDiagnosticView = {
   screeningDecisionCounts: Record<string, number>;
   providerRunCount: number;
   sourceCandidateCount: number;
+  documentCount: number;
+  parsedDocumentCount: number;
+  documentChunkCount: number;
+  selectedFullTextNotFetchedSourceIds: string[];
+  selectedFullTextNotParsedSourceIds: string[];
+  selectedSourcesWithoutChunkGroundedExtractionIds: string[];
+  evidenceCellsWithoutChunkGroundingIds: string[];
   missingSelectedExtractionSourceIds: string[];
   duplicateExtractionSourceIds: string[];
   extractedNotEvidenceSourceIds: string[];
@@ -323,9 +330,41 @@ export type WorkStoreFullTextRecord = WorkStoreBaseEntity & {
   errors: string[];
 };
 
+export type WorkStoreDocument = WorkStoreBaseEntity & {
+  kind: "document";
+  sourceId: string;
+  url: string | null;
+  format: "pdf" | "html" | "xml" | "latex" | "text" | "unknown";
+  status: "fetched" | "parsed" | "failed";
+  fetchedAt: string | null;
+  parsedAt: string | null;
+  parser: string | null;
+  contentPath: string | null;
+  textPath: string | null;
+  textHash: string | null;
+  error: string | null;
+};
+
+export type WorkStoreDocumentChunk = WorkStoreBaseEntity & {
+  kind: "documentChunk";
+  documentId: string;
+  sourceId: string;
+  chunkIndex: number;
+  sectionTitle: string | null;
+  sectionType: string | null;
+  pageStart: number | null;
+  pageEnd: number | null;
+  text: string;
+  tokenCount: number;
+};
+
 export type WorkStoreExtraction = WorkStoreBaseEntity & ResearchObjectLifecycle & {
   kind: "extraction";
   sourceId: string;
+  readLevel?: "metadata" | "abstract" | "partial_full_text" | "full_text";
+  documentId?: string | null;
+  documentChunkIds?: string[];
+  sourceSnippets?: string[];
   extraction: PaperExtraction;
 };
 
@@ -333,6 +372,10 @@ export type WorkStoreEvidenceCell = WorkStoreBaseEntity & ResearchObjectLifecycl
   kind: "evidenceCell";
   sourceId: string;
   extractionId: string;
+  readLevel?: "metadata" | "abstract" | "partial_full_text" | "full_text";
+  documentId?: string | null;
+  documentChunkIds?: string[];
+  sourceSnippets?: string[];
   field: keyof Pick<
     EvidenceMatrixRow,
     | "problemSetting"
@@ -431,6 +474,8 @@ export type WorkStoreEntity =
   | WorkStoreCanonicalSource
   | WorkStoreScreeningDecision
   | WorkStoreFullTextRecord
+  | WorkStoreDocument
+  | WorkStoreDocumentChunk
   | WorkStoreExtraction
   | WorkStoreEvidenceCell
   | WorkStoreClaim
@@ -469,6 +514,8 @@ export type ResearchWorkStoreObjects = {
   canonicalSources: WorkStoreCanonicalSource[];
   screeningDecisions: WorkStoreScreeningDecision[];
   fullTextRecords: WorkStoreFullTextRecord[];
+  documents: WorkStoreDocument[];
+  documentChunks: WorkStoreDocumentChunk[];
   extractions: WorkStoreExtraction[];
   evidenceCells: WorkStoreEvidenceCell[];
   claims: WorkStoreClaim[];
@@ -625,6 +672,31 @@ CREATE TABLE IF NOT EXISTS evidence_cells (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS documents (
+  id TEXT PRIMARY KEY,
+  source_id TEXT NOT NULL,
+  run_id TEXT,
+  url TEXT,
+  format TEXT NOT NULL,
+  status TEXT NOT NULL,
+  content_path TEXT,
+  text_path TEXT,
+  text_hash TEXT,
+  json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS document_chunks (
+  id TEXT PRIMARY KEY,
+  document_id TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  chunk_index INTEGER NOT NULL,
+  section_title TEXT,
+  token_count INTEGER NOT NULL,
+  json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS claims (
   id TEXT PRIMARY KEY,
   run_id TEXT,
@@ -709,6 +781,8 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_sources_search ON sources(title, citation, venue, screening_decision);
 CREATE INDEX IF NOT EXISTS idx_extractions_source ON extractions(source_id);
 CREATE INDEX IF NOT EXISTS idx_evidence_cells_source ON evidence_cells(source_id, extraction_id);
+CREATE INDEX IF NOT EXISTS idx_documents_source ON documents(source_id, status);
+CREATE INDEX IF NOT EXISTS idx_document_chunks_source ON document_chunks(source_id, document_id, chunk_index);
 CREATE INDEX IF NOT EXISTS idx_claims_status ON claims(support_status);
 CREATE INDEX IF NOT EXISTS idx_protocols_protocol_id ON protocols(protocol_id);
 CREATE INDEX IF NOT EXISTS idx_work_items_status ON work_items(status, severity);
@@ -732,6 +806,8 @@ function createEmptyObjects(): ResearchWorkStoreObjects {
     canonicalSources: [],
     screeningDecisions: [],
     fullTextRecords: [],
+    documents: [],
+    documentChunks: [],
     extractions: [],
     evidenceCells: [],
     claims: [],
@@ -778,8 +854,7 @@ function createEmptyNotebook(now: string, brief: ResearchBrief = createEmptyBrie
 
   return {
     schemaVersion: 1,
-    missionTarget: "professional_paper",
-    paperMode: "literature_review",
+    artifactType: "review_paper",
     objective: objective.length > 0 ? objective : "Unscoped research objective",
     researchContract: createEmptyResearchContract(),
     researchContractUpdatedAt: now,
@@ -819,27 +894,15 @@ function normalizeTimestamp(value: unknown, fallback: string): string {
   return readString(value) ?? fallback;
 }
 
-export function normalizeResearchMissionTarget(
+export function normalizeResearchArtifactType(
   value: unknown,
-  fallback: ResearchMissionTarget = "professional_paper"
-): ResearchMissionTarget {
+  fallback: ResearchArtifactType = "review_paper"
+): ResearchArtifactType {
   switch (value) {
-    case "research_brief":
-    case "professional_paper":
-    case "status_report":
-      return value;
-    default:
-      return fallback;
-  }
-}
-
-export function normalizeResearchPaperMode(
-  value: unknown,
-  fallback: ResearchPaperMode = "literature_review"
-): ResearchPaperMode {
-  switch (value) {
-    case "literature_review":
-    case "technical_survey":
+    case "research_report":
+    case "technical_report":
+    case "review_paper":
+    case "survey_paper":
     case "method_paper":
     case "experimental_paper":
     case "position_paper":
@@ -1001,8 +1064,7 @@ function normalizeNotebook(value: unknown, now: string, brief: ResearchBrief): R
 
   return {
     schemaVersion: 1,
-    missionTarget: normalizeResearchMissionTarget(record.missionTarget, base.missionTarget),
-    paperMode: normalizeResearchPaperMode(record.paperMode, base.paperMode),
+    artifactType: normalizeResearchArtifactType(record.artifactType, base.artifactType),
     objective: readString(record.objective) ?? base.objective,
     researchContract,
     researchContractUpdatedAt: normalizeTimestamp(record.researchContractUpdatedAt, normalizeTimestamp(record.updatedAt, now)),
@@ -1042,6 +1104,8 @@ function normalizeObjects(value: unknown): ResearchWorkStoreObjects {
     canonicalSources: normalizeEntityArray(record.canonicalSources, "canonicalSource"),
     screeningDecisions: normalizeEntityArray(record.screeningDecisions, "screeningDecision"),
     fullTextRecords: normalizeEntityArray(record.fullTextRecords, "fullTextRecord"),
+    documents: normalizeEntityArray(record.documents, "document"),
+    documentChunks: normalizeEntityArray(record.documentChunks, "documentChunk"),
     extractions: normalizeEntityArray(record.extractions, "extraction"),
     evidenceCells: normalizeEntityArray(record.evidenceCells, "evidenceCell"),
     claims: normalizeEntityArray(record.claims, "claim"),
@@ -1106,6 +1170,10 @@ function collectionNameForKind(kind: WorkStoreEntityKind): WorkStoreCollectionNa
       return "screeningDecisions";
     case "fullTextRecord":
       return "fullTextRecords";
+    case "document":
+      return "documents";
+    case "documentChunk":
+      return "documentChunks";
     case "extraction":
       return "extractions";
     case "evidenceCell":
@@ -1310,6 +1378,10 @@ function loadWorkspaceDatabase(input: {
       .flatMap((row) => rowJsonEntity<WorkStoreExtraction>(row, "extraction") ?? []);
     const evidenceCells = statementRows<Record<string, unknown>>(database, "SELECT json FROM evidence_cells ORDER BY updated_at, id")
       .flatMap((row) => rowJsonEntity<WorkStoreEvidenceCell>(row, "evidenceCell") ?? []);
+    const documents = statementRows<Record<string, unknown>>(database, "SELECT json FROM documents ORDER BY updated_at, id")
+      .flatMap((row) => rowJsonEntity<WorkStoreDocument>(row, "document") ?? []);
+    const documentChunks = statementRows<Record<string, unknown>>(database, "SELECT json FROM document_chunks ORDER BY source_id, document_id, chunk_index, id")
+      .flatMap((row) => rowJsonEntity<WorkStoreDocumentChunk>(row, "documentChunk") ?? []);
     const claims = statementRows<Record<string, unknown>>(database, "SELECT json FROM claims ORDER BY updated_at, id")
       .flatMap((row) => rowJsonEntity<WorkStoreClaim>(row, "claim") ?? []);
     const citations = statementRows<Record<string, unknown>>(database, "SELECT json FROM support_links ORDER BY updated_at, id")
@@ -1342,6 +1414,8 @@ function loadWorkspaceDatabase(input: {
         canonicalSources: sources,
         screeningDecisions: sources.flatMap((source) => generatedScreeningDecision(source) ?? []),
         fullTextRecords: sources.map((source) => generatedFullTextRecord(source)),
+        documents,
+        documentChunks,
         extractions,
         evidenceCells,
         claims,
@@ -1370,6 +1444,8 @@ DELETE FROM notebook_state;
 DELETE FROM sources;
 DELETE FROM extractions;
 DELETE FROM evidence_cells;
+DELETE FROM documents;
+DELETE FROM document_chunks;
 DELETE FROM claims;
 DELETE FROM support_links;
 DELETE FROM protocols;
@@ -1430,6 +1506,39 @@ INSERT INTO sources (
           jsonText(cell),
           cell.createdAt,
           cell.updatedAt
+        );
+      }
+
+      const insertDocument = database.prepare("INSERT INTO documents (id, source_id, run_id, url, format, status, content_path, text_path, text_hash, json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const document of store.objects.documents) {
+        insertDocument.run(
+          document.id,
+          document.sourceId,
+          document.runId,
+          document.url,
+          document.format,
+          document.status,
+          document.contentPath,
+          document.textPath,
+          document.textHash,
+          jsonText(document),
+          document.createdAt,
+          document.updatedAt
+        );
+      }
+
+      const insertDocumentChunk = database.prepare("INSERT INTO document_chunks (id, document_id, source_id, chunk_index, section_title, token_count, json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+      for (const chunk of store.objects.documentChunks) {
+        insertDocumentChunk.run(
+          chunk.id,
+          chunk.documentId,
+          chunk.sourceId,
+          chunk.chunkIndex,
+          chunk.sectionTitle,
+          chunk.tokenCount,
+          jsonText(chunk),
+          chunk.createdAt,
+          chunk.updatedAt
         );
       }
 
@@ -1887,6 +1996,8 @@ export type WorkspacePromptContext = {
     canonicalSources: number;
     screeningDecisions: number;
     fullTextRecords: number;
+    documents: number;
+    documentChunks: number;
     extractions: number;
     evidenceCells: number;
     claims: number;
@@ -1900,8 +2011,7 @@ export type WorkspacePromptContext = {
   corpus_view: ResearchCorpusDiagnosticView;
   synthesis_view: ResearchSynthesisDiagnosticView;
   notebook: {
-    missionTarget: ResearchMissionTarget;
-    paperMode: ResearchPaperMode;
+    artifactType: ResearchArtifactType;
     objective: string;
     researchContract: ResearchContract;
     legacyDefinitionOfDone: string[];
@@ -2097,6 +2207,17 @@ export function buildResearchCorpusDiagnosticView(
   options: { renderedReferenceSourceIds?: string[] } = {}
 ): ResearchCorpusDiagnosticView {
   const disposition = buildWorkspaceDispositionDiagnostics(store, options);
+  const selectedSourceIdSet = new Set(disposition.selectedSourceIds);
+  const documentSourceIds = new Set(store.objects.documents.map((document) => document.sourceId));
+  const parsedDocumentSourceIds = new Set(store.objects.documents
+    .filter((document) => document.status === "parsed")
+    .map((document) => document.sourceId));
+  const chunkGroundedExtractionSourceIds = new Set(store.objects.extractions
+    .filter((extraction) => researchObjectIsActive(extraction) && (extraction.documentChunkIds?.length ?? 0) > 0)
+    .map((extraction) => extraction.sourceId));
+  const fullTextSelectedSourceIds = store.objects.fullTextRecords
+    .filter((record) => selectedSourceIdSet.has(record.sourceId) && record.fulltextAvailable)
+    .map((record) => record.sourceId);
 
   return {
     diagnosticOnly: true,
@@ -2111,6 +2232,22 @@ export function buildResearchCorpusDiagnosticView(
     screeningDecisionCounts: countBy(store.objects.canonicalSources.map((source) => source.screeningDecision)),
     providerRunCount: store.objects.providerRuns.length,
     sourceCandidateCount: store.objects.sources.length,
+    documentCount: store.objects.documents.length,
+    parsedDocumentCount: store.objects.documents.filter((document) => document.status === "parsed").length,
+    documentChunkCount: store.objects.documentChunks.length,
+    selectedFullTextNotFetchedSourceIds: fullTextSelectedSourceIds
+      .filter((sourceId) => !documentSourceIds.has(sourceId))
+      .slice(0, 40),
+    selectedFullTextNotParsedSourceIds: fullTextSelectedSourceIds
+      .filter((sourceId) => documentSourceIds.has(sourceId) && !parsedDocumentSourceIds.has(sourceId))
+      .slice(0, 40),
+    selectedSourcesWithoutChunkGroundedExtractionIds: disposition.selectedSourceIds
+      .filter((sourceId) => !chunkGroundedExtractionSourceIds.has(sourceId))
+      .slice(0, 40),
+    evidenceCellsWithoutChunkGroundingIds: store.objects.evidenceCells
+      .filter((cell) => researchObjectIsActive(cell) && (cell.documentChunkIds?.length ?? 0) === 0)
+      .map((cell) => cell.id)
+      .slice(0, 40),
     missingSelectedExtractionSourceIds: disposition.missingSelectedExtractionSourceIds.slice(0, 40),
     duplicateExtractionSourceIds: disposition.duplicateExtractionSourceIds.slice(0, 40),
     extractedNotEvidenceSourceIds: disposition.extractedNotEvidenceSourceIds.slice(0, 40),
@@ -2429,6 +2566,8 @@ export function buildWorkspacePromptContextFromWorkStore(store: ResearchWorkStor
       canonicalSources: store.objects.canonicalSources.length,
       screeningDecisions: store.objects.screeningDecisions.length,
       fullTextRecords: store.objects.fullTextRecords.length,
+      documents: store.objects.documents.length,
+      documentChunks: store.objects.documentChunks.length,
       extractions: store.objects.extractions.length,
       evidenceCells: store.objects.evidenceCells.length,
       claims: store.objects.claims.length,
@@ -2442,8 +2581,7 @@ export function buildWorkspacePromptContextFromWorkStore(store: ResearchWorkStor
     corpus_view: buildResearchCorpusDiagnosticView(store),
     synthesis_view: buildResearchSynthesisDiagnosticView(store),
 	    notebook: {
-	      missionTarget: store.notebook.missionTarget,
-	      paperMode: store.notebook.paperMode,
+	      artifactType: store.notebook.artifactType,
 	      objective: store.notebook.objective,
 	      researchContract: {
 	        researchObjectives: store.notebook.researchContract.researchObjectives.slice(0, 12),
@@ -2592,6 +2730,8 @@ export type ResearchWorkStoreSummary = {
   sources: number;
   protocols: number;
   canonicalSources: number;
+  documents: number;
+  documentChunks: number;
   extractions: number;
   evidenceCells: number;
   claims: number;
@@ -2605,6 +2745,8 @@ export function summarizeResearchWorkStore(store: ResearchWorkStore): ResearchWo
     sources: store.objects.sources.length,
     protocols: store.objects.protocols.length,
     canonicalSources: store.objects.canonicalSources.length,
+    documents: store.objects.documents.length,
+    documentChunks: store.objects.documentChunks.length,
     extractions: store.objects.extractions.length,
     evidenceCells: store.objects.evidenceCells.length,
     claims: store.objects.claims.length,

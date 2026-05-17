@@ -25,6 +25,11 @@ export type ResearchWorkspaceToolName =
   | "source.merge"
   | "source.resolve_access"
   | "source.select_evidence"
+  | "document.fetch"
+  | "document.parse"
+  | "document.list_chunks"
+  | "document.read_chunk"
+  | "document.search_text"
   | "extraction.create"
   | "extraction.patch"
   | "evidence.create_cell"
@@ -70,6 +75,11 @@ export const researchWorkspaceToolActions: ResearchWorkspaceToolName[] = [
   "source.merge",
   "source.resolve_access",
   "source.select_evidence",
+  "document.fetch",
+  "document.parse",
+  "document.list_chunks",
+  "document.read_chunk",
+  "document.search_text",
   "extraction.create",
   "extraction.patch",
   "evidence.create_cell",
@@ -357,8 +367,7 @@ export type ResearchActionRequest = {
       userBlockers: string[];
     };
     notebook: {
-      missionTarget: string;
-      paperMode: string;
+      artifactType: string;
       objective: string;
       researchContract: ResearchContract;
       legacyDefinitionOfDone: string[];

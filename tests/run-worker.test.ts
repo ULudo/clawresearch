@@ -40,7 +40,7 @@ import {
   researchWorkStoreFilePath,
   upsertResearchWorkStoreEntities,
   writeResearchWorkStore,
-  type ResearchMissionTarget,
+  type ResearchArtifactType,
   type WorkStoreEntity
 } from "../src/runtime/research-work-store.js";
 
@@ -2564,6 +2564,192 @@ class NotebookToolBackend extends StubResearchBackend {
   }
 }
 
+class DocumentReadingToolBackend extends StubResearchBackend {
+  readonly researchRequests: ResearchActionRequest[] = [];
+  private step = 0;
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+    this.step += 1;
+    const sourceId = "source-document-reading";
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [sourceId],
+      criticScope: null,
+      reason: null
+    };
+    const lastChunk = request.toolResults
+      ?.flatMap((result) => [
+        ...(result.items ?? []),
+        ...(result.entity === null || result.entity === undefined ? [] : [result.entity])
+      ])
+      .find((item) => item.kind === "documentChunk");
+    const lastExtraction = request.toolResults
+      ?.flatMap((result) => [
+        ...(result.items ?? []),
+        ...(result.entity === null || result.entity === undefined ? [] : [result.entity])
+      ])
+      .find((item) => item.kind === "extraction");
+
+    if (this.step === 1) {
+      return {
+        schemaVersion: 1,
+        action: "document.fetch",
+        rationale: "Fetch the selected source full text before extracting.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "documents",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: { sourceId }
+          }
+        },
+        expectedOutcome: "A document record is created.",
+        stopCondition: "Continue to parsing.",
+        transport: "strict_json"
+      };
+    }
+    if (this.step === 2) {
+      return {
+        schemaVersion: 1,
+        action: "document.parse",
+        rationale: "Parse the fetched document into chunks.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "documents",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: { sourceId }
+          }
+        },
+        expectedOutcome: "Document chunks are persisted.",
+        stopCondition: "Continue to chunk inspection.",
+        transport: "strict_json"
+      };
+    }
+    if (this.step === 3) {
+      return {
+        schemaVersion: 1,
+        action: "document.search_text",
+        rationale: "Search parsed chunks for benchmark evidence.",
+        confidence: 0.86,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "documentChunks",
+            entityId: null,
+            filters: {},
+            semanticQuery: "benchmark evaluation failure modes",
+            limit: 5,
+            cursor: null,
+            changes: {},
+            entity: { sourceId }
+          }
+        },
+        expectedOutcome: "Relevant chunks are visible.",
+        stopCondition: "Continue to extraction.",
+        transport: "strict_json"
+      };
+    }
+    if (this.step === 4 && lastChunk?.id !== undefined) {
+      return {
+        schemaVersion: 1,
+        action: "extraction.create",
+        rationale: "Create a chunk-grounded extraction from the visible source text.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "extractions",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              sourceId,
+              readLevel: "partial_full_text",
+              documentChunkIds: [lastChunk.id],
+              problemSetting: "The source discusses benchmark evaluation and failure modes for model-operated research tools.",
+              evaluationSetup: "The text says benchmark evaluation should inspect failure modes and source-grounded evidence.",
+              successSignals: ["Source-grounded benchmark evidence is inspectable through chunks."],
+              limitations: ["Only a small data URL source was parsed in the test."]
+            }
+          }
+        },
+        expectedOutcome: "A chunk-grounded extraction is persisted.",
+        stopCondition: "Continue to evidence creation.",
+        transport: "strict_json"
+      };
+    }
+    if (this.step === 5 && lastExtraction !== undefined) {
+      return {
+        schemaVersion: 1,
+        action: "evidence.create_cell",
+        rationale: "Create a chunk-grounded evidence cell from the extraction.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "evidenceCells",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              sourceId,
+              extractionId: lastExtraction.id,
+              readLevel: "partial_full_text",
+              documentChunkIds: (lastExtraction.fields?.documentChunkIds as string[] | undefined) ?? [lastChunk?.id].filter((id): id is string => typeof id === "string"),
+              field: "evaluationSetup",
+              value: "Benchmark evaluation should inspect source-grounded failure modes.",
+              confidence: "medium"
+            }
+          }
+        },
+        expectedOutcome: "A chunk-grounded evidence cell is persisted.",
+        stopCondition: "Checkpoint after evidence creation.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "Stop the document-reading tool regression after explicit evidence creation.",
+      confidence: 0.8,
+      inputs: {
+        ...baseInputs,
+        reason: "Document reading test complete.",
+        workStore: terminalUserDecisionWorkStore("Document reading test complete.")
+      },
+      expectedOutcome: "Structured test terminal state.",
+      stopCondition: "Structured terminal state reached.",
+      transport: "strict_json"
+    };
+  }
+}
+
 class InvalidStatusThenDecisionBackend extends StubResearchBackend {
   readonly sourceActions: ResearchActionDecision[] = [];
 
@@ -2646,6 +2832,7 @@ async function seedCanonicalWorkspaceSource(input: {
   brief: Parameters<typeof createResearchWorkStore>[0]["brief"];
   now: () => string;
   sourceId?: string;
+  bestAccessUrl?: string;
 }): Promise<string> {
   const sourceId = input.sourceId ?? "source-agentic-tool-runtime";
   const timestamp = input.now();
@@ -2674,7 +2861,7 @@ async function seedCanonicalWorkspaceSource(input: {
       arxivId: null
     },
     accessMode: "fulltext_open",
-    bestAccessUrl: "https://example.org/agentic-tool-runtime.pdf",
+    bestAccessUrl: input.bestAccessUrl ?? "https://example.org/agentic-tool-runtime.pdf",
     screeningDecision: "include",
     screeningRationale: "Seeded test source for explicit researcher-tool execution.",
     tags: ["agentic-runtime"]
@@ -2688,7 +2875,7 @@ async function seedThinReviewWorkspace(input: {
   runId: string;
   brief: Parameters<typeof createResearchWorkStore>[0]["brief"];
   now: () => string;
-  missionTarget: ResearchMissionTarget;
+  artifactType: ResearchArtifactType;
   sourceCount?: number;
   extractedCount?: number;
   evidenceCount?: number;
@@ -2820,8 +3007,7 @@ async function seedThinReviewWorkspace(input: {
     }),
     notebook: {
       schemaVersion: 1,
-      missionTarget: input.missionTarget,
-      paperMode: "literature_review",
+      artifactType: input.artifactType,
       objective: "Produce an artifact-contract regression review.",
       researchContract: {
         researchObjectives: ["Demonstrate that a thin export cannot satisfy a professional-paper artifact contract."],
@@ -2835,7 +3021,7 @@ async function seedThinReviewWorkspace(input: {
         id: "task-thin-synthesis",
         title: "Show thin synthesis cannot pass professional finalization",
         status: "in_progress",
-        notes: "The workspace is mechanically linked but intentionally too thin for professional_paper.",
+        notes: "The workspace is mechanically linked but intentionally too thin for review_paper.",
         linkedSourceIds: citedSourceIds,
         linkedExtractionIds: ["extraction-review-1"],
         linkedEvidenceCellIds: ["evidence-review-1"],
@@ -2844,9 +3030,9 @@ async function seedThinReviewWorkspace(input: {
         linkedArtifactPaths: []
       }],
       currentFocus: "Validate artifact-aware finalization.",
-      readiness: input.missionTarget === "professional_paper"
-        ? "Ready to finalize professional_paper literature_review with caveats according to the fake researcher."
-        : "Ready to finalize research_brief literature_review with caveats according to the fake researcher.",
+      readiness: input.artifactType === "review_paper"
+        ? "Ready to finalize review_paper literature_review with caveats according to the fake researcher."
+        : "Ready to finalize research_report literature_review with caveats according to the fake researcher.",
       notes: [],
       artifactLinks: [],
       updatedAt: timestamp
@@ -3454,8 +3640,7 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
 	            cursor: null,
 	            changes: {},
 	            entity: {
-	              missionTarget: "research_brief",
-	              paperMode: "technical_survey",
+	              artifactType: "research_report",
 	              currentFocus: "Finalize the validated smoke manuscript export.",
 	              readiness: "Ready to finalize with caveats: this is a bounded single-source smoke manuscript whose mechanical provenance and citation invariants have been checked.",
 	              task: {
@@ -4553,8 +4738,8 @@ class FinalizeSeededWorkspaceBackend extends StubResearchBackend {
   private finalized = false;
 
   constructor(
-    private readonly requestedMissionTarget: ResearchMissionTarget | null = null,
-    private readonly missionTarget: ResearchMissionTarget = "professional_paper"
+    private readonly requestedArtifactType: ResearchArtifactType | null = null,
+    private readonly artifactType: ResearchArtifactType = "review_paper"
   ) {
     super();
   }
@@ -4567,10 +4752,9 @@ class FinalizeSeededWorkspaceBackend extends StubResearchBackend {
       searchQueries: [],
       localFocus: [],
       notebookPatch: {
-        missionTarget: this.missionTarget,
-        paperMode: "literature_review",
+        artifactType: this.artifactType,
         currentFocus: "Validate seeded artifact finalization.",
-        readiness: `Ready to finalize ${this.missionTarget} literature_review with caveats according to the fake researcher.`
+        readiness: `Ready to finalize ${this.artifactType} literature_review with caveats according to the fake researcher.`
       }
     };
   }
@@ -4607,8 +4791,8 @@ class FinalizeSeededWorkspaceBackend extends StubResearchBackend {
             limit: null,
             cursor: null,
             changes: {},
-            entity: this.requestedMissionTarget === null ? {} : {
-              missionTarget: this.requestedMissionTarget
+            entity: this.requestedArtifactType === null ? {} : {
+              artifactType: this.requestedArtifactType
             }
           }
         },
@@ -4662,8 +4846,8 @@ class CriticThenFinalizeSeededWorkspaceBackend extends FinalizeSeededWorkspaceBa
   readonly criticRequests: CriticReviewRequest[] = [];
   private reviewed = false;
 
-  constructor(missionTarget: ResearchMissionTarget = "research_brief") {
-    super(null, missionTarget);
+  constructor(artifactType: ResearchArtifactType = "research_report") {
+    super(null, artifactType);
   }
 
   override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
@@ -4761,10 +4945,9 @@ class CriticFreshnessScenarioBackend extends StubResearchBackend {
       searchQueries: [],
       localFocus: [],
       notebookPatch: {
-        missionTarget: "research_brief",
-        paperMode: "literature_review",
+        artifactType: "research_report",
         currentFocus: "Validate release critic freshness.",
-        readiness: "Ready to finalize research_brief literature_review with caveats: the seeded workspace satisfies the bounded regression definition of done."
+        readiness: "Ready to finalize research_report literature_review with caveats: the seeded workspace satisfies the bounded regression definition of done."
       }
     };
   }
@@ -4860,7 +5043,7 @@ class CriticFreshnessScenarioBackend extends StubResearchBackend {
             changes: {},
             entity: {
               currentFocus: "Record critic review and release verification state.",
-              readiness: "Ready to finalize research_brief literature_review with caveats after runtime-owned release checks pass.",
+              readiness: "Ready to finalize research_report literature_review with caveats after runtime-owned release checks pass.",
               tasks: [
                 {
                   id: "task-freshness-note",
@@ -5030,8 +5213,7 @@ class RepeatedCriticReviewDiffBackend extends StubResearchBackend {
       searchQueries: [],
       localFocus: [],
       notebookPatch: {
-        missionTarget: "research_brief",
-        paperMode: "literature_review",
+        artifactType: "research_report",
         currentFocus: "Compare repeated critic objections.",
         readiness: "Not ready until the critic objection diff is visible."
       }
@@ -5193,8 +5375,7 @@ class SectionRepairErgonomicsBackend extends StubResearchBackend {
       searchQueries: [],
       localFocus: [],
       notebookPatch: {
-        missionTarget: "research_brief",
-        paperMode: "literature_review",
+        artifactType: "research_report",
         currentFocus: "Repair manuscript sections from critic feedback and linked evidence.",
         readiness: "Not sufficient yet; section repair ergonomics are under test."
       }
@@ -5457,8 +5638,7 @@ class SectionSourceIdsModeBackend extends StubResearchBackend {
       searchQueries: [],
       localFocus: [],
       notebookPatch: {
-        missionTarget: "research_brief",
-        paperMode: "literature_review",
+        artifactType: "research_report",
         currentFocus: "Repair section source provenance.",
         readiness: "Not sufficient yet; section source provenance modes are under test."
       }
@@ -5554,8 +5734,7 @@ class SupportRemoveRetiredOnlyBackend extends StubResearchBackend {
       searchQueries: [],
       localFocus: [],
       notebookPatch: {
-        missionTarget: "research_brief",
-        paperMode: "literature_review",
+        artifactType: "research_report",
         currentFocus: "Inspect claim.link_support remove diagnostics.",
         readiness: "Not sufficient yet; support remove diagnostics are under test."
       }
@@ -5651,10 +5830,9 @@ class SectionDeleteBackend extends StubResearchBackend {
       searchQueries: [],
       localFocus: [],
       notebookPatch: {
-        missionTarget: "research_brief",
-        paperMode: "literature_review",
+        artifactType: "research_report",
         currentFocus: "Delete a stale manuscript section and validate active manuscript state.",
-        readiness: "Ready to finalize research_brief literature_review after the stale section is deleted and release critic passes."
+        readiness: "Ready to finalize research_report literature_review after the stale section is deleted and release critic passes."
       }
     };
   }
@@ -5833,8 +6011,7 @@ class WorkspaceListFilterBackend extends StubResearchBackend {
       searchQueries: [],
       localFocus: [],
       notebookPatch: {
-        missionTarget: "research_brief",
-        paperMode: "literature_review",
+        artifactType: "research_report",
         currentFocus: "List active manuscript sections.",
         readiness: "Not ready; this test only inspects workspace observations."
       }
@@ -5903,7 +6080,7 @@ class FakeCriticNotebookLinkFinalizeBackend extends CriticAvailableFinalizeSeede
   private patched = false;
 
   constructor(private readonly fakeCriticPath: string) {
-    super(null, "research_brief");
+    super(null, "research_report");
   }
 
   override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
@@ -6504,6 +6681,66 @@ test("planning persists the model-authored notebook patch before research action
     assert.equal(workStore.notebook.currentFocus, "Establish the initial research workspace.");
     assert.match(workStore.notebook.readiness, /Not sufficient yet/);
     assert.match(agentSteps, /protocol\.create_or_revise/);
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("document tools fetch, parse, inspect chunks, and ground extraction/evidence explicitly", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-document-tools-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "document reading tools",
+      researchQuestion: "Can the researcher inspect source text before extraction?",
+      researchDirection: "Use explicit document tools without hidden extraction.",
+      successCriterion: "Document chunks ground extraction and evidence."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "document-tools"]);
+    const documentText = [
+      "Abstract",
+      "Benchmark evaluation failure modes should be inspected from source-grounded evidence.",
+      "",
+      "Method",
+      "The document describes benchmark evaluation for model-operated research tools and records limitations."
+    ].join("\n");
+    await seedCanonicalWorkspaceSource({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      sourceId: "source-document-reading",
+      bestAccessUrl: `data:text/plain,${encodeURIComponent(documentText)}`
+    });
+
+    const backend = new DocumentReadingToolBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const toolResults = backend.researchRequests.flatMap((request) => request.toolResults ?? []);
+
+    assert.equal(exitCode, 0);
+    assert.equal(workStore.objects.documents.length, 1);
+    assert.equal(workStore.objects.documents[0]?.status, "parsed");
+    assert.ok(workStore.objects.documentChunks.length > 0);
+    assert.equal(workStore.objects.extractions.length, 1);
+    assert.equal(workStore.objects.extractions[0]?.readLevel, "partial_full_text");
+    assert.ok((workStore.objects.extractions[0]?.documentChunkIds ?? []).length > 0);
+    assert.equal(workStore.objects.evidenceCells.length, 1);
+    assert.ok((workStore.objects.evidenceCells[0]?.documentChunkIds ?? []).length > 0);
+    assert.ok(toolResults.some((result) => result.action === "document.search_text" && (result.items?.length ?? 0) > 0));
+    assert.ok(toolResults.some((result) => result.action === "extraction.create"));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -7688,7 +7925,7 @@ test("test-08-shaped source collapse blocks finalization and keeps working", asy
       runId: run.id,
       brief,
       now,
-      missionTarget: "professional_paper"
+      artifactType: "review_paper"
     });
 
     const backend = new FinalizeSeededWorkspaceBackend();
@@ -7720,11 +7957,12 @@ test("test-08-shaped source collapse blocks finalization and keeps working", asy
     assert.equal(finalizeResult?.status, "not_ready");
     assert.equal(finalizeResult?.stateDelta?.hardInvariantBlockers, 0);
     assert.ok((finalizeResult?.stateDelta?.artifactContractFailures ?? 0) > 0);
-    assert.match(finalizeResult?.message ?? "", /not ready for professional_paper\/literature_review/i);
+    assert.match(finalizeResult?.message ?? "", /not ready for review_paper/i);
     assert.match(finalizeResult?.message ?? "", /continue/i);
     assert.ok(finalizeResult?.related?.some((item) => item.kind === "artifactContractDiagnostic" && /runtime-owned release-scope critic\.review pass/i.test(item.snippet ?? "")));
     assert.ok(finalizeResult?.related?.some((item) => item.kind === "artifactContractDiagnostic" && /Selected-to-rendered source disposition collapsed/i.test(item.snippet ?? "")));
-    assert.ok(finalizeResult?.related?.some((item) => item.kind === "artifactContractDiagnostic" && /checkpoint brief/i.test(item.snippet ?? "")));
+    assert.ok(finalizeResult?.related?.some((item) => item.kind === "artifactContractDiagnostic" && /checkpoint report/i.test(item.snippet ?? "")));
+    assert.ok(finalizeResult?.related?.some((item) => item.kind === "artifactContractDiagnostic" && /document\.fetch/i.test(item.snippet ?? "")));
     const collapseDiagnostic = finalizeResult?.related?.find((item) => item.kind === "artifactContractDiagnostic" && /Selected-to-rendered source disposition collapsed/i.test(item.snippet ?? ""));
     assert.deepEqual(finalizeResult?.nextHints?.slice(0, 3), ["workspace.list", "claim.link_support", "section.patch"]);
     assert.ok(Array.isArray(collapseDiagnostic?.fields?.selectedToRenderedCollapseSourceIds));
@@ -7736,7 +7974,7 @@ test("test-08-shaped source collapse blocks finalization and keeps working", asy
   }
 });
 
-test("professional_paper finalization requires an explicit research_contract critic review", async () => {
+test("review_paper finalization requires an explicit research_contract critic review", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-professional-contract-critic-"));
   const now = createNow();
 
@@ -7754,14 +7992,14 @@ test("professional_paper finalization requires an explicit research_contract cri
       runId: run.id,
       brief,
       now,
-      missionTarget: "professional_paper",
+      artifactType: "review_paper",
       sourceCount: 12,
       extractedCount: 12,
       evidenceCount: 12,
       citedCount: 12
     });
 
-    const backend = new CriticThenFinalizeSeededWorkspaceBackend("professional_paper");
+    const backend = new CriticThenFinalizeSeededWorkspaceBackend("review_paper");
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
@@ -7795,7 +8033,7 @@ test("professional_paper finalization requires an explicit research_contract cri
   }
 });
 
-test("professional_paper mission cannot be finalized as a research_brief downgrade", async () => {
+test("review_paper mission cannot be finalized as a research_report downgrade", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-professional-no-brief-downgrade-"));
   const now = createNow();
 
@@ -7813,10 +8051,10 @@ test("professional_paper mission cannot be finalized as a research_brief downgra
       runId: run.id,
       brief,
       now,
-      missionTarget: "professional_paper"
+      artifactType: "review_paper"
     });
 
-    const backend = new FinalizeSeededWorkspaceBackend("research_brief");
+    const backend = new FinalizeSeededWorkspaceBackend("research_report");
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
@@ -7862,7 +8100,7 @@ test("manuscript compiler blocks duplicate top-level headings and missing inline
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -7881,7 +8119,7 @@ test("manuscript compiler blocks duplicate top-level headings and missing inline
     } as WorkStoreEntity;
     await writeResearchWorkStore(upsertResearchWorkStoreEntities(seededStore, [badSection], now()));
 
-    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_brief");
+    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_report");
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
@@ -7932,7 +8170,7 @@ test("manuscript compiler blocks duplicated section-title headings without delet
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -7951,7 +8189,7 @@ test("manuscript compiler blocks duplicated section-title headings without delet
     } as WorkStoreEntity;
     await writeResearchWorkStore(upsertResearchWorkStoreEntities(seededStore, [badSection], now()));
 
-    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_brief");
+    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_report");
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
@@ -7998,7 +8236,7 @@ test("manuscript compiler blocks inline citation and support-link provenance mis
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -8025,7 +8263,7 @@ test("manuscript compiler blocks inline citation and support-link provenance mis
     } as WorkStoreEntity;
     await writeResearchWorkStore(upsertResearchWorkStoreEntities(seededStore, [staleSection, staleCitation], now()));
 
-    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_brief");
+    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_report");
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
@@ -8054,7 +8292,7 @@ test("manuscript compiler blocks inline citation and support-link provenance mis
   }
 });
 
-test("research_brief without a runtime release critic pass is not ready", async () => {
+test("research_report without a runtime release critic pass is not ready", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-brief-needs-release-critic-"));
   const now = createNow();
 
@@ -8072,14 +8310,14 @@ test("research_brief without a runtime release critic pass is not ready", async 
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
       citedCount: 1
     });
 
-    const backend = new CriticAvailableFinalizeSeededWorkspaceBackend(null, "research_brief");
+    const backend = new CriticAvailableFinalizeSeededWorkspaceBackend(null, "research_report");
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
@@ -8127,7 +8365,7 @@ test("release.verify reports a fresh release critic review when reviewed objects
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -8179,7 +8417,7 @@ test("release.verify keeps critic fresh after notebook project-management update
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -8229,7 +8467,7 @@ test("release.verify keeps research-contract critic fresh after evidence changes
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -8279,7 +8517,7 @@ test("release.verify reports stale critic review after manuscript section change
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -8333,7 +8571,7 @@ test("release.verify reports incomplete critic review after new evidence is adde
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -8385,7 +8623,7 @@ test("manuscript.finalize blocks when support links changed after release critic
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -8441,7 +8679,7 @@ test("repeated critic.review returns new repeated and resolved objection diagnos
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -8494,7 +8732,7 @@ test("section.read returns repair context with blocks, linked evidence, hygiene 
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -8561,7 +8799,7 @@ test("section.patch supports targeted block replacement without rewriting the wh
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -8795,7 +9033,7 @@ test("section.patch accepts ready_for_review and rejects invalid statuses withou
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -8859,7 +9097,7 @@ test("section.patch suggests section.delete for retired status", async () => {
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -8920,7 +9158,7 @@ test("section.delete removes active manuscript section without deleting research
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -8981,7 +9219,7 @@ test("workspace.list ignores unsupported filters visibly instead of hiding exist
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -9033,7 +9271,7 @@ test("section.delete requires an explicit section id even when only one section 
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -9052,8 +9290,7 @@ test("section.delete requires an explicit section id even when only one section 
           searchQueries: [],
           localFocus: [],
           notebookPatch: {
-            missionTarget: "research_brief",
-            paperMode: "literature_review",
+            artifactType: "research_report",
             currentFocus: "Attempt section.delete without id.",
             readiness: "Not ready."
           }
@@ -9159,7 +9396,7 @@ test("release.verify after section.delete ignores deleted manuscript sections", 
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -9234,7 +9471,7 @@ test("section.delete keeps deleted sections out of finalized paper", async () =>
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -9303,7 +9540,7 @@ test("section.patch blocks unknown section ids instead of creating a new section
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -9355,7 +9592,7 @@ test("section.patch set_order stores model-owned export order without rewriting 
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -9416,7 +9653,7 @@ test("manuscript export and critic preview use model-owned section order", async
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -9476,7 +9713,7 @@ test("manuscript export and critic preview use model-owned section order", async
     }], timestamp);
     await writeResearchWorkStore(orderedStore);
 
-    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_brief");
+    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_report");
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
@@ -9522,7 +9759,7 @@ test("fake critic notebook link does not satisfy finalization authority", async 
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
@@ -9565,7 +9802,7 @@ test("fake critic notebook link does not satisfy finalization authority", async 
   }
 });
 
-test("research_brief mission can finalize after a runtime release critic pass", async () => {
+test("research_report mission can finalize after a runtime release critic pass", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-brief-contract-finalizes-"));
   const now = createNow();
 
@@ -9574,7 +9811,7 @@ test("research_brief mission can finalize after a runtime release critic pass", 
     const brief = {
       topic: "model-driven research workspaces",
       researchQuestion: "Can a lightweight linked workspace finalize as a brief?",
-      researchDirection: "Use a seeded workspace to test research_brief finalization.",
+      researchDirection: "Use a seeded workspace to test research_report finalization.",
       successCriterion: "Produce a research brief."
     };
     const run = await runStore.create(brief, ["clawresearch", "artifact-contract"]);
@@ -9583,14 +9820,14 @@ test("research_brief mission can finalize after a runtime release critic pass", 
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 1,
       extractedCount: 1,
       evidenceCount: 1,
       citedCount: 1
     });
 
-    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_brief");
+    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_report");
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
@@ -9635,14 +9872,14 @@ test("research observations distinguish source-session counts from persisted wor
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 4,
       extractedCount: 2,
       evidenceCount: 1,
       citedCount: 1
     });
 
-    const backend = new FinalizeSeededWorkspaceBackend(null, "research_brief");
+    const backend = new FinalizeSeededWorkspaceBackend(null, "research_report");
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
@@ -9699,7 +9936,7 @@ test("critic review packet uses exact selected and cited sources, not every scre
       runId: run.id,
       brief,
       now,
-      missionTarget: "research_brief",
+      artifactType: "research_report",
       sourceCount: 5,
       extractedCount: 1,
       evidenceCount: 1,
@@ -9728,7 +9965,7 @@ test("critic review packet uses exact selected and cited sources, not every scre
       }
     });
 
-    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_brief");
+    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_report");
     const exitCode = await runDetachedJobWorker({
       projectRoot,
       runId: run.id,
