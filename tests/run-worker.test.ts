@@ -203,6 +203,17 @@ function terminalUserDecisionWorkStore(statusReason: string): ResearchActionDeci
   };
 }
 
+function finalizationDeclaration(artifactType: ResearchArtifactType): Record<string, unknown> {
+  return {
+    intendedArtifact: artifactType,
+    notCheckpoint: true,
+    readinessBasis: `The researcher explicitly finalizes this workspace as ${artifactType} after inspecting the visible release checks and critic feedback.`,
+    knownLimitations: [
+      "This is a scripted regression fixture; scientific adequacy is not inferred by the runtime."
+    ]
+  };
+}
+
 function sourceSelectionWorkStore(mode: "append" | "replace" | "remove"): ResearchActionDecision["inputs"]["workStore"] {
   return {
     collection: "canonicalSources",
@@ -336,7 +347,9 @@ function workspaceManuscriptDecisionForRequest(
         semanticQuery: null,
         limit: null,
         changes: {},
-        entity: {}
+        entity: {
+          finalizationDeclaration: finalizationDeclaration("research_report")
+        }
       }
     },
     expectedOutcome: "Release checks can evaluate the workspace manuscript.",
@@ -681,7 +694,9 @@ class ToolResultAwareSynthesisBackend extends StubResearchBackend {
           limit: null,
           cursor: null,
           changes: {},
-          entity: {}
+          entity: {
+            finalizationDeclaration: finalizationDeclaration("research_report")
+          }
         }
       },
       expectedOutcome: "Release checks run against workspace objects.",
@@ -889,7 +904,9 @@ class SupportLinkSynthesisBackend extends StubResearchBackend {
           limit: null,
           cursor: null,
           changes: {},
-          entity: {}
+          entity: {
+            finalizationDeclaration: finalizationDeclaration("research_report")
+          }
         }
       },
       expectedOutcome: "Release checks pass.",
@@ -1119,7 +1136,9 @@ class MismatchedSupportSynthesisBackend extends StubResearchBackend {
           limit: null,
           cursor: null,
           changes: {},
-          entity: {}
+          entity: {
+            finalizationDeclaration: finalizationDeclaration("research_report")
+          }
         }
       },
       expectedOutcome: "Release remains blocked by invalid support.",
@@ -2595,6 +2614,24 @@ class DocumentReadingToolBackend extends StubResearchBackend {
         ...(result.entity === null || result.entity === undefined ? [] : [result.entity])
       ])
       .find((item) => item.kind === "extraction");
+    const lastEvidenceCell = request.toolResults
+      ?.flatMap((result) => [
+        ...(result.items ?? []),
+        ...(result.entity === null || result.entity === undefined ? [] : [result.entity])
+      ])
+      .find((item) => item.kind === "evidenceCell");
+    const lastClaim = request.toolResults
+      ?.flatMap((result) => [
+        ...(result.items ?? []),
+        ...(result.entity === null || result.entity === undefined ? [] : [result.entity])
+      ])
+      .find((item) => item.kind === "claim");
+    const lastSection = request.toolResults
+      ?.flatMap((result) => [
+        ...(result.items ?? []),
+        ...(result.entity === null || result.entity === undefined ? [] : [result.entity])
+      ])
+      .find((item) => item.kind === "manuscriptSection");
 
     if (this.step === 1) {
       return {
@@ -2647,6 +2684,30 @@ class DocumentReadingToolBackend extends StubResearchBackend {
     if (this.step === 3) {
       return {
         schemaVersion: 1,
+        action: "document.list_chunks",
+        rationale: "List parsed chunks so the next extraction can use exact chunk ids.",
+        confidence: 0.88,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "documentChunks",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: 2,
+            cursor: null,
+            changes: {},
+            entity: { sourceId }
+          }
+        },
+        expectedOutcome: "Chunk ids are visible.",
+        stopCondition: "Continue to chunk search.",
+        transport: "strict_json"
+      };
+    }
+    if (this.step === 4) {
+      return {
+        schemaVersion: 1,
         action: "document.search_text",
         rationale: "Search parsed chunks for benchmark evidence.",
         confidence: 0.86,
@@ -2668,7 +2729,31 @@ class DocumentReadingToolBackend extends StubResearchBackend {
         transport: "strict_json"
       };
     }
-    if (this.step === 4 && lastChunk?.id !== undefined) {
+    if (this.step === 5 && lastChunk?.id !== undefined) {
+      return {
+        schemaVersion: 1,
+        action: "document.read_chunk",
+        rationale: "Read the exact chunk before persisting source-grounded content.",
+        confidence: 0.88,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "documentChunks",
+            entityId: lastChunk.id,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: { documentChunkId: lastChunk.id }
+          }
+        },
+        expectedOutcome: "The chunk text is visible.",
+        stopCondition: "Continue to extraction.",
+        transport: "strict_json"
+      };
+    }
+    if (this.step === 6 && lastChunk?.id !== undefined) {
       return {
         schemaVersion: 1,
         action: "extraction.create",
@@ -2700,7 +2785,7 @@ class DocumentReadingToolBackend extends StubResearchBackend {
         transport: "strict_json"
       };
     }
-    if (this.step === 5 && lastExtraction !== undefined) {
+    if (this.step === 7 && lastExtraction !== undefined) {
       return {
         schemaVersion: 1,
         action: "evidence.create_cell",
@@ -2732,11 +2817,131 @@ class DocumentReadingToolBackend extends StubResearchBackend {
         transport: "strict_json"
       };
     }
+    if (this.step === 8 && lastEvidenceCell?.id !== undefined) {
+      return {
+        schemaVersion: 1,
+        action: "claim.create",
+        rationale: "Create a claim after evidence exists.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "claims",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              text: "Benchmark evaluation of model-operated research tools should inspect source-grounded failure modes.",
+              evidence: "A parsed document chunk and evidence cell state that benchmark evaluation should inspect failure modes.",
+              sourceIds: [sourceId],
+              confidence: "medium"
+            }
+          }
+        },
+        expectedOutcome: "A claim is persisted.",
+        stopCondition: "Continue to support linking.",
+        transport: "strict_json"
+      };
+    }
+    if (this.step === 9 && lastClaim?.id !== undefined && lastEvidenceCell?.id !== undefined) {
+      return {
+        schemaVersion: 1,
+        action: "claim.link_support",
+        rationale: "Attach the evidence cell as durable support for the claim.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "citations",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              mode: "append",
+              claimId: lastClaim.id,
+              evidenceCellId: lastEvidenceCell.id,
+              sourceId,
+              supportSnippet: "Benchmark evaluation should inspect source-grounded failure modes.",
+              confidence: "medium"
+            }
+          }
+        },
+        expectedOutcome: "The claim has a durable support link.",
+        stopCondition: "Continue to manuscript section creation.",
+        transport: "strict_json"
+      };
+    }
+    if (this.step === 10 && lastClaim?.id !== undefined) {
+      return {
+        schemaVersion: 1,
+        action: "section.create",
+        rationale: "Create manuscript prose from the supported claim.",
+        confidence: 0.88,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              sectionId: "document-grounded-synthesis",
+              role: "synthesis",
+              title: "Document-grounded Synthesis",
+              markdown: "Benchmark evaluation of model-operated research tools should inspect source-grounded failure modes rather than relying only on metadata-level summaries. [source-document-reading]",
+              claimIds: [lastClaim.id],
+              sourceIds: [sourceId]
+            }
+          }
+        },
+        expectedOutcome: "A manuscript section is created from supported evidence.",
+        stopCondition: "Continue to targeted section patching.",
+        transport: "strict_json"
+      };
+    }
+    if (this.step === 11 && lastSection?.id !== undefined) {
+      return {
+        schemaVersion: 1,
+        action: "section.patch",
+        rationale: "Patch the section with one additional sentence after checking the created section id.",
+        confidence: 0.86,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "manuscriptSections",
+            entityId: lastSection.id,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              operation: "append_paragraph",
+              markdown: "The same source also records limitations of this miniature test fixture, so the manuscript text should remain appropriately scoped. [source-document-reading]",
+              claimIds: [lastClaim?.id].filter((id): id is string => typeof id === "string"),
+              sourceIds: [sourceId]
+            }
+          }
+        },
+        expectedOutcome: "The section is patched explicitly.",
+        stopCondition: "Stop the document micro-cycle.",
+        transport: "strict_json"
+      };
+    }
 
     return {
       schemaVersion: 1,
       action: "workspace.status",
-      rationale: "Stop the document-reading tool regression after explicit evidence creation.",
+      rationale: "Stop the document-reading tool regression after the explicit micro-cycle.",
       confidence: 0.8,
       inputs: {
         ...baseInputs,
@@ -2744,6 +2949,195 @@ class DocumentReadingToolBackend extends StubResearchBackend {
         workStore: terminalUserDecisionWorkStore("Document reading test complete.")
       },
       expectedOutcome: "Structured test terminal state.",
+      stopCondition: "Structured terminal state reached.",
+      transport: "strict_json"
+    };
+  }
+}
+
+class DocumentSearchBeforeParseBackend extends StubResearchBackend {
+  readonly researchRequests: ResearchActionRequest[] = [];
+  private step = 0;
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+    this.step += 1;
+    const sourceId = "source-document-needs-parse";
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [sourceId],
+      criticScope: null,
+      reason: null
+    };
+
+    if (this.step === 1) {
+      return {
+        schemaVersion: 1,
+        action: "document.fetch",
+        rationale: "Fetch the source before intentionally searching without parsing.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "documents",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: { sourceId }
+          }
+        },
+        expectedOutcome: "A fetched document exists.",
+        stopCondition: "Search before parsing next.",
+        transport: "strict_json"
+      };
+    }
+
+    if (this.step === 2) {
+      return {
+        schemaVersion: 1,
+        action: "document.search_text",
+        rationale: "Search should return a repair diagnostic when chunks do not exist yet.",
+        confidence: 0.8,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "documentChunks",
+            entityId: null,
+            filters: {},
+            semanticQuery: "benchmark",
+            limit: 5,
+            cursor: null,
+            changes: {},
+            entity: { sourceId }
+          }
+        },
+        expectedOutcome: "The result points back to document.parse.",
+        stopCondition: "Stop after diagnostic.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "End the search-before-parse test.",
+      confidence: 0.8,
+      inputs: {
+        ...baseInputs,
+        reason: "Document search-before-parse test complete.",
+        workStore: terminalUserDecisionWorkStore("Document search-before-parse test complete.")
+      },
+      expectedOutcome: "Structured terminal state.",
+      stopCondition: "Structured terminal state reached.",
+      transport: "strict_json"
+    };
+  }
+}
+
+class InvalidDocumentProvenanceBackend extends StubResearchBackend {
+  readonly researchRequests: ResearchActionRequest[] = [];
+  private step = 0;
+
+  override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+    if (request.phase !== "research") {
+      return super.chooseResearchAction(request);
+    }
+    this.researchRequests.push(request);
+    this.step += 1;
+    const sourceId = "source-invalid-provenance";
+    const baseInputs = {
+      providerIds: [],
+      searchQueries: [],
+      evidenceTargets: [],
+      paperIds: [sourceId],
+      criticScope: null,
+      reason: null
+    };
+    const extraction = request.toolResults
+      ?.flatMap((result) => result.entity === null || result.entity === undefined ? [] : [result.entity])
+      .find((entity) => entity.kind === "extraction");
+
+    if (this.step === 1) {
+      return {
+        schemaVersion: 1,
+        action: "extraction.create",
+        rationale: "Create an abstract-level extraction that does not need document chunks.",
+        confidence: 0.9,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "extractions",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              sourceId,
+              readLevel: "abstract",
+              problemSetting: "The abstract-level extraction is valid without document chunks.",
+              evaluationSetup: "The test then tries to create invalid full-text evidence."
+            }
+          }
+        },
+        expectedOutcome: "An abstract-level extraction is persisted.",
+        stopCondition: "Continue to invalid evidence provenance.",
+        transport: "strict_json"
+      };
+    }
+
+    if (this.step === 2 && extraction?.id !== undefined) {
+      return {
+        schemaVersion: 1,
+        action: "evidence.create_cell",
+        rationale: "Try invalid full-text provenance with a missing chunk id.",
+        confidence: 0.8,
+        inputs: {
+          ...baseInputs,
+          workStore: {
+            collection: "evidenceCells",
+            entityId: null,
+            filters: {},
+            semanticQuery: null,
+            limit: null,
+            cursor: null,
+            changes: {},
+            entity: {
+              sourceId,
+              extractionId: extraction.id,
+              readLevel: "partial_full_text",
+              documentChunkIds: ["missing-document-chunk"],
+              field: "evaluationSetup",
+              value: "This evidence incorrectly claims full-text chunk grounding."
+            }
+          }
+        },
+        expectedOutcome: "The evidence create call is blocked with repair context.",
+        stopCondition: "Stop after the blocked diagnostic.",
+        transport: "strict_json"
+      };
+    }
+
+    return {
+      schemaVersion: 1,
+      action: "workspace.status",
+      rationale: "End the invalid provenance test.",
+      confidence: 0.8,
+      inputs: {
+        ...baseInputs,
+        reason: "Invalid document provenance test complete.",
+        workStore: terminalUserDecisionWorkStore("Invalid document provenance test complete.")
+      },
+      expectedOutcome: "Structured terminal state.",
       stopCondition: "Structured terminal state reached.",
       transport: "strict_json"
     };
@@ -3727,7 +4121,9 @@ class ExplicitResearchToolBackend extends StubResearchBackend {
             limit: null,
             cursor: null,
             changes: {},
-            entity: {}
+            entity: {
+              finalizationDeclaration: finalizationDeclaration("research_report")
+            }
           }
         },
         expectedOutcome: "Paper markdown and JSON are exported from workspace state.",
@@ -3952,11 +4348,11 @@ class SupportRepairDiagnosticsBackend extends StubResearchBackend {
     return {
       schemaVersion: 1,
       action: "claim.link_support",
-      rationale: "Intentionally omit evidence/source ids to inspect repair diagnostics.",
+      rationale: "Intentionally omit the evidence-cell id to inspect repair diagnostics without runtime evidence selection.",
       confidence: 0.7,
       inputs: {
         ...baseInputs,
-        paperIds: [],
+        paperIds: [this.sourceId],
         workStore: {
           collection: "citations",
           entityId: null,
@@ -3966,7 +4362,8 @@ class SupportRepairDiagnosticsBackend extends StubResearchBackend {
           cursor: null,
           changes: {},
           entity: {
-            claimId: claim.id
+            claimId: claim.id,
+            sourceId: this.sourceId
           }
         }
       },
@@ -4703,7 +5100,9 @@ class ExplicitManuscriptFinalizeBlockedBackend extends StubResearchBackend {
             limit: null,
             cursor: null,
             changes: {},
-            entity: {}
+            entity: {
+              finalizationDeclaration: finalizationDeclaration("research_report")
+            }
           }
         },
         expectedOutcome: "Release should be visibly blocked by hard invariants.",
@@ -4739,7 +5138,8 @@ class FinalizeSeededWorkspaceBackend extends StubResearchBackend {
 
   constructor(
     private readonly requestedArtifactType: ResearchArtifactType | null = null,
-    private readonly artifactType: ResearchArtifactType = "review_paper"
+    private readonly artifactType: ResearchArtifactType = "review_paper",
+    private readonly includeFinalizationDeclaration = true
   ) {
     super();
   }
@@ -4791,8 +5191,13 @@ class FinalizeSeededWorkspaceBackend extends StubResearchBackend {
             limit: null,
             cursor: null,
             changes: {},
-            entity: this.requestedArtifactType === null ? {} : {
-              artifactType: this.requestedArtifactType
+            entity: {
+              ...(this.requestedArtifactType === null ? {} : {
+                artifactType: this.requestedArtifactType
+              }),
+              ...(this.includeFinalizationDeclaration ? {
+                finalizationDeclaration: finalizationDeclaration(this.requestedArtifactType ?? this.artifactType)
+              } : {})
             }
           }
         },
@@ -4846,8 +5251,11 @@ class CriticThenFinalizeSeededWorkspaceBackend extends FinalizeSeededWorkspaceBa
   readonly criticRequests: CriticReviewRequest[] = [];
   private reviewed = false;
 
-  constructor(artifactType: ResearchArtifactType = "research_report") {
-    super(null, artifactType);
+  constructor(
+    artifactType: ResearchArtifactType = "research_report",
+    includeFinalizationDeclaration = true
+  ) {
+    super(null, artifactType, includeFinalizationDeclaration);
   }
 
   override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
@@ -5144,7 +5552,9 @@ class CriticFreshnessScenarioBackend extends StubResearchBackend {
             limit: null,
             cursor: null,
             changes: {},
-            entity: {}
+            entity: this.terminalAction === "manuscript.finalize"
+              ? { finalizationDeclaration: finalizationDeclaration("research_report") }
+              : {}
           }
         },
         expectedOutcome: "Release verification/finalization reports critic freshness.",
@@ -5950,7 +6360,9 @@ class SectionDeleteBackend extends StubResearchBackend {
             limit: null,
             cursor: null,
             changes: {},
-            entity: {}
+            entity: {
+              finalizationDeclaration: finalizationDeclaration("research_report")
+            }
           }
         },
         expectedOutcome: "paper.md contains only active sections.",
@@ -6646,6 +7058,128 @@ test("notebook.read and notebook.patch are explicit model-facing tools with arti
   }
 });
 
+test("notebook.patch can replace stale notes instead of only appending", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-notebook-notes-replace-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const run = await runStore.create({
+      topic: "notebook notes repair",
+      researchQuestion: "Can the model remove stale notebook instructions?",
+      researchDirection: "Notebook notes should be patchable like IDE state, not append-only clutter.",
+      successCriterion: "notesMode replace removes obsolete notes and stores the current note."
+    }, ["clawresearch", "research-loop"]);
+
+    class NotebookNotesReplaceBackend extends StubResearchBackend {
+      private step = 0;
+
+      override async chooseResearchAction(request: ResearchActionRequest): Promise<ResearchActionDecision> {
+        if (request.phase !== "research") {
+          return super.chooseResearchAction(request);
+        }
+        this.step += 1;
+        const baseInputs = {
+          providerIds: [],
+          searchQueries: [],
+          evidenceTargets: [],
+          paperIds: [],
+          criticScope: null,
+          reason: null
+        };
+        if (this.step === 1) {
+          return {
+            schemaVersion: 1,
+            action: "notebook.patch",
+            rationale: "Record initial notes including a deliberately stale next action.",
+            confidence: 0.9,
+            inputs: {
+              ...baseInputs,
+              workStore: {
+                collection: null,
+                entityId: null,
+                filters: {},
+                semanticQuery: null,
+                limit: null,
+                cursor: null,
+                changes: {},
+                entity: {
+                  currentFocus: "Fetch the seeded document.",
+                  notes: ["Next action: document.fetch source-old", "Keep the source provenance visible."]
+                }
+              }
+            },
+            expectedOutcome: "Initial notes are stored.",
+            stopCondition: "Continue to replace stale notes.",
+            transport: "strict_json"
+          };
+        }
+        if (this.step === 2) {
+          return {
+            schemaVersion: 1,
+            action: "notebook.patch",
+            rationale: "Replace stale notes after the project state changed.",
+            confidence: 0.9,
+            inputs: {
+              ...baseInputs,
+              workStore: {
+                collection: null,
+                entityId: null,
+                filters: {},
+                semanticQuery: null,
+                limit: null,
+                cursor: null,
+                changes: {},
+                entity: {
+                  notesMode: "replace",
+                  currentFocus: "Run release.verify with current workspace state.",
+                  notes: ["Next action: release.verify after current workspace repairs."]
+                }
+              }
+            },
+            expectedOutcome: "Obsolete notes are replaced instead of appended.",
+            stopCondition: "Stop after verifying notes replacement.",
+            transport: "strict_json"
+          };
+        }
+        return {
+          schemaVersion: 1,
+          action: "workspace.status",
+          rationale: "End the notebook notes replacement test.",
+          confidence: 0.8,
+          inputs: {
+            ...baseInputs,
+            reason: "Notebook notes replacement complete.",
+            workStore: terminalUserDecisionWorkStore("Notebook notes replacement complete.")
+          },
+          expectedOutcome: "Structured test terminal state.",
+          stopCondition: "Structured terminal state reached.",
+          transport: "strict_json"
+        };
+      }
+    }
+
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: new NotebookNotesReplaceBackend()
+    });
+
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+
+    assert.equal(exitCode, 0);
+    assert.deepEqual(workStore.notebook.notes, ["Next action: release.verify after current workspace repairs."]);
+    assert.equal(workStore.notebook.currentFocus, "Run release.verify with current workspace state.");
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("planning persists the model-authored notebook patch before research actions", async () => {
   const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-planning-notebook-patch-"));
   const now = createNow();
@@ -6739,8 +7273,126 @@ test("document tools fetch, parse, inspect chunks, and ground extraction/evidenc
     assert.ok((workStore.objects.extractions[0]?.documentChunkIds ?? []).length > 0);
     assert.equal(workStore.objects.evidenceCells.length, 1);
     assert.ok((workStore.objects.evidenceCells[0]?.documentChunkIds ?? []).length > 0);
+    assert.equal(workStore.objects.claims.length, 1);
+    assert.equal(workStore.objects.citations.length, 1);
+    assert.equal(workStore.objects.manuscriptSections.length, 1);
+    assert.match(workStore.objects.manuscriptSections[0]?.markdown ?? "", /miniature test fixture/);
+    assert.ok(toolResults.some((result) => result.action === "document.list_chunks" && result.hasMore === false));
+    const readChunkResult = toolResults.find((result) => result.action === "document.read_chunk" && result.entity?.kind === "documentChunk");
+    const provenanceTemplate = readChunkResult?.query?.provenanceTemplate as {
+      sourceId?: string;
+      documentId?: string;
+      documentChunkIds?: string[];
+      readLevel?: string;
+    } | undefined;
+    assert.equal(provenanceTemplate?.sourceId, "source-document-reading");
+    assert.equal(provenanceTemplate?.documentId, workStore.objects.documents[0]?.id);
+    assert.deepEqual(provenanceTemplate?.documentChunkIds, [readChunkResult?.entity?.id]);
+    assert.equal(provenanceTemplate?.readLevel, "partial_full_text");
     assert.ok(toolResults.some((result) => result.action === "document.search_text" && (result.items?.length ?? 0) > 0));
     assert.ok(toolResults.some((result) => result.action === "extraction.create"));
+    assert.ok(toolResults.some((result) => result.action === "claim.link_support"));
+    assert.ok(toolResults.some((result) => result.action === "section.patch"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("document.search_text returns parse repair diagnostics when chunks are missing", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-document-search-before-parse-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "document search diagnostics",
+      researchQuestion: "Does document search explain missing parsed chunks?",
+      researchDirection: "Expose repair diagnostics instead of silently returning empty evidence.",
+      successCriterion: "Search before parsing points the model to document.parse."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "document-tools"]);
+    await seedCanonicalWorkspaceSource({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      sourceId: "source-document-needs-parse",
+      bestAccessUrl: `data:text/plain,${encodeURIComponent("Abstract\nBenchmark diagnostics need parsed chunks.")}`
+    });
+
+    const backend = new DocumentSearchBeforeParseBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const searchResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "document.search_text");
+
+    assert.equal(exitCode, 0);
+    assert.equal(workStore.objects.documents.length, 1);
+    assert.equal(workStore.objects.documentChunks.length, 0);
+    assert.equal(searchResult?.status, "blocked");
+    assert.match(searchResult?.message ?? "", /not been parsed/i);
+    assert.ok(searchResult?.nextHints?.includes("document.parse"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("full-text extraction and evidence provenance rejects unknown document chunks", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-invalid-document-provenance-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "document provenance",
+      researchQuestion: "Can full-text provenance claim nonexistent chunks?",
+      researchDirection: "Reject invalid document chunk ids with compiler-like repair context.",
+      successCriterion: "Unknown chunk ids block evidence creation without deleting the valid extraction."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "document-tools"]);
+    await seedCanonicalWorkspaceSource({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      sourceId: "source-invalid-provenance"
+    });
+
+    const backend = new InvalidDocumentProvenanceBackend();
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const evidenceResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "evidence.create_cell");
+
+    assert.equal(exitCode, 0);
+    assert.equal(workStore.objects.extractions.length, 1);
+    assert.equal(workStore.objects.evidenceCells.length, 0);
+    assert.equal(evidenceResult?.status, "blocked");
+    assert.match(evidenceResult?.message ?? "", /documentChunkIds were not found/i);
+    assert.deepEqual(evidenceResult?.query?.unknownDocumentChunkIds, ["missing-document-chunk"]);
+    assert.ok(evidenceResult?.nextHints?.includes("document.list_chunks"));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }
@@ -7327,7 +7979,11 @@ test("claim.link_support failures return repair context without auto-approving s
     assert.equal(exitCode, 0);
     assert.equal(workStore.objects.citations.length, 0);
     assert.equal(blockedSupport?.collection, "citations");
+    assert.match(blockedSupport?.message ?? "", /evidenceCellId is required/i);
+    assert.match(blockedSupport?.message ?? "", /runtime will not choose an evidence cell/i);
     assert.match(blockedSupport?.message ?? "", /Only link support when the evidence snippet actually supports the claim/i);
+    assert.deepEqual(blockedSupport?.query?.missing, ["evidenceCellId"]);
+    assert.equal((blockedSupport?.stateDelta as { supportLinksCreated?: number } | undefined)?.supportLinksCreated ?? 0, 0);
     assert.ok(blockedSupport?.items?.some((item) => item.kind === "claim"));
     assert.ok(blockedSupport?.related?.some((item) => item.kind === "evidenceCell"));
     assert.ok(blockedSupport?.nextHints?.includes("evidence.create_cell"));
@@ -7901,7 +8557,68 @@ test("explicit manuscript.finalize fails visibly when release invariants are mis
     assert.equal(releaseResult?.status, "not_ready");
     assert.equal(releaseResult?.stateDelta?.manuscriptFinalized, 0);
     assert.ok(releaseResult?.related?.some((item) => item.kind === "releaseRepair" && item.fields?.suggestedActions !== undefined));
-    assert.ok(releaseResult?.related?.some((item) => item.kind === "notebookReadinessRepair" && item.fields?.patchTarget === "notebook.readiness"));
+  } finally {
+    await rm(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("manuscript.finalize requires an explicit finalization declaration", async () => {
+  const projectRoot = await mkdtemp(path.join(os.tmpdir(), "clawresearch-finalization-declaration-required-"));
+  const now = createNow();
+
+  try {
+    const runStore = new RunStore(projectRoot, "0.7.0", now);
+    const brief = {
+      topic: "model-driven research workspaces",
+      researchQuestion: "Can finalization proceed without a model-authored finalization declaration?",
+      researchDirection: "Seed a mechanically linked report and omit the explicit finalization declaration.",
+      successCriterion: "Finalization should be blocked by a compiler-style declaration diagnostic."
+    };
+    const run = await runStore.create(brief, ["clawresearch", "artifact-contract"]);
+    await seedThinReviewWorkspace({
+      projectRoot,
+      runId: run.id,
+      brief,
+      now,
+      artifactType: "research_report",
+      sourceCount: 3,
+      extractedCount: 3,
+      evidenceCount: 3,
+      citedCount: 3
+    });
+
+    const backend = new CriticThenFinalizeSeededWorkspaceBackend("research_report", false);
+    const exitCode = await runDetachedJobWorker({
+      projectRoot,
+      runId: run.id,
+      version: "0.7.0",
+      now,
+      researchBackend: backend
+    });
+
+    const completedRun = await runStore.load(run.id);
+    const workStore = await loadResearchWorkStore({
+      projectRoot,
+      now: now()
+    });
+    const finalizeResult = backend.researchRequests
+      .flatMap((request) => request.toolResults ?? [])
+      .find((result) => result.action === "manuscript.finalize");
+
+    assert.equal(exitCode, 0);
+    assert.equal(backend.criticRequests.length, 1);
+    await assert.rejects(readFile(completedRun.artifacts.paperPath, "utf8"), /ENOENT/);
+    assert.equal(workStore.worker.completion, null);
+    assert.equal(finalizeResult?.status, "not_ready");
+    assert.match(finalizeResult?.message ?? "", /Finalization declaration is missing or invalid/i);
+    assert.equal(finalizeResult?.stateDelta?.manuscriptFinalized, 0);
+    assert.ok((finalizeResult?.stateDelta?.artifactContractFailures ?? 0) > 0);
+    assert.ok(finalizeResult?.related?.some((item) => (
+      item.kind === "artifactContractDiagnostic"
+        && item.fields?.finalizationDeclarationPresent === false
+    )));
+    assert.ok(finalizeResult?.nextHints?.includes("manuscript.finalize"));
+    assert.ok(finalizeResult?.nextHints?.includes("notebook.read"));
   } finally {
     await rm(projectRoot, { recursive: true, force: true });
   }

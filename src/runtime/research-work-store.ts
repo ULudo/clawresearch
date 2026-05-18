@@ -1,7 +1,7 @@
 import { access, mkdir, readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
-import type { CanonicalPaper, LiteratureContext } from "./literature-store.js";
+import { createLiteratureEntityId, type CanonicalPaper, type LiteratureContext } from "./literature-store.js";
 import type { ReviewProtocol } from "./research-manuscript.js";
 import type { ResearchPlan } from "./research-backend.js";
 import type { CriticReviewArtifact, CriticReviewScope } from "./research-critic.js";
@@ -22,7 +22,6 @@ export type WorkStoreEntityKind =
   | "source"
   | "canonicalSource"
   | "screeningDecision"
-  | "fullTextRecord"
   | "document"
   | "documentChunk"
   | "extraction"
@@ -39,7 +38,6 @@ export type WorkStoreCollectionName =
   | "sources"
   | "canonicalSources"
   | "screeningDecisions"
-  | "fullTextRecords"
   | "documents"
   | "documentChunks"
   | "extractions"
@@ -317,19 +315,6 @@ export type WorkStoreScreeningDecision = WorkStoreBaseEntity & {
   rationale: string | null;
 };
 
-export type WorkStoreFullTextRecord = WorkStoreBaseEntity & {
-  kind: "fullTextRecord";
-  sourceId: string;
-  accessMode: string;
-  format: string;
-  url: string | null;
-  providerId: string | null;
-  fulltextAvailable: boolean;
-  fulltextFetched: boolean;
-  fulltextExtracted: boolean;
-  errors: string[];
-};
-
 export type WorkStoreDocument = WorkStoreBaseEntity & {
   kind: "document";
   sourceId: string;
@@ -473,7 +458,6 @@ export type WorkStoreEntity =
   | WorkStoreSource
   | WorkStoreCanonicalSource
   | WorkStoreScreeningDecision
-  | WorkStoreFullTextRecord
   | WorkStoreDocument
   | WorkStoreDocumentChunk
   | WorkStoreExtraction
@@ -513,7 +497,6 @@ export type ResearchWorkStoreObjects = {
   sources: WorkStoreSource[];
   canonicalSources: WorkStoreCanonicalSource[];
   screeningDecisions: WorkStoreScreeningDecision[];
-  fullTextRecords: WorkStoreFullTextRecord[];
   documents: WorkStoreDocument[];
   documentChunks: WorkStoreDocumentChunk[];
   extractions: WorkStoreExtraction[];
@@ -805,7 +788,6 @@ function createEmptyObjects(): ResearchWorkStoreObjects {
     sources: [],
     canonicalSources: [],
     screeningDecisions: [],
-    fullTextRecords: [],
     documents: [],
     documentChunks: [],
     extractions: [],
@@ -1103,7 +1085,6 @@ function normalizeObjects(value: unknown): ResearchWorkStoreObjects {
     sources: normalizeEntityArray(record.sources, "source"),
     canonicalSources: normalizeEntityArray(record.canonicalSources, "canonicalSource"),
     screeningDecisions: normalizeEntityArray(record.screeningDecisions, "screeningDecision"),
-    fullTextRecords: normalizeEntityArray(record.fullTextRecords, "fullTextRecord"),
     documents: normalizeEntityArray(record.documents, "document"),
     documentChunks: normalizeEntityArray(record.documentChunks, "documentChunk"),
     extractions: normalizeEntityArray(record.extractions, "extraction"),
@@ -1168,8 +1149,6 @@ function collectionNameForKind(kind: WorkStoreEntityKind): WorkStoreCollectionNa
       return "canonicalSources";
     case "screeningDecision":
       return "screeningDecisions";
-    case "fullTextRecord":
-      return "fullTextRecords";
     case "document":
       return "documents";
     case "documentChunk":
@@ -1340,25 +1319,6 @@ function generatedScreeningDecision(source: WorkStoreCanonicalSource): WorkStore
   };
 }
 
-function generatedFullTextRecord(source: WorkStoreCanonicalSource): WorkStoreFullTextRecord {
-  return {
-    id: stableId("fulltext", [source.id]),
-    kind: "fullTextRecord",
-    runId: source.runId,
-    createdAt: source.createdAt,
-    updatedAt: source.updatedAt,
-    sourceId: source.id,
-    accessMode: source.accessMode,
-    format: "unknown",
-    url: source.bestAccessUrl,
-    providerId: source.providerIds[0] ?? null,
-    fulltextAvailable: source.accessMode === "fulltext" || source.bestAccessUrl !== null,
-    fulltextFetched: false,
-    fulltextExtracted: false,
-    errors: []
-  };
-}
-
 function loadWorkspaceDatabase(input: {
   projectRoot: string;
   brief?: ResearchBrief | null;
@@ -1413,7 +1373,6 @@ function loadWorkspaceDatabase(input: {
         sources: rawSources,
         canonicalSources: sources,
         screeningDecisions: sources.flatMap((source) => generatedScreeningDecision(source) ?? []),
-        fullTextRecords: sources.map((source) => generatedFullTextRecord(source)),
         documents,
         documentChunks,
         extractions,
@@ -1867,25 +1826,6 @@ function screeningDecisionsFromPaper(run: RunRecord, paper: CanonicalPaper, now:
   }));
 }
 
-function fullTextRecordFromPaper(run: RunRecord, paper: CanonicalPaper, now: string): WorkStoreFullTextRecord {
-  return {
-    id: stableId("fulltext", [paper.id]),
-    kind: "fullTextRecord",
-    runId: run.id,
-    createdAt: now,
-    updatedAt: now,
-    sourceId: paper.id,
-    accessMode: paper.accessMode,
-    format: paper.fulltextFormat,
-    url: paper.bestAccessUrl,
-    providerId: paper.bestAccessProvider,
-    fulltextAvailable: paper.contentStatus.fulltextAvailable,
-    fulltextFetched: paper.contentStatus.fulltextFetched,
-    fulltextExtracted: paper.contentStatus.fulltextExtracted,
-    errors: paper.accessErrors
-  };
-}
-
 function extractionEntity(run: RunRecord, extraction: PaperExtraction, now: string): WorkStoreExtraction {
   return {
     id: extraction.id,
@@ -1976,7 +1916,6 @@ export function mergeRunSegmentIntoResearchWorkStore(
     ...(gathered?.sources ?? []).map((source) => sourceFromResearchSource(run, source, now)),
     ...canonicalPapers.map((paper) => canonicalSourceFromPaper(run, paper, now)),
     ...canonicalPapers.flatMap((paper) => screeningDecisionsFromPaper(run, paper, now)),
-    ...canonicalPapers.map((paper) => fullTextRecordFromPaper(run, paper, now)),
     ...paperExtractions.map((extraction) => extractionEntity(run, extraction, now)),
     ...workItemsFromCriticReports(run, criticReports, now)
   ];
@@ -1995,7 +1934,6 @@ export type WorkspacePromptContext = {
     sources: number;
     canonicalSources: number;
     screeningDecisions: number;
-    fullTextRecords: number;
     documents: number;
     documentChunks: number;
     extractions: number;
@@ -2146,6 +2084,15 @@ function diagnosticSelectedSourceIds(store: ResearchWorkStore): string[] {
   return explicitSelectedSourceIds(store);
 }
 
+function sourceEquivalentIds(store: ResearchWorkStore, sourceId: string): string[] {
+  const source = store.objects.canonicalSources.find((candidate) => (
+    candidate.id === sourceId || createLiteratureEntityId("paper", candidate.key) === sourceId
+  ));
+  return source === undefined
+    ? [sourceId]
+    : uniqueStrings([source.id, createLiteratureEntityId("paper", source.key)], 4);
+}
+
 export function buildWorkspaceDispositionDiagnostics(
   store: ResearchWorkStore,
   options: { renderedReferenceSourceIds?: string[] } = {}
@@ -2215,9 +2162,12 @@ export function buildResearchCorpusDiagnosticView(
   const chunkGroundedExtractionSourceIds = new Set(store.objects.extractions
     .filter((extraction) => researchObjectIsActive(extraction) && (extraction.documentChunkIds?.length ?? 0) > 0)
     .map((extraction) => extraction.sourceId));
-  const fullTextSelectedSourceIds = store.objects.fullTextRecords
-    .filter((record) => selectedSourceIdSet.has(record.sourceId) && record.fulltextAvailable)
-    .map((record) => record.sourceId);
+  const fullTextSelectedSourceIds = store.objects.canonicalSources
+    .filter((source) => (
+      source.bestAccessUrl !== null
+      && sourceEquivalentIds(store, source.id).some((sourceId) => selectedSourceIdSet.has(sourceId))
+    ))
+    .map((source) => source.id);
 
   return {
     diagnosticOnly: true,
@@ -2565,7 +2515,6 @@ export function buildWorkspacePromptContextFromWorkStore(store: ResearchWorkStor
       sources: store.objects.sources.length,
       canonicalSources: store.objects.canonicalSources.length,
       screeningDecisions: store.objects.screeningDecisions.length,
-      fullTextRecords: store.objects.fullTextRecords.length,
       documents: store.objects.documents.length,
       documentChunks: store.objects.documentChunks.length,
       extractions: store.objects.extractions.length,

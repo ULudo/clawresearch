@@ -82,7 +82,6 @@ function emptyWorkspaceContext(): WorkspacePromptContext {
       sources: 0,
       canonicalSources: 0,
       screeningDecisions: 0,
-      fullTextRecords: 0,
       documents: 0,
       documentChunks: 0,
       extractions: 0,
@@ -466,7 +465,15 @@ test("research-agent backend uses native tool calls by default", async () => {
       "workspace.status"
     ]);
     const workStoreSchema = capturedBody.tools?.[0]?.function?.parameters?.properties?.inputs?.properties?.workStore?.properties;
+    assert.ok(workStoreSchema?.collection?.enum?.includes("documents"));
+    assert.ok(workStoreSchema?.collection?.enum?.includes("documentChunks"));
     const entitySchema = workStoreSchema?.entity;
+    assert.deepEqual(entitySchema?.properties?.finalizationDeclaration?.required, [
+      "intendedArtifact",
+      "notCheckpoint",
+      "readinessBasis",
+      "knownLimitations"
+    ]);
     const typedEntityFields = [
       "sourceId",
       "sourceIds",
@@ -477,6 +484,7 @@ test("research-agent backend uses native tool calls by default", async () => {
       "documentChunkIds",
       "url",
       "readLevel",
+      "finalizationDeclaration",
       "field",
       "value",
       "text",
@@ -499,7 +507,10 @@ test("research-agent backend uses native tool calls by default", async () => {
 	      "statusReason",
 	      "orderIndex",
 	      "sectionOrder",
-	      "nextInternalActions"
+	      "nextInternalActions",
+	      "notes",
+	      "note",
+	      "notesMode"
 	    ];
     for (const field of typedEntityFields) {
       assert.ok(entitySchema?.properties?.[field], `workStore.entity.${field} should be model-facing`);
@@ -516,11 +527,13 @@ test("research-agent backend uses native tool calls by default", async () => {
     assert.match(capturedBody.messages?.[0]?.content ?? "", /lab manual/i);
     assert.match(capturedBody.messages?.[0]?.content ?? "", /Action recipes:/);
     assert.match(capturedBody.messages?.[0]?.content ?? "", /extraction\.create: set workStore\.entity\.sourceId or paperId/i);
+    assert.match(capturedBody.messages?.[0]?.content ?? "", /include known documentChunkIds/i);
     assert.match(capturedBody.messages?.[0]?.content ?? "", /evidence\.create_cell: set workStore\.entity\.sourceId or paperId/i);
 	    assert.match(capturedBody.messages?.[0]?.content ?? "", /claim\.link_support: set workStore\.entity\.mode to append\|replace\|remove/i);
 	    assert.match(capturedBody.messages?.[0]?.content ?? "", /section\.patch: use operation replace_all/i);
     assert.match(capturedBody.messages?.[0]?.content ?? "", /sourceIdsMode append\|replace\|remove\|recompute_from_claims/i);
 	    assert.match(capturedBody.messages?.[0]?.content ?? "", /set_order/i);
+    assert.match(capturedBody.messages?.[0]?.content ?? "", /manuscript\.finalize: include workStore\.entity\.finalizationDeclaration/i);
     assert.doesNotMatch(capturedBody.messages?.[0]?.content ?? "", /bounded first-pass/i);
   } finally {
     globalThis.fetch = originalFetch;

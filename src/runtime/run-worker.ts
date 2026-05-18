@@ -365,7 +365,6 @@ const workStoreCollections: WorkStoreCollectionName[] = [
   "sources",
   "canonicalSources",
   "screeningDecisions",
-  "fullTextRecords",
   "documents",
   "documentChunks",
   "extractions",
@@ -383,7 +382,6 @@ const workStoreEntityKinds: WorkStoreEntityKind[] = [
   "source",
   "canonicalSource",
   "screeningDecision",
-  "fullTextRecord",
   "document",
   "documentChunk",
   "extraction",
@@ -407,7 +405,7 @@ function workStoreContextForAgent(store: ResearchWorkStore): ResearchActionReque
     sourceCandidates: store.objects.sources.length,
     canonicalSources: store.objects.canonicalSources.length,
     screenedInSources: store.objects.canonicalSources.filter((source) => source.screeningDecision === "include").length,
-    fullTextAvailableSources: store.objects.fullTextRecords.filter((record) => record.fulltextAvailable).length,
+    fullTextAvailableSources: store.objects.canonicalSources.filter((source) => source.bestAccessUrl !== null && source.accessMode !== "metadata_only").length,
     fetchedDocuments: store.objects.documents.length,
     parsedDocuments: store.objects.documents.filter((document) => document.status === "parsed").length,
     documentChunks: store.objects.documentChunks.length,
@@ -720,11 +718,19 @@ function patchNotebook(input: {
     upsertTask(taskFromNotebookPatch({ run: input.run, nowText: input.nowText, entry: singleTask }));
   }
 
-  const notes = uniqueStrings([
-    ...input.store.notebook.notes,
-    ...stringArrayInput(input.entity.notes, 40),
+  const notesMode = stringInput(input.entity.notesMode, "append");
+  const patchedNotes = uniqueStrings([
+    ...stringArrayInput(input.entity.notes, 80),
     nullableStringInput(input.entity.note)
-  ]).slice(-80);
+  ]);
+  const notes = notesMode === "clear"
+    ? []
+    : notesMode === "replace"
+      ? patchedNotes.slice(-80)
+      : uniqueStrings([
+        ...input.store.notebook.notes,
+        ...patchedNotes
+      ]).slice(-80);
   const artifactLinks = [...input.store.notebook.artifactLinks];
   const upsertArtifactLink = (artifact: ResearchNotebookArtifactLink): void => {
     const index = artifactLinks.findIndex((existing) => existing.path === artifact.path && existing.label === artifact.label);
@@ -1011,13 +1017,6 @@ const workspaceFilterFieldHints: Record<WorkStoreCollectionName, string[]> = {
     "decision",
     "rationale",
     "confidence"
-  ],
-  fullTextRecords: [
-    ...commonWorkspaceFilterFields,
-    "sourceId",
-    "status",
-    "accessMode",
-    "url"
   ],
   documents: [
     ...commonWorkspaceFilterFields,
@@ -1700,23 +1699,6 @@ function entityPreviewForAgent(entity: WorkStoreEntity, store: ResearchWorkStore
           stage: entity.stage
         }
       };
-    case "fullTextRecord":
-      return {
-        id: entity.id,
-        kind: entity.kind,
-        sourceId: entity.sourceId,
-        sourceTitle: previewSourceTitle(store, entity.sourceId),
-        status: entity.accessMode,
-        fields: {
-          format: entity.format,
-          url: entity.url,
-          providerId: entity.providerId,
-          fulltextAvailable: entity.fulltextAvailable,
-          fulltextFetched: entity.fulltextFetched,
-          fulltextExtracted: entity.fulltextExtracted,
-          errors: entity.errors.slice(0, 4)
-        }
-      };
     case "document":
       return {
         id: entity.id,
@@ -1752,7 +1734,11 @@ function entityPreviewForAgent(entity: WorkStoreEntity, store: ResearchWorkStore
           sectionTitle: entity.sectionTitle,
           pageStart: entity.pageStart,
           pageEnd: entity.pageEnd,
-          tokenCount: entity.tokenCount
+          tokenCount: entity.tokenCount,
+          provenanceSourceId: entity.sourceId,
+          provenanceDocumentId: entity.documentId,
+          provenanceDocumentChunkIds: [entity.id],
+          provenanceReadLevel: "partial_full_text"
         }
       };
     case "providerRun":
@@ -2004,19 +1990,10 @@ function notebookReadinessRepairPreviews(issue: string | null): AgentVisibleEnti
   }];
 }
 
-function notebookReadinessTextIsExplicitRelease(readiness: string): boolean {
-  return /\b(ready|finali[sz]e|release|submit|export)\b/i.test(readiness)
-    && /\b(caveat|limitation|bounded|despite|sufficient|complete|meets?|satisfies|acceptable)\b/i.test(readiness);
-}
-
 function notebookFinalizationReadinessIssue(notebook: ResearchNotebook): string | null {
   const readiness = notebook.readiness.trim();
   if (readiness.length === 0 || readiness === defaultNotebookReadiness) {
     return "Research readiness has not been recorded in the notebook. Use notebook.patch to write the model-owned readiness assessment before manuscript.finalize.";
-  }
-  if (/\b(not sufficient|not ready|insufficient|needs more|not enough|unfinished|cannot finali[sz]e|blocked)\b/i.test(readiness)
-    && !notebookReadinessTextIsExplicitRelease(readiness)) {
-    return "Notebook readiness currently says the project is not sufficient or not ready. Patch notebook.readiness to an intentional release statement with caveats before manuscript.finalize.";
   }
   return null;
 }
@@ -2407,6 +2384,7 @@ function criticFreshnessEvaluationForStore(input: {
 type ArtifactContractEvaluation = {
   artifactType: ResearchArtifactType;
   requestedArtifactType: ResearchArtifactType;
+  finalizationDeclaration: FinalizationDeclarationEvaluation;
   canFinalize: boolean;
   supportedCheckpoint: ResearchArtifactType | null;
   failures: string[];
@@ -2415,6 +2393,17 @@ type ArtifactContractEvaluation = {
   disposition: ResearchWorkspaceDispositionDiagnostics;
   releaseCriticFreshness: CriticFreshnessEvaluation;
   researchContractCriticFreshness: CriticFreshnessEvaluation;
+};
+
+type FinalizationDeclarationEvaluation = {
+  required: boolean;
+  present: boolean;
+  valid: boolean;
+  intendedArtifact: ResearchArtifactType | null;
+  notCheckpoint: boolean | null;
+  readinessBasis: string | null;
+  knownLimitations: string[] | null;
+  problems: string[];
 };
 
 function requestedArtifactTypeFromToolInput(input: {
@@ -2430,19 +2419,79 @@ function requestedArtifactTypeFromToolInput(input: {
   );
 }
 
+function finalizationDeclarationFromToolInput(input: {
+  entity: Record<string, unknown>;
+  requestedArtifactType: ResearchArtifactType;
+  notebookArtifactType: ResearchArtifactType;
+  required: boolean;
+}): FinalizationDeclarationEvaluation {
+  const declaration = objectInput(input.entity.finalizationDeclaration)
+    ?? objectInput(input.entity.releaseDeclaration)
+    ?? objectInput(input.entity.finalization);
+  const problems: string[] = [];
+  if (declaration === null) {
+    return {
+      required: input.required,
+      present: false,
+      valid: !input.required,
+      intendedArtifact: null,
+      notCheckpoint: null,
+      readinessBasis: null,
+      knownLimitations: null,
+      problems: input.required
+        ? ["manuscript.finalize requires workStore.entity.finalizationDeclaration."]
+        : []
+    };
+  }
+
+  const intendedArtifactRaw = declaration.intendedArtifact ?? declaration.artifactType;
+  const intendedArtifact = typeof intendedArtifactRaw === "string"
+    ? normalizeResearchArtifactType(intendedArtifactRaw, input.requestedArtifactType)
+    : null;
+  const notCheckpoint = typeof declaration.notCheckpoint === "boolean"
+    ? declaration.notCheckpoint
+    : typeof declaration.checkpoint === "boolean"
+      ? !declaration.checkpoint
+      : null;
+  const readinessBasis = stringInput(declaration.readinessBasis ?? declaration.basis ?? declaration.reason, "");
+  const knownLimitationsValue = declaration.knownLimitations ?? declaration.limitations;
+  const knownLimitations = Array.isArray(knownLimitationsValue)
+    ? stringArrayInput(knownLimitationsValue, 40)
+    : null;
+
+  if (intendedArtifact === null) {
+    problems.push("finalizationDeclaration.intendedArtifact is required and must be a known artifactType.");
+  } else if (intendedArtifact !== input.notebookArtifactType || intendedArtifact !== input.requestedArtifactType) {
+    problems.push(`finalizationDeclaration.intendedArtifact is ${intendedArtifact}, but notebook artifactType is ${input.notebookArtifactType} and requested artifactType is ${input.requestedArtifactType}.`);
+  }
+  if (notCheckpoint !== true) {
+    problems.push("finalizationDeclaration.notCheckpoint must be true; manuscript.finalize is not a checkpoint export.");
+  }
+  if (readinessBasis.length === 0) {
+    problems.push("finalizationDeclaration.readinessBasis is required so the researcher explicitly states why this artifact contract is being finalized.");
+  }
+  if (knownLimitations === null) {
+    problems.push("finalizationDeclaration.knownLimitations must be an array; use [] if no limitations are being declared.");
+  }
+
+  return {
+    required: input.required,
+    present: true,
+    valid: problems.length === 0,
+    intendedArtifact,
+    notCheckpoint,
+    readinessBasis: readinessBasis.length === 0 ? null : readinessBasis,
+    knownLimitations,
+    problems
+  };
+}
+
 function uniqueSourceCount(values: string[]): number {
   return new Set(values.filter((value) => value.trim().length > 0)).size;
 }
 
 function manuscriptSectionMatches(section: WorkStoreManuscriptSection, pattern: RegExp): boolean {
   return pattern.test(`${section.sectionId} ${section.role} ${section.title} ${section.markdown}`);
-}
-
-function notebookReadinessAddressesArtifact(notebook: ResearchNotebook): boolean {
-  const readiness = notebook.readiness.toLowerCase();
-  const artifactWords = notebook.artifactType.replace(/_/g, " ").split(/\s+/);
-  return [...artifactWords, "paper", "review", "manuscript", "report"]
-    .some((word) => word.length > 3 && readiness.includes(word));
 }
 
 function artifactTypeNeedsReleaseCritic(artifactType: ResearchArtifactType): boolean {
@@ -2467,6 +2516,7 @@ function evaluateArtifactContract(input: {
   references: ReferencesArtifact;
   hardInvariantFailures: ManuscriptCheck[];
   requestedArtifactType: ResearchArtifactType;
+  finalizationDeclaration: FinalizationDeclarationEvaluation;
   criticAvailable: boolean;
   releaseCriticFreshness?: CriticFreshnessEvaluation;
 }): ArtifactContractEvaluation {
@@ -2507,6 +2557,15 @@ function evaluateArtifactContract(input: {
   if (input.requestedArtifactType !== store.notebook.artifactType) {
     failures.push(`Notebook artifactType is ${store.notebook.artifactType}, but manuscript.finalize requested ${input.requestedArtifactType}. Do not downgrade the artifact type just to stop; continue research or explicitly revise the model-owned notebook artifactType with a real research reason.`);
     nextHints.add("notebook.patch");
+  }
+
+  if (input.finalizationDeclaration.required && !input.finalizationDeclaration.valid) {
+    failures.push(`Finalization declaration is missing or invalid: ${input.finalizationDeclaration.problems.join(" ")}`);
+    nextHints.add("manuscript.finalize");
+    if (!input.finalizationDeclaration.present) {
+      nextHints.add("workspace.read");
+      nextHints.add("notebook.read");
+    }
   }
 
   if (input.hardInvariantFailures.length > 0) {
@@ -2614,10 +2673,6 @@ function evaluateArtifactContract(input: {
       failures.push("No manuscript section records limitations, caveats, or threats to validity.");
       nextHints.add("section.create");
     }
-    if (!notebookReadinessAddressesArtifact(store.notebook)) {
-      failures.push(`Notebook readiness does not explicitly state why ${store.notebook.artifactType} is ready. Patch the model-owned readiness assessment before finalization.`);
-      nextHints.add("notebook.patch");
-    }
   }
 
   if (!artifactTypeNeedsPaperStructure(store.notebook.artifactType) && releaseCriticFreshness.reviewReadiness === "block") {
@@ -2631,6 +2686,7 @@ function evaluateArtifactContract(input: {
   return {
     artifactType: store.notebook.artifactType,
     requestedArtifactType: input.requestedArtifactType,
+    finalizationDeclaration: input.finalizationDeclaration,
     canFinalize: failures.length === 0,
     supportedCheckpoint,
     failures,
@@ -2695,6 +2751,9 @@ function artifactContractPreviews(evaluation: ArtifactContractEvaluation): Agent
       fields: {
         artifactType: evaluation.artifactType,
         requestedArtifactType: evaluation.requestedArtifactType,
+        finalizationDeclarationPresent: evaluation.finalizationDeclaration.present,
+        finalizationDeclarationValid: evaluation.finalizationDeclaration.valid,
+        finalizationDeclarationProblems: evaluation.finalizationDeclaration.problems,
         supportedCheckpoint: evaluation.supportedCheckpoint,
         recommendedCriticScope: evaluation.researchContractCriticFreshness.status !== "fresh"
           || evaluation.researchContractCriticFreshness.reviewReadiness !== "pass"
@@ -2721,6 +2780,9 @@ function artifactContractPreviews(evaluation: ArtifactContractEvaluation): Agent
       fields: {
         artifactType: evaluation.artifactType,
         requestedArtifactType: evaluation.requestedArtifactType,
+        finalizationDeclarationPresent: evaluation.finalizationDeclaration.present,
+        finalizationDeclarationValid: evaluation.finalizationDeclaration.valid,
+        finalizationDeclarationProblems: evaluation.finalizationDeclaration.problems,
         supportedCheckpoint: evaluation.supportedCheckpoint,
         recommendedCriticScope: evaluation.researchContractCriticFreshness.status !== "fresh"
           || evaluation.researchContractCriticFreshness.reviewReadiness !== "pass"
@@ -2785,16 +2847,6 @@ function renderableSourceIdForSupport(store: ResearchWorkStore, sourceId: string
   return store.objects.canonicalSources.find((candidate) => (
     candidate.id === sourceId || createLiteratureEntityId("paper", candidate.key) === sourceId
   ))?.id ?? sourceId;
-}
-
-function evidenceCellForSourceSupport(store: ResearchWorkStore, sourceId: string): WorkStoreEvidenceCell | null {
-  const equivalentIds = new Set(sourceEquivalentIds(store, sourceId));
-  return store.objects.evidenceCells.find((cell) => (
-    researchObjectIsActive(cell)
-    && equivalentIds.has(cell.sourceId)
-    && cell.field !== "confidence"
-    && meaningfulSupportSnippet(cell.value) !== null
-  )) ?? null;
 }
 
 function activeCitationsForClaim(store: ResearchWorkStore, claimId: string): WorkStoreCitation[] {
@@ -3168,9 +3220,7 @@ function supportLinkFromInput(input: {
   if (input.evidenceCellId !== null && requestedEvidenceCell === null) {
     return null;
   }
-  const evidenceCell = requestedEvidenceCell
-    ?? evidenceCellForSourceSupport(input.store, input.sourceId)
-    ?? null;
+  const evidenceCell = requestedEvidenceCell;
   if (evidenceCell === null) {
     return null;
   }
@@ -3326,63 +3376,6 @@ function evidenceCellQualityWarnings(cell: WorkStoreEvidenceCell): string[] {
   }
 
   return warnings;
-}
-
-function repairWorkspaceCitationsFromClaimSources(input: {
-  run: RunRecord;
-  now: string;
-  store: ResearchWorkStore;
-}): { store: ResearchWorkStore; repairedCount: number } {
-  const knownSourceIds = new Set(input.store.objects.canonicalSources.map((source) => source.id));
-  let nextStore = input.store;
-  let repairedCount = 0;
-
-  for (const claim of input.store.objects.claims) {
-    const sectionIds = input.store.objects.manuscriptSections
-      .filter((section) => section.claimIds.includes(claim.id))
-      .map((section) => section.id);
-    if (sectionIds.length === 0) {
-      continue;
-    }
-    for (const sourceId of claim.sourceIds.filter((candidate) => knownSourceIds.has(candidate))) {
-      const alreadyLinked = nextStore.objects.citations.some((citation) => (
-        researchObjectIsActive(citation) && citation.sourceId === sourceId && citation.claimIds.includes(claim.id)
-      ));
-      if (alreadyLinked) {
-        continue;
-      }
-      const evidenceCell = evidenceCellForSourceSupport(input.store, sourceId);
-      if (evidenceCell === null) {
-        continue;
-      }
-
-      const citation: WorkStoreCitation = {
-        id: generatedSupportLinkId(input.run, claim.id, sourceId, evidenceCell?.id ?? null),
-        kind: "citation",
-        runId: input.run.id,
-        createdAt: input.now,
-        updatedAt: input.now,
-        status: "active",
-        supersededBy: null,
-        statusReason: null,
-        sourceId,
-        sourceTitle: sourceTitleForSupport(input.store, sourceId),
-        evidenceCellId: evidenceCell?.id ?? null,
-        supportSnippet: meaningfulSupportSnippet(evidenceCell?.value, claim.evidence, claim.text) ?? claim.text,
-        confidence: claim.confidence,
-        relevance: "recovered_from_claim_source",
-        claimIds: [claim.id],
-        sectionIds
-      };
-      nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(nextStore, citation, input.now);
-      repairedCount += 1;
-    }
-  }
-
-  return {
-    store: nextStore,
-    repairedCount
-  };
 }
 
 type SupportReadinessIssue = {
@@ -4008,6 +4001,145 @@ function documentChunksForToolInput(input: {
     .sort((left, right) => left.chunkIndex - right.chunkIndex);
 }
 
+function documentCursorOffset(cursor: string | null | undefined): number {
+  if (cursor === null || cursor === undefined) {
+    return 0;
+  }
+  const match = /^documentChunks:(\d+)$/.exec(cursor.trim());
+  return match === null ? 0 : Number.parseInt(match[1], 10);
+}
+
+function documentProvenanceRelatedPreviews(input: {
+  store: ResearchWorkStore;
+  sourceId: string;
+  documentId?: string | null;
+}): AgentVisibleEntityPreview[] {
+  const equivalentIds = new Set(sourceEquivalentIds(input.store, input.sourceId));
+  const documents = input.store.objects.documents
+    .filter((document) => equivalentIds.has(document.sourceId))
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  const documentIds = new Set([
+    ...(input.documentId === undefined || input.documentId === null ? [] : [input.documentId]),
+    ...documents.map((document) => document.id)
+  ]);
+  const chunks = input.store.objects.documentChunks
+    .filter((chunk) => equivalentIds.has(chunk.sourceId) && (documentIds.size === 0 || documentIds.has(chunk.documentId)))
+    .sort((left, right) => left.chunkIndex - right.chunkIndex);
+
+  return [
+    ...documents.slice(0, 6).map((document) => entityPreviewForAgent(document, input.store)),
+    ...chunks.slice(0, 12).map((chunk) => entityPreviewForAgent(chunk, input.store))
+  ];
+}
+
+function validateDocumentProvenance(input: {
+  store: ResearchWorkStore;
+  source: WorkStoreCanonicalSource;
+  entity: Record<string, unknown>;
+  readLevel: WorkStoreExtraction["readLevel"] | WorkStoreEvidenceCell["readLevel"];
+}): {
+  ok: boolean;
+  message: string | null;
+  related: AgentVisibleEntityPreview[];
+  query: Record<string, unknown>;
+  nextHints: string[];
+} {
+  const documentId = stringInput(input.entity.documentId, "");
+  const documentChunkIds = stringArrayInput(input.entity.documentChunkIds ?? input.entity.chunkIds, 40);
+  const sourceIds = new Set(sourceEquivalentIds(input.store, input.source.id));
+  const document = documentId.length === 0
+    ? null
+    : readResearchWorkStoreEntity<WorkStoreDocument>(input.store, "documents", documentId);
+  const chunks = documentChunkIds.flatMap((chunkId) => {
+    const chunk = readResearchWorkStoreEntity<WorkStoreDocumentChunk>(input.store, "documentChunks", chunkId);
+    return chunk === null ? [] : [chunk];
+  });
+  const unknownChunkIds = documentChunkIds.filter((chunkId) => (
+    readResearchWorkStoreEntity<WorkStoreDocumentChunk>(input.store, "documentChunks", chunkId) === null
+  ));
+  const query = {
+    sourceId: input.source.id,
+    readLevel: input.readLevel ?? null,
+    documentId: documentId || null,
+    documentChunkIds,
+    unknownDocumentChunkIds: unknownChunkIds
+  };
+  const related = documentProvenanceRelatedPreviews({
+    store: input.store,
+    sourceId: input.source.id,
+    documentId: documentId || null
+  });
+  const nextHints = ["document.fetch", "document.parse", "document.list_chunks", "document.read_chunk", "document.search_text"];
+
+  if (documentId.length > 0 && document === null) {
+    return {
+      ok: false,
+      message: `Document provenance blocked because documentId ${documentId} was not found.`,
+      related,
+      query,
+      nextHints
+    };
+  }
+  if (document !== null && !sourceIds.has(document.sourceId)) {
+    return {
+      ok: false,
+      message: `Document provenance blocked because document ${document.id} belongs to source ${document.sourceId}, not source ${input.source.id}.`,
+      related,
+      query,
+      nextHints
+    };
+  }
+  if (unknownChunkIds.length > 0) {
+    return {
+      ok: false,
+      message: `Document provenance blocked because documentChunkIds were not found: ${unknownChunkIds.join(", ")}.`,
+      related,
+      query,
+      nextHints
+    };
+  }
+  const wrongSourceChunks = chunks.filter((chunk) => !sourceIds.has(chunk.sourceId));
+  if (wrongSourceChunks.length > 0) {
+    return {
+      ok: false,
+      message: `Document provenance blocked because chunk(s) ${wrongSourceChunks.map((chunk) => chunk.id).join(", ")} belong to a different source.`,
+      related,
+      query,
+      nextHints
+    };
+  }
+  const requestedDocument = document;
+  const wrongDocumentChunks = requestedDocument === null
+    ? []
+    : chunks.filter((chunk) => chunk.documentId !== requestedDocument.id);
+  if (wrongDocumentChunks.length > 0) {
+    return {
+      ok: false,
+      message: `Document provenance blocked because chunk(s) ${wrongDocumentChunks.map((chunk) => chunk.id).join(", ")} do not belong to document ${requestedDocument?.id ?? documentId}.`,
+      related,
+      query,
+      nextHints
+    };
+  }
+  if ((input.readLevel === "partial_full_text" || input.readLevel === "full_text") && documentChunkIds.length === 0) {
+    return {
+      ok: false,
+      message: `Document provenance blocked because readLevel ${input.readLevel} requires known documentChunkIds. Use document.list_chunks/read_chunk/search_text, or set readLevel to abstract/metadata if the claim is not full-text grounded.`,
+      related,
+      query,
+      nextHints
+    };
+  }
+
+  return {
+    ok: true,
+    message: null,
+    related,
+    query,
+    nextHints
+  };
+}
+
 function supportedClaimsFromToolInput(value: unknown): PaperExtraction["supportedClaims"] {
   if (!Array.isArray(value)) {
     return [];
@@ -4160,7 +4292,7 @@ function claimFromToolInput(input: {
     createdAt: input.now,
     updatedAt: input.now,
     text,
-    evidence: stringInput(entity.evidence, input.decision.expectedOutcome),
+    evidence: stringInput(entity.evidence, "Model-authored claim. Durable support still requires claim.link_support with an explicit evidenceCellId."),
     sourceIds,
     supportStatus: sourceIds.length > 0 ? "unchecked" : "weak",
     confidence: stringInput(entity.confidence, sourceIds.length > 0 ? "medium" : "low"),
@@ -5827,7 +5959,11 @@ async function executeResearchObjectToolAction(input: {
 
   if (input.decision.action === "document.list_chunks") {
     const chunks = documentChunksForToolInput({ store: input.store, entity: args.entity });
-    const message = `Document chunk list returned ${chunks.length} chunk(s).`;
+    const limit = Math.max(1, Math.min(args.limit ?? 20, 80));
+    const offset = Math.min(documentCursorOffset(args.cursor), chunks.length);
+    const page = chunks.slice(offset, offset + limit);
+    const nextCursor = offset + page.length < chunks.length ? `documentChunks:${offset + page.length}` : null;
+    const message = `Document chunk list returned ${page.length}/${chunks.length} chunk(s).`;
     return {
       handled: true,
       store: input.store,
@@ -5839,9 +5975,12 @@ async function executeResearchObjectToolAction(input: {
         readOnly: true,
         message,
         collection: "documentChunks",
-        count: chunks.length,
+        count: page.length,
         totalCount: chunks.length,
-        items: chunks.slice(0, Math.max(1, Math.min(args.limit ?? 20, 80))).map((chunk) => entityPreviewForAgent(chunk, input.store)),
+        cursor: args.cursor,
+        hasMore: nextCursor !== null,
+        nextCursor,
+        items: page.map((chunk) => entityPreviewForAgent(chunk, input.store)),
         nextHints: ["document.read_chunk", "document.search_text", "extraction.create"]
       })
     };
@@ -5867,6 +6006,14 @@ async function executeResearchObjectToolAction(input: {
         collection: "documentChunks",
         count: chunk === null ? 0 : 1,
         totalCount: chunk === null ? 0 : 1,
+        query: chunk === null ? { requestedDocumentChunkId: chunkId || null } : {
+          provenanceTemplate: {
+            sourceId: chunk.sourceId,
+            documentId: chunk.documentId,
+            documentChunkIds: [chunk.id],
+            readLevel: "partial_full_text"
+          }
+        },
         entity: chunk === null ? null : entityPreviewForAgent(chunk, input.store),
         items: chunk === null ? documentChunksForToolInput({ store: input.store, entity: args.entity }).slice(0, 12).map((entry) => entityPreviewForAgent(entry, input.store)) : [],
         nextHints: chunk === null ? ["document.list_chunks"] : ["extraction.create", "evidence.create_cell"]
@@ -5878,6 +6025,37 @@ async function executeResearchObjectToolAction(input: {
     const query = stringInput(args.semanticQuery ?? args.entity.query ?? args.entity.text, "");
     const terms = query.toLowerCase().split(/[^a-z0-9]+/).filter((term) => term.length > 2);
     const baseChunks = documentChunksForToolInput({ store: input.store, entity: args.entity });
+    if (baseChunks.length === 0) {
+      const document = documentFromToolInput({ store: input.store, entity: args.entity });
+      const source = knownSourceFromToolInput({
+        store: input.store,
+        decision: input.decision,
+        entity: args.entity
+      });
+      const message = document === null
+        ? "Document text search returned no chunks because no fetched/parsed document was found for the requested source."
+        : `Document text search returned no chunks because document ${document.id} has not been parsed into readable chunks.`;
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "blocked",
+          readOnly: true,
+          message,
+          collection: "documentChunks",
+          query: { semanticQuery: query },
+          count: 0,
+          totalCount: 0,
+          entity: document === null ? null : entityPreviewForAgent(document, input.store),
+          items: document === null && source !== null ? [entityPreviewForAgent(source, input.store)] : [],
+          nextHints: document === null ? ["document.fetch", "workspace.read"] : ["document.parse", "document.list_chunks"]
+        })
+      };
+    }
     const scored = baseChunks
       .map((chunk) => ({
         chunk,
@@ -6414,6 +6592,40 @@ async function executeResearchObjectToolAction(input: {
     const resolvedSourceId = sourceId.length > 0
       ? sourceId
       : evidenceCell?.sourceId ?? "";
+    if (mode !== "remove" && evidenceCellId.length === 0) {
+      const message = "claim.link_support append/replace blocked because evidenceCellId is required. The runtime will not choose an evidence cell for the researcher.";
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: claimLinkSupportBlockedResult({
+          run: input.run,
+          timestamp: nowText,
+          message,
+          store: input.store,
+          sourceId: resolvedSourceId.length > 0 ? resolvedSourceId : null,
+          query: {
+            missing: ["evidenceCellId"],
+            mode,
+            claimId,
+            sourceId: resolvedSourceId.length > 0 ? resolvedSourceId : null,
+            retryShape: {
+              action: "claim.link_support",
+              workStore: {
+                entity: {
+                  mode,
+                  claimId: claimId ?? "<claim-id>",
+                  evidenceCellId: "<evidence-cell-id>",
+                  sourceId: resolvedSourceId.length > 0 ? resolvedSourceId : "<source-id>",
+                  supportSnippet: "<source-derived snippet>"
+                }
+              }
+            }
+          },
+          nextHints: ["workspace.list", "evidence.create_cell", "claim.link_support"]
+        })
+      };
+    }
     if (claimId === null || (mode !== "remove" && resolvedSourceId.length === 0)) {
       const missing = [
         claimId === null ? "claimId" : null,
@@ -6859,6 +7071,32 @@ async function executeResearchObjectToolAction(input: {
       ...args.changes,
       ...lifecyclePatch
     };
+    const requestedReadLevel = safeReadLevel(args.entity.readLevel ?? args.changes.readLevel);
+    if (requestedReadLevel !== undefined) {
+      changes.readLevel = requestedReadLevel;
+    }
+    const requestedDocumentId = args.entity.documentId ?? args.changes.documentId;
+    if (typeof requestedDocumentId === "string" || requestedDocumentId === null) {
+      changes.documentId = requestedDocumentId === null ? null : stringInput(requestedDocumentId, "");
+    }
+    const requestedDocumentChunkIds = args.entity.documentChunkIds ?? args.entity.chunkIds ?? args.changes.documentChunkIds ?? args.changes.chunkIds;
+    if (Array.isArray(requestedDocumentChunkIds)) {
+      changes.documentChunkIds = stringArrayInput(requestedDocumentChunkIds, 80);
+    }
+    const snippetPatchRequested = [
+      "sourceSnippets",
+      "supportSnippets",
+      "quotes",
+      "sourceSnippet",
+      "supportSnippet",
+      "quote"
+    ].some((field) => field in args.entity || field in args.changes);
+    if (snippetPatchRequested) {
+      changes.sourceSnippets = sourceSnippetsFromEntity({
+        ...args.changes,
+        ...args.entity
+      });
+    }
     for (const field of Object.keys(extractionFieldPatch)) {
       delete changes[field];
     }
@@ -6886,6 +7124,62 @@ async function executeResearchObjectToolAction(input: {
           nextHints: ["workspace.read", "evidence.patch", "extraction.patch"]
         })
       };
+    }
+    if ("readLevel" in changes || "documentId" in changes || "documentChunkIds" in changes) {
+      const source = canonicalSourceForId(input.store, extraction.sourceId);
+      if (source === null) {
+        const message = `Extraction patch blocked because source ${extraction.sourceId} was not found for provenance validation.`;
+        return {
+          handled: true,
+          store: input.store,
+          message,
+          result: makeAgentToolResult({
+            run: input.run,
+            action: input.decision.action,
+            timestamp: nowText,
+            status: "blocked",
+            readOnly: false,
+            message,
+            collection: "extractions",
+            query: { entityId: extractionId, sourceId: extraction.sourceId },
+            nextHints: ["workspace.list", "workspace.read"]
+          })
+        };
+      }
+      const provisional: WorkStoreExtraction = {
+        ...extraction,
+        ...changes
+      };
+      const validation = validateDocumentProvenance({
+        store: input.store,
+        source,
+        entity: {
+          documentId: provisional.documentId ?? "",
+          documentChunkIds: provisional.documentChunkIds ?? []
+        },
+        readLevel: provisional.readLevel
+      });
+      if (!validation.ok) {
+        const message = `Extraction patch ${extractionId} blocked. ${validation.message}`;
+        return {
+          handled: true,
+          store: input.store,
+          message,
+          result: makeAgentToolResult({
+            run: input.run,
+            action: input.decision.action,
+            timestamp: nowText,
+            status: "blocked",
+            readOnly: false,
+            message,
+            collection: "extractions",
+            query: validation.query,
+            entity: entityPreviewForAgent(extraction, input.store),
+            related: validation.related,
+            nextHints: validation.nextHints
+          })
+        };
+      }
     }
     const nextStore = patchResearchWorkStoreEntity(input.store, {
       collection: "extractions",
@@ -6941,6 +7235,33 @@ async function executeResearchObjectToolAction(input: {
           totalCount: input.store.objects.extractions.length,
           items: recentSourcePreviews(input.store),
           nextHints: ["workspace.read", "workspace.list", "extraction.create"]
+        })
+      };
+    }
+    const validation = validateDocumentProvenance({
+      store: input.store,
+      source: extractionResult.source,
+      entity: args.entity,
+      readLevel: extractionResult.extraction.readLevel
+    });
+    if (!validation.ok) {
+      const message = `Extraction create blocked. ${validation.message}`;
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "blocked",
+          readOnly: false,
+          message,
+          collection: "extractions",
+          query: validation.query,
+          entity: entityPreviewForAgent(extractionResult.source, input.store),
+          related: validation.related,
+          nextHints: validation.nextHints
         })
       };
     }
@@ -7075,6 +7396,32 @@ async function executeResearchObjectToolAction(input: {
     if (requestedExtractionId.length > 0) {
       changes.extractionId = requestedExtractionId;
     }
+    const requestedReadLevel = safeReadLevel(args.entity.readLevel ?? args.changes.readLevel);
+    if (requestedReadLevel !== undefined) {
+      changes.readLevel = requestedReadLevel;
+    }
+    const requestedDocumentId = args.entity.documentId ?? args.changes.documentId;
+    if (typeof requestedDocumentId === "string" || requestedDocumentId === null) {
+      changes.documentId = requestedDocumentId === null ? null : stringInput(requestedDocumentId, "");
+    }
+    const requestedDocumentChunkIds = args.entity.documentChunkIds ?? args.entity.chunkIds ?? args.changes.documentChunkIds ?? args.changes.chunkIds;
+    if (Array.isArray(requestedDocumentChunkIds)) {
+      changes.documentChunkIds = stringArrayInput(requestedDocumentChunkIds, 80);
+    }
+    const snippetPatchRequested = [
+      "sourceSnippets",
+      "supportSnippets",
+      "quotes",
+      "sourceSnippet",
+      "supportSnippet",
+      "quote"
+    ].some((field) => field in args.entity || field in args.changes);
+    if (snippetPatchRequested) {
+      changes.sourceSnippets = sourceSnippetsFromEntity({
+        ...args.changes,
+        ...args.entity
+      });
+    }
     if (Object.keys(changes).length === 0) {
       const message = `Evidence patch skipped for ${evidenceCellId} because no patch fields were provided.`;
       return {
@@ -7093,6 +7440,62 @@ async function executeResearchObjectToolAction(input: {
           nextHints: ["workspace.read", "evidence.patch", "claim.link_support"]
         })
       };
+    }
+    if ("readLevel" in changes || "documentId" in changes || "documentChunkIds" in changes) {
+      const source = canonicalSourceForId(input.store, cell.sourceId);
+      if (source === null) {
+        const message = `Evidence patch blocked because source ${cell.sourceId} was not found for provenance validation.`;
+        return {
+          handled: true,
+          store: input.store,
+          message,
+          result: makeAgentToolResult({
+            run: input.run,
+            action: input.decision.action,
+            timestamp: nowText,
+            status: "blocked",
+            readOnly: false,
+            message,
+            collection: "evidenceCells",
+            query: { entityId: evidenceCellId, sourceId: cell.sourceId },
+            nextHints: ["workspace.list", "workspace.read"]
+          })
+        };
+      }
+      const provisional: WorkStoreEvidenceCell = {
+        ...cell,
+        ...changes
+      };
+      const validation = validateDocumentProvenance({
+        store: input.store,
+        source,
+        entity: {
+          documentId: provisional.documentId ?? "",
+          documentChunkIds: provisional.documentChunkIds ?? []
+        },
+        readLevel: provisional.readLevel
+      });
+      if (!validation.ok) {
+        const message = `Evidence patch ${evidenceCellId} blocked. ${validation.message}`;
+        return {
+          handled: true,
+          store: input.store,
+          message,
+          result: makeAgentToolResult({
+            run: input.run,
+            action: input.decision.action,
+            timestamp: nowText,
+            status: "blocked",
+            readOnly: false,
+            message,
+            collection: "evidenceCells",
+            query: validation.query,
+            entity: entityPreviewForAgent(cell, input.store),
+            related: validation.related,
+            nextHints: validation.nextHints
+          })
+        };
+      }
     }
     const nextStore = patchResearchWorkStoreEntity(input.store, {
       collection: "evidenceCells",
@@ -7136,7 +7539,21 @@ async function executeResearchObjectToolAction(input: {
         decision: input.decision,
         entity: args.entity
       });
-      const message = "Evidence cell create blocked because it requires a known source id, an existing extraction for that source, and explicit evidence value/text; process rationale/expectedOutcome is never persisted as evidence content.";
+      const requestedExtractionId = stringInput(args.entity.extractionId, "");
+      const sourceEquivalentIdList = requestedSource === null ? [] : sourceEquivalentIds(input.store, requestedSource.id);
+      const extractionCandidates = requestedSource === null
+        ? input.store.objects.extractions.slice(-8)
+        : input.store.objects.extractions.filter((extraction) => sourceEquivalentIdList.includes(extraction.sourceId));
+      const requestedValue = Array.isArray(args.entity.value)
+        ? stringArrayInput(args.entity.value, 40)
+        : stringInput(args.entity.value ?? args.entity.evidenceText ?? args.entity.text, "");
+      const missing = [
+        requestedSource === null ? "sourceId" : null,
+        requestedSource !== null && requestedExtractionId.length > 0 && readResearchWorkStoreEntity(input.store, "extractions", requestedExtractionId) === null ? "known extractionId" : null,
+        requestedSource !== null && requestedExtractionId.length === 0 && extractionCandidates.length === 0 ? "extractionId" : null,
+        Array.isArray(requestedValue) ? requestedValue.length === 0 ? "value/text" : null : requestedValue.trim().length === 0 ? "value/text" : null
+      ].filter((item): item is string => item !== null);
+      const message = `Evidence cell create blocked because ${missing.length === 0 ? "the supplied evidence payload could not be normalized" : missing.join(", ")} ${missing.length === 1 ? "is" : "are"} missing or invalid. Process rationale/expectedOutcome is never persisted as evidence content.`;
       return {
         handled: true,
         store: input.store,
@@ -7152,18 +7569,77 @@ async function executeResearchObjectToolAction(input: {
           count: 0,
           totalCount: input.store.objects.evidenceCells.length,
           items: requestedSource === null ? recentSourcePreviews(input.store) : [entityPreviewForAgent(requestedSource, input.store)],
-          related: recentExtractionPreviews(input.store, requestedSource?.id ?? null),
+          related: extractionCandidates.slice(-8).map((extraction) => entityPreviewForAgent(extraction, input.store)),
           query: {
+            missing,
             sourceId: requestedSource?.id ?? null,
             extractionId: stringInput(args.entity.extractionId, "") || null,
-            required: ["known sourceId", "existing extraction for that source", "explicit evidence value/text"]
+            candidateExtractionIds: extractionCandidates.map((extraction) => extraction.id),
+            retryShape: {
+              action: "evidence.create_cell",
+              workStore: {
+                entity: {
+                  sourceId: requestedSource?.id ?? "<source-id>",
+                  extractionId: extractionCandidates[0]?.id ?? "<extraction-id>",
+                  field: "successSignals",
+                  value: "<source-derived evidence text>",
+                  readLevel: "abstract"
+                }
+              }
+            }
           },
           nextHints: ["extraction.create", "workspace.list", "workspace.read"]
         })
       };
     }
-    const warnings = evidenceCellQualityWarnings(cell);
     const source = canonicalSourceForId(input.store, cell.sourceId);
+    if (source === null) {
+      const message = `Evidence cell create blocked because source ${cell.sourceId} was not found for provenance validation.`;
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "blocked",
+          readOnly: false,
+          message,
+          collection: "evidenceCells",
+          query: { sourceId: cell.sourceId },
+          nextHints: ["workspace.list", "workspace.read"]
+        })
+      };
+    }
+    const validation = validateDocumentProvenance({
+      store: input.store,
+      source,
+      entity: args.entity,
+      readLevel: cell.readLevel
+    });
+    if (!validation.ok) {
+      const message = `Evidence cell create blocked. ${validation.message}`;
+      return {
+        handled: true,
+        store: input.store,
+        message,
+        result: makeAgentToolResult({
+          run: input.run,
+          action: input.decision.action,
+          timestamp: nowText,
+          status: "blocked",
+          readOnly: false,
+          message,
+          collection: "evidenceCells",
+          query: validation.query,
+          entity: entityPreviewForAgent(source, input.store),
+          related: validation.related,
+          nextHints: validation.nextHints
+        })
+      };
+    }
+    const warnings = evidenceCellQualityWarnings(cell);
     const extraction = readResearchWorkStoreEntity<WorkStoreExtraction>(input.store, "extractions", cell.extractionId);
     const nextStore = createResearchWorkStoreEntity<WorkStoreEntity>(input.store, cell, nowText);
     await writeResearchWorkStore(nextStore);
@@ -7684,6 +8160,12 @@ async function executeResearchObjectToolAction(input: {
       entity: args.entity,
       notebook: input.store.notebook
     });
+    const finalizationDeclaration = finalizationDeclarationFromToolInput({
+      entity: args.entity,
+      requestedArtifactType,
+      notebookArtifactType: input.store.notebook.artifactType,
+      required: false
+    });
     const releaseCriticFreshness = criticFreshnessEvaluationForStore({
       store: input.store,
       stage: "release",
@@ -7695,6 +8177,7 @@ async function executeResearchObjectToolAction(input: {
       references,
       hardInvariantFailures: checkBundle.checks.filter((check) => check.status === "fail" && check.severity === "blocker"),
       requestedArtifactType,
+      finalizationDeclaration,
       criticAvailable: criticReviewAvailable(input.researchBackend),
       releaseCriticFreshness
     });
@@ -7782,6 +8265,12 @@ async function executeResearchObjectToolAction(input: {
       entity: args.entity,
       notebook: input.store.notebook
     });
+    const finalizationDeclaration = finalizationDeclarationFromToolInput({
+      entity: args.entity,
+      requestedArtifactType,
+      notebookArtifactType: input.store.notebook.artifactType,
+      required: true
+    });
     const releaseCriticFreshness = criticFreshnessEvaluationForStore({
       store: input.store,
       stage: "release",
@@ -7793,6 +8282,7 @@ async function executeResearchObjectToolAction(input: {
       references,
       hardInvariantFailures: hardFailures,
       requestedArtifactType,
+      finalizationDeclaration,
       criticAvailable: criticReviewAvailable(input.researchBackend),
       releaseCriticFreshness
     });

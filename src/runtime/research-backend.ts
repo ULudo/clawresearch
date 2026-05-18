@@ -559,6 +559,8 @@ function criticReviewInstruction(request: CriticReviewRequest): string {
     "For release-stage review, release.verify often runs after critic.review. If releaseChecksExist=false before finalization, recommend release.verify as the next mechanical check, but do not treat missing release checks as an objection unless manuscriptFinalized=true or paperExportExists=true.",
     "Treat missing or inconsistent final files as objections only when manuscriptFinalized=true or paperExportExists=true.",
     "draftManuscriptPreview.abstract is empty unless the researcher created a model-authored abstract section. Do not treat runtime preview metadata as authored abstract text.",
+    "Inline markers like [source-id] are ClawResearch citation markers. Do not object solely because a known source id appears in brackets if compiler/release checks accept it; object only when the marker is unknown, unsupported, misleading, or contrary to the requested style.",
+    "Notebook notes can be model-authored project-management notes. Object to notes only when they actively contradict currentFocus, readiness, tasks, or release diagnostics in a way that could mislead the next action.",
     "Your job is to identify concrete weaknesses, unsupported claims, missing synthesis, overstatements, citation/provenance problems, and manuscript-readiness issues.",
     "Distinguish mechanical/provenance issues from scientific/research-quality objections.",
     "Be concrete. For every objection, name the affected claim, section, evidence cell, citation, release check, or source when possible.",
@@ -673,7 +675,7 @@ function agentStepInstruction(request: ResearchActionRequest): string {
     '    "criticScope": "research_contract|protocol|sources|evidence|release|null",',
     '    "reason": "short status reason or null",',
     '    "workStore": {',
-    '      "collection": "providerRuns|sources|canonicalSources|screeningDecisions|fullTextRecords|extractions|evidenceCells|claims|citations|protocols|workItems|manuscriptSections|releaseChecks|null",',
+    '      "collection": "providerRuns|sources|canonicalSources|screeningDecisions|documents|documentChunks|extractions|evidenceCells|claims|citations|protocols|workItems|manuscriptSections|releaseChecks|null",',
     '      "entityId": "known entity id or null",',
     '      "filters": {},',
     '      "filterJson": "{\\"field\\":\\"simple exact match value\\"} or null",',
@@ -920,6 +922,30 @@ const commonWorkStoreEntityProperties: Record<string, Record<string, unknown>> =
     enum: ["metadata", "abstract", "partial_full_text", "full_text", null],
     description: "How much of the source was read for extraction/evidence provenance."
   },
+  finalizationDeclaration: {
+    type: ["object", "null"],
+    additionalProperties: false,
+    properties: {
+      intendedArtifact: {
+        type: ["string", "null"],
+        enum: ["research_report", "technical_report", "review_paper", "survey_paper", "method_paper", "experimental_paper", "position_paper", null]
+      },
+      notCheckpoint: {
+        type: ["boolean", "null"]
+      },
+      readinessBasis: {
+        type: ["string", "null"]
+      },
+      knownLimitations: {
+        type: ["array", "null"],
+        items: {
+          type: "string"
+        }
+      }
+    },
+    required: ["intendedArtifact", "notCheckpoint", "readinessBasis", "knownLimitations"],
+    description: "Required by manuscript.finalize. Explicit model-authored declaration that the current artifactType is intentionally being finalized and is not a checkpoint export."
+  },
   field: {
     type: ["string", "null"],
     description: "Evidence matrix field name such as limitations, architecture, evaluationSetup, or successSignals."
@@ -1026,6 +1052,22 @@ const commonWorkStoreEntityProperties: Record<string, Record<string, unknown>> =
       type: "string"
     },
     description: "Machine-actionable follow-up actions for workspace.status."
+  },
+  notes: {
+    type: ["array", "string", "null"],
+    items: {
+      type: "string"
+    },
+    description: "Notebook/project notes for notebook.patch. Use notesMode replace or clear to remove stale active notes; append is the default."
+  },
+  note: {
+    type: ["string", "null"],
+    description: "Single notebook/project note for notebook.patch."
+  },
+  notesMode: {
+    type: ["string", "null"],
+    enum: ["append", "replace", "clear", null],
+    description: "How notebook.patch handles notes. append preserves old notes, replace stores only the supplied notes, clear removes notebook notes."
   }
 };
 
@@ -1038,15 +1080,17 @@ const researchActionRecipeLines = [
   "- document.list_chunks: set workStore.entity.documentId or sourceId to inspect chunk ids and previews.",
   "- document.read_chunk: set workStore.entity.documentChunkId or entityId to read one chunk.",
   "- document.search_text: set workStore.entity.documentId or sourceId plus workStore.semanticQuery/query to search parsed chunks.",
-  "- extraction.create: set workStore.entity.sourceId or paperId to a known canonical source; include source-derived extraction fields such as problemSetting, architecture, evaluationSetup, successSignals, limitations, and evidenceNotes via payloadJson when they are not typed entity fields.",
+  "- extraction.create: set workStore.entity.sourceId or paperId to a known canonical source; include source-derived extraction fields such as problemSetting, architecture, evaluationSetup, successSignals, limitations, and evidenceNotes via payloadJson when they are not typed entity fields. If readLevel is partial_full_text/full_text, include known documentChunkIds from document.list_chunks/read_chunk/search_text.",
   "- extraction.patch: set workStore.entityId or entity.extractionId; patch source-derived fields, or set entity.status to active|superseded|retired with supersededBy/statusReason.",
-  "- evidence.create_cell: set workStore.entity.sourceId or paperId, extractionId when known, field, and value or text; keep the value grounded in the source/extraction.",
+  "- evidence.create_cell: set workStore.entity.sourceId or paperId, extractionId when known, field, and value or text; keep the value grounded in the source/extraction. If the evidence is full-text-grounded, include documentChunkIds; otherwise use readLevel abstract or metadata.",
   "- evidence.patch: set workStore.entityId or entity.evidenceCellId; patch field/value/confidence, or set entity.status to active|superseded|retired with supersededBy/statusReason.",
   "- claim.link_support: set workStore.entity.mode to append|replace|remove. append attaches claimId plus evidenceCellId/sourceId and supportSnippet; replace supersedes older support links; remove retires the matched support link without deleting audit history.",
   "- section.read: inspect full markdown, numbered blocks, linked claims/evidence/sources, mechanical hygiene warnings, and relevant critic objections before repairing prose.",
   "- section.create: include manuscript prose in markdown/content/paragraphs, without an inner top-level paper title or duplicated section-heading prefix. Add inline citation markers like [source-id] for cited workspace sources.",
   "- section.patch: use operation replace_all, replace_block, insert_after_block, append_paragraph, remove_block, update_title, set_order, or set_claim_links. Use blockIndex from section.read for block operations; use orderIndex or sectionOrder for model-owned export order. Use sourceIdsMode append|replace|remove|recompute_from_claims for exact section provenance repair; set_claim_links defaults to recompute_from_claims. Keep/repair inline source markers such as [source-id] when the prose uses source support.",
-  "- section.delete: provide a known section id/sectionId when a manuscript section should be removed from the active paper. This preserves claims/evidence/sources/support links and writes an audit event, but the section will not appear in critic packets, release checks, manuscript.finalize, or paper.md."
+  "- section.delete: provide a known section id/sectionId when a manuscript section should be removed from the active paper. This preserves claims/evidence/sources/support links and writes an audit event, but the section will not appear in critic packets, release checks, manuscript.finalize, or paper.md.",
+  "- notebook.read / notebook.patch: read or update the living model-owned project notebook. Use notebook.patch for objective, researchContract, tasks, currentFocus, readiness, artifactType, and links. Use notesMode replace or clear when critic/release feedback says old notebook notes are stale.",
+  "- manuscript.finalize: include workStore.entity.finalizationDeclaration with intendedArtifact matching the notebook artifactType, notCheckpoint true, readinessBasis, and knownLimitations. The runtime checks this declaration mechanically; the critic judges semantic artifact fit."
 ];
 
 function researchActionToolDefinition(request: ResearchActionRequest): Record<string, unknown> {
@@ -1122,7 +1166,8 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
                       "sources",
                       "canonicalSources",
                       "screeningDecisions",
-                      "fullTextRecords",
+                      "documents",
+                      "documentChunks",
                       "extractions",
                       "evidenceCells",
                       "claims",
@@ -1176,7 +1221,7 @@ function researchActionToolDefinition(request: ResearchActionRequest): Record<st
                   },
                   payloadJson: {
                     type: ["string", "null"],
-                    description: "Fallback JSON object string for create/status/notebook payload fields not covered by typed workStore.entity fields. source.select_evidence must include {\"mode\":\"append|replace|remove\"}. extraction.create may include source-derived fields such as {\"problemSetting\":\"...\",\"architecture\":\"...\",\"successSignals\":[\"...\"],\"limitations\":[\"...\"]}. extraction.patch/evidence.patch may include {\"status\":\"retired|superseded|active\",\"supersededBy\":\"...\",\"statusReason\":\"...\"}. claim.link_support may include {\"mode\":\"append|replace|remove\",\"oldEvidenceCellId\":\"...\",\"oldSourceId\":\"...\"}. section.create/patch should include {\"markdown\":\"...\"}; targeted section.patch may include {\"operation\":\"replace_block|append_paragraph|remove_block|update_title|set_order|set_claim_links\",\"blockIndex\":1,\"orderIndex\":10,\"sectionOrder\":10,\"sourceIdsMode\":\"append|replace|remove|recompute_from_claims\",\"sourceIds\":[\"...\"],\"claimIds\":[\"...\"]}; use section.delete, not status retired, to remove a section from the active manuscript. notebook.patch may include {\"artifactType\":\"research_report|technical_report|review_paper|survey_paper|method_paper|experimental_paper|position_paper\",\"objective\":\"...\",\"researchContract\":{\"researchObjectives\":[\"...\"],\"coveragePlan\":[\"...\"],\"adequacyRationale\":[\"...\"],\"knownUncertainties\":[\"...\"]},\"tasks\":[{\"id\":\"task-1\",\"title\":\"...\",\"status\":\"todo\",\"linkedEvidenceCellIds\":[\"...\"]}]}. section.link_claim may include {\"sectionId\":\"...\",\"claimId\":\"...\"}. workspace.status may include {\"status\":\"externally_blocked|needs_user_decision\",\"statusReason\":\"...\",\"nextInternalActions\":[\"...\"]}; non-terminal status notes are returned as observations and do not stop the worker."
+                    description: "Fallback JSON object string for create/status/notebook payload fields not covered by typed workStore.entity fields. source.select_evidence must include {\"mode\":\"append|replace|remove\"}. extraction.create may include source-derived fields such as {\"problemSetting\":\"...\",\"architecture\":\"...\",\"successSignals\":[\"...\"],\"limitations\":[\"...\"],\"readLevel\":\"partial_full_text\",\"documentChunkIds\":[\"chunk-id\"]}. extraction.patch/evidence.patch may include {\"status\":\"retired|superseded|active\",\"supersededBy\":\"...\",\"statusReason\":\"...\",\"readLevel\":\"partial_full_text\",\"documentChunkIds\":[\"chunk-id\"]}. claim.link_support may include {\"mode\":\"append|replace|remove\",\"oldEvidenceCellId\":\"...\",\"oldSourceId\":\"...\"}. section.create/patch should include {\"markdown\":\"...\"}; targeted section.patch may include {\"operation\":\"replace_block|append_paragraph|remove_block|update_title|set_order|set_claim_links\",\"blockIndex\":1,\"orderIndex\":10,\"sectionOrder\":10,\"sourceIdsMode\":\"append|replace|remove|recompute_from_claims\",\"sourceIds\":[\"...\"],\"claimIds\":[\"...\"]}; use section.delete, not status retired, to remove a section from the active manuscript. notebook.patch may include {\"artifactType\":\"research_report|technical_report|review_paper|survey_paper|method_paper|experimental_paper|position_paper\",\"objective\":\"...\",\"researchContract\":{\"researchObjectives\":[\"...\"],\"coveragePlan\":[\"...\"],\"adequacyRationale\":[\"...\"],\"knownUncertainties\":[\"...\"]},\"tasks\":[{\"id\":\"task-1\",\"title\":\"...\",\"status\":\"todo\",\"linkedEvidenceCellIds\":[\"...\"]}],\"notesMode\":\"append|replace|clear\",\"notes\":[\"...\"]}. manuscript.finalize must include {\"finalizationDeclaration\":{\"intendedArtifact\":\"review_paper|...\",\"notCheckpoint\":true,\"readinessBasis\":\"...\",\"knownLimitations\":[\"...\"]}}. section.link_claim may include {\"sectionId\":\"...\",\"claimId\":\"...\"}. workspace.status may include {\"status\":\"externally_blocked|needs_user_decision\",\"statusReason\":\"...\",\"nextInternalActions\":[\"...\"]}; non-terminal status notes are returned as observations and do not stop the worker."
                   },
                   link: {
                     type: "object",
